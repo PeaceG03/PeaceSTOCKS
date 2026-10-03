@@ -1,0 +1,381 @@
+{
+  "benchmark": "peacestocks-4day-storage-baseline-v1",
+  "dates": ["2026-08-31", "2026-09-01", "2026-09-02", "2026-09-03"],
+  "universe": [
+    {
+      "providerSecurityId": "SPY",
+      "symbol": "SPY",
+      "assetType": "ETF",
+      "securityId": "sec_5f9408ceb4f64c95c5130109"
+    },
+    {
+      "providerSecurityId": "AAPL",
+      "symbol": "AAPL",
+      "assetType": "STOCK",
+      "securityId": "sec_13783b4e461d2b24b7c646c8"
+    },
+    {
+      "providerSecurityId": "QQQ",
+      "symbol": "QQQ",
+      "assetType": "ETF",
+      "securityId": "sec_d14d69985490a201cf3e2d35"
+    }
+  ],
+  "logicalSchema": "foundation-d.1-10m-v1",
+  "sessions": {
+    "2026-08-31": {
+      "bars": 117,
+      "securities": 3,
+      "expectedIntervals": 39,
+      "states": ["VALID_TRADED"]
+    },
+    "2026-09-01": {
+      "bars": 117,
+      "securities": 3,
+      "expectedIntervals": 39,
+      "states": ["VALID_TRADED"]
+    },
+    "2026-09-02": {
+      "bars": 117,
+      "securities": 3,
+      "expectedIntervals": 39,
+      "states": ["VALID_TRADED"]
+    },
+    "2026-09-03": {
+      "bars": 117,
+      "securities": 3,
+      "expectedIntervals": 39,
+      "states": ["VALID_TRADED"]
+    }
+  },
+  "totalBars": 468,
+  "formats": {
+    "JSONL": {
+      "perDay": {
+        "2026-08-31": {
+          "bars": 117,
+          "rawBytes": 89173,
+          "compressedBytes": 89173,
+          "encodeMs": 0.325,
+          "decodeMs": 0.528,
+          "randomReadMs": 0.133,
+          "streamBarsPerSec": 221590.91,
+          "streamMBPerSec": 168.8883,
+          "cpuMs": 0,
+          "roundTrip": true,
+          "integrity": true
+        },
+        "2026-09-01": {
+          "bars": 117,
+          "rawBytes": 89175,
+          "compressedBytes": 89175,
+          "encodeMs": 0.417,
+          "decodeMs": 0.318,
+          "randomReadMs": 0.107,
+          "streamBarsPerSec": 367924.53,
+          "streamMBPerSec": 280.4245,
+          "cpuMs": 0,
+          "roundTrip": true,
+          "integrity": true
+        },
+        "2026-09-02": {
+          "bars": 117,
+          "rawBytes": 89115,
+          "compressedBytes": 89115,
+          "encodeMs": 0.322,
+          "decodeMs": 0.366,
+          "randomReadMs": 0.097,
+          "streamBarsPerSec": 319672.13,
+          "streamMBPerSec": 243.4836,
+          "cpuMs": 0,
+          "roundTrip": true,
+          "integrity": true
+        },
+        "2026-09-03": {
+          "bars": 117,
+          "rawBytes": 89164,
+          "compressedBytes": 89164,
+          "encodeMs": 0.246,
+          "decodeMs": 0.315,
+          "randomReadMs": 0.092,
+          "streamBarsPerSec": 371428.57,
+          "streamMBPerSec": 283.0603,
+          "cpuMs": 16,
+          "roundTrip": true,
+          "integrity": true
+        }
+      },
+      "total": {}
+    },
+    "PARQUET_ZSTD": {
+      "perDay": {
+        "2026-08-31": {
+          "bars": 117,
+          "rawBytes": 89173,
+          "compressedBytes": 36564,
+          "encodeMs": 38.873,
+          "decodeMs": 52.934,
+          "randomReadMs": 3.647,
+          "streamBarsPerSec": 2210.3,
+          "streamMBPerSec": 0.6907,
+          "cpuMs": 78,
+          "roundTrip": true,
+          "integrity": true,
+          "settings": "parquet-wasm 0.7.2, apache-arrow 18.1.0, ZSTD, dictionary encoding, one file per security/day"
+        },
+        "2026-09-01": {
+          "bars": 117,
+          "rawBytes": 89175,
+          "compressedBytes": 36664,
+          "encodeMs": 16.353,
+          "decodeMs": 14.464,
+          "randomReadMs": 2.994,
+          "streamBarsPerSec": 8089.05,
+          "streamMBPerSec": 2.5348,
+          "cpuMs": 78,
+          "roundTrip": true,
+          "integrity": true,
+          "settings": "parquet-wasm 0.7.2, apache-arrow 18.1.0, ZSTD, dictionary encoding, one file per security/day"
+        },
+        "2026-09-02": {
+          "bars": 117,
+          "rawBytes": 89115,
+          "compressedBytes": 36586,
+          "encodeMs": 12.628,
+          "decodeMs": 10.792,
+          "randomReadMs": 2.822,
+          "streamBarsPerSec": 10841.36,
+          "streamMBPerSec": 3.3901,
+          "cpuMs": 79,
+          "roundTrip": true,
+          "integrity": true,
+          "settings": "parquet-wasm 0.7.2, apache-arrow 18.1.0, ZSTD, dictionary encoding, one file per security/day"
+        },
+        "2026-09-03": {
+          "bars": 117,
+          "rawBytes": 89164,
+          "compressedBytes": 36643,
+          "encodeMs": 8.148,
+          "decodeMs": 9.629,
+          "randomReadMs": 3.079,
+          "streamBarsPerSec": 12150.79,
+          "streamMBPerSec": 3.8055,
+          "cpuMs": 0,
+          "roundTrip": true,
+          "integrity": true,
+          "settings": "parquet-wasm 0.7.2, apache-arrow 18.1.0, ZSTD, dictionary encoding, one file per security/day"
+        }
+      },
+      "total": {}
+    },
+    "DUST_V1": {
+      "perDay": {
+        "2026-08-31": {
+          "bars": 117,
+          "rawBytes": 89173,
+          "compressedBytes": 6617,
+          "encodeMs": 4.028,
+          "decodeMs": 1.349,
+          "randomReadMs": 0.397,
+          "streamBarsPerSec": 86730.91,
+          "streamMBPerSec": 4.9051,
+          "cpuMs": 47,
+          "roundTrip": true,
+          "integrity": true,
+          "settings": "Dust V1 current codec, one block per security/day"
+        },
+        "2026-09-01": {
+          "bars": 117,
+          "rawBytes": 89175,
+          "compressedBytes": 6655,
+          "encodeMs": 3.39,
+          "decodeMs": 1.116,
+          "randomReadMs": 0.337,
+          "streamBarsPerSec": 104838.71,
+          "streamMBPerSec": 5.9633,
+          "cpuMs": 0,
+          "roundTrip": true,
+          "integrity": true,
+          "settings": "Dust V1 current codec, one block per security/day"
+        },
+        "2026-09-02": {
+          "bars": 117,
+          "rawBytes": 89115,
+          "compressedBytes": 6576,
+          "encodeMs": 2.896,
+          "decodeMs": 1.328,
+          "randomReadMs": 0.278,
+          "streamBarsPerSec": 88102.41,
+          "streamMBPerSec": 4.9518,
+          "cpuMs": 0,
+          "roundTrip": true,
+          "integrity": true,
+          "settings": "Dust V1 current codec, one block per security/day"
+        },
+        "2026-09-03": {
+          "bars": 117,
+          "rawBytes": 89164,
+          "compressedBytes": 6593,
+          "encodeMs": 1.812,
+          "decodeMs": 1.121,
+          "randomReadMs": 0.353,
+          "streamBarsPerSec": 104371.1,
+          "streamMBPerSec": 5.8814,
+          "cpuMs": 0,
+          "roundTrip": true,
+          "integrity": true,
+          "settings": "Dust V1 current codec, one block per security/day"
+        }
+      },
+      "total": {}
+    }
+  },
+  "summary": {
+    "JSONL": {
+      "totalBars": 468,
+      "totalBytes": 356627,
+      "bytesPerBar": 762.0235042735043,
+      "meanBytesPerDay": 89156.75,
+      "medianBytesPerDay": 89168.5,
+      "minBytesPerDay": 89115,
+      "maxBytesPerDay": 89175,
+      "projectedGBPerYear": 0.022467501,
+      "projectedYearsOn32GB": 1424.2794514619138,
+      "meanEncodeMs": 0.3275,
+      "meanDecodeMs": 0.38175000000000003,
+      "meanRandomReadMs": 0.10724999999999998,
+      "meanStreamBarsPerSec": 320154.03500000003,
+      "meanStreamMBPerSec": 243.964175,
+      "roundTripDays": 4,
+      "integrityDays": 4
+    },
+    "PARQUET_ZSTD": {
+      "totalBars": 468,
+      "totalBytes": 146457,
+      "bytesPerBar": 312.9423076923077,
+      "meanBytesPerDay": 36614.25,
+      "medianBytesPerDay": 36614.5,
+      "minBytesPerDay": 36564,
+      "maxBytesPerDay": 36664,
+      "projectedGBPerYear": 0.009226791,
+      "projectedYearsOn32GB": 3468.1613575077185,
+      "meanEncodeMs": 19.0005,
+      "meanDecodeMs": 21.95475,
+      "meanRandomReadMs": 3.1355000000000004,
+      "meanStreamBarsPerSec": 8322.875,
+      "meanStreamMBPerSec": 2.6052750000000002,
+      "roundTripDays": 4,
+      "integrityDays": 4
+    },
+    "DUST_V1": {
+      "totalBars": 468,
+      "totalBytes": 26441,
+      "bytesPerBar": 56.49786324786325,
+      "meanBytesPerDay": 6610.25,
+      "medianBytesPerDay": 6605,
+      "minBytesPerDay": 6576,
+      "maxBytesPerDay": 6655,
+      "projectedGBPerYear": 0.001665783,
+      "projectedYearsOn32GB": 19210.18524021436,
+      "meanEncodeMs": 3.0315,
+      "meanDecodeMs": 1.2285,
+      "meanRandomReadMs": 0.34125,
+      "meanStreamBarsPerSec": 96010.7825,
+      "meanStreamMBPerSec": 5.425400000000001,
+      "roundTripDays": 4,
+      "integrityDays": 4
+    }
+  },
+  "peakRssBytes": 234618880,
+  "provider": "massive-stocks",
+  "warnings": [
+    "Representative three-security fixture; not a full-universe storage projection.",
+    "One Parquet file per security/day makes random-read behavior comparable to one Dust block but adds repeated file/footer overhead.",
+    "Raw provider payloads were not persisted."
+  ],
+  "selection": {
+    "rationale": "Four consecutive recent completed U.S. sessions selected because all were retrievable at 10-minute resolution under the configured Massive plan; no claim is made that they represent ideal regime buckets.",
+    "frozenFixture": "src/storage-benchmark-fixtures.ts",
+    "providerPlanLimitation": "Full-universe intraday retrieval was not attempted; this is a three-security representative fixture."
+  },
+  "barOnlyProjection": {
+    "note": "Measured from the 3-security fixture only; not a full-universe archive forecast.",
+    "formats": {
+      "JSONL": "0.022467501 GB/year; 1424.279 years on 32 GB",
+      "PARQUET_ZSTD": "0.009226791 GB/year; 3468.161 years on 32 GB",
+      "DUST_V1": "0.001665783 GB/year; 19210.185 years on 32 GB"
+    }
+  },
+  "permanentMetadataAllowance": {
+    "status": "NOT_MEASURED",
+    "includedInBarProjection": false,
+    "requiredCategories": [
+      "partition/manifests",
+      "Security Master/lifecycle deltas",
+      "corporate actions",
+      "predictions/beliefs",
+      "revisions/corrections"
+    ],
+    "note": "No full-universe allowance is invented from this small fixture. Production total-archive projection remains open."
+  },
+  "targetClassification": {
+    "JSONL": "CLOSE",
+    "PARQUET_ZSTD": "CLOSE",
+    "DUST_V1": "CLOSE",
+    "reason": "All three pass the representative bar-only arithmetic, but none can be rated PASS for the 32 GB/10-year total archive until full-universe density and permanent Foundation D metadata are measured."
+  },
+  "integrityValidation": {
+    "validFileRoundTrips": "4/4 days for all three formats; all Dust blocks decoded and checksum-validated",
+    "dustChecksumCorruption": "PASS in existing intraday-dust regression suite; temporary benchmark harness corruption probe used an insufficient header byte and is not treated as evidence.",
+    "parquetContainer": "4/4 days had PAR1 header/footer and SHA-256 length-valid hashes",
+    "rawProviderPayloadsPersisted": false
+  },
+  "storageContributors": {
+    "JSONL": [
+      "repeated field names and JSON punctuation",
+      "repeated timestamps/provenance/flags per observation",
+      "uncompressed text numbers"
+    ],
+    "PARQUET_ZSTD": [
+      "per-security/day file/footer overhead in this benchmark setting",
+      "typed columns and string/provenance columns",
+      "ZSTD and dictionary encoding"
+    ],
+    "DUST_V1": [
+      "per-block headers/dictionaries/checksums",
+      "scaled integer and delta/varint payload",
+      "deflate-raw secondary compression",
+      "per-security/day block granularity"
+    ]
+  },
+  "dustV2Candidates": [
+    "benchmark a larger block/row-group strategy on full-universe partitions",
+    "measure adaptive run-length/bit packing for repeated state/quality fields",
+    "measure frame-of-reference and column grouping for price/volume",
+    "measure index overhead against random-read latency",
+    "retain provenance dictionarying and checksums unless measured otherwise"
+  ],
+  "scopeStatus": {
+    "status": "COMPLETE_FOR_FROZEN_FIXTURE",
+    "fullUniverse": "NOT_MEASURED",
+    "fullUniverseReason": "The configured intraday plan was not used for a large historical backfill; the frozen fixture is SPY/AAPL/QQQ only."
+  },
+  "dailyEvidenceReconciliation": {
+    "status": "NOT_RUN",
+    "reason": "This pass is a storage-format baseline and did not modify existing daily evidence; no migration or deletion occurred."
+  },
+  "scannerReaderIntegration": {
+    "status": "EXISTING_COMPATIBILITY_PASSED",
+    "evidence": "Markets test suite covers Reader reconstruction and Scanner V0 daily compatibility; strategy rules unchanged."
+  },
+  "longRunReliability": {
+    "status": "EXISTING_ARCHITECTURE_PRESERVED",
+    "liveMultiDayCollectorRun": false,
+    "evidence": "Existing scheduler/backfill/idempotency/recovery tests remain green."
+  },
+  "temporaryArtifacts": {
+    "rawProviderPayloads": "NOT_PERSISTED",
+    "temporaryBenchmarkDirectory": "PURGED_AFTER_MEASUREMENT",
+    "committedArtifacts": ["date/universe fixture", "measured JSON report"]
+  }
+}

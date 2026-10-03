@@ -1,0 +1,280 @@
+import { createHash } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
+import { join } from "node:path";
+import type {
+  CanonicalDailyBar,
+  CorporateAction,
+  MarketProvider,
+  RunStatus,
+  ScannerRunReport,
+  SessionKind,
+  SessionRecord,
+  ProviderSecurityRecord,
+  PredictionStatus,
+} from "./contracts";
+import { MARKET_SCHEMA_VERSION, SCANNER_VERSION } from "./contracts";
+import { rankSecurities } from "./ranking";
+import { fingerprint } from "./identity";
+import { refreshEligibility, refreshUniverse } from "./universe";
+import type { MarketStorage } from "./storage";
+import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
+import type { DustReader } from "./reader";
+
+export interface SessionCalendar {
+  getSession(sessionDate: string): SessionRecord;
+}
+export type ScannerRunMode = "FORWARD" | "EVIDENCE_ONLY";
+
+const HOLIDAYS = new Set(["01-01", "07-04", "12-25"]);
+export const US_EQUITY_CALENDAR: SessionCalendar = {
+  getSession(sessionDate) {
+    const date = new Date(`${sessionDate}T00:00:00Z`);
+    const weekday = date.getUTCDay();
+    const kind: SessionKind =
+      weekday === 0 || weekday === 6 || HOLIDAYS.has(sessionDate.slice(5)) ? "CLOSED" : "NORMAL";
+    return { sessionDate, kind, market: "US_EQUITIES", source: "scanner-v0-calendar" };
+  },
+};
+
+export class MarketsScanner {
+  constructor(
+    private readonly provider: MarketProvider,
+    private readonly storage: MarketStorage,
+    private readonly calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
+  ) {}
+
+  async run(sessionDate: string, mode: ScannerRunMode = "FORWARD"): Promise<ScannerRunReport> {
+    await this.storage.initialize();
+    const session = this.calendar.getSession(sessionDate);
+    const runId = `scan_${fingerprint({ sessionDate, provider: this.provider.providerName, version: SCANNER_VERSION, ...(mode === "EVIDENCE_ONLY" ? { mode } : {}) }).slice(0, 24)}`;
+    if (session.kind === "CLOSED" || session.kind === "HOLIDAY")
+      return this.finish({
+        runId,
+        session,
+        status: "COMPLETE",
+        expectedSecurities: 0,
+        processedSecurities: 0,
+        validSecurities: 0,
+        incompleteSecurities: 0,
+        unresolvedFailures: [],
+        scannerVersion: SCANNER_VERSION,
+      });
+    const failures: string[] = [];
+    let refresh;
+    try {
+      refresh = await refreshUniverse(this.provider, this.storage, sessionDate);
+      const bindUniverse = (
+        this.provider as MarketProvider & {
+          bindUniverse?: (records: ProviderSecurityRecord[]) => void;
+        }
+      ).bindUniverse;
+      if (bindUniverse)
+        bindUniverse.call(
+          this.provider,
+          refresh.securities.map((security) => ({
+            provider: this.provider.providerName,
+            providerSecurityId:
+              security.providerIdentities.find(
+                (identity) => identity.provider === this.provider.providerName,
+              )?.providerSecurityId ?? security.securityId,
+            symbol: security.currentSymbol,
+            assetType: security.assetType,
+            country: security.country,
+            exchange: security.exchange,
+            active: security.status === "ACTIVE",
+            tradable: security.tradable,
+            ...(security.fractional === undefined ? {} : { fractional: security.fractional }),
+          })),
+        );
+    } catch (error) {
+      failures.push(`UNIVERSE_PROVIDER_ERROR:${String(error)}`);
+      await this.storage.writePredictionStatus({
+        predictionStatusId: `prediction-status_${runId}`,
+        sessionDate,
+        status: "UNAVAILABLE",
+        reason: "SOURCE_COLLECTION_FAILED",
+        scannerVersion: SCANNER_VERSION,
+        configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
+        recordedAt: new Date().toISOString(),
+        sourceRunId: runId,
+        supersedesPredictionIds: [],
+      });
+      return this.finish({
+        runId,
+        session,
+        status: "FAILED",
+        expectedSecurities: 0,
+        processedSecurities: 0,
+        validSecurities: 0,
+        incompleteSecurities: 0,
+        unresolvedFailures: failures,
+        scannerVersion: SCANNER_VERSION,
+        predictionStatus: "UNAVAILABLE",
+        predictionReason: "SOURCE_COLLECTION_FAILED",
+      });
+    }
+    const ids = refresh.securities
+      .filter((security) => security.status === "ACTIVE")
+      .map((security) => security.securityId);
+    let bars: CanonicalDailyBar[] = [];
+    let actions: CorporateAction[] = [];
+    try {
+      [bars, actions] = await Promise.all([
+        this.provider.getDailyBars(sessionDate, ids),
+        this.provider.getCorporateActions(sessionDate, ids),
+      ]);
+      await this.storage.appendBars(bars);
+      await this.storage.appendActions(actions);
+    } catch (error) {
+      failures.push(`EVIDENCE_PROVIDER_ERROR:${String(error)}`);
+    }
+    const expected = ids.length;
+    const received = new Set(
+      bars.filter((bar) => bar.sessionDate === sessionDate).map((bar) => bar.securityId),
+    );
+    const partitionQuality =
+      failures.length === 0 ? "GOOD" : received.size > 0 ? "PARTIAL_RUN" : "PROVIDER_ERROR";
+    try {
+      await finalizeDailyPartition(
+        this.storage,
+        sessionDate,
+        this.provider.providerName,
+        partitionQuality,
+      );
+    } catch (error) {
+      failures.push(`PARTITION_FINALIZATION_ERROR:${String(error)}`);
+    }
+    const incomplete = ids.filter((id) => !received.has(id)).length;
+    if (incomplete) failures.push(`MISSING_SECURITY_EVIDENCE:${incomplete}`);
+    const securities = await refreshEligibility(this.storage);
+    const allBars = await this.storage.loadBars();
+    const benchmark = allBars.filter((bar) => bar.securityId === "BENCHMARK_US_EQUITY");
+    const result = rankSecurities(securities, allBars, benchmark, sessionDate);
+    const sourceCollectionFailed = failures.some((failure) =>
+      failure.startsWith("EVIDENCE_PROVIDER_ERROR:"),
+    );
+    const predictionUnavailableReason: PredictionStatus["reason"] | undefined =
+      sourceCollectionFailed
+        ? "SOURCE_COLLECTION_FAILED"
+        : mode === "EVIDENCE_ONLY"
+          ? "EVIDENCE_ONLY"
+          : undefined;
+    const predictionIds = result.predictions.map((prediction) => prediction.predictionId);
+    const emptyPredictionSets = result.predictions.every(
+      (prediction) => prediction.securityIds.length === 0,
+    );
+    if (predictionUnavailableReason) {
+      failures.push("PREDICTION_UNAVAILABLE_SOURCE_COLLECTION_FAILED");
+      await this.storage.writePredictionStatus({
+        predictionStatusId: `prediction-status_${runId}`,
+        sessionDate,
+        status: "UNAVAILABLE",
+        reason: predictionUnavailableReason,
+        scannerVersion: SCANNER_VERSION,
+        configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
+        recordedAt: new Date().toISOString(),
+        sourceRunId: runId,
+        supersedesPredictionIds: predictionIds,
+      });
+    } else {
+      try {
+        await this.storage.writeBeliefs(result.beliefs);
+        await this.storage.writePredictions(result.predictions);
+        await this.storage.writeDecisions(result.beliefs);
+        await this.storage.writePredictionStatus({
+          predictionStatusId: `prediction-status_${runId}`,
+          sessionDate,
+          status: "FROZEN",
+          reason: emptyPredictionSets ? "NO_QUALIFYING_CANDIDATES" : "PREDICTIONS_FROZEN",
+          scannerVersion: SCANNER_VERSION,
+          configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
+          recordedAt: new Date().toISOString(),
+          sourceRunId: runId,
+          supersedesPredictionIds: [],
+        });
+      } catch (error) {
+        failures.push(`IMMUTABLE_DECISION_CONFLICT:${String(error)}`);
+      }
+    }
+    const status: RunStatus =
+      failures.length === 0 ? "COMPLETE" : received.size > 0 ? "COMPLETE_WITH_WARNINGS" : "FAILED";
+    return this.finish({
+      runId,
+      session,
+      status,
+      expectedSecurities: expected,
+      processedSecurities: received.size,
+      validSecurities: bars.filter((bar) => bar.dataQuality === "GOOD").length,
+      incompleteSecurities: incomplete,
+      unresolvedFailures: failures,
+      scannerVersion: SCANNER_VERSION,
+      ...(predictionUnavailableReason
+        ? {
+            predictionStatus: "UNAVAILABLE" as const,
+            predictionReason: predictionUnavailableReason,
+          }
+        : {
+            predictionStatus: "FROZEN" as const,
+            predictionReason: emptyPredictionSets
+              ? ("NO_QUALIFYING_CANDIDATES" as const)
+              : ("PREDICTIONS_FROZEN" as const),
+          }),
+    });
+  }
+
+  private async finish(
+    input: Omit<ScannerRunReport, "completedAt" | "storage">,
+  ): Promise<ScannerRunReport> {
+    const report: ScannerRunReport = {
+      ...input,
+      completedAt: new Date().toISOString(),
+      storage: await this.storage.measureStorage(),
+    };
+    await this.storage.writeRunReport(report);
+    return report;
+  }
+}
+
+export async function finalizeDailyPartition(
+  storage: MarketStorage,
+  sessionDate: string,
+  provider: string,
+  quality: "GOOD" | "PARTIAL_RUN" | "PROVIDER_ERROR",
+): Promise<void> {
+  const path = join(storage.permanentRoot, "daily-bars", `${sessionDate.slice(0, 7)}.jsonl`);
+  const bytes = await readFile(path).catch(() => Buffer.from(""));
+  const lines = bytes.length ? bytes.toString("utf8").trim().split("\n").filter(Boolean) : [];
+  const sessionDates = lines
+    .map((line) => line.match(/"sessionDate":"(\d{4}-\d{2}-\d{2})"/)?.[1])
+    .filter((value): value is string => Boolean(value))
+    .sort();
+  const manifest = {
+    partitionId: `daily-bars-${sessionDate.slice(0, 7)}`,
+    category: "canonical-daily-bars",
+    sessionStart: sessionDates[0] ?? sessionDate,
+    sessionEnd: sessionDates.at(-1) ?? sessionDate,
+    rowCount: lines.length,
+    schemaVersion: MARKET_SCHEMA_VERSION,
+    byteSize: (await stat(path).catch(() => ({ size: 0 }))).size,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    provider,
+    finalizedAt: new Date().toISOString(),
+    quality,
+  };
+  await storage.writePartitionManifest(manifest);
+}
+
+/**
+ * Scanner V0 compatibility boundary: reconstruct daily evidence from the
+ * canonical 10-minute Reader without storing a second permanent daily source.
+ */
+export async function reconstructDailyBarsFromReader(
+  reader: Pick<DustReader, "reconstructDaily">,
+  sessionDate: string,
+  securityIds: readonly string[],
+): Promise<CanonicalDailyBar[]> {
+  const reconstructed = await Promise.all(
+    securityIds.map((securityId) => reader.reconstructDaily(sessionDate, securityId)),
+  );
+  return reconstructed.filter((bar): bar is CanonicalDailyBar => bar !== undefined);
+}

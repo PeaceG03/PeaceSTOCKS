@@ -1,0 +1,414 @@
+import type {
+  CanonicalDailyBar,
+  CanonicalTenMinuteBar,
+  CorporateAction,
+  MarketProvider,
+  MassiveAggregateBar,
+  ProviderSecurityRecord,
+} from "./contracts";
+import { MARKET_SCHEMA_VERSION } from "./contracts";
+import { securityId } from "./identity";
+import { intradaySessionSpec, normalizeMassiveTenMinuteBars } from "./intraday";
+
+const DEFAULT_BASE_URL = "https://api.massive.com";
+const DEFAULT_MIN_REQUEST_INTERVAL_MS = 12_500;
+const PAGE_LIMIT = 1_000;
+type JsonRecord = Record<string, unknown>;
+
+export interface MassiveProviderOptions {
+  apiKey?: string;
+  baseUrl?: string;
+  fetchImpl?: typeof fetch;
+  minRequestIntervalMs?: number;
+  now?: () => string;
+}
+
+const text = (value: unknown): string | undefined =>
+  typeof value === "string" && value.length > 0 ? value : undefined;
+const finite = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) ? value : undefined;
+const records = (value: unknown): JsonRecord[] =>
+  Array.isArray(value)
+    ? value.filter((item): item is JsonRecord => !!item && typeof item === "object")
+    : [];
+
+const details = (record: JsonRecord): Record<string, string | number | boolean> =>
+  Object.fromEntries(
+    Object.entries(record).filter(
+      ([key, value]) => key !== "ticker" && ["string", "number", "boolean"].includes(typeof value),
+    ),
+  ) as Record<string, string | number | boolean>;
+
+function requireDate(value: string): void {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new Error("INVALID_SESSION_DATE");
+}
+
+function responseRecord(value: unknown): JsonRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("MASSIVE_INVALID_RESPONSE");
+  return value as JsonRecord;
+}
+
+function safeProviderErrorBody(body: string): string {
+  const trimmed = body.trim();
+  if (!trimmed) return "empty-body";
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as JsonRecord;
+      const safe = Object.fromEntries(
+        ["status", "code", "message", "error", "request_id", "requestId"].flatMap((key) =>
+          key in record && ["string", "number", "boolean"].includes(typeof record[key])
+            ? [[key, record[key]]]
+            : [],
+        ),
+      );
+      return JSON.stringify(Object.keys(safe).length ? safe : { body: trimmed.slice(0, 500) });
+    }
+  } catch {
+    // Preserve a bounded, non-secret diagnostic for non-JSON provider errors.
+  }
+  return trimmed.replaceAll(/\s+/gu, " ").slice(0, 500);
+}
+
+/** Read-only adapter for Massive Stocks REST reference, EOD, split, and dividend APIs. */
+export class MassiveMarketProvider implements MarketProvider {
+  readonly providerName = "massive-stocks";
+  private readonly apiKey: string;
+  private readonly baseUrl: URL;
+  private readonly fetchImpl: typeof fetch;
+  private readonly minRequestIntervalMs: number;
+  private readonly now: () => string;
+  private lastRequestAt = 0;
+  private readonly symbolBySecurityId = new Map<string, string>();
+
+  constructor(options: MassiveProviderOptions = {}) {
+    this.apiKey = options.apiKey ?? process.env.MASSIVE_API_KEY ?? "";
+    this.baseUrl = new URL(options.baseUrl ?? DEFAULT_BASE_URL);
+    if (this.baseUrl.protocol !== "https:") throw new Error("MASSIVE_HTTPS_REQUIRED");
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.minRequestIntervalMs = options.minRequestIntervalMs ?? DEFAULT_MIN_REQUEST_INTERVAL_MS;
+    if (this.minRequestIntervalMs < 0) throw new Error("MASSIVE_INVALID_RATE_LIMIT");
+    this.now = options.now ?? (() => new Date().toISOString());
+  }
+
+  private requireApiKey(): void {
+    if (!this.apiKey) throw new Error("MASSIVE_API_KEY_REQUIRED");
+  }
+
+  private async waitForRateLimit(): Promise<void> {
+    const wait = this.lastRequestAt + this.minRequestIntervalMs - Date.now();
+    if (wait > 0) await new Promise<void>((resolve) => setTimeout(resolve, wait));
+    this.lastRequestAt = Date.now();
+  }
+
+  private url(pathOrUrl: string, params?: Record<string, string>): URL {
+    const url = new URL(pathOrUrl, this.baseUrl);
+    if (url.origin !== this.baseUrl.origin || url.protocol !== "https:")
+      throw new Error("MASSIVE_UNTRUSTED_NEXT_URL");
+    if (params) for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+    url.searchParams.set("apiKey", this.apiKey);
+    return url;
+  }
+
+  private async get(pathOrUrl: string, params?: Record<string, string>): Promise<JsonRecord> {
+    this.requireApiKey();
+    await this.waitForRateLimit();
+    const response = await this.fetchImpl(this.url(pathOrUrl, params), {
+      headers: { accept: "application/json" },
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      const requestId = response.headers.get("request-id") ?? response.headers.get("x-request-id");
+      throw new Error(
+        `MASSIVE_HTTP_${response.status}:requestId=${requestId ?? "unknown"}:body=${safeProviderErrorBody(body)}`,
+      );
+    }
+    return responseRecord(await response.json());
+  }
+
+  private normalize(record: JsonRecord): ProviderSecurityRecord | undefined {
+    const symbol = text(record.ticker);
+    const providerSecurityId =
+      text(record.share_class_figi) ?? text(record.composite_figi) ?? symbol;
+    const type = text(record.type)?.toUpperCase();
+    const market = text(record.market)?.toLowerCase();
+    const locale = text(record.locale)?.toLowerCase();
+    const listingDate = text(record.list_date);
+    const providerUpdatedAt = text(record.last_updated);
+    if (!symbol || !providerSecurityId || (type !== "CS" && type !== "ETF")) return undefined;
+    if (market && market !== "stocks") return undefined;
+    if (locale && locale !== "us") return undefined;
+    return {
+      provider: this.providerName,
+      providerSecurityId,
+      symbol,
+      assetType: type === "ETF" ? "ETF" : "STOCK",
+      country: "US",
+      exchange: text(record.primary_exchange) ?? "UNKNOWN",
+      active: record.active !== false,
+      tradable: record.active !== false,
+      ...(typeof record.fractionable === "boolean" ? { fractional: record.fractionable } : {}),
+      ...(listingDate ? { listingDate } : {}),
+      ...(providerUpdatedAt ? { providerUpdatedAt } : {}),
+    };
+  }
+
+  async listApprovedSecurities(): Promise<ProviderSecurityRecord[]> {
+    const output = new Map<string, ProviderSecurityRecord>();
+    for (const active of ["true", "false"]) {
+      let next: string | undefined = "/v3/reference/tickers";
+      let first = true;
+      while (next) {
+        const response = await this.get(
+          next,
+          first
+            ? {
+                market: "stocks",
+                locale: "us",
+                active,
+                order: "asc",
+                sort: "ticker",
+                limit: String(PAGE_LIMIT),
+              }
+            : undefined,
+        );
+        first = false;
+        for (const record of records(response.results)) {
+          const normalized = this.normalize(record);
+          if (normalized)
+            output.set(`${normalized.providerSecurityId}|${normalized.assetType}`, normalized);
+        }
+        const candidate = text(response.next_url);
+        next = candidate && candidate !== next ? candidate : undefined;
+      }
+    }
+    const result = [...output.values()].sort((a, b) => a.symbol.localeCompare(b.symbol));
+    this.bindUniverse(result);
+    return result;
+  }
+
+  bindUniverse(recordsToBind: ProviderSecurityRecord[]): void {
+    this.symbolBySecurityId.clear();
+    for (const record of recordsToBind) {
+      this.symbolBySecurityId.set(
+        securityId(record.provider, record.providerSecurityId, record.assetType),
+        record.symbol,
+      );
+    }
+  }
+
+  async getDailyBars(sessionDate: string, securityIds: string[]): Promise<CanonicalDailyBar[]> {
+    requireDate(sessionDate);
+    if (!this.symbolBySecurityId.size) throw new Error("MASSIVE_UNIVERSE_REQUIRED_BEFORE_BARS");
+    const response = await this.get(`/v2/aggs/grouped/locale/us/market/stocks/${sessionDate}`, {
+      adjusted: "false",
+      include_otc: "false",
+    });
+    const ids = new Set(securityIds);
+    const bySymbol = new Map(
+      [...this.symbolBySecurityId.entries()]
+        .filter(([id]) => ids.has(id))
+        .map(([id, symbol]) => [symbol, id]),
+    );
+    const observedAt = this.now();
+    const retrievalId = text(response.request_id) ?? `grouped-${sessionDate}`;
+    return records(response.results)
+      .flatMap((raw) => {
+        const id = bySymbol.get(text(raw.T) ?? "");
+        const open = finite(raw.o),
+          high = finite(raw.h),
+          low = finite(raw.l),
+          close = finite(raw.c),
+          volume = finite(raw.v);
+        if (
+          !id ||
+          open === undefined ||
+          high === undefined ||
+          low === undefined ||
+          close === undefined ||
+          volume === undefined
+        )
+          return [];
+        const timestamp = finite(raw.t);
+        return [
+          {
+            securityId: id,
+            sessionDate,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            ...(timestamp === undefined
+              ? {}
+              : { sourceTimestamp: new Date(timestamp).toISOString() }),
+            observedAt,
+            ingestedAt: observedAt,
+            dataQuality: "GOOD" as const,
+            corporateActionIds: [],
+            flags: ["MASSIVE_GROUPED_DAILY", "UNADJUSTED"],
+            schemaVersion: MARKET_SCHEMA_VERSION,
+            revision: 1,
+            provenance: {
+              provider: this.providerName,
+              dataset: "stocks-grouped-daily",
+              retrievalId,
+              providerTimestamp: observedAt,
+              ingestionVersion: "markets-scanner-v0",
+              normalizerVersion: "massive-v1",
+            },
+          },
+        ];
+      })
+      .sort((a, b) => a.securityId.localeCompare(b.securityId));
+  }
+
+  async getIntradayBars(
+    sessionDate: string,
+    securityIds: string[],
+  ): Promise<CanonicalTenMinuteBar[]> {
+    requireDate(sessionDate);
+    if (!this.symbolBySecurityId.size) throw new Error("MASSIVE_UNIVERSE_REQUIRED_BEFORE_BARS");
+    const session = intradaySessionSpec(sessionDate);
+    if (session.expectedIntervals === 0) return [];
+    const output: CanonicalTenMinuteBar[] = [];
+    const observedAt = this.now();
+    for (const securityIdValue of securityIds) {
+      const symbol = this.symbolBySecurityId.get(securityIdValue);
+      if (!symbol) continue;
+      const response = await this.get(
+        `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/10/minute/${sessionDate}/${sessionDate}`,
+        {
+          adjusted: "false",
+          sort: "asc",
+          limit: "50000",
+        },
+      );
+      const aggregates: MassiveAggregateBar[] = records(response.results).flatMap((raw) => {
+        const timestamp = finite(raw.t);
+        const open = finite(raw.o),
+          high = finite(raw.h),
+          low = finite(raw.l),
+          close = finite(raw.c),
+          volume = finite(raw.v);
+        if (
+          timestamp === undefined ||
+          open === undefined ||
+          high === undefined ||
+          low === undefined ||
+          close === undefined ||
+          volume === undefined
+        )
+          return [];
+        const vwap = finite(raw.vw);
+        const transactionCount = finite(raw.n);
+        return [
+          {
+            symbol,
+            timestamp,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            ...(vwap === undefined ? {} : { vwap }),
+            ...(transactionCount === undefined ? {} : { transactionCount }),
+          },
+        ];
+      });
+      output.push(
+        ...normalizeMassiveTenMinuteBars({
+          sessionDate,
+          securityId: securityIdValue,
+          symbol,
+          aggregates,
+          observedAt,
+          provenance: {
+            provider: this.providerName,
+            dataset: "stocks-aggregates-10m",
+            retrievalId: text(response.request_id) ?? `aggregate-10m-${sessionDate}-${symbol}`,
+            providerTimestamp: observedAt,
+            ingestionVersion: "markets-scanner-v0.2",
+            normalizerVersion: "massive-10m-v1",
+          },
+        }),
+      );
+    }
+    return output.sort(
+      (a, b) => a.securityId.localeCompare(b.securityId) || a.intervalIndex - b.intervalIndex,
+    );
+  }
+  private async actions(
+    path: string,
+    dateParam: string,
+    sessionDate: string,
+  ): Promise<JsonRecord[]> {
+    const response = await this.get(path, {
+      [dateParam]: sessionDate,
+      limit: "5000",
+      order: "asc",
+    });
+    const result = records(response.results);
+    const next = text(response.next_url);
+    if (!next) return result;
+    const page = await this.get(next);
+    return [...result, ...records(page.results)];
+  }
+
+  async getCorporateActions(
+    sessionDate: string,
+    securityIds: string[],
+  ): Promise<CorporateAction[]> {
+    requireDate(sessionDate);
+    const ids = new Set(securityIds);
+    const bySymbol = new Map(
+      [...this.symbolBySecurityId.entries()]
+        .filter(([id]) => ids.has(id))
+        .map(([id, symbol]) => [symbol, id]),
+    );
+    const [splits, dividends] = await Promise.all([
+      this.actions("/stocks/v1/splits", "execution_date", sessionDate),
+      this.actions("/stocks/v1/dividends", "ex_dividend_date", sessionDate),
+    ]);
+    const observedAt = this.now();
+    const provenance = (dataset: string, id: string) => ({
+      provider: this.providerName,
+      dataset,
+      retrievalId: id,
+      providerTimestamp: observedAt,
+      ingestionVersion: "markets-scanner-v0",
+      normalizerVersion: "massive-v1",
+    });
+    const result: CorporateAction[] = [];
+    for (const raw of splits) {
+      const id = bySymbol.get(text(raw.ticker) ?? "");
+      if (!id) continue;
+      const actionId = text(raw.id) ?? `split:${id}:${sessionDate}`;
+      result.push({
+        actionId,
+        securityId: id,
+        actionType: text(raw.adjustment_type) === "reverse_split" ? "REVERSE_SPLIT" : "SPLIT",
+        effectiveDate: sessionDate,
+        details: details(raw),
+        observedAt,
+        provenance: provenance("stocks-splits", actionId),
+      });
+    }
+    for (const raw of dividends) {
+      const id = bySymbol.get(text(raw.ticker) ?? "");
+      if (!id) continue;
+      const actionId = text(raw.id) ?? `dividend:${id}:${sessionDate}`;
+      result.push({
+        actionId,
+        securityId: id,
+        actionType: "DIVIDEND",
+        effectiveDate: sessionDate,
+        details: details(raw),
+        observedAt,
+        provenance: provenance("stocks-dividends", actionId),
+      });
+    }
+    return result.sort((a, b) => a.actionId.localeCompare(b.actionId));
+  }
+}

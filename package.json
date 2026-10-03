@@ -1,0 +1,23 @@
+{
+  "name": "@peacestocks/markets-scanner",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone PeaceSTOCKS markets scanner, migrated from PeaceAI packages/markets-scanner.",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test src/*.test.ts",
+    "scheduler": "tsx src/host.ts",
+    "backfill": "tsx src/backfill.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,78 @@
+import type { FeatureRecipe } from "./contracts";
+
+export const FEATURE_RECIPES: readonly FeatureRecipe[] = [
+  {
+    featureId: "RETURN_5D",
+    version: "1",
+    requiredInputs: ["close"],
+    method: "close[t]/close[t-5]-1",
+    lookback: 5,
+    minimumHistory: 6,
+    precision: "source-close",
+    missingDataBehavior: "null",
+  },
+  {
+    featureId: "RETURN_20D",
+    version: "1",
+    requiredInputs: ["close"],
+    method: "close[t]/close[t-20]-1",
+    lookback: 20,
+    minimumHistory: 21,
+    precision: "source-close",
+    missingDataBehavior: "null",
+  },
+  {
+    featureId: "MOMENTUM_60D",
+    version: "1",
+    requiredInputs: ["close"],
+    method: "close[t]/close[t-60]-1",
+    lookback: 60,
+    minimumHistory: 61,
+    precision: "source-close",
+    missingDataBehavior: "null",
+  },
+  {
+    featureId: "VOLATILITY_20D",
+    version: "1",
+    requiredInputs: ["close"],
+    method: "sample-stdev(daily-close-returns,20)*sqrt(252)",
+    lookback: 20,
+    minimumHistory: 22,
+    precision: "double",
+    missingDataBehavior: "null",
+  },
+  {
+    featureId: "DRAWDOWN_60D",
+    version: "1",
+    requiredInputs: ["close"],
+    method: "close[t]/max(close[t-60:t])-1",
+    lookback: 60,
+    minimumHistory: 61,
+    precision: "source-close",
+    missingDataBehavior: "null",
+  },
+  {
+    featureId: "AVG_DOLLAR_VOLUME_20D",
+    version: "1",
+    requiredInputs: ["close", "volume"],
+    method: "mean(close*volume,20)",
+    lookback: 20,
+    minimumHistory: 20,
+    precision: "double",
+    missingDataBehavior: "null",
+  },
+  {
+    featureId: "RELATIVE_STRENGTH_MARKET_20D",
+    version: "1",
+    requiredInputs: ["close", "benchmarkClose"],
+    method: "asset-return-20d - benchmark-return-20d",
+    lookback: 20,
+    minimumHistory: 21,
+    precision: "double",
+    missingDataBehavior: "null",
+  },
+] as const;
+
+export const FEATURE_RECIPE_VERSIONS = Object.fromEntries(
+  FEATURE_RECIPES.map((recipe) => [recipe.featureId, recipe.version]),
+);
