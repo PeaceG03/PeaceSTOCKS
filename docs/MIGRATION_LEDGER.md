@@ -8,7 +8,7 @@ This ledger records the split only. It does not claim the scanner is production-
 
 | Source | Destination | Status |
 | --- | --- | --- |
-| `PeaceAI/packages/markets-scanner/src/**` (34 files) | `PeaceSTOCKS/src/**` | copied; six files rewired from `@peaceai/contracts` to `./store-path` |
+| `PeaceAI/packages/markets-scanner/src/**` (30 files) | `PeaceSTOCKS/src/**` (those 30, plus `store-path.ts`) | copied; six files rewired from `@peaceai/contracts` to `./store-path` |
 | `PeaceAI/packages/contracts/src/storagePathSafety.ts` | `PeaceSTOCKS/src/store-path.ts` | copied as the only runtime dependency the scanner imported |
 | `PeaceAI/packages/markets-scanner/README.md` | `PeaceSTOCKS/README.md` | copied, with a standalone header added |
 | `PeaceAI/packages/markets-scanner/package.json` | `PeaceSTOCKS/package.json` | adapted: name `@peacestocks/markets-scanner`, no workspace dependency |
