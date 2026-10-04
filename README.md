@@ -2,6 +2,19 @@
 
 PeaceSTOCKS is its own product. The current codebase began as the standalone markets scanner, but the canonical product/engineering specification now lives under `docs/`.
 
+## Runtime model
+
+PeaceSTOCKS is built and controlled from this GitHub repository.
+
+- **GitHub** — code, docs, tests, CI, deployment, scanner bootstrap workflows.
+- **Online scanner runtime** — executes the real scanner while the user's PC may be off.
+- **External persistent storage** — scanner state/results/pending archive evidence.
+- **Website** — viewing/control terminal.
+- **Local Dust archive** — long-term compact historical evidence.
+- **Brokerage** — future custody of real money.
+
+The first online Scanner V0 may use GitHub Actions as a bootstrap execution path, but durable evidence/state must live outside the ephemeral runner and the same scanner must remain deployable to a dedicated worker.
+
 ## Mandatory start here
 
 Before planning or changing PeaceSTOCKS, read in this order:
