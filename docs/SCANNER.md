@@ -50,6 +50,19 @@ Ticker symbols are not identities.
 
 Inactive securities remain historically preserved.
 
+## Dynamic universe refresh
+
+Scanner V0 must refresh the supported U.S. stock/ETF universe from the provider rather than rely on a frozen symbol list.
+
+Required behavior:
+
+- automatically discover newly listed supported U.S. stocks/ETFs;
+- assign/preserve stable internal identity;
+- add them to point-in-time universe evidence;
+- begin them at the appropriate history eligibility level;
+- never fabricate missing prior history;
+- preserve inactive/delisted securities historically.
+
 ## History eligibility
 
 Current levels:
