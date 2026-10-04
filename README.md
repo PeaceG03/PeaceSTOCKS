@@ -1,5 +1,32 @@
 # PeaceSTOCKS
 
+PeaceSTOCKS is its own product. The current codebase began as the standalone markets scanner, but the canonical product/engineering specification now lives under `docs/`.
+
+## Mandatory start here
+
+Before planning or changing PeaceSTOCKS, read in this order:
+
+1. `docs/CURRENT_STATUS.md`
+2. `docs/CANONICAL_DECISIONS.md`
+3. `docs/GROK_WORKFLOW.md`
+4. `docs/CANONICAL_BUILD_ORDER.md`
+5. `docs/ARCHITECTURE.md`
+6. the subsystem-specific doc for the active task.
+
+`docs/CANONICAL_DECISIONS.md` is binding:
+
+- **LOCKED** choices are requirements.
+- **PRODUCTIONIZE** choices are the strongest prior tested route and must be integrated/certified first.
+- **OPEN** choices are the only ones Architect may freely select.
+
+Do not replace a tested canonical choice with an older/easier implementation merely because it is already present in source.
+
+For example, the current local archive productionization target is `PACKED_BLOCKS_FOR_DELTA_STATES_ZSTD7`; legacy Deflate-based Dust V1 is reference/history code, not the production default.
+
+The production scanner is online-first and must continue running while the user's local archive PC is off. Unsynced sealed evidence stays online until verified local storage and durable ACK.
+
+---
+
 Standalone repository for the PeaceSTOCKS markets scanner. Migrated from PeaceAI `packages/markets-scanner` (`@peaceai/markets-scanner`) without deleting the original. The only PeaceAI runtime dependency, store-path safety, now lives in `src/store-path.ts`. Package name in this repo is `@peacestocks/markets-scanner`. Environment variable names are unchanged. This migration does not claim the scanner is production-ready.
 
 # PeaceAI Markets Scanner V0
