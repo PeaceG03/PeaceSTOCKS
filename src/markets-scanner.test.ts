@@ -448,3 +448,83 @@ test("valid scan with no qualifying candidates is frozen as a valid empty result
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("scanner uses the SPY security id as the market benchmark", async () => {
+  const root = await fixtureRoot();
+  try {
+    const storage = new MarketStorage(root);
+    const records = [
+      providerRecord("issuer-aaa", "AAA"),
+      providerRecord("issuer-bbb", "BBB"),
+      providerRecord("issuer-spy", "SPY", "ETF"),
+    ];
+    const aaa = securityId("fixture-provider", "issuer-aaa", "STOCK");
+    const bbb = securityId("fixture-provider", "issuer-bbb", "STOCK");
+    const spy = securityId("fixture-provider", "issuer-spy", "ETF");
+    const prior = Array.from({ length: 20 }, (_, index) => {
+      const date = `2025-11-${String(index + 1).padStart(2, "0")}`;
+      return [bar(aaa, date, 100 + index * 3), bar(bbb, date, 100), bar(spy, date, 100 + index)];
+    }).flat();
+    await storage.appendBars(prior);
+    const session = "2026-01-22";
+    const report = await new MarketsScanner(
+      new FixtureProvider(records, [
+        bar(aaa, session, 200),
+        bar(bbb, session, 100),
+        bar(spy, session, 121),
+      ]),
+      storage,
+    ).run(session);
+    assert.equal(report.status, "COMPLETE");
+    assert.equal(report.skips, undefined);
+    const beliefs = (await readFile(join(root, "permanent", "beliefs", `${session}.jsonl`), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { securityId: string; familyScores: { relativeStrength?: number } });
+    const aaaScore = beliefs.find((item) => item.securityId === aaa)?.familyScores.relativeStrength;
+    const bbbScore = beliefs.find((item) => item.securityId === bbb)?.familyScores.relativeStrength;
+    assert.equal(typeof aaaScore, "number");
+    assert.equal(typeof bbbScore, "number");
+    assert.notEqual(aaaScore, bbbScore);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("short or missing SPY history records a relative-strength skip without failing the scan", async () => {
+  const root = await fixtureRoot();
+  try {
+    const id = securityId("fixture-provider", "issuer-1", "STOCK");
+    const missing = await new MarketsScanner(
+      new FixtureProvider([providerRecord("issuer-1", "AAA")], [bar(id, "2026-01-02", 100)]),
+      new MarketStorage(root),
+    ).run("2026-01-02");
+    assert.equal(missing.status, "COMPLETE");
+    assert.deepEqual(missing.skips, ["RELATIVE_STRENGTH_SKIP:SPY_NOT_IN_SECURITY_MASTER"]);
+
+    const shortRoot = await fixtureRoot();
+    try {
+      const storage = new MarketStorage(shortRoot);
+      const spy = securityId("fixture-provider", "issuer-spy", "ETF");
+      const prior = Array.from({ length: 4 }, (_, index) =>
+        bar(spy, `2025-11-${String(index + 1).padStart(2, "0")}`, 100 + index),
+      );
+      prior.push(bar(id, "2025-11-01", 100), bar(id, "2025-11-02", 101), bar(id, "2025-11-03", 102), bar(id, "2025-11-04", 103));
+      await storage.appendBars(prior);
+      const session = "2026-01-22";
+      const report = await new MarketsScanner(
+        new FixtureProvider(
+          [providerRecord("issuer-1", "AAA"), providerRecord("issuer-spy", "SPY", "ETF")],
+          [bar(id, session, 104), bar(spy, session, 104)],
+        ),
+        storage,
+      ).run(session);
+      assert.equal(report.status, "COMPLETE");
+      assert.deepEqual(report.skips, ["RELATIVE_STRENGTH_SKIP:SPY_HISTORY_SHORT"]);
+    } finally {
+      await rm(shortRoot, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

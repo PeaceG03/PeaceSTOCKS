@@ -11,6 +11,7 @@ import type {
   SessionRecord,
   ProviderSecurityRecord,
   PredictionStatus,
+  SecurityMasterRecord,
 } from "./contracts";
 import { MARKET_SCHEMA_VERSION, SCANNER_VERSION } from "./contracts";
 import { rankSecurities } from "./ranking";
@@ -35,6 +36,19 @@ export const US_EQUITY_CALENDAR: SessionCalendar = {
     return { sessionDate, kind, market: "US_EQUITIES", source: "scanner-v0-calendar" };
   },
 };
+
+
+const SPY_BENCHMARK_TICKER = "SPY";
+const SPY_HISTORY_SESSIONS_REQUIRED = 21;
+
+export function resolveSpyBenchmarkId(
+  securities: readonly SecurityMasterRecord[],
+): string | undefined {
+  const matches = securities.filter(
+    (security) => security.currentSymbol === SPY_BENCHMARK_TICKER && security.assetType === "ETF",
+  );
+  return (matches.find((security) => security.status === "ACTIVE") ?? matches[0])?.securityId;
+}
 
 export class MarketsScanner {
   constructor(
@@ -148,7 +162,13 @@ export class MarketsScanner {
     if (incomplete) failures.push(`MISSING_SECURITY_EVIDENCE:${incomplete}`);
     const securities = await refreshEligibility(this.storage);
     const allBars = await this.storage.loadBars();
-    const benchmark = allBars.filter((bar) => bar.securityId === "BENCHMARK_US_EQUITY");
+    const spyId = resolveSpyBenchmarkId(securities);
+    const benchmark = spyId ? allBars.filter((bar) => bar.securityId === spyId) : [];
+    const spySessions = new Set(benchmark.map((bar) => bar.sessionDate));
+    const skips: string[] = [];
+    if (!spyId) skips.push("RELATIVE_STRENGTH_SKIP:SPY_NOT_IN_SECURITY_MASTER");
+    else if (spySessions.size < SPY_HISTORY_SESSIONS_REQUIRED)
+      skips.push("RELATIVE_STRENGTH_SKIP:SPY_HISTORY_SHORT");
     const result = rankSecurities(securities, allBars, benchmark, sessionDate);
     const sourceCollectionFailed = failures.some((failure) =>
       failure.startsWith("EVIDENCE_PROVIDER_ERROR:"),
@@ -207,6 +227,7 @@ export class MarketsScanner {
       validSecurities: bars.filter((bar) => bar.dataQuality === "GOOD").length,
       incompleteSecurities: incomplete,
       unresolvedFailures: failures,
+      ...(skips.length ? { skips } : {}),
       scannerVersion: SCANNER_VERSION,
       ...(predictionUnavailableReason
         ? {

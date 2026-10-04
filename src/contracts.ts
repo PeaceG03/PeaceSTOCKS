@@ -354,6 +354,7 @@ export interface ScannerRunReport {
   validSecurities: number;
   incompleteSecurities: number;
   unresolvedFailures: string[];
+  skips?: string[];
   storage: StorageReport;
   scannerVersion: string;
   completedAt: string;
