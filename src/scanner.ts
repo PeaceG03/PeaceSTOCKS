@@ -1,6 +1,4 @@
 import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
 import type {
   CanonicalDailyBar,
   CorporateAction,
@@ -17,7 +15,7 @@ import { MARKET_SCHEMA_VERSION, SCANNER_VERSION } from "./contracts";
 import { rankSecurities } from "./ranking";
 import { fingerprint } from "./identity";
 import { refreshEligibility, refreshUniverse } from "./universe";
-import type { MarketStorage } from "./storage";
+import type { MarketStore } from "./storage";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import type { DustReader } from "./reader";
 
@@ -53,7 +51,7 @@ export function resolveSpyBenchmarkId(
 export class MarketsScanner {
   constructor(
     private readonly provider: MarketProvider,
-    private readonly storage: MarketStorage,
+    private readonly storage: MarketStore,
     private readonly calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
   ) {}
 
@@ -261,10 +259,11 @@ export class MarketsScanner {
   }
 
   private async finish(
-    input: Omit<ScannerRunReport, "completedAt" | "storage">,
+    input: Omit<ScannerRunReport, "completedAt" | "storage" | "sourceCommit">,
   ): Promise<ScannerRunReport> {
     const report: ScannerRunReport = {
       ...input,
+      sourceCommit: process.env.PEACESTOCKS_SOURCE_COMMIT?.trim() || "UNKNOWN",
       completedAt: new Date().toISOString(),
       storage: await this.storage.measureStorage(),
     };
@@ -274,13 +273,13 @@ export class MarketsScanner {
 }
 
 export async function finalizeDailyPartition(
-  storage: MarketStorage,
+  storage: MarketStore,
   sessionDate: string,
   provider: string,
   quality: "GOOD" | "PARTIAL_RUN" | "PROVIDER_ERROR",
 ): Promise<void> {
-  const path = join(storage.permanentRoot, "daily-bars", `${sessionDate.slice(0, 7)}.jsonl`);
-  const bytes = await readFile(path).catch(() => Buffer.from(""));
+  const relative = `daily-bars/${sessionDate.slice(0, 7)}.jsonl`;
+  const bytes = await storage.readPermanent(relative);
   const lines = bytes.length ? bytes.toString("utf8").trim().split("\n").filter(Boolean) : [];
   const sessionDates = lines
     .map((line) => line.match(/"sessionDate":"(\d{4}-\d{2}-\d{2})"/)?.[1])
@@ -293,7 +292,7 @@ export async function finalizeDailyPartition(
     sessionEnd: sessionDates.at(-1) ?? sessionDate,
     rowCount: lines.length,
     schemaVersion: MARKET_SCHEMA_VERSION,
-    byteSize: (await stat(path).catch(() => ({ size: 0 }))).size,
+    byteSize: bytes.length,
     sha256: createHash("sha256").update(bytes).digest("hex"),
     provider,
     finalizedAt: new Date().toISOString(),

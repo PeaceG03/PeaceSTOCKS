@@ -357,6 +357,7 @@ export interface ScannerRunReport {
   skips?: string[];
   storage: StorageReport;
   scannerVersion: string;
+  sourceCommit: string;
   completedAt: string;
   predictionStatus?: PredictionAvailability;
   predictionReason?: PredictionStatus["reason"];

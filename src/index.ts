@@ -2,6 +2,8 @@ export * from "./contracts";
 export * from "./identity";
 export * from "./recipes";
 export * from "./storage";
+export * from "./object-store";
+export * from "./object-storage";
 export * from "./universe";
 export * from "./features";
 export * from "./ranking";

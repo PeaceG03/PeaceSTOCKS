@@ -24,6 +24,28 @@ import { stableJson } from "./identity";
 
 export const MARKET_STORAGE_PATH_ERROR = "MARKET_STORAGE_PATH_INVALID";
 
+export interface MarketStore {
+  initialize(): Promise<void>;
+  loadSecurities(): Promise<SecurityMasterRecord[]>;
+  saveSecurities(records: SecurityMasterRecord[]): Promise<void>;
+  loadMembership(): Promise<UniverseMembershipEvidence[]>;
+  appendMembership(records: UniverseMembershipEvidence[]): Promise<void>;
+  loadBars(sessionDate?: string): Promise<CanonicalDailyBar[]>;
+  appendBars(records: CanonicalDailyBar[]): Promise<void>;
+  appendActions(records: CorporateAction[]): Promise<void>;
+  writeBeliefs(records: ScannerBelief[]): Promise<void>;
+  writePredictions(records: PredictionSet[]): Promise<void>;
+  writePredictionStatus(record: PredictionStatus): Promise<void>;
+  writeDecisions(records: ScannerBelief[]): Promise<void>;
+  writePartitionManifest(manifest: PartitionManifest): Promise<void>;
+  writeRunReport(report: unknown): Promise<void>;
+  loadRunReports(): Promise<ScannerRunReport[]>;
+  measureStorage(): Promise<StorageReport>;
+  readPermanent(relativePath: string): Promise<Buffer>;
+  loadSchedulerState(): Promise<unknown>;
+  saveSchedulerState(state: unknown): Promise<void>;
+}
+
 type StoredRecord =
   | SecurityMasterRecord
   | UniverseMembershipEvidence
@@ -62,7 +84,7 @@ function lineText(records: StoredRecord[]): string {
   return records.map((record) => stableJson(record)).join("\n") + (records.length ? "\n" : "");
 }
 
-export class MarketStorage {
+export class MarketStorage implements MarketStore {
   readonly root: string;
   readonly permanentRoot: string;
   readonly cacheRoot: string;
@@ -461,4 +483,25 @@ export class MarketStorage {
       throw error;
     }
   }
+
+  async readPermanent(relativePath: string): Promise<Buffer> {
+    try {
+      return await readFile(this.path(relativePath));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return Buffer.from("");
+      throw error;
+    }
+  }
+
+  async loadSchedulerState(): Promise<unknown> {
+    return readJson(join(this.root, "scheduler-host-state.json"));
+  }
+
+  async saveSchedulerState(state: unknown): Promise<void> {
+    await this.atomicWrite(
+      join(this.root, "scheduler-host-state.json"),
+      JSON.stringify(state, null, 2) + "\n",
+    );
+  }
+
 }

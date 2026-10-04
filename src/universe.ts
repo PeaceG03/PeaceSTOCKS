@@ -7,7 +7,7 @@ import type {
   UniverseRefreshResult,
 } from "./contracts";
 import { securityId } from "./identity";
-import type { MarketStorage } from "./storage";
+import type { MarketStore } from "./storage";
 
 export function eligibilityForBarCount(barCount: number): HistoryEligibility {
   if (barCount <= 0) return "LEVEL_0";
@@ -34,7 +34,7 @@ function nextMembershipReason(
 
 export async function refreshUniverse(
   provider: MarketProvider,
-  storage: MarketStorage,
+  storage: MarketStore,
   asOf: string,
 ): Promise<UniverseRefreshResult> {
   await storage.initialize();
@@ -163,7 +163,7 @@ export async function refreshUniverse(
   };
 }
 
-export async function refreshEligibility(storage: MarketStorage): Promise<SecurityMasterRecord[]> {
+export async function refreshEligibility(storage: MarketStore): Promise<SecurityMasterRecord[]> {
   const securities = await storage.loadSecurities();
   const bars = await storage.loadBars();
   const counts = new Map<string, number>();

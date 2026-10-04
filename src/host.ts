@@ -15,7 +15,8 @@ import {
 } from "./intraday-backfill";
 import { collectionDue } from "./scheduler";
 import { MarketsScanner, type SessionCalendar } from "./scanner";
-import { MarketStorage } from "./storage";
+import type { MarketStore } from "./storage";
+import { openMarketStore } from "./object-storage";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 
 export const DEFAULT_MARKETS_ROOT = "C:\\ProgramData\\PeaceAI\\Markets";
@@ -97,12 +98,10 @@ export function findMissedEligibleSessions(
   return output;
 }
 
-async function readState(root: string): Promise<SchedulerHostState | undefined> {
-  assertSafeStoreDirectory(root, MARKET_SCHEDULER_HOST_PATH_ERROR);
-  const statePath = join(root, HOST_STATE_FILE);
-  assertSafeStoreFile(statePath, MARKET_SCHEDULER_HOST_PATH_ERROR);
+async function readState(storage: MarketStore): Promise<SchedulerHostState | undefined> {
   try {
-    const state = JSON.parse(await readFile(statePath, "utf8")) as SchedulerHostState;
+    const state = (await storage.loadSchedulerState()) as SchedulerHostState | undefined;
+    if (!state) return undefined;
     if (
       state.schemaVersion !== "peaceai-markets-scheduler-host:v1" ||
       !state.forwardClockStartedAt ||
@@ -178,7 +177,7 @@ export async function runScannerHost(
   }
 
   const calendar = options.calendar ?? US_EQUITY_MARKET_CALENDAR;
-  const storage = new MarketStorage(root);
+  const storage = openMarketStore(root);
   await storage.initialize();
   const reports = await storage.loadRunReports();
   const completed = new Set(
@@ -187,7 +186,7 @@ export async function runScannerHost(
       .map((report) => report.session.sessionDate),
   );
   const today = sessionDate(now);
-  let state = await readState(root);
+  let state = await readState(storage);
   if (!state) {
     const latest = reports.at(-1)?.session.sessionDate;
     const latestIsRecent =
@@ -199,7 +198,7 @@ export async function runScannerHost(
       forwardClockStartedAt: now.toISOString(),
       lastObservedSessionDate: latestIsRecent ? latest : today,
     };
-    await atomicJson(join(root, HOST_STATE_FILE), state);
+    await storage.saveSchedulerState(state);
   }
 
   const due = collectionDue({
@@ -261,7 +260,7 @@ export async function runScannerHost(
     ...state,
     lastObservedSessionDate: nextObserved,
   } satisfies SchedulerHostState;
-  await atomicJson(join(root, HOST_STATE_FILE), nextState);
+  await storage.saveSchedulerState(nextState);
   const intraday = options.intraday
     ? await backfillHistoricalIntradayEvidence({
         root,
