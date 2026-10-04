@@ -13,6 +13,26 @@ PeaceSTOCKS should remain useful even when:
 
 Failures must become explicit states, not silent missing data.
 
+## GitHub-first scanner startup
+
+The scanner should be made and versioned in the dedicated GitHub repository first.
+
+The first deployable online path may use GitHub Actions as a bootstrap runtime/orchestrator so Scanner V0 can start collecting/ranking without waiting for the final dedicated-worker infrastructure.
+
+Bootstrap rules:
+
+- scanner code runs from `PeaceG03/PeaceSTOCKS`;
+- production secrets live in GitHub environment/repository secret storage or the target runtime secret store, never Git;
+- durable state, scanner results, pending archive evidence, and scheduler cursor live in external persistent storage;
+- every run records the source commit;
+- workflows are manually triggerable for certification and scheduled for EOD operation;
+- a failed workflow/run cannot silently advance scanner state;
+- reruns remain idempotent.
+
+GitHub Actions is a startup/deployment mechanism, not the historical archive.
+
+Final production reliability may move scheduled execution to a dedicated online worker if required, without changing Scanner contracts.
+
 ## Scanner operational loop
 
 Intended daily EOD flow:
@@ -258,9 +278,11 @@ Move PeaceSTOCKS into `PeaceG03/PeaceSTOCKS`.
 
 Keep Scanner as first production subsystem.
 
-### Milestone B — online real scanner
+### Milestone B — GitHub-built online real scanner
 
-Deploy/prove the real Massive EOD full-universe scanner through the intended hosted backend path.
+Build the real Scanner V0 in `PeaceG03/PeaceSTOCKS`, add CI/deployment/bootstrap workflows, and prove a real Massive EOD full-universe scan online.
+
+The first online execution path may be GitHub Actions backed by external durable storage. The implementation must remain deployable to a dedicated worker when final reliability requires it.
 
 The production proof must not depend on the user's desktop PC remaining on.
 
