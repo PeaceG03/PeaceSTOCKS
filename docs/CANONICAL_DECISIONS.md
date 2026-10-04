@@ -253,6 +253,17 @@ This does not block daily EOD Scanner V0 completion.
 
 ---
 
+## D-012 — Automatic universe refresh for new listings
+**Status: LOCKED**
+
+The Scanner V0 universe is not a static symbol list.
+
+Each production universe refresh must automatically discover newly supported U.S. stocks and ETFs from the approved provider path and assign/preserve stable internal identity.
+
+New listings enter the universe according to the normal eligibility/history rules; they are not granted fabricated history or immediate advanced eligibility.
+
+Securities that later become inactive/delisted remain preserved historically rather than disappearing from prior universe evidence.
+
 # Current scanner decisions to preserve
 
 ## D-200 — Eligibility history ladder
@@ -367,6 +378,29 @@ CLI/API is sufficient for Scanner V0 production proof.
 The final PeaceSTOCKS web UI can be designed later.
 
 ---
+
+# Superseded decisions / historical evolution
+
+These are preserved so future agents do not accidentally resurrect an older plan.
+
+## H-001 — Monthly contribution amount
+An earlier planning value was about **$50/month**.
+
+That was later superseded by the current estimate of **about $175/month** if the user explicitly redirects available cash.
+
+The current canonical amount is therefore the later ~$175/month concept, not the older $50/month number.
+
+## H-002 — Dust V1
+The earlier Dust V1 implementation used Deflate Raw with scaled integers, delta/ZigZag varints, dictionaries, and checksums.
+
+It was useful and remains historical/reference code.
+
+It was superseded as the preferred productionization target by `PACKED_BLOCKS_FOR_DELTA_STATES_ZSTD7`.
+
+## H-003 — Local-first scanner operation
+Earlier implementation work included local scheduled scanner operation.
+
+The canonical production architecture is now **online-first**. Local scanner execution remains development/verification/fallback, not the production target.
 
 # Rule for future “better” ideas
 
