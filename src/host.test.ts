@@ -32,7 +32,7 @@ test("scheduler host catch-up excludes the current session before close", () => 
   );
   assert.deepEqual(missed, ["2026-08-31"]);
 });
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runScannerHost } from "./host";
@@ -68,6 +68,33 @@ test("scheduler cursor stays before a provider-not-ready session", async () => {
   } finally {
     if (previous === undefined) delete process.env.MASSIVE_API_KEY;
     else process.env.MASSIVE_API_KEY = previous;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("online host refuses to start when the object store bucket is missing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peacestocks-host-"));
+  const previousKey = process.env.MASSIVE_API_KEY;
+  const previousRequire = process.env.PEACESTOCKS_REQUIRE_OBJECT_STORE;
+  const previousBucket = process.env.PEACESTOCKS_R2_BUCKET;
+  process.env.MASSIVE_API_KEY = "test-key";
+  process.env.PEACESTOCKS_REQUIRE_OBJECT_STORE = "1";
+  delete process.env.PEACESTOCKS_R2_BUCKET;
+  try {
+    await assert.rejects(
+      () => runScannerHost({ now: new Date("2026-01-22T21:45:00.000Z"), storageRoot: root }),
+      /OBJECT_STORE_REQUIRED/,
+    );
+    const names = await readdir(root);
+    assert.equal(names.includes("scheduler-host-state.json"), false);
+    assert.equal(names.includes("scheduler-host-runs"), false);
+  } finally {
+    if (previousKey === undefined) delete process.env.MASSIVE_API_KEY;
+    else process.env.MASSIVE_API_KEY = previousKey;
+    if (previousRequire === undefined) delete process.env.PEACESTOCKS_REQUIRE_OBJECT_STORE;
+    else process.env.PEACESTOCKS_REQUIRE_OBJECT_STORE = previousRequire;
+    if (previousBucket === undefined) delete process.env.PEACESTOCKS_R2_BUCKET;
+    else process.env.PEACESTOCKS_R2_BUCKET = previousBucket;
     await rm(root, { recursive: true, force: true });
   }
 });

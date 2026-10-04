@@ -170,6 +170,12 @@ export async function runScannerHost(
   if (typeof configuredRoot !== "string" || !configuredRoot.trim())
     throw new Error(MARKET_SCHEDULER_HOST_PATH_ERROR);
   const root = prepareSafeStoreDirectory(configuredRoot, MARKET_SCHEDULER_HOST_PATH_ERROR);
+  if (
+    process.env.PEACESTOCKS_REQUIRE_OBJECT_STORE === "1" &&
+    !process.env.PEACESTOCKS_R2_BUCKET?.trim()
+  ) {
+    throw new Error("OBJECT_STORE_REQUIRED");
+  }
   if (!process.env.MASSIVE_API_KEY) {
     const failed = makeResult("FAILED", "MASSIVE_API_KEY_REQUIRED");
     await writeHostResult(root, failed);

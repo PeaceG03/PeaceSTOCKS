@@ -1,0 +1,42 @@
+name: Scanner
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 21:30 UTC is 4:30 PM ET in winter and 5:30 PM ET in summer, after the close plus the 30 minute delay.
+    - cron: "30 21 * * 1-5"
+    # Next-morning UTC retry for a session the provider had not published yet. Saturday covers Friday.
+    - cron: "30 1 * * 2-6"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+      PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+      PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+      PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+      PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+      PEACESTOCKS_SOURCE_COMMIT: ${{ github.sha }}
+      PEACESTOCKS_REQUIRE_OBJECT_STORE: "1"
+      PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Refuse a run that would write the store to the runner disk
+        run: |
+          test -n "$PEACESTOCKS_R2_BUCKET"
+          test -n "$PEACESTOCKS_R2_ACCOUNT_ID"
+          test -n "$PEACESTOCKS_R2_ACCESS_KEY_ID"
+          test -n "$PEACESTOCKS_R2_SECRET_ACCESS_KEY"
+          test -n "$MASSIVE_API_KEY"
+          test -n "$PEACESTOCKS_SOURCE_COMMIT"
+      - run: pnpm scheduler
