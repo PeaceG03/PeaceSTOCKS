@@ -24,6 +24,37 @@ Reconciliation
 
 Risk is not a suggestion.
 
+## Money custody and website controls
+
+PeaceSTOCKS does not hold cash.
+
+GitHub stores code, not money.
+
+The website is a control/view terminal, not a bank.
+
+All real funds remain at an approved brokerage.
+
+### Adding capital
+
+The user funds the brokerage through the brokerage's approved funding flow.
+
+PeaceSTOCKS may later display:
+
+- brokerage cash;
+- allocated PeaceSTOCKS capital;
+- generated capital;
+- allowed deployment amount.
+
+An `Add Capital` control may launch or request an approved brokerage funding flow, but PeaceSTOCKS does not independently pull money from a bank.
+
+### Withdrawing capital
+
+PeaceSTOCKS may calculate/display eligible principal or profit distributions.
+
+Actual withdrawal occurs through the brokerage's approved withdrawal flow and requires appropriate user authorization.
+
+PeaceSTOCKS cannot change the destination account or withdraw autonomously.
+
 ## Initial live-capital concept
 
 The current long-term plan is to begin extremely small.
