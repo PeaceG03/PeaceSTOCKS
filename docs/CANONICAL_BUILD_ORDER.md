@@ -172,9 +172,11 @@ Completion:
 
 A full real U.S. stock/ETF scan completes through the production provider path and produces retrievable results.
 
-## Phase 6 — Online scanner operational reliability
+## Phase 6 — GitHub-built online scanner operational reliability
 
-Goal: the production scanner works repeatedly online, not once and not only from a developer PC.
+Goal: the production scanner is built/versioned/deployed from GitHub and works repeatedly online, not once and not only from a developer PC.
+
+Bootstrap execution may use GitHub Actions with external durable state. Final execution may graduate to a dedicated online worker without redesigning Scanner logic.
 
 Required:
 
