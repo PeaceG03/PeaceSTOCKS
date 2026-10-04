@@ -37,6 +37,71 @@ Supporting all layers:
 - result readers/UI;
 - archival storage.
 
+## 0. GitHub control plane and deployment model
+
+The canonical PeaceSTOCKS source lives in:
+
+`PeaceG03/PeaceSTOCKS`
+
+GitHub owns:
+
+- source code;
+- canonical documentation;
+- tests;
+- version history;
+- Architect/Builder/Auditor evidence;
+- CI validation;
+- deployment workflows;
+- manual/scheduled bootstrap scanner workflows.
+
+Production scanner behavior is always traceable to a specific Git commit.
+
+### Bootstrap online path
+
+Scanner V0 may initially execute through GitHub Actions so it can begin operating online before a dedicated always-on worker is fully hardened.
+
+```text
+PeaceG03/PeaceSTOCKS
+        ↓
+GitHub Actions
+        ↓
+Scanner V0
+        ↓
+Massive / provider
+        ↓
+external persistent state/results/buffer
+        ↓
+Results/Health API
+        ↓
+Website terminal
+```
+
+The GitHub runner filesystem is ephemeral and must never be the canonical evidence/archive.
+
+### Mature online path
+
+The same Scanner code is deployable from GitHub to the long-running online worker:
+
+```text
+GitHub commit
+    ↓
+CI/Auditor verification
+    ↓
+deployment workflow
+    ↓
+online Scanner worker
+    ↓
+persistent state/results
+```
+
+This separation lets GitHub remain the engineering/control center while runtime hosting can improve without rewriting Scanner logic.
+
+### Website terminal
+
+The website is a viewer/controller, not the scanner engine.
+
+It communicates with stable APIs/read surfaces and can be replaced independently.
+
 ## 1. Provider boundary
 
 `MarketProvider` is the normalization boundary.
