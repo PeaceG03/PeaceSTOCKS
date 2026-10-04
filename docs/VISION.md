@@ -12,6 +12,7 @@ The system should optimize for durable evidence and repeatable decision quality,
 
 - U.S. common stocks
 - U.S. ETFs
+- automatic discovery of newly listed supported stocks/ETFs within that scope
 - end-of-day / free-data constraints accepted for Scanner V0
 
 ### Future expansion only after the stock/ETF foundation is proven
