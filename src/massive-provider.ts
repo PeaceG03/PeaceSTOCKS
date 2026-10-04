@@ -20,6 +20,7 @@ export interface MassiveProviderOptions {
   baseUrl?: string;
   fetchImpl?: typeof fetch;
   minRequestIntervalMs?: number;
+  retryBackoffMs?: number;
   now?: () => string;
 }
 
@@ -80,7 +81,10 @@ export class MassiveMarketProvider implements MarketProvider {
   private readonly minRequestIntervalMs: number;
   private readonly now: () => string;
   private lastRequestAt = 0;
+  private pace: Promise<void> = Promise.resolve();
   private readonly symbolBySecurityId = new Map<string, string>();
+  private readonly maxTransientAttempts = 3;
+  private readonly retryBackoffMs: number;
 
   constructor(options: MassiveProviderOptions = {}) {
     this.apiKey = options.apiKey ?? process.env.MASSIVE_API_KEY ?? "";
@@ -89,6 +93,8 @@ export class MassiveMarketProvider implements MarketProvider {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.minRequestIntervalMs = options.minRequestIntervalMs ?? DEFAULT_MIN_REQUEST_INTERVAL_MS;
     if (this.minRequestIntervalMs < 0) throw new Error("MASSIVE_INVALID_RATE_LIMIT");
+    this.retryBackoffMs = options.retryBackoffMs ?? 250;
+    if (this.retryBackoffMs < 0) throw new Error("MASSIVE_INVALID_RATE_LIMIT");
     this.now = options.now ?? (() => new Date().toISOString());
   }
 
@@ -97,9 +103,21 @@ export class MassiveMarketProvider implements MarketProvider {
   }
 
   private async waitForRateLimit(): Promise<void> {
-    const wait = this.lastRequestAt + this.minRequestIntervalMs - Date.now();
+    const run = this.pace.then(async () => {
+      const wait = this.lastRequestAt + this.minRequestIntervalMs - Date.now();
+      if (wait > 0) await new Promise<void>((resolve) => setTimeout(resolve, wait));
+      this.lastRequestAt = Date.now();
+    });
+    this.pace = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    await run;
+  }
+
+  private async backoff(attempt: number): Promise<void> {
+    const wait = this.retryBackoffMs * attempt;
     if (wait > 0) await new Promise<void>((resolve) => setTimeout(resolve, wait));
-    this.lastRequestAt = Date.now();
   }
 
   private url(pathOrUrl: string, params?: Record<string, string>): URL {
@@ -113,18 +131,50 @@ export class MassiveMarketProvider implements MarketProvider {
 
   private async get(pathOrUrl: string, params?: Record<string, string>): Promise<JsonRecord> {
     this.requireApiKey();
-    await this.waitForRateLimit();
-    const response = await this.fetchImpl(this.url(pathOrUrl, params), {
-      headers: { accept: "application/json" },
-    });
-    if (!response.ok) {
+    let transientAttempt = 0;
+    for (;;) {
+      await this.waitForRateLimit();
+      let response: Response;
+      try {
+        response = await this.fetchImpl(this.url(pathOrUrl, params), {
+          headers: { accept: "application/json" },
+        });
+      } catch (error) {
+        transientAttempt += 1;
+        if (transientAttempt >= this.maxTransientAttempts) {
+          throw new Error(
+            `MASSIVE_NETWORK:${error instanceof Error ? error.message : "UNKNOWN"}`,
+          );
+        }
+        await this.backoff(transientAttempt);
+        continue;
+      }
+      if (response.ok) return responseRecord(await response.json());
       const body = await response.text();
       const requestId = response.headers.get("request-id") ?? response.headers.get("x-request-id");
+      const safeBody = safeProviderErrorBody(body);
+      if (response.status === 429) {
+        transientAttempt += 1;
+        if (transientAttempt < this.maxTransientAttempts) {
+          await this.backoff(transientAttempt);
+          continue;
+        }
+      }
+      if (response.status === 403 && /before end of day/iu.test(safeBody)) {
+        throw new Error(`PROVIDER_NOT_READY:${safeBody}`);
+      }
+      if (
+        response.status === 401 ||
+        (response.status === 403 && /invalid api key|unknown api key/iu.test(safeBody))
+      ) {
+        throw new Error(
+          `MASSIVE_CREDENTIAL_REJECTED:requestId=${requestId ?? "unknown"}:body=${safeBody}`,
+        );
+      }
       throw new Error(
-        `MASSIVE_HTTP_${response.status}:requestId=${requestId ?? "unknown"}:body=${safeProviderErrorBody(body)}`,
+        `MASSIVE_HTTP_${response.status}:requestId=${requestId ?? "unknown"}:body=${safeBody}`,
       );
     }
-    return responseRecord(await response.json());
   }
 
   private normalize(record: JsonRecord): ProviderSecurityRecord | undefined {

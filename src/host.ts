@@ -32,7 +32,7 @@ export interface SchedulerHostState {
 }
 
 export interface SchedulerHostResult {
-  readonly status: "NOT_DUE" | "COMPLETED" | "CATCH_UP_COMPLETED" | "FAILED";
+  readonly status: "NOT_DUE" | "COMPLETED" | "CATCH_UP_COMPLETED" | "FAILED" | "NOT_READY";
   readonly reason:
     | "BEFORE_CLOSE"
     | "WAITING_FOR_DATA"
@@ -40,6 +40,8 @@ export interface SchedulerHostResult {
     | "ALREADY_COMPLETE"
     | "NO_MISSED_SESSION"
     | "MASSIVE_API_KEY_REQUIRED"
+    | "MASSIVE_CREDENTIAL_REJECTED"
+    | "PROVIDER_NOT_READY"
     | "COLLECTION_FAILED"
     | "CATCH_UP_EVIDENCE_ONLY"
     | "PROBE_ONLY";
@@ -181,7 +183,7 @@ export async function runScannerHost(
   const reports = await storage.loadRunReports();
   const completed = new Set(
     reports
-      .filter((report) => report.status !== "FAILED")
+      .filter((report) => report.status !== "FAILED" && report.status !== "PROVIDER_NOT_READY")
       .map((report) => report.session.sessionDate),
   );
   const today = sessionDate(now);
@@ -226,16 +228,38 @@ export async function runScannerHost(
     calendar,
   );
   const collected: ScannerRunReport[] = [];
+  const credentialRejected = (report: ScannerRunReport) =>
+    report.unresolvedFailures.some((failure) => failure.includes("MASSIVE_CREDENTIAL_REJECTED"));
   for (const missedSession of missed) {
-    collected.push(await scanner.run(missedSession, "EVIDENCE_ONLY"));
+    const report = await scanner.run(missedSession, "EVIDENCE_ONLY");
+    collected.push(report);
+    if (credentialRejected(report) || report.status === "PROVIDER_NOT_READY") break;
   }
-  if (due.due && !completed.has(due.session.sessionDate)) {
+  if (
+    due.due &&
+    !completed.has(due.session.sessionDate) &&
+    !collected.some((report) => credentialRejected(report) || report.status === "PROVIDER_NOT_READY")
+  ) {
     collected.push(await scanner.run(due.session.sessionDate, "FORWARD"));
   }
 
+  const unresolved = collected
+    .filter(
+      (report) =>
+        report.status === "FAILED" ||
+        report.status === "PROVIDER_NOT_READY" ||
+        credentialRejected(report),
+    )
+    .map((report) => report.session.sessionDate)
+    .sort();
+  const nextObserved = unresolved[0]
+    ? addDays(unresolved[0], -1)
+    : due.due
+      ? due.session.sessionDate
+      : today;
   const nextState = {
     ...state,
-    lastObservedSessionDate: due.due ? due.session.sessionDate : today,
+    lastObservedSessionDate: nextObserved,
   } satisfies SchedulerHostState;
   await atomicJson(join(root, HOST_STATE_FILE), nextState);
   const intraday = options.intraday
@@ -249,9 +273,25 @@ export async function runScannerHost(
           : { maxSessions: options.intraday.maxSessions }),
       })
     : undefined;
+  const credential = collected.find((report) => credentialRejected(report));
+  const notReady = collected.find((report) => report.status === "PROVIDER_NOT_READY");
   const failed = collected.find((report) => report.status === "FAILED");
   const finalBase =
-    failed || intraday?.stoppedOnError
+    credential
+      ? makeResult(
+          "FAILED",
+          "MASSIVE_CREDENTIAL_REJECTED",
+          collected.map((report) => report.session.sessionDate),
+          collected,
+        )
+      : notReady
+        ? makeResult(
+            "NOT_READY",
+            "PROVIDER_NOT_READY",
+            collected.map((report) => report.session.sessionDate),
+            collected,
+          )
+      : failed || intraday?.stoppedOnError
       ? makeResult(
           "FAILED",
           "COLLECTION_FAILED",
@@ -287,7 +327,7 @@ async function main(): Promise<void> {
   process.stdout.write(
     `${JSON.stringify({ status: output.status, reason: output.reason, sessions: output.sessions })}\n`,
   );
-  process.exitCode = output.status === "FAILED" ? 2 : 0;
+  process.exitCode = output.status === "FAILED" || output.status === "NOT_READY" ? 2 : 0;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {

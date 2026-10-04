@@ -101,7 +101,13 @@ export class MarketsScanner {
           })),
         );
     } catch (error) {
-      failures.push(`UNIVERSE_PROVIDER_ERROR:${String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      const providerNotReady = message.startsWith("PROVIDER_NOT_READY");
+      failures.push(
+        providerNotReady
+          ? `PROVIDER_NOT_READY:${message}`
+          : `UNIVERSE_PROVIDER_ERROR:${message}`,
+      );
       await this.storage.writePredictionStatus({
         predictionStatusId: `prediction-status_${runId}`,
         sessionDate,
@@ -116,7 +122,7 @@ export class MarketsScanner {
       return this.finish({
         runId,
         session,
-        status: "FAILED",
+        status: providerNotReady ? "PROVIDER_NOT_READY" : "FAILED",
         expectedSecurities: 0,
         processedSecurities: 0,
         validSecurities: 0,
@@ -140,7 +146,12 @@ export class MarketsScanner {
       await this.storage.appendBars(bars);
       await this.storage.appendActions(actions);
     } catch (error) {
-      failures.push(`EVIDENCE_PROVIDER_ERROR:${String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      failures.push(
+        message.startsWith("PROVIDER_NOT_READY")
+          ? `PROVIDER_NOT_READY:${message}`
+          : `EVIDENCE_PROVIDER_ERROR:${message}`,
+      );
     }
     const expected = ids.length;
     const received = new Set(
@@ -170,9 +181,10 @@ export class MarketsScanner {
     else if (spySessions.size < SPY_HISTORY_SESSIONS_REQUIRED)
       skips.push("RELATIVE_STRENGTH_SKIP:SPY_HISTORY_SHORT");
     const result = rankSecurities(securities, allBars, benchmark, sessionDate);
-    const sourceCollectionFailed = failures.some((failure) =>
-      failure.startsWith("EVIDENCE_PROVIDER_ERROR:"),
-    );
+    const providerNotReady = failures.some((failure) => failure.startsWith("PROVIDER_NOT_READY"));
+    const sourceCollectionFailed =
+      providerNotReady ||
+      failures.some((failure) => failure.startsWith("EVIDENCE_PROVIDER_ERROR:"));
     const predictionUnavailableReason: PredictionStatus["reason"] | undefined =
       sourceCollectionFailed
         ? "SOURCE_COLLECTION_FAILED"
@@ -216,8 +228,13 @@ export class MarketsScanner {
         failures.push(`IMMUTABLE_DECISION_CONFLICT:${String(error)}`);
       }
     }
-    const status: RunStatus =
-      failures.length === 0 ? "COMPLETE" : received.size > 0 ? "COMPLETE_WITH_WARNINGS" : "FAILED";
+    const status: RunStatus = providerNotReady
+      ? "PROVIDER_NOT_READY"
+      : failures.length === 0
+        ? "COMPLETE"
+        : received.size > 0
+          ? "COMPLETE_WITH_WARNINGS"
+          : "FAILED";
     return this.finish({
       runId,
       session,
