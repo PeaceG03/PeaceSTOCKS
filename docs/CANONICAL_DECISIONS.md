@@ -264,6 +264,90 @@ New listings enter the universe according to the normal eligibility/history rule
 
 Securities that later become inactive/delisted remain preserved historically rather than disappearing from prior universe evidence.
 
+## D-013 — GitHub is the PeaceSTOCKS development/control source of truth
+**Status: LOCKED**
+
+PeaceSTOCKS source code, canonical docs, tests, deployment workflows, version history, and audited production revisions live in:
+
+`PeaceG03/PeaceSTOCKS`
+
+GitHub is the engineering/control source of truth.
+
+The scanner must be built from this repository so every production deployment can be traced to a specific reviewed commit.
+
+GitHub is **not** the long-term market-data archive and is **not** the brokerage/custodian.
+
+## D-014 — GitHub workflow bootstrap for Scanner V0
+**Status: PRODUCTIONIZE**
+
+The first online Scanner V0 may use GitHub Actions/workflows as the bootstrap execution/orchestration path so the scanner can begin operating without depending on the user's PC.
+
+The bootstrap path must:
+
+- run from the dedicated PeaceSTOCKS repository;
+- use repository/environment secrets rather than committed credentials;
+- write durable scanner state/results/evidence to external persistent storage rather than the ephemeral runner filesystem;
+- preserve provider pacing/retry rules;
+- preserve scheduler cursor safety;
+- preserve idempotency;
+- expose failures rather than hiding them;
+- be manually triggerable for verification;
+- support scheduled EOD execution where appropriate.
+
+GitHub-hosted execution is not allowed to become the only durability layer.
+
+Architect must design the workflow so the scanner can later move to or coexist with a dedicated always-on worker without redesigning scanner logic or canonical evidence.
+
+If GitHub scheduling/runtime reliability cannot satisfy the final production reliability criteria, the same scanner implementation must be deployable to the dedicated online worker while GitHub remains the source/control/deployment system.
+
+## D-015 — Website is a viewing/control terminal
+**Status: LOCKED**
+
+The PeaceSTOCKS website does not contain the canonical scanner engine.
+
+The website reads scanner state/results through stable backend/API interfaces and may provide authorized control actions such as:
+
+- view latest scan;
+- view Top 15/Top 50 and family scores;
+- view provider/scanner health;
+- view archive sync status;
+- inspect failures;
+- request an allowed/manual scanner run;
+- later view Strategy Lab, portfolio, and risk status.
+
+The website may be redesigned/replaced without changing the scanner engine.
+
+## D-016 — Brokerage is the money custodian
+**Status: LOCKED**
+
+PeaceSTOCKS, GitHub, the website, and the scanner must never hold user cash themselves.
+
+Real money remains in an approved brokerage account.
+
+Future capital flow is:
+
+```text
+User bank
+↕
+Approved brokerage
+↕
+Broker API / approved funding flow
+↕
+PeaceSTOCKS Risk + Execution
+```
+
+Adding or withdrawing money requires the brokerage's authorized funding/withdrawal path and user approval where required.
+
+PeaceSTOCKS must not autonomously:
+
+- withdraw funds;
+- change bank links;
+- change payout destinations;
+- add external funding accounts;
+- expand its own capital allowance.
+
+The website may display balances and offer an authorized launch/control surface, but custody and transfer execution remain with the brokerage.
+
 # Current scanner decisions to preserve
 
 ## D-200 — Eligibility history ladder
