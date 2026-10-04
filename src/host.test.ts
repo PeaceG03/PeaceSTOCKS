@@ -98,3 +98,44 @@ test("online host refuses to start when the object store bucket is missing", asy
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("failed evidence does not move the scheduler cursor forward", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peacestocks-host-"));
+  const previous = process.env.MASSIVE_API_KEY;
+  process.env.MASSIVE_API_KEY = "test-key";
+  const seeded = {
+    schemaVersion: "peaceai-markets-scheduler-host:v1",
+    forwardClockStartedAt: "2026-01-20T21:45:00.000Z",
+    lastObservedSessionDate: "2026-01-20",
+  };
+  await import("node:fs/promises").then(({ writeFile, mkdir }) =>
+    mkdir(root, { recursive: true }).then(() =>
+      writeFile(join(root, "scheduler-host-state.json"), `${JSON.stringify(seeded, null, 2)}\n`),
+    ),
+  );
+  try {
+    const provider = new MassiveMarketProvider({
+      apiKey: "test-key",
+      minRequestIntervalMs: 0,
+      retryBackoffMs: 0,
+      fetchImpl: async () => {
+        throw new Error("socket hang up");
+      },
+    });
+    const result = await runScannerHost({
+      now: new Date("2026-01-22T21:45:00.000Z"),
+      storageRoot: root,
+      provider,
+      completionDelayMinutes: 30,
+    });
+    assert.equal(result.status, "FAILED");
+    const state = JSON.parse(await readFile(join(root, "scheduler-host-state.json"), "utf8")) as {
+      lastObservedSessionDate: string;
+    };
+    assert.equal(state.lastObservedSessionDate, "2026-01-20");
+  } finally {
+    if (previous === undefined) delete process.env.MASSIVE_API_KEY;
+    else process.env.MASSIVE_API_KEY = previous;
+    await rm(root, { recursive: true, force: true });
+  }
+});

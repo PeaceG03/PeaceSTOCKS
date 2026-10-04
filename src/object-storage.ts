@@ -170,6 +170,31 @@ export class ObjectMarketStorage implements MarketStore {
     );
   }
 
+  private async readJsonl<T>(keyOrPrefix: string, exact: boolean): Promise<T[]> {
+    const keys = exact ? [keyOrPrefix] : await this.client.list(keyOrPrefix);
+    const rows: T[] = [];
+    for (const key of keys) rows.push(...lines<T>(await this.readText(key)));
+    return rows;
+  }
+
+  async loadBeliefs(sessionDate?: string): Promise<ScannerBelief[]> {
+    return sessionDate
+      ? this.readJsonl(`permanent/beliefs/${sessionDate}.jsonl`, true)
+      : this.readJsonl("permanent/beliefs/", false);
+  }
+
+  async loadPredictions(sessionDate?: string): Promise<PredictionSet[]> {
+    return sessionDate
+      ? this.readJsonl(`permanent/predictions/${sessionDate}.jsonl`, true)
+      : this.readJsonl("permanent/predictions/", false);
+  }
+
+  async loadPredictionStatuses(sessionDate?: string): Promise<PredictionStatus[]> {
+    return sessionDate
+      ? this.readJsonl(`permanent/prediction-status/${sessionDate}.jsonl`, true)
+      : this.readJsonl("permanent/prediction-status/", false);
+  }
+
   async writeDecisions(records: ScannerBelief[]): Promise<void> {
     await this.writeImmutable(
       `permanent/decisions/${records[0]?.sessionDate ?? "empty"}.jsonl`,

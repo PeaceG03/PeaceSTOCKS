@@ -36,6 +36,9 @@ export interface MarketStore {
   writeBeliefs(records: ScannerBelief[]): Promise<void>;
   writePredictions(records: PredictionSet[]): Promise<void>;
   writePredictionStatus(record: PredictionStatus): Promise<void>;
+  loadBeliefs(sessionDate?: string): Promise<ScannerBelief[]>;
+  loadPredictions(sessionDate?: string): Promise<PredictionSet[]>;
+  loadPredictionStatuses(sessionDate?: string): Promise<PredictionStatus[]>;
   writeDecisions(records: ScannerBelief[]): Promise<void>;
   writePartitionManifest(manifest: PartitionManifest): Promise<void>;
   writeRunReport(report: unknown): Promise<void>;
@@ -274,6 +277,16 @@ export class MarketStorage implements MarketStore {
       [record],
       (item) => item.predictionStatusId,
     );
+  }
+
+  async loadBeliefs(sessionDate?: string): Promise<ScannerBelief[]> {
+    if (sessionDate) return readJsonLines<ScannerBelief>(this.path(`beliefs/${sessionDate}.jsonl`));
+    return this.readTree("beliefs", async (file) => readJsonLines<ScannerBelief>(file));
+  }
+
+  async loadPredictions(sessionDate?: string): Promise<PredictionSet[]> {
+    if (sessionDate) return readJsonLines<PredictionSet>(this.path(`predictions/${sessionDate}.jsonl`));
+    return this.readTree("predictions", async (file) => readJsonLines<PredictionSet>(file));
   }
 
   async loadPredictionStatuses(sessionDate?: string): Promise<PredictionStatus[]> {

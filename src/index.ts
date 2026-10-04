@@ -17,6 +17,8 @@ export * from "./backfill";
 export * from "./intraday-backfill";
 export * from "./intraday";
 export * from "./dust";
+export * from "./packed-dust";
+export * from "./read-api";
 export * from "./reader";
 export * from "./validation";
 export * from "./benchmark";
