@@ -1,6 +1,8 @@
 name = "peacestocks-read"
 main = "src/read-worker.ts"
 compatibility_date = "2026-10-04"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
 
 [[r2_buckets]]
 binding = "PEACESTOCKS"
