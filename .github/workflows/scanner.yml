@@ -76,6 +76,10 @@ jobs:
   backfill:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'backfill' }}
     runs-on: ubuntu-latest
+    # actions: read lets backfill see a queued scan and yield the Massive budget to it.
+    permissions:
+      contents: read
+      actions: read
     timeout-minutes: 120
     env:
       MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
@@ -110,4 +114,5 @@ jobs:
       - name: Daily historical backfill into R2
         env:
           PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
+          GITHUB_TOKEN: ${{ github.token }}
         run: pnpm backfill --from "$MARKETS_BACKFILL_FROM" --to "$MARKETS_BACKFILL_TO" --max-sessions "${{ github.event.inputs.max_sessions }}"

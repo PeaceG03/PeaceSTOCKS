@@ -7,6 +7,7 @@ import type { MarketStore } from "./storage";
 import { refreshEligibility, refreshUniverse } from "./universe";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import { finalizeDailyPartition } from "./scanner";
+import { scanYieldReason } from "./scan-yield";
 
 const STATE_VERSION = "markets-scanner-backfill-v1" as const;
 export const MARKET_BACKFILL_PATH_ERROR = "MARKET_BACKFILL_PATH_INVALID";
@@ -32,6 +33,8 @@ export interface BackfillResult {
   barsStored: number;
   actionsStored: number;
   stoppedOnError: boolean;
+  /** Set when backfill stopped at a session boundary so a scan gets the request budget. */
+  yieldedForScan?: string;
   eligibility: Record<string, number>;
 }
 
@@ -178,12 +181,34 @@ export async function backfillHistoricalEvidence(options: {
   maxSessions?: number;
   storage?: MarketStore;
   env?: NodeJS.ProcessEnv;
+  /** Asked before starting and before every session; a reason stops at the session boundary. */
+  shouldYield?: () => Promise<string | undefined>;
 }): Promise<BackfillResult> {
   const env = options.env ?? process.env;
   requireObjectStore(env);
   const provider = options.provider ?? new MassiveMarketProvider();
   const storage = options.storage ?? openMarketStore(options.root, env);
   await storage.initialize();
+  // On Actions the scan always wins the Massive budget; local/test runs opt in via shouldYield.
+  const shouldYield =
+    options.shouldYield ??
+    (env.GITHUB_ACTIONS === "true" ? () => scanYieldReason({ env }) : async () => undefined);
+  const startYield = await shouldYield();
+  if (startYield)
+    return {
+      provider: provider.providerName,
+      requestedFrom: options.from,
+      requestedTo: options.to,
+      attemptedSessions: [],
+      completedSessions: [],
+      skippedExistingSessions: [],
+      failedSessions: {},
+      barsStored: 0,
+      actionsStored: 0,
+      stoppedOnError: false,
+      yieldedForScan: startYield,
+      eligibility: {},
+    };
 
   // Cold start: build the security master before grouped-daily can bind symbols.
   await refreshUniverse(provider, storage, options.to);
@@ -204,7 +229,8 @@ export async function backfillHistoricalEvidence(options: {
   const failedSessions: Record<string, string> = { ...state.failedSessions };
   let barsStored = 0,
     actionsStored = 0,
-    stoppedOnError = false;
+    stoppedOnError = false,
+    yieldedForScan: string | undefined;
   const activeIds = securities
     .filter((security) => security.status === "ACTIVE")
     .map((security) => security.securityId);
@@ -220,6 +246,8 @@ export async function backfillHistoricalEvidence(options: {
       await writeProgress(storage, state);
       continue;
     }
+    yieldedForScan = await shouldYield();
+    if (yieldedForScan) break;
     attemptedSessions.push(sessionDate);
     try {
       const bars = await provider.getDailyBars(sessionDate, activeIds);
@@ -272,6 +300,7 @@ export async function backfillHistoricalEvidence(options: {
     barsStored,
     actionsStored,
     stoppedOnError,
+    ...(yieldedForScan ? { yieldedForScan } : {}),
     eligibility,
   };
 }

@@ -146,3 +146,60 @@ test("backfill stops on provider-not-ready without marking the session complete"
   const progress = (await storage.loadBackfillProgress()) as { completedSessions: string[] };
   assert.deepEqual(progress.completedSessions, []);
 });
+
+test("backfill stops at a session boundary when a scan needs the request budget", async () => {
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
+  const calls = { sessions: [] as string[] };
+  let checks = 0;
+  const result = await backfillHistoricalEvidence({
+    root: "/unused",
+    from: "2026-01-20",
+    to: "2026-01-22",
+    provider: makeProvider(calls),
+    storage,
+    env: {},
+    // Start check and first session pass; the scan shows up before the second session.
+    shouldYield: async () => (++checks >= 3 ? "SCAN_RUN_WAITING:42:schedule:pending" : undefined),
+  });
+  assert.equal(result.yieldedForScan, "SCAN_RUN_WAITING:42:schedule:pending");
+  assert.equal(result.stoppedOnError, false);
+  assert.deepEqual(result.completedSessions, ["2026-01-20"]);
+  assert.deepEqual(result.attemptedSessions, ["2026-01-20"]);
+  assert.deepEqual(calls.sessions, ["2026-01-20"]);
+  // Progress is saved, so the next run resumes after the completed session.
+  const resumed = await backfillHistoricalEvidence({
+    root: "/unused",
+    from: "2026-01-20",
+    to: "2026-01-22",
+    provider: makeProvider(calls),
+    storage,
+    env: {},
+  });
+  assert.deepEqual(resumed.skippedExistingSessions, ["2026-01-20"]);
+  assert.deepEqual(resumed.completedSessions, ["2026-01-21", "2026-01-22"]);
+});
+
+test("backfill that must yield at start makes no provider calls", async () => {
+  const storage = new ObjectMarketStorage(new MemoryObjectClient());
+  let listed = false;
+  const provider = makeProvider({ sessions: [] });
+  const result = await backfillHistoricalEvidence({
+    root: "/unused",
+    from: "2026-01-20",
+    to: "2026-01-22",
+    provider: {
+      ...provider,
+      async listApprovedSecurities() {
+        listed = true;
+        return provider.listApprovedSecurities();
+      },
+    },
+    storage,
+    env: {},
+    shouldYield: async () => "SCAN_GUARD_WINDOW:2026-01-22T21:20:00.000Z",
+  });
+  assert.equal(listed, false);
+  assert.equal(result.yieldedForScan, "SCAN_GUARD_WINDOW:2026-01-22T21:20:00.000Z");
+  assert.deepEqual(result.attemptedSessions, []);
+});
