@@ -31,6 +31,12 @@ on:
     # Next-morning UTC retry for a session the provider had not published yet. Saturday covers Friday.
     - cron: "30 1 * * 2-6"
 
+# One writer at a time: scans and backfills both write R2 (month files, cursor), so they queue
+# instead of overlapping. A run already in progress is never canceled.
+concurrency:
+  group: peacestocks-r2-writer
+  cancel-in-progress: false
+
 jobs:
   scan:
     if: ${{ github.event_name == 'schedule' || github.event.inputs.mode == 'scan' }}
