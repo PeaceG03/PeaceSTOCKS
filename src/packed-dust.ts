@@ -105,9 +105,13 @@ function unzigzag(value: number): number {
   return value % 2 === 0 ? value / 2 : -(value + 1) / 2;
 }
 
+// Node's spawnSync default maxBuffer is 1 MiB, which made month-sized blocks fail with ZSTD_FAILED.
+const ZSTD_MAX_OUTPUT_BYTES = 1024 * 1024 * 1024;
+
 function zstd(mode: "compress" | "decompress", input: Uint8Array): Uint8Array {
   const result = spawnSync("zstd", mode === "compress" ? ["-7", "-c"] : ["-d", "-c"], {
     input: Buffer.from(input),
+    maxBuffer: ZSTD_MAX_OUTPUT_BYTES,
   });
   if (result.error || result.status !== 0) throw new Error("ZSTD_FAILED");
   return new Uint8Array(result.stdout);
