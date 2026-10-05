@@ -108,6 +108,21 @@ test("Massive 429 and network failures back off, then surface", async () => {
   });
   await assert.rejects(limitedProvider.listApprovedSecurities(), /MASSIVE_HTTP_429/);
   assert.equal(limited, 3);
+  assert.equal(limitedProvider.rateLimitedResponses, 3);
+
+  // A 429 that a retry recovers from is still counted.
+  let recovered = 0;
+  const recoveringProvider = new MassiveMarketProvider({
+    apiKey: "test-key",
+    minRequestIntervalMs: 0,
+    retryBackoffMs: 0,
+    fetchImpl: async () =>
+      ++recovered === 1
+        ? new Response("{}", { status: 429 })
+        : new Response(JSON.stringify({ results: [] }), { status: 200 }),
+  });
+  await recoveringProvider.listApprovedSecurities();
+  assert.equal(recoveringProvider.rateLimitedResponses, 1);
 
   let network = 0;
   const networkProvider = new MassiveMarketProvider({

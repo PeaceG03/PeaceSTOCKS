@@ -84,6 +84,7 @@ export class MassiveMarketProvider implements MarketProvider {
   private pace: Promise<void> = Promise.resolve();
   private readonly symbolBySecurityId = new Map<string, string>();
   private readonly maxTransientAttempts = 3;
+  private rateLimitedCount = 0;
   private readonly retryBackoffMs: number;
 
   constructor(options: MassiveProviderOptions = {}) {
@@ -96,6 +97,11 @@ export class MassiveMarketProvider implements MarketProvider {
     this.retryBackoffMs = options.retryBackoffMs ?? 250;
     if (this.retryBackoffMs < 0) throw new Error("MASSIVE_INVALID_RATE_LIMIT");
     this.now = options.now ?? (() => new Date().toISOString());
+  }
+
+  /** Every HTTP 429 received, including ones a retry later recovered from. */
+  get rateLimitedResponses(): number {
+    return this.rateLimitedCount;
   }
 
   private requireApiKey(): void {
@@ -154,6 +160,7 @@ export class MassiveMarketProvider implements MarketProvider {
       const requestId = response.headers.get("request-id") ?? response.headers.get("x-request-id");
       const safeBody = safeProviderErrorBody(body);
       if (response.status === 429) {
+        this.rateLimitedCount += 1;
         transientAttempt += 1;
         if (transientAttempt < this.maxTransientAttempts) {
           await this.backoff(transientAttempt);

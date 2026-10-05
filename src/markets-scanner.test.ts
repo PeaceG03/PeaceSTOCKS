@@ -528,3 +528,30 @@ test("short or missing SPY history records a relative-strength skip without fail
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("each run report records only the 429s received during that run", async () => {
+  const root = await fixtureRoot();
+  try {
+    const id = securityId("fixture-provider", "issuer-1", "STOCK");
+    class CountingProvider extends FixtureProvider {
+      rateLimitedResponses = 5; // earlier runs in the same process
+      override async getDailyBars(sessionDate: string, securityIds: string[]) {
+        this.rateLimitedResponses += sessionDate === "2026-01-02" ? 2 : 0;
+        return super.getDailyBars(sessionDate, securityIds);
+      }
+    }
+    const scanner = new MarketsScanner(
+      new CountingProvider([providerRecord("issuer-1", "AAA")], [bar(id, "2026-01-02", 100), bar(id, "2026-01-05", 101)]),
+      new MarketStorage(root),
+    );
+    assert.equal((await scanner.run("2026-01-02")).rateLimitedResponses, 2);
+    assert.equal((await scanner.run("2026-01-05")).rateLimitedResponses, 0);
+    const plain = await new MarketsScanner(
+      new FixtureProvider([providerRecord("issuer-1", "AAA")], [bar(id, "2026-01-02", 100)]),
+      new MarketStorage(root),
+    ).run("2026-01-02");
+    assert.equal(plain.rateLimitedResponses, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -55,7 +55,10 @@ export class MarketsScanner {
     private readonly calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
   ) {}
 
+  private rateLimitedAtRunStart = 0;
+
   async run(sessionDate: string, mode: ScannerRunMode = "FORWARD"): Promise<ScannerRunReport> {
+    this.rateLimitedAtRunStart = this.provider.rateLimitedResponses ?? 0;
     await this.storage.initialize();
     const session = this.calendar.getSession(sessionDate);
     const runId = `scan_${fingerprint({ sessionDate, provider: this.provider.providerName, version: SCANNER_VERSION, ...(mode === "EVIDENCE_ONLY" ? { mode } : {}) }).slice(0, 24)}`;
@@ -259,11 +262,12 @@ export class MarketsScanner {
   }
 
   private async finish(
-    input: Omit<ScannerRunReport, "completedAt" | "storage" | "sourceCommit">,
+    input: Omit<ScannerRunReport, "completedAt" | "storage" | "sourceCommit" | "rateLimitedResponses">,
   ): Promise<ScannerRunReport> {
     const report: ScannerRunReport = {
       ...input,
       sourceCommit: process.env.PEACESTOCKS_SOURCE_COMMIT?.trim() || "UNKNOWN",
+      rateLimitedResponses: (this.provider.rateLimitedResponses ?? 0) - this.rateLimitedAtRunStart,
       completedAt: new Date().toISOString(),
       storage: await this.storage.measureStorage(),
     };

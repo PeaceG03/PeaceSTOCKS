@@ -361,10 +361,14 @@ export interface ScannerRunReport {
   completedAt: string;
   predictionStatus?: PredictionAvailability;
   predictionReason?: PredictionStatus["reason"];
+  /** HTTP 429 responses the provider received during this run, including ones a retry recovered. */
+  rateLimitedResponses?: number;
 }
 
 export interface MarketProvider {
   readonly providerName: string;
+  /** Running count of HTTP 429 responses received, when the provider tracks it. */
+  readonly rateLimitedResponses?: number;
   listApprovedSecurities(): Promise<ProviderSecurityRecord[]>;
   getDailyBars(sessionDate: string, securityIds: string[]): Promise<CanonicalDailyBar[]>;
   getIntradayBars?(sessionDate: string, securityIds: string[]): Promise<CanonicalTenMinuteBar[]>;
