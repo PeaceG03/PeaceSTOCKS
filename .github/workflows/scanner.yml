@@ -31,7 +31,7 @@ on:
 
 jobs:
   scan:
-    if: github.event_name == 'schedule' || github.event.inputs.mode == 'scan'
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.mode == 'scan' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -42,7 +42,6 @@ jobs:
       PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
       PEACESTOCKS_SOURCE_COMMIT: ${{ github.sha }}
       PEACESTOCKS_REQUIRE_OBJECT_STORE: "1"
-      PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -61,10 +60,13 @@ jobs:
           test -n "$PEACESTOCKS_R2_SECRET_ACCESS_KEY"
           test -n "$MASSIVE_API_KEY"
           test -n "$PEACESTOCKS_SOURCE_COMMIT"
-      - run: pnpm scheduler
+      - name: Run online scanner host
+        env:
+          PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
+        run: pnpm scheduler
 
   backfill:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'backfill'
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'backfill' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -75,7 +77,6 @@ jobs:
       PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
       PEACESTOCKS_SOURCE_COMMIT: ${{ github.sha }}
       PEACESTOCKS_REQUIRE_OBJECT_STORE: "1"
-      PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
       MARKETS_BACKFILL_FROM: ${{ github.event.inputs.from }}
       MARKETS_BACKFILL_TO: ${{ github.event.inputs.to }}
     steps:
@@ -99,4 +100,6 @@ jobs:
           test -n "$MARKETS_BACKFILL_FROM"
           test -n "$MARKETS_BACKFILL_TO"
       - name: Daily historical backfill into R2
+        env:
+          PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
         run: pnpm backfill --from "$MARKETS_BACKFILL_FROM" --to "$MARKETS_BACKFILL_TO" --max-sessions "${{ github.event.inputs.max_sessions }}"
