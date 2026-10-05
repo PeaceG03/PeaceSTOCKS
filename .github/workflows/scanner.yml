@@ -1,6 +1,8 @@
 name: Scanner
 
 on:
+  # Intentionally no push trigger: online work is schedule + workflow_dispatch only.
+  # Push events that only change this file must not start a scan or backfill.
   workflow_dispatch:
     inputs:
       mode:

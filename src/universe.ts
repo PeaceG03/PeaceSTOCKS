@@ -165,9 +165,7 @@ export async function refreshUniverse(
 
 export async function refreshEligibility(storage: MarketStore): Promise<SecurityMasterRecord[]> {
   const securities = await storage.loadSecurities();
-  const bars = await storage.loadBars();
-  const counts = new Map<string, number>();
-  for (const bar of bars) counts.set(bar.securityId, (counts.get(bar.securityId) ?? 0) + 1);
+  const counts = await storage.tallyBarCounts();
   const refreshed = securities.map((security) => ({
     ...security,
     barCount: counts.get(security.securityId) ?? 0,

@@ -103,38 +103,41 @@ export class ObjectMarketStorage implements MarketStore {
   }
 
   async appendBars(records: CanonicalDailyBar[]): Promise<void> {
-    const existing = await this.loadBars();
-    const corrections: CorrectionRecord[] = [];
-    for (const record of records) {
-      const prior = [...existing, ...records].find(
-        (item) =>
-          item.securityId === record.securityId &&
-          item.sessionDate === record.sessionDate &&
-          item.revision === record.revision - 1,
-      );
-      if (prior)
-        corrections.push({
-          correctionId: `${record.securityId}|${record.sessionDate}|${record.revision}`,
-          evidenceKey: `${record.securityId}|${record.sessionDate}`,
-          supersedesRevision: prior.revision,
-          replacementRevision: record.revision,
-          reason: "provider-revision",
-          correctedAt: record.ingestedAt,
-          provenance: record.provenance,
-        });
-    }
     const byMonth = new Map<string, CanonicalDailyBar[]>();
     for (const record of records)
       byMonth.set(record.sessionDate.slice(0, 7), [
         ...(byMonth.get(record.sessionDate.slice(0, 7)) ?? []),
         record,
       ]);
-    for (const [month, monthRecords] of byMonth)
+    const corrections: CorrectionRecord[] = [];
+    for (const [month, monthRecords] of byMonth) {
+      const existing = lines<CanonicalDailyBar>(
+        await this.readText(`permanent/daily-bars/${month}.jsonl`),
+      );
+      for (const record of monthRecords) {
+        const prior = [...existing, ...monthRecords].find(
+          (item) =>
+            item.securityId === record.securityId &&
+            item.sessionDate === record.sessionDate &&
+            item.revision === record.revision - 1,
+        );
+        if (prior)
+          corrections.push({
+            correctionId: `${record.securityId}|${record.sessionDate}|${record.revision}`,
+            evidenceKey: `${record.securityId}|${record.sessionDate}`,
+            supersedesRevision: prior.revision,
+            replacementRevision: record.revision,
+            reason: "provider-revision",
+            correctedAt: record.ingestedAt,
+            provenance: record.provenance,
+          });
+      }
       await this.appendUnique(
         `permanent/daily-bars/${month}.jsonl`,
         monthRecords,
         (record) => `${record.securityId}|${record.sessionDate}|${record.revision}`,
       );
+    }
     await this.appendCorrections(corrections);
   }
 
@@ -270,6 +273,19 @@ export class ObjectMarketStorage implements MarketStore {
 
   async saveBackfillProgress(state: unknown): Promise<void> {
     await this.writeText("backfill-state.json", JSON.stringify(state, null, 2) + "\n");
+  }
+
+  async tallyBarCounts(): Promise<Map<string, number>> {
+    const counts = new Map<string, number>();
+    for (const key of await this.client.list("permanent/daily-bars/")) {
+      const body = await this.readText(key);
+      for (const line of body.split("\n")) {
+        if (!line) continue;
+        const securityId = /"securityId":"([^"]+)"/u.exec(line)?.[1];
+        if (securityId) counts.set(securityId, (counts.get(securityId) ?? 0) + 1);
+      }
+    }
+    return counts;
   }
 
   async putPendingArchive(objectId: string, body: Uint8Array): Promise<PendingArchiveRecord> {

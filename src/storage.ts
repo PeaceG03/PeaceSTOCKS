@@ -49,6 +49,7 @@ export interface MarketStore {
   saveSchedulerState(state: unknown): Promise<void>;
   loadBackfillProgress(): Promise<unknown>;
   saveBackfillProgress(state: unknown): Promise<void>;
+  tallyBarCounts(): Promise<Map<string, number>>;
 }
 
 type StoredRecord =
@@ -197,38 +198,39 @@ export class MarketStorage implements MarketStore {
   }
 
   async appendBars(records: CanonicalDailyBar[]): Promise<void> {
-    const existing = await this.loadBars();
-    const corrections: CorrectionRecord[] = [];
-    for (const record of records) {
-      const prior = [...existing, ...records].find(
-        (item) =>
-          item.securityId === record.securityId &&
-          item.sessionDate === record.sessionDate &&
-          item.revision === record.revision - 1,
-      );
-      if (prior)
-        corrections.push({
-          correctionId: `${record.securityId}|${record.sessionDate}|${record.revision}`,
-          evidenceKey: `${record.securityId}|${record.sessionDate}`,
-          supersedesRevision: prior.revision,
-          replacementRevision: record.revision,
-          reason: "provider-revision",
-          correctedAt: record.ingestedAt,
-          provenance: record.provenance,
-        });
-    }
     const byMonth = new Map<string, CanonicalDailyBar[]>();
     for (const record of records)
       byMonth.set(record.sessionDate.slice(0, 7), [
         ...(byMonth.get(record.sessionDate.slice(0, 7)) ?? []),
         record,
       ]);
-    for (const [month, monthRecords] of byMonth)
+    const corrections: CorrectionRecord[] = [];
+    for (const [month, monthRecords] of byMonth) {
+      const existing = await readJsonLines<CanonicalDailyBar>(this.path(`daily-bars/${month}.jsonl`));
+      for (const record of monthRecords) {
+        const prior = [...existing, ...monthRecords].find(
+          (item) =>
+            item.securityId === record.securityId &&
+            item.sessionDate === record.sessionDate &&
+            item.revision === record.revision - 1,
+        );
+        if (prior)
+          corrections.push({
+            correctionId: `${record.securityId}|${record.sessionDate}|${record.revision}`,
+            evidenceKey: `${record.securityId}|${record.sessionDate}`,
+            supersedesRevision: prior.revision,
+            replacementRevision: record.revision,
+            reason: "provider-revision",
+            correctedAt: record.ingestedAt,
+            provenance: record.provenance,
+          });
+      }
       await this.appendUnique(
         `daily-bars/${month}.jsonl`,
         monthRecords,
         (record) => `${record.securityId}|${record.sessionDate}|${record.revision}`,
       );
+    }
     await this.appendCorrections(corrections);
   }
 
@@ -528,6 +530,13 @@ export class MarketStorage implements MarketStore {
       join(this.root, "backfill-state.json"),
       JSON.stringify(state, null, 2) + "\n",
     );
+  }
+
+  async tallyBarCounts(): Promise<Map<string, number>> {
+    const counts = new Map<string, number>();
+    for (const bar of await this.loadBars())
+      counts.set(bar.securityId, (counts.get(bar.securityId) ?? 0) + 1);
+    return counts;
   }
 
 }

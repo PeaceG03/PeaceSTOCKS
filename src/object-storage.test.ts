@@ -115,3 +115,17 @@ test("R2 client signs requests for the configured bucket and does not use dust-v
   assert.match(captured?.headers.get("authorization") ?? "", /AWS4-HMAC-SHA256/);
   assert.equal(captured?.method, "PUT");
 });
+
+test("appendBars only touches the months being written", async () => {
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
+  const id = securityId("fixture-provider", "issuer-1", "STOCK");
+  await storage.appendBars([bar(id, "2026-01-22", 100)]);
+  await storage.appendBars([bar(id, "2026-02-02", 101)]);
+  const keys = await client.list("permanent/daily-bars/");
+  assert.deepEqual(keys, ["permanent/daily-bars/2026-01.jsonl", "permanent/daily-bars/2026-02.jsonl"]);
+  await storage.appendBars([bar(id, "2026-02-03", 102)]);
+  assert.equal((await storage.loadBars("2026-02-02")).length, 1);
+  assert.equal((await storage.loadBars("2026-02-03")).length, 1);
+  assert.equal((await storage.loadBars("2026-01-22")).length, 1);
+});
