@@ -7,7 +7,7 @@ import type { MarketStore } from "./storage";
 import { refreshEligibility, refreshUniverse } from "./universe";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import { finalizeDailyPartition } from "./scanner";
-import { scanYieldReason } from "./scan-yield";
+import { ScanYieldError, scanYieldReason } from "./scan-yield";
 
 const STATE_VERSION = "markets-scanner-backfill-v1" as const;
 export const MARKET_BACKFILL_PATH_ERROR = "MARKET_BACKFILL_PATH_INVALID";
@@ -193,25 +193,32 @@ export async function backfillHistoricalEvidence(options: {
   const shouldYield =
     options.shouldYield ??
     (env.GITHUB_ACTIONS === "true" ? () => scanYieldReason({ env }) : async () => undefined);
+  const yieldedBeforeSessions = (reason: string): BackfillResult => ({
+    provider: provider.providerName,
+    requestedFrom: options.from,
+    requestedTo: options.to,
+    attemptedSessions: [],
+    completedSessions: [],
+    skippedExistingSessions: [],
+    failedSessions: {},
+    barsStored: 0,
+    actionsStored: 0,
+    stoppedOnError: false,
+    yieldedForScan: reason,
+    eligibility: {},
+  });
   const startYield = await shouldYield();
-  if (startYield)
-    return {
-      provider: provider.providerName,
-      requestedFrom: options.from,
-      requestedTo: options.to,
-      attemptedSessions: [],
-      completedSessions: [],
-      skippedExistingSessions: [],
-      failedSessions: {},
-      barsStored: 0,
-      actionsStored: 0,
-      stoppedOnError: false,
-      yieldedForScan: startYield,
-      eligibility: {},
-    };
+  if (startYield) return yieldedBeforeSessions(startYield);
 
-  // Cold start: build the security master before grouped-daily can bind symbols.
-  await refreshUniverse(provider, storage, options.to);
+  // Cold start: build the security master before grouped-daily can bind symbols. The yield check
+  // also runs at every ticker-list page boundary; stopping there discards the partial list, so
+  // the stored master is never compared against half the provider universe.
+  try {
+    await refreshUniverse(provider, storage, options.to, { shouldStop: shouldYield });
+  } catch (error) {
+    if (error instanceof ScanYieldError) return yieldedBeforeSessions(error.reason);
+    throw error;
+  }
   let securities = await storage.loadSecurities();
   const bind = (
     provider as MarketProvider & { bindUniverse?: (records: ProviderSecurityRecord[]) => void }

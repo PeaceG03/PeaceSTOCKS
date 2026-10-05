@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { securityId } from "./identity";
 import { MassiveMarketProvider } from "./massive-provider";
+import { ScanYieldError } from "./scan-yield";
 
 function securityIdForTest(): string {
   return securityId("massive-stocks", "SPY", "ETF");
@@ -182,4 +183,35 @@ test("an invalid Massive credential is rejected without retry", async () => {
   });
   await assert.rejects(provider.listApprovedSecurities(), /MASSIVE_CREDENTIAL_REJECTED/);
   assert.equal(calls, 1);
+});
+
+test("Massive ticker listing checks shouldStop at each later page boundary and returns nothing partial", async () => {
+  const urls: string[] = [];
+  const provider = new MassiveMarketProvider({
+    apiKey: "test-key",
+    minRequestIntervalMs: 0,
+    fetchImpl: async (input) => {
+      const url = String(input);
+      urls.push(url);
+      const page = urls.length;
+      return new Response(
+        JSON.stringify({
+          results: [{ ticker: `T${page}`, type: "CS", market: "stocks", locale: "us", active: true }],
+          next_url: `https://api.massive.com/v3/reference/tickers?cursor=p${page + 1}`,
+        }),
+        { status: 200 },
+      );
+    },
+  });
+  let asked = 0;
+  await assert.rejects(
+    provider.listApprovedSecurities({
+      shouldStop: async () => (++asked === 3 ? "SCAN_GUARD_WINDOW:2026-01-22T21:15:00.000Z" : undefined),
+    }),
+    (error: unknown) =>
+      error instanceof ScanYieldError && error.reason === "SCAN_GUARD_WINDOW:2026-01-22T21:15:00.000Z",
+  );
+  // Not asked before the first page; asked before pages 2, 3 and 4; stopped before page 4.
+  assert.equal(asked, 3);
+  assert.equal(urls.length, 3);
 });

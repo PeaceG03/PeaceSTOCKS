@@ -1,4 +1,5 @@
 import type {
+  ListSecuritiesOptions,
   CanonicalDailyBar,
   CanonicalTenMinuteBar,
   CorporateAction,
@@ -8,6 +9,7 @@ import type {
 } from "./contracts";
 import { MARKET_SCHEMA_VERSION } from "./contracts";
 import { securityId } from "./identity";
+import { ScanYieldError } from "./scan-yield";
 import { intradaySessionSpec, normalizeMassiveTenMinuteBars } from "./intraday";
 
 const DEFAULT_BASE_URL = "https://api.massive.com";
@@ -211,12 +213,20 @@ export class MassiveMarketProvider implements MarketProvider {
     };
   }
 
-  async listApprovedSecurities(): Promise<ProviderSecurityRecord[]> {
+  async listApprovedSecurities(options: ListSecuritiesOptions = {}): Promise<ProviderSecurityRecord[]> {
     const output = new Map<string, ProviderSecurityRecord>();
+    let pagesFetched = 0;
     for (const active of ["true", "false"]) {
       let next: string | undefined = "/v3/reference/tickers";
       let first = true;
       while (next) {
+        // The caller checked before calling; re-check at every later page boundary. Stopping
+        // throws away everything read so far and leaves the bound universe untouched.
+        if (pagesFetched > 0 && options.shouldStop) {
+          const reason = await options.shouldStop();
+          if (reason) throw new ScanYieldError(reason);
+        }
+        pagesFetched += 1;
         const response = await this.get(
           next,
           first

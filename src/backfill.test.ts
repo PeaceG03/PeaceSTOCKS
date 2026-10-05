@@ -5,6 +5,8 @@ import { backfillHistoricalEvidence } from "./backfill";
 import { securityId } from "./identity";
 import { MemoryObjectClient } from "./object-store";
 import { ObjectMarketStorage } from "./object-storage";
+import { MassiveMarketProvider } from "./massive-provider";
+import { refreshUniverse } from "./universe";
 
 const providerName = "fixture-provider";
 
@@ -202,4 +204,68 @@ test("backfill that must yield at start makes no provider calls", async () => {
   assert.equal(listed, false);
   assert.equal(result.yieldedForScan, "SCAN_GUARD_WINDOW:2026-01-22T21:20:00.000Z");
   assert.deepEqual(result.attemptedSessions, []);
+});
+
+test("backfill that yields mid ticker-list paging discards the partial list and keeps the stored master", async () => {
+  const storage = new ObjectMarketStorage(new MemoryObjectClient());
+  const ticker = (symbol: string) => ({
+    ticker: symbol,
+    type: "CS",
+    market: "stocks",
+    locale: "us",
+    active: true,
+    primary_exchange: "XNYS",
+  });
+  const fullPages: Record<string, unknown> = {
+    first: { results: [ticker("AAA")], next_url: "https://api.massive.com/v3/reference/tickers?cursor=p2" },
+    p2: { results: [ticker("BBB"), ticker("CCC")] },
+  };
+  const urls: string[] = [];
+  const massive = (pages: Record<string, unknown>) =>
+    new MassiveMarketProvider({
+      apiKey: "test-key",
+      minRequestIntervalMs: 0,
+      fetchImpl: async (input) => {
+        const url = String(input);
+        urls.push(url);
+        const body = url.includes("cursor=p2")
+          ? pages.p2
+          : url.includes("active=false")
+            ? { results: [] }
+            : pages.first;
+        return new Response(JSON.stringify(body), { status: 200 });
+      },
+    });
+  // A complete earlier refresh stored AAA, BBB and CCC as active.
+  await refreshUniverse(massive(fullPages), storage, "2026-01-15");
+  const masterBefore = await storage.loadSecurities();
+  const membershipBefore = await storage.loadMembership();
+  assert.deepEqual(
+    masterBefore.map((item) => [item.currentSymbol, item.status]).sort(),
+    [["AAA", "ACTIVE"], ["BBB", "ACTIVE"], ["CCC", "ACTIVE"]],
+  );
+  urls.length = 0;
+
+  let checks = 0;
+  const result = await backfillHistoricalEvidence({
+    root: "/unused",
+    from: "2026-01-20",
+    to: "2026-01-22",
+    provider: massive(fullPages),
+    storage,
+    env: {},
+    // The start check passes; the scan appears at the first ticker-list page boundary.
+    shouldYield: async () => (++checks >= 2 ? "SCAN_RUN_WAITING:7:schedule:queued" : undefined),
+  });
+
+  assert.equal(result.yieldedForScan, "SCAN_RUN_WAITING:7:schedule:queued");
+  assert.equal(result.stoppedOnError, false);
+  assert.deepEqual(result.attemptedSessions, []);
+  assert.equal(checks, 2);
+  // Only the first page was read: no second page, no inactive pass, no bars or actions.
+  assert.equal(urls.length, 1);
+  assert.match(urls[0] ?? "", /\/v3\/reference\/tickers\?.*active=true/);
+  // BBB and CCC were on the unread page; they must not be marked inactive or delisted.
+  assert.deepEqual(await storage.loadSecurities(), masterBefore);
+  assert.deepEqual(await storage.loadMembership(), membershipBefore);
 });

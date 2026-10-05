@@ -1,4 +1,5 @@
 import type {
+  ListSecuritiesOptions,
   HistoryEligibility,
   MarketProvider,
   ProviderSecurityRecord,
@@ -36,6 +37,7 @@ export async function refreshUniverse(
   provider: MarketProvider,
   storage: MarketStore,
   asOf: string,
+  options: ListSecuritiesOptions = {},
 ): Promise<UniverseRefreshResult> {
   await storage.initialize();
   const existing = await storage.loadSecurities();
@@ -53,7 +55,7 @@ export async function refreshUniverse(
   let updated = 0;
   let rejected = 0;
 
-  for (const providerRecord of await provider.listApprovedSecurities()) {
+  for (const providerRecord of await provider.listApprovedSecurities(options)) {
     if (!inScope(providerRecord)) {
       rejected += 1;
       continue;

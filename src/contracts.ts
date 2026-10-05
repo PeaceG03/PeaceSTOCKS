@@ -365,11 +365,19 @@ export interface ScannerRunReport {
   rateLimitedResponses?: number;
 }
 
+export interface ListSecuritiesOptions {
+  shouldStop?: () => Promise<string | undefined>;
+}
+
 export interface MarketProvider {
   readonly providerName: string;
   /** Running count of HTTP 429 responses received, when the provider tracks it. */
   readonly rateLimitedResponses?: number;
-  listApprovedSecurities(): Promise<ProviderSecurityRecord[]>;
+  /**
+   * shouldStop is asked at every page boundary after the first page; a reason aborts the whole
+   * listing (no partial result is returned) so the caller can yield to a scan.
+   */
+  listApprovedSecurities(options?: ListSecuritiesOptions): Promise<ProviderSecurityRecord[]>;
   getDailyBars(sessionDate: string, securityIds: string[]): Promise<CanonicalDailyBar[]>;
   getIntradayBars?(sessionDate: string, securityIds: string[]): Promise<CanonicalTenMinuteBar[]>;
   getCorporateActions(sessionDate: string, securityIds: string[]): Promise<CorporateAction[]>;

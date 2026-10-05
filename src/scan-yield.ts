@@ -54,3 +54,11 @@ export async function scanYieldReason(options: ScanYieldOptions = {}): Promise<s
     return `SCAN_CHECK_FAILED:${String(error).slice(0, 120)}`;
   }
 }
+
+/** Thrown from inside a paged provider call when a scan becomes due; nothing partial is kept. */
+export class ScanYieldError extends Error {
+  constructor(readonly reason: string) {
+    super(`SCAN_YIELD:${reason}`);
+    this.name = "ScanYieldError";
+  }
+}
