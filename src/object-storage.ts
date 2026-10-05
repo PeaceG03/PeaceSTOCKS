@@ -263,6 +263,15 @@ export class ObjectMarketStorage implements MarketStore {
     await this.writeText("scheduler-host-state.json", JSON.stringify(state, null, 2) + "\n");
   }
 
+  async loadBackfillProgress(): Promise<unknown> {
+    const body = await this.readText("backfill-state.json");
+    return body ? (JSON.parse(body) as unknown) : undefined;
+  }
+
+  async saveBackfillProgress(state: unknown): Promise<void> {
+    await this.writeText("backfill-state.json", JSON.stringify(state, null, 2) + "\n");
+  }
+
   async putPendingArchive(objectId: string, body: Uint8Array): Promise<PendingArchiveRecord> {
     const id = safeObjectId(objectId);
     const record: PendingArchiveRecord = {

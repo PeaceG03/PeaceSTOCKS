@@ -1,10 +1,10 @@
 import { readFile, writeFile, rename } from "node:fs/promises";
-import { join } from "node:path";
 import { assertSafeStoreFile, prepareSafeStoreFile } from "./store-path";
 import type { MarketProvider, ProviderSecurityRecord, SecurityMasterRecord } from "./contracts";
 import { MassiveMarketProvider } from "./massive-provider";
-import { MarketStorage } from "./storage";
-import { refreshEligibility } from "./universe";
+import { openMarketStore } from "./object-storage";
+import type { MarketStore } from "./storage";
+import { refreshEligibility, refreshUniverse } from "./universe";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import { finalizeDailyPartition } from "./scanner";
 
@@ -52,6 +52,7 @@ function dates(from: string, to: string): string[] {
   return result;
 }
 
+/** File-path helpers kept for path-safety tests; live backfill uses MarketStore. */
 export async function loadBackfillState(
   path: string,
   provider: string,
@@ -125,23 +126,74 @@ function providerRecords(
   });
 }
 
+function emptyState(provider: string, from: string, to: string): BackfillState {
+  return {
+    schemaVersion: STATE_VERSION,
+    provider,
+    from,
+    to,
+    completedSessions: [],
+    failedSessions: {},
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function readProgress(
+  storage: MarketStore,
+  provider: string,
+  from: string,
+  to: string,
+): Promise<BackfillState> {
+  try {
+    const raw = (await storage.loadBackfillProgress()) as BackfillState | undefined;
+    if (
+      raw &&
+      raw.schemaVersion === STATE_VERSION &&
+      raw.provider === provider &&
+      raw.from === from &&
+      raw.to === to
+    )
+      return raw;
+  } catch {
+    // Treat corrupt or missing progress as a fresh range.
+  }
+  return emptyState(provider, from, to);
+}
+
+async function writeProgress(storage: MarketStore, state: BackfillState): Promise<void> {
+  await storage.saveBackfillProgress({ ...state, updatedAt: new Date().toISOString() });
+}
+
+function requireObjectStore(env: NodeJS.ProcessEnv): void {
+  if (env.PEACESTOCKS_REQUIRE_OBJECT_STORE === "1" && !env.PEACESTOCKS_R2_BUCKET?.trim()) {
+    throw new Error("OBJECT_STORE_REQUIRED");
+  }
+}
+
 export async function backfillHistoricalEvidence(options: {
   root: string;
   from: string;
   to: string;
   provider?: MarketProvider;
   maxSessions?: number;
+  storage?: MarketStore;
+  env?: NodeJS.ProcessEnv;
 }): Promise<BackfillResult> {
+  const env = options.env ?? process.env;
+  requireObjectStore(env);
   const provider = options.provider ?? new MassiveMarketProvider();
-  const storage = new MarketStorage(options.root);
+  const storage = options.storage ?? openMarketStore(options.root, env);
   await storage.initialize();
-  const securities = await storage.loadSecurities();
+
+  // Cold start: build the security master before grouped-daily can bind symbols.
+  await refreshUniverse(provider, storage, options.to);
+  let securities = await storage.loadSecurities();
   const bind = (
     provider as MarketProvider & { bindUniverse?: (records: ProviderSecurityRecord[]) => void }
   ).bindUniverse;
   if (bind) bind.call(provider, providerRecords(securities, provider.providerName));
-  const statePath = join(options.root, "backfill-state.json");
-  const state = await loadBackfillState(statePath, provider.providerName, options.from, options.to);
+
+  const state = await readProgress(storage, provider.providerName, options.from, options.to);
   const sessions = dates(options.from, options.to).slice(
     0,
     options.maxSessions ?? Number.MAX_SAFE_INTEGER,
@@ -165,7 +217,7 @@ export async function backfillHistoricalEvidence(options: {
     if (existing.length > 0) {
       state.completedSessions = [...new Set([...state.completedSessions, sessionDate])].sort();
       skippedExistingSessions.push(sessionDate);
-      await saveBackfillState(statePath, state);
+      await writeProgress(storage, state);
       continue;
     }
     attemptedSessions.push(sessionDate);
@@ -178,7 +230,10 @@ export async function backfillHistoricalEvidence(options: {
         await storage.appendActions(actions);
         actionsStored += actions.length;
       } catch (error) {
-        failedSessions[`${sessionDate}:corporate-actions`] = String(error);
+        const message = String(error);
+        if (message.includes("PROVIDER_NOT_READY") || message.includes("MASSIVE_CREDENTIAL_REJECTED"))
+          throw error;
+        failedSessions[`${sessionDate}:corporate-actions`] = message;
       }
       await finalizeDailyPartition(
         storage,
@@ -189,16 +244,17 @@ export async function backfillHistoricalEvidence(options: {
       state.completedSessions = [...new Set([...state.completedSessions, sessionDate])].sort();
       delete failedSessions[sessionDate];
       completedSessions.push(sessionDate);
-      await saveBackfillState(statePath, { ...state, failedSessions });
+      await writeProgress(storage, { ...state, failedSessions });
     } catch (error) {
-      failedSessions[sessionDate] = String(error);
+      const message = String(error);
+      failedSessions[sessionDate] = message;
       stoppedOnError = true;
-      await saveBackfillState(statePath, { ...state, failedSessions });
+      await writeProgress(storage, { ...state, failedSessions });
       break;
     }
   }
-  const refreshed = await refreshEligibility(storage);
-  const eligibility = refreshed.reduce<Record<string, number>>(
+  securities = await refreshEligibility(storage);
+  const eligibility = securities.reduce<Record<string, number>>(
     (counts, security) => ({
       ...counts,
       [security.eligibility]: (counts[security.eligibility] ?? 0) + 1,
@@ -226,7 +282,10 @@ function argument(name: string): string | undefined {
 }
 
 if (process.argv[1]?.endsWith("backfill.ts")) {
-  const root = process.env.MARKETS_STORAGE_ROOT ?? "C:\\ProgramData\\PeaceAI\\Markets";
+  const root =
+    process.env.PEACEAI_MARKETS_ROOT ??
+    process.env.MARKETS_STORAGE_ROOT ??
+    "C:\\ProgramData\\PeaceAI\\Markets";
   const from = argument("--from") ?? process.env.MARKETS_BACKFILL_FROM;
   const to = argument("--to") ?? process.env.MARKETS_BACKFILL_TO;
   if (!from || !to) throw new Error("BACKFILL_RANGE_REQUIRED");
@@ -238,4 +297,5 @@ if (process.argv[1]?.endsWith("backfill.ts")) {
     ...(maxText ? { maxSessions: Number(maxText) } : {}),
   });
   console.log(JSON.stringify(result));
+  if (result.stoppedOnError) process.exitCode = 2;
 }

@@ -166,11 +166,11 @@ Do not duplicate:
 
 ## Migration from current PeaceAI repo
 
-Current sources under:
+Current sources live under:
 
-`packages/markets-scanner/`
+`src/`
 
-should initially move to:
+(migrated from PeaceAI `packages/markets-scanner/`; previously planned target was:)
 
 `Scanner/`
 

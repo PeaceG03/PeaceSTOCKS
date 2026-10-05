@@ -14,7 +14,7 @@ Do not let storage-format research, live trading, or future product expansion bl
 
 Current scanner source exists under:
 
-`packages/markets-scanner/`
+`src/`
 
 Implemented areas include:
 

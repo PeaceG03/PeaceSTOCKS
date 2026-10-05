@@ -127,10 +127,32 @@ export async function readableSet(
   return project(ids, beliefs, securities, report);
 }
 
+export async function readableByTicker(
+  storage: MarketStore,
+  ticker: string,
+): Promise<ReadableResult | undefined> {
+  const report = await latestSuccess(storage);
+  if (!report) return undefined;
+  const symbol = ticker.trim().toUpperCase();
+  if (!symbol || !/^[A-Z0-9.-]{1,12}$/u.test(symbol)) return undefined;
+  const [beliefs, securities] = await Promise.all([
+    storage.loadBeliefs(report.session.sessionDate),
+    storage.loadSecurities(),
+  ]);
+  const security = securities.find((item) => item.currentSymbol.toUpperCase() === symbol);
+  if (!security) return undefined;
+  return project([security.securityId], beliefs, securities, report)[0];
+}
+
 export async function readScannerRoute(
   storage: MarketStore,
   path: string,
 ): Promise<{ status: number; body: unknown }> {
+  const tickerMatch = /^\/scanner\/ticker\/([^/]+)$/u.exec(path);
+  if (tickerMatch) {
+    const row = await readableByTicker(storage, decodeURIComponent(tickerMatch[1] ?? ""));
+    return row ? { status: 200, body: row } : { status: 404, body: { error: "TICKER_NOT_FOUND" } };
+  }
   switch (path) {
     case "/scanner/latest":
       return { status: 200, body: (await latestScan(storage)) ?? null };

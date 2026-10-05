@@ -113,7 +113,7 @@ export class MarketsScanner {
         reason: "SOURCE_COLLECTION_FAILED",
         scannerVersion: SCANNER_VERSION,
         configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
-        recordedAt: new Date().toISOString(),
+        recordedAt: `${sessionDate}T23:59:59.999Z`,
         sourceRunId: runId,
         supersedesPredictionIds: [],
       });
@@ -202,7 +202,7 @@ export class MarketsScanner {
         reason: predictionUnavailableReason,
         scannerVersion: SCANNER_VERSION,
         configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
-        recordedAt: new Date().toISOString(),
+        recordedAt: `${sessionDate}T23:59:59.999Z`,
         sourceRunId: runId,
         supersedesPredictionIds: predictionIds,
       });
@@ -218,7 +218,7 @@ export class MarketsScanner {
           reason: emptyPredictionSets ? "NO_QUALIFYING_CANDIDATES" : "PREDICTIONS_FROZEN",
           scannerVersion: SCANNER_VERSION,
           configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
-          recordedAt: new Date().toISOString(),
+          recordedAt: `${sessionDate}T23:59:59.999Z`,
           sourceRunId: runId,
           supersedesPredictionIds: [],
         });

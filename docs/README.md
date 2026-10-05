@@ -71,7 +71,7 @@ Do not infer completion of a future phase from its documentation.
 
 The existing implementation lives under:
 
-`packages/markets-scanner/`
+`src/`
 
 Major implemented pieces already include:
 

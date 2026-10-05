@@ -41,7 +41,9 @@ import { MassiveMarketProvider } from "./massive-provider";
 test("scheduler cursor stays before a provider-not-ready session", async () => {
   const root = await mkdtemp(join(tmpdir(), "peacestocks-host-"));
   const previous = process.env.MASSIVE_API_KEY;
+  const previousBucket = process.env.PEACESTOCKS_R2_BUCKET;
   process.env.MASSIVE_API_KEY = "test-key";
+  delete process.env.PEACESTOCKS_R2_BUCKET;
   try {
     const provider = new MassiveMarketProvider({
       apiKey: "test-key",
@@ -68,6 +70,8 @@ test("scheduler cursor stays before a provider-not-ready session", async () => {
   } finally {
     if (previous === undefined) delete process.env.MASSIVE_API_KEY;
     else process.env.MASSIVE_API_KEY = previous;
+    if (previousBucket === undefined) delete process.env.PEACESTOCKS_R2_BUCKET;
+    else process.env.PEACESTOCKS_R2_BUCKET = previousBucket;
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -102,7 +106,9 @@ test("online host refuses to start when the object store bucket is missing", asy
 test("failed evidence does not move the scheduler cursor forward", async () => {
   const root = await mkdtemp(join(tmpdir(), "peacestocks-host-"));
   const previous = process.env.MASSIVE_API_KEY;
+  const previousBucket = process.env.PEACESTOCKS_R2_BUCKET;
   process.env.MASSIVE_API_KEY = "test-key";
+  delete process.env.PEACESTOCKS_R2_BUCKET;
   const seeded = {
     schemaVersion: "peaceai-markets-scheduler-host:v1",
     forwardClockStartedAt: "2026-01-20T21:45:00.000Z",
@@ -136,6 +142,8 @@ test("failed evidence does not move the scheduler cursor forward", async () => {
   } finally {
     if (previous === undefined) delete process.env.MASSIVE_API_KEY;
     else process.env.MASSIVE_API_KEY = previous;
+    if (previousBucket === undefined) delete process.env.PEACESTOCKS_R2_BUCKET;
+    else process.env.PEACESTOCKS_R2_BUCKET = previousBucket;
     await rm(root, { recursive: true, force: true });
   }
 });

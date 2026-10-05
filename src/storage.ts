@@ -47,6 +47,8 @@ export interface MarketStore {
   readPermanent(relativePath: string): Promise<Buffer>;
   loadSchedulerState(): Promise<unknown>;
   saveSchedulerState(state: unknown): Promise<void>;
+  loadBackfillProgress(): Promise<unknown>;
+  saveBackfillProgress(state: unknown): Promise<void>;
 }
 
 type StoredRecord =
@@ -513,6 +515,17 @@ export class MarketStorage implements MarketStore {
   async saveSchedulerState(state: unknown): Promise<void> {
     await this.atomicWrite(
       join(this.root, "scheduler-host-state.json"),
+      JSON.stringify(state, null, 2) + "\n",
+    );
+  }
+
+  async loadBackfillProgress(): Promise<unknown> {
+    return readJson(join(this.root, "backfill-state.json"));
+  }
+
+  async saveBackfillProgress(state: unknown): Promise<void> {
+    await this.atomicWrite(
+      join(this.root, "backfill-state.json"),
       JSON.stringify(state, null, 2) + "\n",
     );
   }

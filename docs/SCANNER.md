@@ -12,7 +12,7 @@ It is not a trading engine.
 
 Current source location:
 
-`packages/markets-scanner/`
+`src/` (flat tree; migrated from PeaceAI `packages/markets-scanner/`)
 
 The package already contains:
 

@@ -95,6 +95,10 @@ test("a rerun keeps one belief and the read API returns tickers", async () => {
     assert.equal(typeof rows[0]?.overallRank, "number");
     const health = await readScannerRoute(storage, "/scanner/health");
     assert.equal((health.body as { sourceCommit: string; sessionDate: string }).sessionDate, "2026-01-22");
+    const byTicker = await readScannerRoute(storage, "/scanner/ticker/AAA");
+    assert.equal(byTicker.status, 200);
+    assert.equal((byTicker.body as { ticker: string }).ticker, "AAA");
+    assert.equal(await readScannerRoute(storage, "/scanner/ticker/MISSING").then((result) => result.status), 404);
     assert.equal(await readScannerRoute(storage, "/nope").then((result) => result.status), 404);
     assert.equal(first.status === "COMPLETE" || first.status === "COMPLETE_WITH_WARNINGS", true);
   } finally {
