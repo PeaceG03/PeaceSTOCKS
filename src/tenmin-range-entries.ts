@@ -15,6 +15,14 @@
 
 import {
   TENMIN_AGED_OUT,
+  TENMIN_DELISTED_COVERAGE_MISSING,
+  type TenMinDelistedCoverage,
+  type TenMinRangeGapEntry,
+  type TenMinRangeManifest,
+  type TenMinRangeSecurityEntry,
+  type TenMinRangeTickerFetch,
+  type TenMinSecurityLink,
+  tenMinRangeDelistedCoverage,
   tenMinRangeFileKey,
   tenMinRangeFileName,
   tenMinRangeManifestKey,
@@ -22,6 +30,7 @@ import {
 } from "./tenmin-range-reply-dust";
 import { GROUPED_DAILY_MISSING } from "./tenmin-grouped-daily";
 import { type ReplyDustStore, sameBytes, sha256Hex } from "./intraday-reply-dust";
+import type { ObjectMetadata } from "./object-store";
 import { type ReplyDustBackend, nodeReplyDustBackend } from "./reply-dust";
 import { TENMIN_RANGE_PAGE_CAP } from "./massive-provider";
 
@@ -746,5 +755,256 @@ export async function rebuildTenMinRangeEntriesFromStore(
     records: sorted,
     keys: sorted.map((r) => resolveTenMinRangeEntryKey(rangeFrom, rangeTo, r)),
     warnings,
+  };
+}
+
+
+const ZERO_REPLY_SHA256 = "0".repeat(64);
+
+/** Build per-page STORED records + one record per gap (exact status; no object → zero sha / 0 length). */
+export function buildTenMinRangeEntryRecordsFromState(input: {
+  from: string;
+  to: string;
+  doneFetches: ReadonlyMap<string, { securityId: string; fetch: TenMinRangeTickerFetch }>;
+  gaps: readonly TenMinRangeGapEntry[];
+}): TenMinRangeEntryRecord[] {
+  const records: TenMinRangeEntryRecord[] = [];
+  for (const { securityId, fetch } of input.doneFetches.values()) {
+    for (const file of fetch.files) {
+      records.push({
+        securityId,
+        symbol: fetch.symbol,
+        fetchFrom: fetch.fetchFrom,
+        fetchTo: fetch.fetchTo,
+        pageNumber: file.page,
+        pageCount: fetch.pageCount,
+        replySha256: file.replySha256,
+        byteLength: file.byteLength,
+        status: TENMIN_RANGE_STATUS_STORED,
+      });
+    }
+  }
+  for (const gap of input.gaps) {
+    records.push({
+      securityId: gap.securityId,
+      symbol: gap.symbol,
+      fetchFrom: gap.fetchFrom ?? input.from,
+      fetchTo: gap.fetchTo ?? input.to,
+      pageNumber: 1,
+      pageCount: 1,
+      replySha256: ZERO_REPLY_SHA256,
+      byteLength: 0,
+      status: gap.reason,
+    });
+  }
+  return sortTenMinRangeEntries(records);
+}
+
+/**
+ * Hydrate a fat-compatible TenMinRangeManifest view from a compact pointer + entries records
+ * so resume/reopen/skip-sealed consumers keep working unchanged.
+ */
+export function hydrateTenMinRangeManifestFromCompact(
+  compact: TenMinRangeCompactManifest,
+  records: readonly TenMinRangeEntryRecord[],
+): TenMinRangeManifest {
+  const byFetch = new Map<string, TenMinRangeEntryRecord[]>();
+  for (const r of records) {
+    if (r.status !== TENMIN_RANGE_STATUS_STORED) continue;
+    const key = `${r.securityId}\0${r.symbol}\0${r.fetchFrom}\0${r.fetchTo}\0${r.copySha256 ?? ""}`;
+    const list = byFetch.get(key) ?? [];
+    list.push(r);
+    byFetch.set(key, list);
+  }
+  const bySecurity = new Map<string, TenMinRangeTickerFetch[]>();
+  for (const [, pages] of byFetch) {
+    const first = pages[0]!;
+    const ordered = [...pages].sort((a, b) => a.pageNumber - b.pageNumber);
+    const files = ordered.map((p) => {
+      const objectKey = resolveTenMinRangeEntryKey(compact.rangeFrom, compact.rangeTo, p);
+      return {
+        page: p.pageNumber,
+        relativePath: objectKey.slice(objectKey.lastIndexOf("/") + 1),
+        request: "",
+        fetchedAt: "",
+        byteLength: p.byteLength,
+        version: 1,
+        replySha256: p.replySha256,
+        replyByteLength: 0,
+        fileSha256: "",
+        sessionDates: [] as string[],
+      };
+    });
+    const fetch: TenMinRangeTickerFetch = {
+      symbol: first.symbol,
+      fetchFrom: first.fetchFrom,
+      fetchTo: first.fetchTo,
+      observedAt: "",
+      pageCount: first.pageCount,
+      files,
+      sessionDates: [],
+    };
+    const list = bySecurity.get(first.securityId) ?? [];
+    list.push(fetch);
+    bySecurity.set(first.securityId, list);
+  }
+  const securities: TenMinRangeSecurityEntry[] = [...bySecurity.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([securityId, fetches]) => ({
+      securityId,
+      dataset: "stocks-aggregates-10m" as const,
+      ...(compact.securityLink ? { securityLink: compact.securityLink } : {}),
+      fetches,
+      sessionDates: [],
+    }));
+  const gaps = compact.gaps.map((g) => ({ ...g }));
+  return {
+    schemaVersion: TENMIN_RANGE_MANIFEST_COMPACT_SCHEMA,
+    format: compact.format,
+    provider: compact.provider,
+    rangeFrom: compact.rangeFrom,
+    rangeTo: compact.rangeTo,
+    securityCount: securities.length,
+    fileCount: securities.reduce((n, s) => n + s.fetches.reduce((m, f) => m + f.files.length, 0), 0),
+    fallbackFileCount: compact.fallbackFileCount,
+    securities,
+    days: [],
+    gaps,
+    ...(compact.securityLink
+      ? { securityLink: compact.securityLink, securityLinkSource: compact.securityLinkSource }
+      : {}),
+    delistedCoverage: tenMinRangeDelistedCoverage({
+      delistedCoverage: compact.delistedCoverage ?? TENMIN_DELISTED_COVERAGE_MISSING,
+      gaps,
+    }),
+    checksum: compact.checksum,
+  };
+}
+
+export const TENMIN_RANGE_ENTRIES_CONFLICT = "TENMIN_RANGE_ENTRIES_CONFLICT" as const;
+
+/**
+ * Verified write of entries-<sha>.bin.zst: compress → if key exists with identical bytes reuse;
+ * different bytes → conflict (never overwrite); else put → readback → decompress+decode compare
+ * → HEAD metadata compare.
+ */
+export async function writeTenMinRangeEntriesObjectVerified(
+  store: ReplyDustStore,
+  calendarFrom: string,
+  calendarTo: string,
+  records: readonly TenMinRangeEntryRecord[],
+  backend: ReplyDustBackend = nodeReplyDustBackend,
+): Promise<{ bodySha256: string; compressed: Uint8Array; key: string; reused: boolean }> {
+  const body = encodeTenMinRangeEntriesBody(records);
+  const holes = validateTenMinRangeEntriesPages(records.filter((r) => r.status === TENMIN_RANGE_STATUS_STORED));
+  if (holes.length) throw new Error(holes[0]!);
+  const { bodySha256, compressed } = compressTenMinRangeEntries(body, backend);
+  const key = tenMinRangeEntriesObjectKey(calendarFrom, calendarTo, bodySha256);
+  const metadata: ObjectMetadata = {
+    "rd-entries-schema": String(TENMIN_RANGE_ENTRIES_SCHEMA_VERSION),
+    "rd-entries-sha256": bodySha256,
+    "rd-entries-byte-length": String(compressed.length),
+  };
+  const existing = await store.get(key);
+  if (existing) {
+    if (!sameBytes(existing, compressed))
+      throw new Error(`${TENMIN_RANGE_ENTRIES_CONFLICT}:${key}`);
+    return { bodySha256, compressed, key, reused: true };
+  }
+  await store.put(key, compressed, metadata);
+  const readback = await store.get(key);
+  if (!readback || !sameBytes(readback, compressed))
+    throw new Error(`TENMIN_RANGE_ENTRIES_READBACK_MISMATCH:${key}`);
+  const decodedBody = decompressTenMinRangeEntries(readback, backend);
+  if (!sameBytes(decodedBody, body)) throw new Error(`TENMIN_RANGE_ENTRIES_DECODE_MISMATCH:${key}`);
+  const round = decodeTenMinRangeEntriesBody(decodedBody);
+  if (JSON.stringify(round.records) !== JSON.stringify(sortTenMinRangeEntries(records)))
+    throw new Error(`TENMIN_RANGE_ENTRIES_ROUNDTRIP_MISMATCH:${key}`);
+  const head = await store.head(key);
+  if (
+    !head ||
+    head.size !== compressed.length ||
+    head.metadata["rd-entries-sha256"] !== bodySha256 ||
+    head.metadata["rd-entries-byte-length"] !== String(compressed.length)
+  )
+    throw new Error(`TENMIN_RANGE_ENTRIES_METADATA_MISMATCH:${key}`);
+  return { bodySha256, compressed, key, reused: false };
+}
+
+/** Verified write of compact pointer manifest.json (LAST at seal). */
+export async function writeTenMinRangeCompactManifestVerified(
+  store: ReplyDustStore,
+  manifest: TenMinRangeCompactManifest,
+): Promise<void> {
+  const key = tenMinRangeManifestKey(manifest.rangeFrom, manifest.rangeTo);
+  const bytes = new TextEncoder().encode(`${JSON.stringify(manifest, null, 2)}\n`);
+  const metadata: ObjectMetadata = { "rd-manifest-checksum": manifest.checksum };
+  await store.put(key, bytes, metadata);
+  const readback = await store.get(key);
+  if (!readback || !sameBytes(readback, bytes))
+    throw new Error(`REPLY_DUST_MANIFEST_READBACK_MISMATCH:${key}`);
+  const head = await store.head(key);
+  if (!head || head.size !== bytes.length || head.metadata["rd-manifest-checksum"] !== manifest.checksum)
+    throw new Error(`REPLY_DUST_MANIFEST_READBACK_MISMATCH:${key}`);
+  // Parse+checksum verify
+  parseTenMinRangeCompactManifest(readback);
+}
+
+/**
+ * Seal a range as compact v2: entries object first (immutable), then manifest.json last.
+ * On any failure the caller must leave the range unsealed (do not delete prior objects).
+ */
+export async function sealTenMinRangeCompactV2(options: {
+  store: ReplyDustStore;
+  provider: string;
+  from: string;
+  to: string;
+  doneFetches: ReadonlyMap<string, { securityId: string; fetch: TenMinRangeTickerFetch }>;
+  gaps: readonly TenMinRangeGapEntry[];
+  securityLink?: { status: TenMinSecurityLink; source: string };
+  delistedCoverage: TenMinDelistedCoverage;
+  fallbackFileCount?: number;
+  backend?: ReplyDustBackend;
+}): Promise<{ manifest: TenMinRangeManifest; entriesKey: string; entriesSha256: string; entriesByteLength: number; reusedEntries: boolean }> {
+  const backend = options.backend ?? nodeReplyDustBackend;
+  const records = buildTenMinRangeEntryRecordsFromState({
+    from: options.from,
+    to: options.to,
+    doneFetches: options.doneFetches,
+    gaps: options.gaps,
+  });
+  const written = await writeTenMinRangeEntriesObjectVerified(
+    options.store,
+    options.from,
+    options.to,
+    records,
+    backend,
+  );
+  const compact = buildTenMinRangeCompactManifest({
+    provider: options.provider,
+    rangeFrom: options.from,
+    rangeTo: options.to,
+    records,
+    entriesSha256: written.bodySha256,
+    entriesByteLength: written.compressed.length,
+    gaps: options.gaps.map((g) => ({
+      securityId: g.securityId,
+      symbol: g.symbol,
+      reason: g.reason,
+      at: g.at,
+      ...(g.fetchFrom ? { fetchFrom: g.fetchFrom } : {}),
+      ...(g.fetchTo ? { fetchTo: g.fetchTo } : {}),
+    })),
+    ...(options.securityLink ? { securityLink: options.securityLink } : {}),
+    delistedCoverage: options.delistedCoverage,
+    fallbackFileCount: options.fallbackFileCount ?? 0,
+  });
+  await writeTenMinRangeCompactManifestVerified(options.store, compact);
+  return {
+    manifest: hydrateTenMinRangeManifestFromCompact(compact, records),
+    entriesKey: written.key,
+    entriesSha256: written.bodySha256,
+    entriesByteLength: written.compressed.length,
+    reusedEntries: written.reused,
   };
 }

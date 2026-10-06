@@ -8,12 +8,14 @@ import { readReplyDustSecurityDay, writeReplyDustFile, writeReplyDustManifest } 
 import { MassiveMarketProvider } from "./massive-provider";
 import { MemoryObjectClient, type ObjectMetadata, OBJECT_METADATA_MAX_BYTES, R2ObjectClient } from "./object-store";
 import { REPLY_DUST_FALLBACK_VERSION, REPLY_DUST_VERSION, type ReplyDustBackend, decodeReplyDust, nodeReplyDustBackend } from "./reply-dust";
+import { TENMIN_RANGE_MANIFEST_COMPACT_SCHEMA } from "./tenmin-range-entries";
 import {
   TENMIN_RANGE_MANIFEST_SCHEMA,
   TENMIN_RANGE_OBJECT_SCHEMA,
   easternSessionDate,
   loadTenMinRangeProgress,
   readRangeReplies,
+  replySessionDates,
   readRangeSecurityDay,
   readTenMinRangeManifest,
   tenMinRangeFileKey,
@@ -142,8 +144,11 @@ test("range Reply Dust round-trips every page under the ticker+span key layout",
     const prefix = `permanent/tenmin-reply-dust/${FROM}_${TO}/`;
     const name = (symbol: string, page: number) =>
       tenMinRangeFileName(id(symbol), symbol, FROM, TO, page);
+    const listed = await store.list(prefix);
+    const entriesObjs = listed.filter((k) => /\/entries-[0-9a-f]{64}\.bin\.zst$/u.test(k));
+    assert.equal(entriesObjs.length, 1, "seal writes one entries object");
     assert.deepEqual(
-      await store.list(prefix),
+      listed.filter((k) => !/\/entries-[0-9a-f]{64}\.bin\.zst$/u.test(k)),
       [
         `${prefix}${name("AAA", 2)}`,
         `${prefix}${name("AAA", 1)}`,
@@ -204,13 +209,16 @@ test("range manifest is deterministic and day index uses America/New_York dates"
     const store = new MemoryObjectClient();
     await write(store, root, {});
     const manifest = (await readTenMinRangeManifest(store, FROM, TO))!;
-    assert.equal(manifest.schemaVersion, TENMIN_RANGE_MANIFEST_SCHEMA);
+    assert.equal(manifest.schemaVersion, TENMIN_RANGE_MANIFEST_COMPACT_SCHEMA);
     assert.equal(manifest.securityCount, 3);
     assert.equal(manifest.fileCount, 6);
     assert.deepEqual(manifest.gaps, []);
     const sec = (symbol: string) => manifest.securities.find((s) => s.securityId === id(symbol))!;
     assert.equal(sec("AAA").fetches.length, 1);
-    assert.deepEqual(sec("AAA").sessionDates, ["2026-01-02", "2026-01-05", "2026-01-06"]);
+    assert.deepEqual(sec("AAA").sessionDates, []); // compact v2 has no days[] index
+    const aaaPages = await readRangeReplies(store, FROM, TO, id("AAA"));
+    const sessionDates = [...new Set(aaaPages.flatMap((p) => replySessionDates(p.reply)))].sort();
+    assert.deepEqual(sessionDates, ["2026-01-02", "2026-01-05", "2026-01-06"]);
   });
 });
 

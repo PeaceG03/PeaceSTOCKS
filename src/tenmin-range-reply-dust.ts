@@ -81,11 +81,27 @@ export type TenMinDelistedCoverage = "MISSING" | "COMPLETE";
 export const TENMIN_DELISTED_COVERAGE_MISSING: TenMinDelistedCoverage = "MISSING";
 export const TENMIN_DELISTED_COVERAGE_COMPLETE: TenMinDelistedCoverage = "COMPLETE";
 
-/** A manifest written before the field existed is MISSING. */
+/**
+ * A manifest written before the field existed is MISSING.
+ * COMPLETE is never exposed while a GROUPED_DAILY_MISSING gap is open.
+ */
 export function tenMinRangeDelistedCoverage(
-  manifest: Pick<TenMinRangeManifest, "delistedCoverage">,
+  manifest: Pick<TenMinRangeManifest, "delistedCoverage" | "gaps">,
 ): TenMinDelistedCoverage {
+  const gaps = "gaps" in manifest && Array.isArray(manifest.gaps) ? manifest.gaps : [];
+  if (gaps.some((g) => g.reason === "GROUPED_DAILY_MISSING")) return TENMIN_DELISTED_COVERAGE_MISSING;
   return manifest.delistedCoverage === TENMIN_DELISTED_COVERAGE_COMPLETE
+    ? TENMIN_DELISTED_COVERAGE_COMPLETE
+    : TENMIN_DELISTED_COVERAGE_MISSING;
+}
+
+/** Resolve coverage for a seal: never COMPLETE while GROUPED_DAILY_MISSING is open. */
+export function resolveTenMinDelistedCoverageForSeal(
+  requested: TenMinDelistedCoverage | undefined,
+  gaps: readonly TenMinRangeGapEntry[],
+): TenMinDelistedCoverage {
+  if (gaps.some((g) => g.reason === "GROUPED_DAILY_MISSING")) return TENMIN_DELISTED_COVERAGE_MISSING;
+  return requested === TENMIN_DELISTED_COVERAGE_COMPLETE
     ? TENMIN_DELISTED_COVERAGE_COMPLETE
     : TENMIN_DELISTED_COVERAGE_MISSING;
 }
@@ -117,8 +133,9 @@ export interface TenMinRangeGapEntry {
 }
 
 export interface TenMinRangeManifest {
-  schemaVersion: typeof TENMIN_RANGE_MANIFEST_SCHEMA;
-  format: typeof REPLY_DUST_FORMAT;
+  /** Fat v1 (historical) or compact v2 (entries pointer). Dual reader accepts both. */
+  schemaVersion: typeof TENMIN_RANGE_MANIFEST_SCHEMA | "tenmin-range-reply-dust-manifest-compact-v2";
+  format: typeof REPLY_DUST_FORMAT | "REPLY_DUST_V1_ZSTD19_DICT4K";
   provider: string;
   /** Calendar folder identity (stable across window clamps). */
   rangeFrom: string;
@@ -511,10 +528,18 @@ function verifyRangeBytes(
   backend: ReplyDustBackend,
   label: string,
 ): Uint8Array {
-  if (bytes.length !== file.byteLength || bytes[0] !== file.version || sha256Hex(bytes) !== file.fileSha256)
+  // Compact-hydrated file entries may omit fileSha256 / replyByteLength (0 / ""); still
+  // verify whatever is known (byteLength + replySha256) so dual-reader resume/read works.
+  if (file.byteLength > 0 && bytes.length !== file.byteLength)
     throw new Error(`REPLY_DUST_FILE_CHECKSUM_MISMATCH:${label}:p${file.page}`);
+  if (file.fileSha256) {
+    if (bytes[0] !== file.version || sha256Hex(bytes) !== file.fileSha256)
+      throw new Error(`REPLY_DUST_FILE_CHECKSUM_MISMATCH:${label}:p${file.page}`);
+  }
   const reply = decodeReplyDust(bytes, backend);
-  if (reply.length !== file.replyByteLength || sha256Hex(reply) !== file.replySha256)
+  if (file.replySha256 && sha256Hex(reply) !== file.replySha256)
+    throw new Error(`REPLY_DUST_REPLY_CHECKSUM_MISMATCH:${label}:p${file.page}`);
+  if (file.replyByteLength > 0 && reply.length !== file.replyByteLength)
     throw new Error(`REPLY_DUST_REPLY_CHECKSUM_MISMATCH:${label}:p${file.page}`);
   return reply;
 }
@@ -748,22 +773,43 @@ export async function readTenMinRangeManifest(
   store: ReplyDustStore,
   from: string,
   to: string,
-  options: { allowEmpty?: boolean } = {},
+  options: { allowEmpty?: boolean; backend?: import("./reply-dust").ReplyDustBackend } = {},
 ): Promise<TenMinRangeManifest | undefined> {
   const bytes = await store.get(tenMinRangeManifestKey(from, to));
   if (!bytes) return undefined;
-  const manifest = JSON.parse(new TextDecoder().decode(bytes)) as TenMinRangeManifest;
-  const { checksum, ...body } = manifest;
-  if (
-    manifest.schemaVersion !== TENMIN_RANGE_MANIFEST_SCHEMA ||
-    manifest.rangeFrom !== from ||
-    manifest.rangeTo !== to ||
-    manifestChecksum(body) !== checksum
-  )
-    throw new Error("REPLY_DUST_MANIFEST_CHECKSUM_MISMATCH");
+  const parsed = JSON.parse(new TextDecoder().decode(bytes)) as { schemaVersion?: string };
+  if (parsed.schemaVersion === TENMIN_RANGE_MANIFEST_SCHEMA) {
+    const manifest = parsed as TenMinRangeManifest;
+    const { checksum, ...body } = manifest;
+    if (
+      manifest.rangeFrom !== from ||
+      manifest.rangeTo !== to ||
+      manifestChecksum(body) !== checksum
+    )
+      throw new Error("REPLY_DUST_MANIFEST_CHECKSUM_MISMATCH");
+    if (isEmptyTenMinRangeManifest(manifest) && options.allowEmpty !== true)
+      throw new Error(`${TENMIN_UNIVERSE_EMPTY}:${from}_${to}:sealed-manifest-has-0-securities`);
+    return { ...manifest, delistedCoverage: tenMinRangeDelistedCoverage(manifest) };
+  }
+  // Compact v2: load entries and hydrate a fat-compatible view for resume/reopen consumers.
+  const {
+    TENMIN_RANGE_MANIFEST_COMPACT_SCHEMA,
+    hydrateTenMinRangeManifestFromCompact,
+    loadTenMinRangeEntries,
+  } = await import("./tenmin-range-entries");
+  if (parsed.schemaVersion !== TENMIN_RANGE_MANIFEST_COMPACT_SCHEMA)
+    throw new Error(`REPLY_DUST_MANIFEST_SCHEMA_UNKNOWN:${String(parsed.schemaVersion)}`);
+  const loaded = await loadTenMinRangeEntries(store, from, to, {
+    manifestBytes: bytes,
+    ...(options.backend ? { backend: options.backend } : {}),
+  });
+  if (loaded.usedFallback)
+    throw new Error(
+      `TENMIN_MANIFEST_V2_ENTRIES_UNREADABLE:${from}_${to}:${loaded.warnings[0] ?? "fallback"}`,
+    );
+  const manifest = hydrateTenMinRangeManifestFromCompact(loaded.manifest, loaded.records);
   if (isEmptyTenMinRangeManifest(manifest) && options.allowEmpty !== true)
     throw new Error(`${TENMIN_UNIVERSE_EMPTY}:${from}_${to}:sealed-manifest-has-0-securities`);
-  // Older manifests have no delistedCoverage: expose it as MISSING (checksum already verified).
   return { ...manifest, delistedCoverage: tenMinRangeDelistedCoverage(manifest) };
 }
 
@@ -1236,20 +1282,37 @@ export async function writeTenMinRangeReplyDust(options: {
     };
   }
 
-  const manifest = buildTenMinRangeManifest({
-    provider,
-    from,
-    to,
-    securities: groupSecurities(doneFetches),
-    gaps: [...gaps.values()],
-    ...(options.securityLink ? { securityLink: options.securityLink } : {}),
-    delistedCoverage: options.delistedCoverage ?? TENMIN_DELISTED_COVERAGE_MISSING,
-  });
-  if (isEmptyTenMinRangeManifest(manifest))
+  const gapList = [...gaps.values()];
+  // Refuse to seal an empty universe before writing any compact objects.
+  if (doneFetches.size === 0)
     throw new Error(
-      `${TENMIN_UNIVERSE_EMPTY}:${from}_${to}:planned=${options.fetches.length}:gaps=${manifest.gaps.length}`,
+      `${TENMIN_UNIVERSE_EMPTY}:${from}_${to}:planned=${options.fetches.length}:gaps=${gapList.length}`,
     );
-  await writeTenMinRangeManifest(store, manifest);
+  const delistedCoverage = resolveTenMinDelistedCoverageForSeal(
+    options.delistedCoverage ?? TENMIN_DELISTED_COVERAGE_MISSING,
+    gapList,
+  );
+  // Production seal writes compact v2 (entries object first, then pointer manifest).
+  const { sealTenMinRangeCompactV2 } = await import("./tenmin-range-entries");
+  let manifest: TenMinRangeManifest;
+  try {
+    const sealed = await sealTenMinRangeCompactV2({
+      store,
+      provider,
+      from,
+      to,
+      doneFetches,
+      gaps: gapList,
+      ...(options.securityLink ? { securityLink: options.securityLink } : {}),
+      delistedCoverage,
+      fallbackFileCount: fallbackFiles,
+      backend,
+    });
+    manifest = sealed.manifest;
+  } catch (error) {
+    // Entries or manifest write failed: leave unsealed (PARTIAL). Do not delete anything.
+    throw withTenMinMassiveRequests(error, massiveRequests);
+  }
   await rm(tenMinRangeProgressPath(root, from, to), { force: true });
   return {
     manifest,
