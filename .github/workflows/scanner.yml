@@ -40,7 +40,8 @@ concurrency:
 jobs:
   scan:
     if: ${{ github.event_name == 'schedule' || github.event.inputs.mode == 'scan' }}
-    runs-on: ubuntu-latest
+    # Pinned so the runner image cannot change mid-rollout; move to 26.04 deliberately later.
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
       MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
@@ -60,6 +61,34 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Reply Dust writes need exactly zstd 1.5.7 (different zstd builds can produce different bytes).
+      # Build it from the checksum-verified release tarball, cache the binary, and put it first on PATH.
+      # Non-blocking until Reply Dust is switched on, so a download hiccup can't stop a scan;
+      # the writer itself refuses to start without exactly 1.5.7.
+      - name: Restore pinned zstd 1.5.7
+        id: zstd-cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/zstd-1.5.7
+          key: zstd-1.5.7-eb33e51f49a15e02-${{ runner.os }}-ubuntu-24.04
+      - name: Build pinned zstd 1.5.7
+        if: ${{ steps.zstd-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+          echo "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3  zstd-1.5.7.tar.gz" | sha256sum -c -
+          tar xzf zstd-1.5.7.tar.gz
+          make -C zstd-1.5.7 -j"$(nproc)" zstd-release
+          install -D -m 0755 zstd-1.5.7/programs/zstd ~/.local/zstd-1.5.7/bin/zstd
+      - name: Use pinned zstd 1.5.7
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ~/.local/zstd-1.5.7/bin/zstd --version | grep -F ' v1.5.7,'
+          echo "$HOME/.local/zstd-1.5.7/bin" >> "$GITHUB_PATH"
       - name: Refuse a run that would write the store to the runner disk
         run: |
           test -n "$PEACESTOCKS_R2_BUCKET"
@@ -75,7 +104,8 @@ jobs:
 
   backfill:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'backfill' }}
-    runs-on: ubuntu-latest
+    # Pinned so the runner image cannot change mid-rollout; move to 26.04 deliberately later.
+    runs-on: ubuntu-24.04
     # actions: read lets backfill see a queued scan and yield the Massive budget to it.
     permissions:
       contents: read
@@ -101,6 +131,34 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Reply Dust writes need exactly zstd 1.5.7 (different zstd builds can produce different bytes).
+      # Build it from the checksum-verified release tarball, cache the binary, and put it first on PATH.
+      # Non-blocking until Reply Dust is switched on, so a download hiccup can't stop a scan;
+      # the writer itself refuses to start without exactly 1.5.7.
+      - name: Restore pinned zstd 1.5.7
+        id: zstd-cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/zstd-1.5.7
+          key: zstd-1.5.7-eb33e51f49a15e02-${{ runner.os }}-ubuntu-24.04
+      - name: Build pinned zstd 1.5.7
+        if: ${{ steps.zstd-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+          echo "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3  zstd-1.5.7.tar.gz" | sha256sum -c -
+          tar xzf zstd-1.5.7.tar.gz
+          make -C zstd-1.5.7 -j"$(nproc)" zstd-release
+          install -D -m 0755 zstd-1.5.7/programs/zstd ~/.local/zstd-1.5.7/bin/zstd
+      - name: Use pinned zstd 1.5.7
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ~/.local/zstd-1.5.7/bin/zstd --version | grep -F ' v1.5.7,'
+          echo "$HOME/.local/zstd-1.5.7/bin" >> "$GITHUB_PATH"
       - name: Refuse a run that would write the store to the runner disk
         run: |
           test -n "$PEACESTOCKS_R2_BUCKET"
