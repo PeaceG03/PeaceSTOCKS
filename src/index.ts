@@ -19,6 +19,7 @@ export * from "./intraday";
 export * from "./dust";
 export * from "./packed-dust";
 export * from "./reply-dust";
+export * from "./intraday-reply-dust";
 export * from "./packed-fixture";
 export * from "./archive-sync";
 export * from "./read-api";
@@ -43,4 +44,6 @@ export const MARKET_STORAGE_LAYOUT = {
   partitionManifests: "permanent/partitions/*.json",
   intradayDust: "permanent/intraday-dust/YYYY-MM-DD/<security-id>.dust",
   intradayManifests: "permanent/intraday-dust/YYYY-MM-DD/manifest.json",
+  intradayReplyDust: "permanent/intraday-reply-dust/YYYY-MM-DD/<base64url security-id>.rdust",
+  intradayReplyDustManifests: "permanent/intraday-reply-dust/YYYY-MM-DD/manifest.json",
 } as const;

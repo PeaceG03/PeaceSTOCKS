@@ -110,6 +110,68 @@ export function mergeSameIdentity(
   output.set(key, unique.length ? { ...rest, formerSymbols: unique } : rest);
 }
 
+/**
+ * Turns one parsed Massive 10-minute aggregates reply into canonical bars. Both the live fetch and
+ * the Reply Dust reader use this, so a stored reply rebuilds exactly the bars the fetch produced.
+ */
+export function massiveTenMinuteBarsFromReply(input: {
+  provider: string;
+  sessionDate: string;
+  securityId: string;
+  symbol: string;
+  reply: Record<string, unknown>;
+  observedAt: string;
+}): CanonicalTenMinuteBar[] {
+  const aggregates: MassiveAggregateBar[] = records(input.reply.results).flatMap((raw) => {
+    const timestamp = finite(raw.t);
+    const open = finite(raw.o),
+      high = finite(raw.h),
+      low = finite(raw.l),
+      close = finite(raw.c),
+      volume = finite(raw.v);
+    if (
+      timestamp === undefined ||
+      open === undefined ||
+      high === undefined ||
+      low === undefined ||
+      close === undefined ||
+      volume === undefined
+    )
+      return [];
+    const vwap = finite(raw.vw);
+    const transactionCount = finite(raw.n);
+    return [
+      {
+        symbol: input.symbol,
+        timestamp,
+        open,
+        high,
+        low,
+        close,
+        volume,
+        ...(vwap === undefined ? {} : { vwap }),
+        ...(transactionCount === undefined ? {} : { transactionCount }),
+      },
+    ];
+  });
+  return normalizeMassiveTenMinuteBars({
+    sessionDate: input.sessionDate,
+    securityId: input.securityId,
+    symbol: input.symbol,
+    aggregates,
+    observedAt: input.observedAt,
+    provenance: {
+      provider: input.provider,
+      dataset: "stocks-aggregates-10m",
+      retrievalId:
+        text(input.reply.request_id) ?? `aggregate-10m-${input.sessionDate}-${input.symbol}`,
+      providerTimestamp: input.observedAt,
+      ingestionVersion: "markets-scanner-v0.2",
+      normalizerVersion: "massive-10m-v1",
+    },
+  });
+}
+
 export class MassiveMarketProvider implements MarketProvider {
   readonly providerName = "massive-stocks";
   private readonly apiKey: string;
@@ -429,53 +491,14 @@ export class MassiveMarketProvider implements MarketProvider {
           limit: "50000",
         },
       );
-      const aggregates: MassiveAggregateBar[] = records(response.results).flatMap((raw) => {
-        const timestamp = finite(raw.t);
-        const open = finite(raw.o),
-          high = finite(raw.h),
-          low = finite(raw.l),
-          close = finite(raw.c),
-          volume = finite(raw.v);
-        if (
-          timestamp === undefined ||
-          open === undefined ||
-          high === undefined ||
-          low === undefined ||
-          close === undefined ||
-          volume === undefined
-        )
-          return [];
-        const vwap = finite(raw.vw);
-        const transactionCount = finite(raw.n);
-        return [
-          {
-            symbol,
-            timestamp,
-            open,
-            high,
-            low,
-            close,
-            volume,
-            ...(vwap === undefined ? {} : { vwap }),
-            ...(transactionCount === undefined ? {} : { transactionCount }),
-          },
-        ];
-      });
       output.push(
-        ...normalizeMassiveTenMinuteBars({
+        ...massiveTenMinuteBarsFromReply({
+          provider: this.providerName,
           sessionDate,
           securityId: securityIdValue,
           symbol,
-          aggregates,
+          reply: response,
           observedAt,
-          provenance: {
-            provider: this.providerName,
-            dataset: "stocks-aggregates-10m",
-            retrievalId: text(response.request_id) ?? `aggregate-10m-${sessionDate}-${symbol}`,
-            providerTimestamp: observedAt,
-            ingestionVersion: "markets-scanner-v0.2",
-            normalizerVersion: "massive-10m-v1",
-          },
         }),
       );
     }

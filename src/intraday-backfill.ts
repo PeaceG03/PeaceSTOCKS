@@ -1,9 +1,24 @@
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { appendFile, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { assertSafeStoreFile, prepareSafeStoreFile } from "./store-path";
-import type { MarketProvider, ProviderSecurityRecord, SecurityMasterRecord } from "./contracts";
+import type {
+  CanonicalTenMinuteBar,
+  MarketProvider,
+  ProviderSecurityRecord,
+  SecurityMasterRecord,
+} from "./contracts";
+import {
+  FileReplyDustStore,
+  type ReplyDustFileEntry,
+  type ReplyDustStore,
+  canonicalBarsFromReply,
+  readReplyDustReply,
+  writeReplyDustFile,
+  writeReplyDustManifest,
+} from "./intraday-reply-dust";
 import { intradaySessionSpec } from "./intraday";
 import { MassiveMarketProvider } from "./massive-provider";
+import { REPLY_DUST_FALLBACK_VERSION, type ReplyDustBackend } from "./reply-dust";
 import { DustReader } from "./reader";
 import { MarketStorage } from "./storage";
 import { EphemeralValidationBuffer, sealValidatedDustSession } from "./validation";
@@ -33,6 +48,10 @@ export interface IntradayBackfillResult {
   barsStored: number;
   sealedArchives: number;
   stoppedOnError: boolean;
+  /** Present only with replyDust on: Reply Dust files written by this run. */
+  replyDustFilesWritten?: number;
+  /** Present only with replyDust on: files written as the raw-zstd fallback (0x81). */
+  replyDustFallbackFiles?: number;
 }
 
 function parseDate(value: string): Date {
@@ -104,6 +123,53 @@ export async function saveIntradayBackfillState(
   assertSafeStoreFile(target, MARKET_INTRADAY_BACKFILL_PATH_ERROR);
 }
 
+// Reply Dust per-file progress marker: one JSON line per file, appended only after that file is
+// stored and read back. Append-only so a session of thousands of files costs one line each; a torn
+// last line from a crash is ignored (that one file is simply redone). Removed once the session is sealed.
+function replyDustProgressPath(root: string, sessionDate: string): string {
+  return join(root, "transient", "reply-dust-progress", `${sessionDate}.jsonl`);
+}
+
+export async function loadReplyDustProgress(
+  root: string,
+  sessionDate: string,
+): Promise<ReplyDustFileEntry[]> {
+  const target = prepareSafeStoreFile(
+    replyDustProgressPath(root, sessionDate),
+    MARKET_INTRADAY_BACKFILL_PATH_ERROR,
+  );
+  let text: string;
+  try {
+    text = await readFile(target, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  const entries: ReplyDustFileEntry[] = [];
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    try {
+      entries.push(JSON.parse(line) as ReplyDustFileEntry);
+    } catch {
+      // torn final line from a crash mid-append
+    }
+  }
+  return entries;
+}
+
+async function appendReplyDustProgress(
+  root: string,
+  sessionDate: string,
+  entry: ReplyDustFileEntry,
+): Promise<void> {
+  const target = prepareSafeStoreFile(
+    replyDustProgressPath(root, sessionDate),
+    MARKET_INTRADAY_BACKFILL_PATH_ERROR,
+  );
+  // Start on a fresh line in case a previous crash left a torn one.
+  await appendFile(target, `\n${JSON.stringify(entry)}\n`, "utf8");
+}
+
 function providerRecords(
   securities: SecurityMasterRecord[],
   provider: string,
@@ -135,9 +201,21 @@ export async function backfillHistoricalIntradayEvidence(options: {
   to: string;
   provider?: MarketProvider;
   maxSessions?: number;
+  /**
+   * Off by default. When on, each security's exact 10-minute reply is also stored as a Reply
+   * Dust file under permanent/intraday-reply-dust/; the old .dust session is still sealed as before.
+   * A given provider must keep raw replies (MassiveMarketProvider keepRawReplies: true).
+   */
+  replyDust?: boolean;
+  /** Where Reply Dust files go; defaults to the local market root. */
+  replyDustStore?: ReplyDustStore;
+  replyDustBackend?: ReplyDustBackend;
 }): Promise<IntradayBackfillResult> {
-  const provider = options.provider ?? new MassiveMarketProvider();
+  const replyDust = options.replyDust === true;
+  const provider =
+    options.provider ?? new MassiveMarketProvider(replyDust ? { keepRawReplies: true } : {});
   if (!provider.getIntradayBars) throw new Error("INTRADAY_PROVIDER_UNSUPPORTED");
+  if (replyDust && !provider.takeRawReplies) throw new Error("REPLY_DUST_PROVIDER_KEEPS_NO_REPLIES");
   const storage = new MarketStorage(options.root);
   await storage.initialize();
   const securities = await storage.loadSecurities();
@@ -167,6 +245,57 @@ export async function backfillHistoricalIntradayEvidence(options: {
   let sealedArchives = 0;
   let stoppedOnError = false;
   const reader = new DustReader(options.root);
+  const replyStore = replyDust ? (options.replyDustStore ?? new FileReplyDustStore(options.root)) : undefined;
+  let replyDustFilesWritten = 0;
+  let replyDustFallbackFiles = 0;
+
+  // Fetch one security at a time and store its reply before the next fetch, so at most one raw
+  // reply is held in memory. Progress advances per file, only after the file is stored and read back.
+  const fetchWithReplyDust = async (sessionDate: string): Promise<CanonicalTenMinuteBar[]> => {
+    const store = replyStore!;
+    const getIntradayBars = provider.getIntradayBars!.bind(provider);
+    const takeRawReplies = provider.takeRawReplies!.bind(provider);
+    if (takeRawReplies().length) throw new Error("REPLY_DUST_UNEXPECTED_HELD_REPLIES");
+    const written = await loadReplyDustProgress(options.root, sessionDate);
+    const done = new Map(written.map((entry) => [entry.securityId, entry]));
+    const bars: CanonicalTenMinuteBar[] = [];
+    for (const securityId of activeIds) {
+      const prior = done.get(securityId);
+      if (prior) {
+        const reply = await readReplyDustReply(store, sessionDate, prior, options.replyDustBackend);
+        bars.push(...canonicalBarsFromReply(provider.providerName, sessionDate, prior, reply));
+        continue;
+      }
+      const securityBars = await getIntradayBars(sessionDate, [securityId]);
+      const replies = takeRawReplies();
+      if (!securityBars.length && !replies.length) continue;
+      const reply = replies[0];
+      if (
+        replies.length !== 1 ||
+        !reply ||
+        reply.dataset !== "stocks-aggregates-10m" ||
+        reply.securityId !== securityId ||
+        reply.sessionDate !== sessionDate
+      )
+        throw new Error(`REPLY_DUST_REPLY_MISSING_OR_UNEXPECTED:${securityId}:${replies.length}`);
+      const observedAt = securityBars[0]?.observedAt;
+      if (!observedAt) throw new Error(`REPLY_DUST_NO_BARS_FOR_REPLY:${securityId}`);
+      const entry = await writeReplyDustFile(store, reply, observedAt, options.replyDustBackend);
+      replyDustFilesWritten += 1;
+      if (entry.version === REPLY_DUST_FALLBACK_VERSION) replyDustFallbackFiles += 1;
+      await appendReplyDustProgress(options.root, sessionDate, entry);
+      written.push(entry);
+      bars.push(...securityBars);
+    }
+    await writeReplyDustManifest(store, {
+      provider: provider.providerName,
+      sessionDate,
+      files: written,
+    });
+    return bars.sort(
+      (a, b) => a.securityId.localeCompare(b.securityId) || a.intervalIndex - b.intervalIndex,
+    );
+  };
 
   for (const sessionDate of sessions) {
     if (state.completedSessions.includes(sessionDate)) {
@@ -185,10 +314,15 @@ export async function backfillHistoricalIntradayEvidence(options: {
     attemptedSessions.push(sessionDate);
     const buffer = new EphemeralValidationBuffer(options.root, sessionDate);
     try {
-      let bars = await buffer.load();
-      if (!bars.length) {
-        bars = await provider.getIntradayBars(sessionDate, activeIds);
-        await buffer.append(bars);
+      let bars: CanonicalTenMinuteBar[];
+      if (replyDust) {
+        bars = await fetchWithReplyDust(sessionDate);
+      } else {
+        bars = await buffer.load();
+        if (!bars.length) {
+          bars = await provider.getIntradayBars(sessionDate, activeIds);
+          await buffer.append(bars);
+        }
       }
       const expected = new Set(activeIds);
       const actual = new Set(bars.map((bar) => bar.securityId));
@@ -215,6 +349,14 @@ export async function backfillHistoricalIntradayEvidence(options: {
       delete failedSessions[sessionDate];
       completedSessions.push(sessionDate);
       await saveIntradayBackfillState(statePath, { ...state, failedSessions });
+      if (replyDust)
+        await rm(
+          prepareSafeStoreFile(
+            replyDustProgressPath(options.root, sessionDate),
+            MARKET_INTRADAY_BACKFILL_PATH_ERROR,
+          ),
+          { force: true },
+        );
     } catch (error) {
       failedSessions[sessionDate] = String(error);
       stoppedOnError = true;
@@ -233,5 +375,6 @@ export async function backfillHistoricalIntradayEvidence(options: {
     barsStored,
     sealedArchives,
     stoppedOnError,
+    ...(replyDust ? { replyDustFilesWritten, replyDustFallbackFiles } : {}),
   };
 }
