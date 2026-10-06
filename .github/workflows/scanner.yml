@@ -6,13 +6,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "scan (online scheduler) or backfill (daily historical evidence)"
+        description: "scan (online scheduler), backfill (daily historical evidence), or tenmin_history (10-minute range history; off unless chosen)"
         required: true
         default: scan
         type: choice
         options:
           - scan
           - backfill
+          - tenmin_history
       from:
         description: "Backfill from date (YYYY-MM-DD inclusive)"
         required: false
@@ -25,6 +26,19 @@ on:
         description: "Max trading sessions to attempt during backfill"
         required: false
         default: "35"
+      tenmin_history_reopen:
+        description: "tenmin_history only: reopen sealed ranges to retry gaps + new securities (default off)"
+        required: false
+        default: false
+        type: boolean
+      tenmin_history_max_ranges:
+        description: "tenmin_history only: max two-month ranges to attempt (empty = no cap)"
+        required: false
+        default: ""
+      tenmin_history_budget_ms:
+        description: "tenmin_history only: wall-clock budget in ms; default 110 min so the run stops cleanly before the 120 min job timeout"
+        required: false
+        default: "6600000"
   schedule:
     # 21:30 UTC is 4:30 PM ET in winter and 5:30 PM ET in summer, after the close plus the 30 minute delay.
     - cron: "30 21 * * 1-5"
@@ -174,3 +188,74 @@ jobs:
           PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
           GITHUB_TOKEN: ${{ github.token }}
         run: pnpm backfill --from "$MARKETS_BACKFILL_FROM" --to "$MARKETS_BACKFILL_TO" --max-sessions "${{ github.event.inputs.max_sessions }}"
+
+  # Manual only: never on schedule. Shares peacestocks-r2-writer concurrency with scan/backfill
+  # so it queues behind (or ahead of) them; the host also yields via scanYieldReason.
+  tenmin_history:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'tenmin_history' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    timeout-minutes: 120
+    env:
+      MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+      PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+      PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+      PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+      PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+      PEACESTOCKS_SOURCE_COMMIT: ${{ github.sha }}
+      PEACESTOCKS_REQUIRE_OBJECT_STORE: "1"
+      PEACESTOCKS_TENMIN_HISTORY: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # History writing needs exactly zstd 1.5.7; host refuses to start without it (fatal even if
+      # these steps are continue-on-error, matching scan/backfill pin steps).
+      - name: Restore pinned zstd 1.5.7
+        id: zstd-cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/zstd-1.5.7
+          key: zstd-1.5.7-eb33e51f49a15e02-${{ runner.os }}-ubuntu-24.04
+      - name: Build pinned zstd 1.5.7
+        if: ${{ steps.zstd-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+          echo "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3  zstd-1.5.7.tar.gz" | sha256sum -c -
+          tar xzf zstd-1.5.7.tar.gz
+          make -C zstd-1.5.7 -j"$(nproc)" zstd-release
+          install -D -m 0755 zstd-1.5.7/programs/zstd ~/.local/zstd-1.5.7/bin/zstd
+      - name: Use pinned zstd 1.5.7
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ~/.local/zstd-1.5.7/bin/zstd --version | grep -F ' v1.5.7,'
+          echo "$HOME/.local/zstd-1.5.7/bin" >> "$GITHUB_PATH"
+      - name: Refuse a run that would write the store to the runner disk
+        run: |
+          test -n "$PEACESTOCKS_R2_BUCKET"
+          test -n "$PEACESTOCKS_R2_ACCOUNT_ID"
+          test -n "$PEACESTOCKS_R2_ACCESS_KEY_ID"
+          test -n "$PEACESTOCKS_R2_SECRET_ACCESS_KEY"
+          test -n "$MASSIVE_API_KEY"
+          test -n "$PEACESTOCKS_SOURCE_COMMIT"
+      - name: Ten-minute history runner (Reply Dust ranges)
+        env:
+          PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
+          GITHUB_TOKEN: ${{ github.token }}
+          PEACESTOCKS_TENMIN_HISTORY_REOPEN: ${{ github.event.inputs.tenmin_history_reopen == 'true' && '1' || '' }}
+          PEACESTOCKS_TENMIN_HISTORY_MAX_RANGES: ${{ github.event.inputs.tenmin_history_max_ranges }}
+          PEACESTOCKS_TENMIN_HISTORY_BUDGET_MS: ${{ github.event.inputs.tenmin_history_budget_ms }}
+        run: pnpm scheduler
