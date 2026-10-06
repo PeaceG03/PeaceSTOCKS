@@ -365,10 +365,13 @@ export class MarketStorage implements MarketStore {
 
   async writeRunReport(report: unknown): Promise<void> {
     this.guardRoot();
-    await this.atomicWrite(
-      join(this.root, "runs", `${(report as { runId: string }).runId}.json`),
-      JSON.stringify(report, null, 2) + "\n",
-    );
+    const typed = report as { runId: string; status?: string };
+    // ALREADY_FROZEN must not clobber a prior COMPLETE report that shares the deterministic runId.
+    const file =
+      typed.status === "ALREADY_FROZEN"
+        ? `${typed.runId}.already-frozen.json`
+        : `${typed.runId}.json`;
+    await this.atomicWrite(join(this.root, "runs", file), JSON.stringify(report, null, 2) + "\n");
   }
 
   async loadRunReports(): Promise<ScannerRunReport[]> {

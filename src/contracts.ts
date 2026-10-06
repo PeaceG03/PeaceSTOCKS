@@ -16,7 +16,13 @@ export type DataQuality =
   | "PARTIAL_RUN";
 export type SessionKind = "NORMAL" | "HOLIDAY" | "HALF_DAY" | "CLOSED" | "HALT_EXCEPTION";
 export type RunStatus =
-  "COMPLETE" | "COMPLETE_WITH_WARNINGS" | "PARTIAL" | "FAILED" | "CORRECTED_RECONCILED" | "PROVIDER_NOT_READY";
+  | "COMPLETE"
+  | "COMPLETE_WITH_WARNINGS"
+  | "PARTIAL"
+  | "FAILED"
+  | "CORRECTED_RECONCILED"
+  | "PROVIDER_NOT_READY"
+  | "ALREADY_FROZEN";
 export type StorageClass = "PERMANENT_EVIDENCE" | "DERIVED_CACHE" | "TRANSIENT_WORKSPACE";
 export const INTRADAY_SCHEMA_VERSION = "foundation-d.1-10m-v1" as const;
 export const DUST_SCHEMA_VERSION = "dust-v1" as const;

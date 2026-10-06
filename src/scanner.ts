@@ -14,6 +14,7 @@ import type {
 import { MARKET_SCHEMA_VERSION, SCANNER_VERSION } from "./contracts";
 import { rankSecurities } from "./ranking";
 import { fingerprint } from "./identity";
+import { makePredictionStatus, sessionAlreadyFrozen } from "./prediction-status";
 import { refreshEligibility, refreshUniverse } from "./universe";
 import type { MarketStore } from "./storage";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
@@ -97,6 +98,27 @@ export class MarketsScanner {
             }
           : {}),
       });
+    // Before any Massive request for D: skip if predictions already frozen for the session.
+    if (await sessionAlreadyFrozen(this.storage, sessionDate)) {
+      return this.finish({
+        runId,
+        session,
+        status: "ALREADY_FROZEN",
+        expectedSecurities: 0,
+        processedSecurities: 0,
+        validSecurities: 0,
+        incompleteSecurities: 0,
+        unresolvedFailures: [],
+        scannerVersion: SCANNER_VERSION,
+        predictionStatus: "FROZEN",
+        predictionReason: "PREDICTIONS_FROZEN",
+        ...(this.groupedReplyDust
+          ? {
+              groupedReplyDust: disabledScanGroupedReplyDustReport("ALREADY_FROZEN"),
+            }
+          : {}),
+      });
+    }
     const failures: string[] = [];
     let refresh;
     try {
@@ -133,17 +155,22 @@ export class MarketsScanner {
           ? `PROVIDER_NOT_READY:${message}`
           : `UNIVERSE_PROVIDER_ERROR:${message}`,
       );
-      await this.storage.writePredictionStatus({
-        predictionStatusId: `prediction-status_${runId}`,
-        sessionDate,
-        status: "UNAVAILABLE",
-        reason: "SOURCE_COLLECTION_FAILED",
-        scannerVersion: SCANNER_VERSION,
-        configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
-        recordedAt: `${sessionDate}T23:59:59.999Z`,
-        sourceRunId: runId,
-        supersedesPredictionIds: [],
-      });
+      try {
+        await this.storage.writePredictionStatus(
+          makePredictionStatus(runId, {
+            sessionDate,
+            status: "UNAVAILABLE",
+            reason: "SOURCE_COLLECTION_FAILED",
+            scannerVersion: SCANNER_VERSION,
+            configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
+            recordedAt: `${sessionDate}T23:59:59.999Z`,
+            sourceRunId: runId,
+            supersedesPredictionIds: [],
+          }),
+        );
+      } catch (statusError) {
+        failures.push(`IMMUTABLE_PREDICTION_STATUS_CONFLICT:${String(statusError)}`);
+      }
       return this.finish({
         runId,
         session,
@@ -242,34 +269,45 @@ export class MarketsScanner {
       (prediction) => prediction.securityIds.length === 0,
     );
     if (predictionUnavailableReason) {
-      failures.push("PREDICTION_UNAVAILABLE_SOURCE_COLLECTION_FAILED");
-      await this.storage.writePredictionStatus({
-        predictionStatusId: `prediction-status_${runId}`,
-        sessionDate,
-        status: "UNAVAILABLE",
-        reason: predictionUnavailableReason,
-        scannerVersion: SCANNER_VERSION,
-        configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
-        recordedAt: `${sessionDate}T23:59:59.999Z`,
-        sourceRunId: runId,
-        supersedesPredictionIds: predictionIds,
-      });
+      // Use the matching reason code — do not stamp SOURCE_COLLECTION_FAILED when collection ok.
+      failures.push(
+        predictionUnavailableReason === "SOURCE_COLLECTION_FAILED"
+          ? "PREDICTION_UNAVAILABLE_SOURCE_COLLECTION_FAILED"
+          : `PREDICTION_UNAVAILABLE_${predictionUnavailableReason}`,
+      );
+      try {
+        await this.storage.writePredictionStatus(
+          makePredictionStatus(runId, {
+            sessionDate,
+            status: "UNAVAILABLE",
+            reason: predictionUnavailableReason,
+            scannerVersion: SCANNER_VERSION,
+            configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
+            recordedAt: `${sessionDate}T23:59:59.999Z`,
+            sourceRunId: runId,
+            supersedesPredictionIds: predictionIds,
+          }),
+        );
+      } catch (statusError) {
+        failures.push(`IMMUTABLE_PREDICTION_STATUS_CONFLICT:${String(statusError)}`);
+      }
     } else {
       try {
         await this.storage.writeBeliefs(result.beliefs);
         await this.storage.writePredictions(result.predictions);
         await this.storage.writeDecisions(result.beliefs);
-        await this.storage.writePredictionStatus({
-          predictionStatusId: `prediction-status_${runId}`,
-          sessionDate,
-          status: "FROZEN",
-          reason: emptyPredictionSets ? "NO_QUALIFYING_CANDIDATES" : "PREDICTIONS_FROZEN",
-          scannerVersion: SCANNER_VERSION,
-          configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
-          recordedAt: `${sessionDate}T23:59:59.999Z`,
-          sourceRunId: runId,
-          supersedesPredictionIds: [],
-        });
+        await this.storage.writePredictionStatus(
+          makePredictionStatus(runId, {
+            sessionDate,
+            status: "FROZEN",
+            reason: emptyPredictionSets ? "NO_QUALIFYING_CANDIDATES" : "PREDICTIONS_FROZEN",
+            scannerVersion: SCANNER_VERSION,
+            configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
+            recordedAt: `${sessionDate}T23:59:59.999Z`,
+            sourceRunId: runId,
+            supersedesPredictionIds: [],
+          }),
+        );
       } catch (error) {
         failures.push(`IMMUTABLE_DECISION_CONFLICT:${String(error)}`);
       }

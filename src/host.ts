@@ -195,6 +195,7 @@ export async function runScannerHost(
   const storage = openMarketStore(root);
   await storage.initialize();
   const reports = await storage.loadRunReports();
+  // ALREADY_FROZEN counts as completed (not FAILED / PROVIDER_NOT_READY).
   const completed = new Set(
     reports
       .filter((report) => report.status !== "FAILED" && report.status !== "PROVIDER_NOT_READY")

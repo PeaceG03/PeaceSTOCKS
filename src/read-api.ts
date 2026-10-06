@@ -1,4 +1,5 @@
 import type { PredictionSet, ScannerBelief, ScannerRunReport, SecurityMasterRecord } from "./contracts";
+import { resolveSessionPredictionStatus } from "./prediction-status";
 import type { MarketStore } from "./storage";
 
 export interface ReadableResult {
@@ -55,9 +56,13 @@ function project(
   beliefs: readonly ScannerBelief[],
   securities: readonly SecurityMasterRecord[],
   report: ScannerRunReport,
+  /** When set (from resolveSessionPredictionStatus), overrides report.predictionStatus. */
+  resolvedPredictionStatus?: string,
 ): ReadableResult[] {
   const beliefById = new Map(beliefs.map((belief) => [belief.securityId, belief]));
   const securityById = new Map(securities.map((security) => [security.securityId, security]));
+  const predictionStatus =
+    resolvedPredictionStatus ?? report.predictionStatus ?? "UNKNOWN";
   return ids.map((securityId) => {
     const security = securityById.get(securityId);
     const belief = beliefById.get(securityId);
@@ -69,7 +74,7 @@ function project(
       familyScores: belief?.familyScores ?? {},
       sessionDate: report.session.sessionDate,
       runId: report.runId,
-      predictionStatus: report.predictionStatus ?? "UNKNOWN",
+      predictionStatus,
       providerHealth: providerHealth(report),
       skips: report.skips ?? [],
     };
@@ -104,12 +109,14 @@ export async function lastFailure(storage: MarketStore): Promise<ScannerRunRepor
 export async function scannerHealth(storage: MarketStore): Promise<ScannerHealth | undefined> {
   const report = await latestScan(storage);
   if (!report) return undefined;
+  const statuses = await storage.loadPredictionStatuses(report.session.sessionDate);
+  const resolved = resolveSessionPredictionStatus(statuses);
   return {
     status: report.status,
     sessionDate: report.session.sessionDate,
     sourceCommit: report.sourceCommit,
     completedAt: report.completedAt,
-    predictionStatus: report.predictionStatus ?? "UNKNOWN",
+    predictionStatus: resolved?.status ?? report.predictionStatus ?? "UNKNOWN",
   };
 }
 
@@ -119,12 +126,15 @@ export async function readableSet(
 ): Promise<ReadableResult[]> {
   const report = await latestSuccess(storage);
   if (!report) return [];
-  const [ids, beliefs, securities] = await Promise.all([
-    setIds(storage, report.session.sessionDate, setType),
-    storage.loadBeliefs(report.session.sessionDate),
+  const sessionDate = report.session.sessionDate;
+  const [ids, beliefs, securities, statuses] = await Promise.all([
+    setIds(storage, sessionDate, setType),
+    storage.loadBeliefs(sessionDate),
     storage.loadSecurities(),
+    storage.loadPredictionStatuses(sessionDate),
   ]);
-  return project(ids, beliefs, securities, report);
+  const resolved = resolveSessionPredictionStatus(statuses);
+  return project(ids, beliefs, securities, report, resolved?.status);
 }
 
 export async function readableByTicker(
@@ -135,13 +145,16 @@ export async function readableByTicker(
   if (!report) return undefined;
   const symbol = ticker.trim().toUpperCase();
   if (!symbol || !/^[A-Z0-9.-]{1,12}$/u.test(symbol)) return undefined;
-  const [beliefs, securities] = await Promise.all([
-    storage.loadBeliefs(report.session.sessionDate),
+  const sessionDate = report.session.sessionDate;
+  const [beliefs, securities, statuses] = await Promise.all([
+    storage.loadBeliefs(sessionDate),
     storage.loadSecurities(),
+    storage.loadPredictionStatuses(sessionDate),
   ]);
   const security = securities.find((item) => item.currentSymbol.toUpperCase() === symbol);
   if (!security) return undefined;
-  return project([security.securityId], beliefs, securities, report)[0];
+  const resolved = resolveSessionPredictionStatus(statuses);
+  return project([security.securityId], beliefs, securities, report, resolved?.status)[0];
 }
 
 export async function readScannerRoute(

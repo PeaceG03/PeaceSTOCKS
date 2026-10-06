@@ -238,9 +238,12 @@ export class ObjectMarketStorage implements MarketStore {
   }
 
   async writeRunReport(report: unknown): Promise<void> {
-    const runId = (report as { runId?: string }).runId;
+    const typed = report as { runId?: string; status?: string };
+    const runId = typed.runId;
     if (!runId) throw new Error("RUN_ID_REQUIRED");
-    await this.writeText(`runs/${runId}.json`, JSON.stringify(report, null, 2) + "\n");
+    const file =
+      typed.status === "ALREADY_FROZEN" ? `${runId}.already-frozen.json` : `${runId}.json`;
+    await this.writeText(`runs/${file}`, JSON.stringify(report, null, 2) + "\n");
   }
 
   async loadRunReports(): Promise<ScannerRunReport[]> {
