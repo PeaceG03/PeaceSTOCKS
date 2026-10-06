@@ -18,6 +18,9 @@ import { collectionDue } from "./scheduler";
 import { MarketsScanner, type SessionCalendar } from "./scanner";
 import type { MarketStore } from "./storage";
 import { openMarketStore } from "./object-storage";
+import { R2ObjectClient } from "./object-store";
+import { FileReplyDustStore, type ReplyDustStore } from "./intraday-reply-dust";
+import { scanGroupedReplyDustEnabled } from "./scan-grouped-reply-dust";
 import { runTenMinHistoryFromEnv, tenMinHistorySummary } from "./tenmin-history";
 import { tenMinRunOutcome } from "./tenmin-redispatch";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
@@ -160,6 +163,9 @@ export async function runScannerHost(
     readonly calendar?: SessionCalendar;
     readonly completionDelayMinutes?: number;
     readonly provider?: MassiveMarketProvider;
+    readonly env?: NodeJS.ProcessEnv;
+    /** Tests inject the Reply Dust object store when SCAN_GROUPED_REPLY_DUST is on. */
+    readonly groupedReplyDustStore?: ReplyDustStore;
     readonly intraday?: {
       readonly from: string;
       readonly to: string;
@@ -230,10 +236,25 @@ export async function runScannerHost(
     return probed;
   }
 
+  const env = options.env ?? process.env;
+  const groupedDustOn = scanGroupedReplyDustEnabled(env);
+  const provider =
+    options.provider ?? new MassiveMarketProvider(groupedDustOn ? { keepRawReplies: true } : {});
+  let groupedReplyDustStore: ReplyDustStore | undefined;
+  if (groupedDustOn) {
+    groupedReplyDustStore =
+      options.groupedReplyDustStore ??
+      (env.PEACESTOCKS_R2_BUCKET?.trim()
+        ? R2ObjectClient.fromEnv(env)
+        : new FileReplyDustStore(root));
+  }
   const scanner = new MarketsScanner(
-    options.provider ?? new MassiveMarketProvider(),
+    provider,
     storage,
     calendar,
+    groupedDustOn
+      ? { enabled: true, ...(groupedReplyDustStore ? { store: groupedReplyDustStore } : {}) }
+      : undefined,
   );
   const collected: ScannerRunReport[] = [];
   const credentialRejected = (report: ScannerRunReport) =>

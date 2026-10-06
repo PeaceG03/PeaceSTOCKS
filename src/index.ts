@@ -21,6 +21,7 @@ export * from "./packed-dust";
 export * from "./reply-dust";
 export * from "./intraday-reply-dust";
 export * from "./daily-reply-dust";
+export * from "./scan-grouped-reply-dust";
 export * from "./tenmin-range-reply-dust";
 export * from "./tenmin-history";
 export * from "./reply-dust-pin";

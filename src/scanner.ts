@@ -18,6 +18,14 @@ import { refreshEligibility, refreshUniverse } from "./universe";
 import type { MarketStore } from "./storage";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import type { DustReader } from "./reader";
+import type { ReplyDustStore } from "./intraday-reply-dust";
+import type { ReplyDustBackend } from "./reply-dust";
+import type { ZstdVersionProbe } from "./reply-dust-pin";
+import {
+  disabledScanGroupedReplyDustReport,
+  maybeStoreScanGroupedReplyDust,
+  type ScanGroupedReplyDustReport,
+} from "./scan-grouped-reply-dust";
 
 export interface SessionCalendar {
   getSession(sessionDate: string): SessionRecord;
@@ -48,11 +56,19 @@ export function resolveSpyBenchmarkId(
   return (matches.find((security) => security.status === "ACTIVE") ?? matches[0])?.securityId;
 }
 
+export interface MarketsScannerGroupedReplyDustOptions {
+  enabled: boolean;
+  store?: ReplyDustStore;
+  backend?: ReplyDustBackend;
+  zstdVersionProbe?: ZstdVersionProbe;
+}
+
 export class MarketsScanner {
   constructor(
     private readonly provider: MarketProvider,
     private readonly storage: MarketStore,
     private readonly calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
+    private readonly groupedReplyDust: MarketsScannerGroupedReplyDustOptions | undefined = undefined,
   ) {}
 
   private rateLimitedAtRunStart = 0;
@@ -73,6 +89,13 @@ export class MarketsScanner {
         incompleteSecurities: 0,
         unresolvedFailures: [],
         scannerVersion: SCANNER_VERSION,
+        ...(this.groupedReplyDust
+          ? {
+              groupedReplyDust: disabledScanGroupedReplyDustReport(
+                session.kind === "HOLIDAY" ? "HOLIDAY" : "CLOSED",
+              ),
+            }
+          : {}),
       });
     const failures: string[] = [];
     let refresh;
@@ -140,11 +163,13 @@ export class MarketsScanner {
       .map((security) => security.securityId);
     let bars: CanonicalDailyBar[] = [];
     let actions: CorporateAction[] = [];
+    let hadDailyBarsFetch = false;
     try {
       [bars, actions] = await Promise.all([
         this.provider.getDailyBars(sessionDate, ids),
         this.provider.getCorporateActions(sessionDate, ids),
       ]);
+      hadDailyBarsFetch = true;
       await this.storage.appendBars(bars);
       await this.storage.appendActions(actions);
     } catch (error) {
@@ -154,6 +179,20 @@ export class MarketsScanner {
           ? `PROVIDER_NOT_READY:${message}`
           : `EVIDENCE_PROVIDER_ERROR:${message}`,
       );
+    }
+    let groupedReplyDust: ScanGroupedReplyDustReport | undefined;
+    if (this.groupedReplyDust) {
+      groupedReplyDust = await maybeStoreScanGroupedReplyDust({
+        enabled: this.groupedReplyDust.enabled,
+        ...(this.groupedReplyDust.store ? { store: this.groupedReplyDust.store } : {}),
+        provider: this.provider,
+        sessionDate,
+        hadDailyBarsFetch,
+        ...(this.groupedReplyDust.backend ? { backend: this.groupedReplyDust.backend } : {}),
+        ...(this.groupedReplyDust.zstdVersionProbe
+          ? { zstdVersionProbe: this.groupedReplyDust.zstdVersionProbe }
+          : {}),
+      });
     }
     const expected = ids.length;
     const received = new Set(
@@ -259,6 +298,7 @@ export class MarketsScanner {
               ? ("NO_QUALIFYING_CANDIDATES" as const)
               : ("PREDICTIONS_FROZEN" as const),
           }),
+      ...(groupedReplyDust ? { groupedReplyDust } : {}),
     });
   }
 

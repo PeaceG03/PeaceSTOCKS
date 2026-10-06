@@ -377,6 +377,12 @@ export interface ScannerRunReport {
   predictionReason?: PredictionStatus["reason"];
   /** HTTP 429 responses the provider received during this run, including ones a retry recovered. */
   rateLimitedResponses?: number;
+  /**
+   * Grouped-daily Reply Dust side-store for this session (SCAN_GROUPED_REPLY_DUST). Absent when the
+   * feature was not considered; when present, failures here are warnings only and must not change
+   * other report fields.
+   */
+  groupedReplyDust?: import("./scan-grouped-reply-dust").ScanGroupedReplyDustReport;
 }
 
 export interface ListSecuritiesOptions {

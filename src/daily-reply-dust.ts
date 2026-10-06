@@ -26,6 +26,19 @@ export const DAILY_REPLY_DUST_MANIFEST_SCHEMA = "daily-reply-dust-manifest-v1" a
 export const DAILY_REPLY_DUST_FILE_NAME = "grouped-daily.rdust";
 export const DAILY_REPLY_DUST_OBJECT_SCHEMA = "daily-reply-dust-object-v1";
 
+/** Extra copy of a day's grouped-daily reply (scan may append when Massive bytes differ). */
+export interface DailyReplyDustCopyEntry {
+  relativePath: string;
+  request: string;
+  fetchedAt: string;
+  retrievalId: string;
+  version: number;
+  byteLength: number;
+  fileSha256: string;
+  replySha256: string;
+  replyByteLength: number;
+}
+
 export interface DailyReplyDustManifest {
   schemaVersion: typeof DAILY_REPLY_DUST_MANIFEST_SCHEMA;
   format: typeof REPLY_DUST_FORMAT;
@@ -46,6 +59,11 @@ export interface DailyReplyDustManifest {
   fileSha256: string;
   replySha256: string;
   replyByteLength: number;
+  /**
+   * Extra verified copies beyond the canonical grouped-daily.rdust (never overwrite the first).
+   * Absent on manifests written before multi-copy support. History always reads the canonical.
+   */
+  copies?: DailyReplyDustCopyEntry[];
   checksum: string;
 }
 
@@ -60,7 +78,18 @@ export function dailyReplyDustManifestKey(sessionDate: string): string {
   return `${dayPrefix(sessionDate)}/manifest.json`;
 }
 
-const checksumOf = (body: Omit<DailyReplyDustManifest, "checksum">): string =>
+/** Hashed extra copy when a later reply's raw bytes differ from the canonical. */
+export function dailyReplyDustHashedFileKey(sessionDate: string, replySha256: string): string {
+  if (!/^[0-9a-f]{64}$/u.test(replySha256)) throw new Error("INVALID_REPLY_SHA256");
+  return `${dayPrefix(sessionDate)}/grouped-daily-${replySha256}.rdust`;
+}
+
+export function dailyReplyDustHashedFileName(replySha256: string): string {
+  if (!/^[0-9a-f]{64}$/u.test(replySha256)) throw new Error("INVALID_REPLY_SHA256");
+  return `grouped-daily-${replySha256}.rdust`;
+}
+
+export const dailyReplyDustManifestChecksum = (body: Omit<DailyReplyDustManifest, "checksum">): string =>
   sha256Hex(JSON.stringify(body));
 
 function parseReply(reply: Uint8Array): Record<string, unknown> {
@@ -144,7 +173,7 @@ export async function writeDailyReplyDust(
     replySha256,
     replyByteLength: reply.body.length,
   };
-  const manifest: DailyReplyDustManifest = { ...body, checksum: checksumOf(body) };
+  const manifest: DailyReplyDustManifest = { ...body, checksum: dailyReplyDustManifestChecksum(body) };
   const bytes = new TextEncoder().encode(`${JSON.stringify(manifest, null, 2)}\n`);
   await store.put(manifestKey, bytes);
   const stored = await store.get(manifestKey);
@@ -163,7 +192,7 @@ export async function readDailyReplyDustManifest(
   if (
     manifest.schemaVersion !== DAILY_REPLY_DUST_MANIFEST_SCHEMA ||
     manifest.sessionDate !== sessionDate ||
-    checksumOf(body) !== checksum
+    dailyReplyDustManifestChecksum(body) !== checksum
   )
     throw new Error("REPLY_DUST_MANIFEST_CHECKSUM_MISMATCH");
   return manifest;

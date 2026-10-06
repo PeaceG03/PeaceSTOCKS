@@ -69,6 +69,9 @@ jobs:
       PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
       PEACESTOCKS_SOURCE_COMMIT: ${{ github.sha }}
       PEACESTOCKS_REQUIRE_OBJECT_STORE: "1"
+      # Exactly "true" stores the scan's already-fetched grouped-daily reply as Reply Dust (no extra
+      # Massive requests). Anything else leaves the scan unchanged.
+      SCAN_GROUPED_REPLY_DUST: ${{ vars.SCAN_GROUPED_REPLY_DUST }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
