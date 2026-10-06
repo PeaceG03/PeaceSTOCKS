@@ -5,6 +5,7 @@ import type {
   CorporateAction,
   MarketProvider,
   MassiveAggregateBar,
+  ProviderRawReply,
   ProviderSecurityRecord,
 } from "./contracts";
 import { MARKET_SCHEMA_VERSION } from "./contracts";
@@ -24,6 +25,8 @@ export interface MassiveProviderOptions {
   minRequestIntervalMs?: number;
   retryBackoffMs?: number;
   now?: () => string;
+  /** Keep each bar reply's exact bytes until takeRawReplies(); off by default so nothing piles up unread. */
+  keepRawReplies?: boolean;
 }
 
 const text = (value: unknown): string | undefined =>
@@ -119,6 +122,8 @@ export class MassiveMarketProvider implements MarketProvider {
   private readonly symbolBySecurityId = new Map<string, string>();
   private readonly maxTransientAttempts = 3;
   private rateLimitedCount = 0;
+  private rawReplies: ProviderRawReply[] = [];
+  private readonly keepRawReplies: boolean;
   private readonly retryBackoffMs: number;
 
   constructor(options: MassiveProviderOptions = {}) {
@@ -131,6 +136,7 @@ export class MassiveMarketProvider implements MarketProvider {
     this.retryBackoffMs = options.retryBackoffMs ?? 250;
     if (this.retryBackoffMs < 0) throw new Error("MASSIVE_INVALID_RATE_LIMIT");
     this.now = options.now ?? (() => new Date().toISOString());
+    this.keepRawReplies = options.keepRawReplies ?? false;
   }
 
   /** Every HTTP 429 received, including ones a retry later recovered from. */
@@ -169,7 +175,40 @@ export class MassiveMarketProvider implements MarketProvider {
     return url;
   }
 
+  /** Hands over (and forgets) every bar reply received since the last call, oldest first. */
+  takeRawReplies(): ProviderRawReply[] {
+    const taken = this.rawReplies;
+    this.rawReplies = [];
+    return taken;
+  }
+
   private async get(pathOrUrl: string, params?: Record<string, string>): Promise<JsonRecord> {
+    return (await this.getWithBody(pathOrUrl, params)).record;
+  }
+
+  // Bar requests keep the exact reply bytes; the parsed record is built from those same bytes.
+  private async getBars(
+    reply: Omit<ProviderRawReply, "request" | "fetchedAt" | "body">,
+    path: string,
+    params: Record<string, string>,
+  ): Promise<JsonRecord> {
+    const { record, body } = await this.getWithBody(path, params);
+    if (!this.keepRawReplies) return record;
+    const request = new URL(path, this.baseUrl);
+    for (const [key, value] of Object.entries(params)) request.searchParams.set(key, value);
+    this.rawReplies.push({
+      ...reply,
+      request: `${request.pathname}${request.search}`,
+      fetchedAt: this.now(),
+      body,
+    });
+    return record;
+  }
+
+  private async getWithBody(
+    pathOrUrl: string,
+    params?: Record<string, string>,
+  ): Promise<{ record: JsonRecord; body: Uint8Array }> {
     this.requireApiKey();
     let transientAttempt = 0;
     for (;;) {
@@ -189,7 +228,10 @@ export class MassiveMarketProvider implements MarketProvider {
         await this.backoff(transientAttempt);
         continue;
       }
-      if (response.ok) return responseRecord(await response.json());
+      if (response.ok) {
+        const body = new Uint8Array(await response.arrayBuffer());
+        return { record: responseRecord(JSON.parse(new TextDecoder().decode(body))), body };
+      }
       const body = await response.text();
       const requestId = response.headers.get("request-id") ?? response.headers.get("x-request-id");
       const safeBody = safeProviderErrorBody(body);
@@ -301,10 +343,11 @@ export class MassiveMarketProvider implements MarketProvider {
   async getDailyBars(sessionDate: string, securityIds: string[]): Promise<CanonicalDailyBar[]> {
     requireDate(sessionDate);
     if (!this.symbolBySecurityId.size) throw new Error("MASSIVE_UNIVERSE_REQUIRED_BEFORE_BARS");
-    const response = await this.get(`/v2/aggs/grouped/locale/us/market/stocks/${sessionDate}`, {
-      adjusted: "false",
-      include_otc: "false",
-    });
+    const response = await this.getBars(
+      { dataset: "stocks-grouped-daily", sessionDate },
+      `/v2/aggs/grouped/locale/us/market/stocks/${sessionDate}`,
+      { adjusted: "false", include_otc: "false" },
+    );
     const ids = new Set(securityIds);
     const bySymbol = new Map(
       [...this.symbolBySecurityId.entries()]
@@ -377,7 +420,8 @@ export class MassiveMarketProvider implements MarketProvider {
     for (const securityIdValue of securityIds) {
       const symbol = this.symbolBySecurityId.get(securityIdValue);
       if (!symbol) continue;
-      const response = await this.get(
+      const response = await this.getBars(
+        { dataset: "stocks-aggregates-10m", sessionDate, securityId: securityIdValue, symbol },
         `/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/10/minute/${sessionDate}/${sessionDate}`,
         {
           adjusted: "false",

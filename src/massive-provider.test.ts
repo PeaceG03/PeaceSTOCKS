@@ -287,3 +287,89 @@ test("same-identity merge: active wins in either order, same status keeps the la
   assert.equal(same.get("FIGI-X|STOCK")?.active, true);
   assert.equal(same.get("FIGI-X|STOCK")?.formerSymbols, undefined);
 });
+
+test("grouped daily and 10-minute requests keep Massive's exact reply bytes", async () => {
+  // Odd spacing and a unicode escape prove the stored bytes are the wire bytes, not re-serialized JSON.
+  const grouped = '{"adjusted":false,"results":[{"T":"SPY","v":1234.5,"vw":100.1,"o":100,"c":101,"h":102,"l":99,"t":1767387600000,"n":7}],  "status":"OK","request_id":"req-\\u0067rouped"}';
+  const tenMinute = `{"ticker":"SPY","results":[{"v":10,"vw":100.25,"o":100,"c":100.5,"h":101,"l":99,"t":${Date.parse("2026-01-02T14:30:00.000Z")},"n":4}],"status":"OK","request_id":"req-10m"}\n`;
+  const provider = new MassiveMarketProvider({
+    apiKey: "secret-key",
+    minRequestIntervalMs: 0,
+    keepRawReplies: true,
+    now: () => "2026-01-02T22:00:00.000Z",
+    fetchImpl: async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.includes("/grouped/")) return new Response(grouped, { status: 200 });
+      if (url.pathname.includes("/range/10/minute/")) return new Response(tenMinute, { status: 200 });
+      return new Response('{"status":"ERROR"}', { status: 500 });
+    },
+  });
+  provider.bindUniverse([
+    { provider: "massive-stocks", providerSecurityId: "SPY", symbol: "SPY", assetType: "ETF", country: "US", exchange: "ARCX", active: true, tradable: true },
+  ]);
+  const id = securityIdForTest();
+  const daily = await provider.getDailyBars("2026-01-02", [id]);
+  const intraday = await provider.getIntradayBars("2026-01-02", [id]);
+  assert.equal(daily.length, 1);
+  assert.equal(daily[0]?.provenance.retrievalId, "req-grouped");
+  assert.ok(intraday.some((bar) => bar.close === 100.5));
+  const replies = provider.takeRawReplies();
+  assert.deepEqual(
+    replies.map(({ body, ...meta }) => meta),
+    [
+      {
+        dataset: "stocks-grouped-daily",
+        sessionDate: "2026-01-02",
+        request: "/v2/aggs/grouped/locale/us/market/stocks/2026-01-02?adjusted=false&include_otc=false",
+        fetchedAt: "2026-01-02T22:00:00.000Z",
+      },
+      {
+        dataset: "stocks-aggregates-10m",
+        sessionDate: "2026-01-02",
+        securityId: id,
+        symbol: "SPY",
+        request: "/v2/aggs/ticker/SPY/range/10/minute/2026-01-02/2026-01-02?adjusted=false&sort=asc&limit=50000",
+        fetchedAt: "2026-01-02T22:00:00.000Z",
+      },
+    ],
+  );
+  assert.deepEqual(replies[0]?.body, new TextEncoder().encode(grouped));
+  assert.deepEqual(replies[1]?.body, new TextEncoder().encode(tenMinute));
+  assert.ok(replies.every((reply) => !reply.request.includes("secret-key")));
+  assert.deepEqual(provider.takeRawReplies(), []);
+});
+
+test("failed and non-bar requests keep no raw reply", async () => {
+  const provider = new MassiveMarketProvider({
+    apiKey: "test-key",
+    minRequestIntervalMs: 0,
+    retryBackoffMs: 0,
+    keepRawReplies: true,
+    fetchImpl: async (input) =>
+      String(input).includes("/v3/reference/tickers")
+        ? new Response('{"results":[],"status":"OK"}', { status: 200 })
+        : new Response('{"status":"ERROR","message":"boom"}', { status: 500 }),
+  });
+  provider.bindUniverse([
+    { provider: "massive-stocks", providerSecurityId: "SPY", symbol: "SPY", assetType: "ETF", country: "US", exchange: "ARCX", active: true, tradable: true },
+  ]);
+  await provider.listApprovedSecurities();
+  provider.bindUniverse([
+    { provider: "massive-stocks", providerSecurityId: "SPY", symbol: "SPY", assetType: "ETF", country: "US", exchange: "ARCX", active: true, tradable: true },
+  ]);
+  await assert.rejects(provider.getDailyBars("2026-01-02", [securityIdForTest()]));
+  assert.deepEqual(provider.takeRawReplies(), []);
+});
+
+test("raw replies are not kept unless asked for", async () => {
+  const provider = new MassiveMarketProvider({
+    apiKey: "test-key",
+    minRequestIntervalMs: 0,
+    fetchImpl: async () => new Response('{"results":[],"status":"OK"}', { status: 200 }),
+  });
+  provider.bindUniverse([
+    { provider: "massive-stocks", providerSecurityId: "SPY", symbol: "SPY", assetType: "ETF", country: "US", exchange: "ARCX", active: true, tradable: true },
+  ]);
+  await provider.getDailyBars("2026-01-02", [securityIdForTest()]);
+  assert.deepEqual(provider.takeRawReplies(), []);
+});

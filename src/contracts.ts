@@ -379,6 +379,19 @@ export interface ListSecuritiesOptions {
   shouldStop?: () => Promise<string | undefined>;
 }
 
+/** Massive's reply to one bar request, exactly as received, kept so it can be stored losslessly. */
+export interface ProviderRawReply {
+  dataset: "stocks-grouped-daily" | "stocks-aggregates-10m";
+  sessionDate: string;
+  /** Set for per-security requests (10-minute bars); absent for the whole-market grouped reply. */
+  securityId?: string;
+  symbol?: string;
+  /** Request path and query with the API key removed. */
+  request: string;
+  fetchedAt: string;
+  body: Uint8Array;
+}
+
 export interface MarketProvider {
   readonly providerName: string;
   /** Running count of HTTP 429 responses received, when the provider tracks it. */
@@ -391,4 +404,6 @@ export interface MarketProvider {
   getDailyBars(sessionDate: string, securityIds: string[]): Promise<CanonicalDailyBar[]>;
   getIntradayBars?(sessionDate: string, securityIds: string[]): Promise<CanonicalTenMinuteBar[]>;
   getCorporateActions(sessionDate: string, securityIds: string[]): Promise<CorporateAction[]>;
+  /** Hands over (and forgets) every bar reply received since the last call, oldest first. */
+  takeRawReplies?(): ProviderRawReply[];
 }
