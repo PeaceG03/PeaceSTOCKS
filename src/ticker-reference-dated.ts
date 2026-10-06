@@ -228,6 +228,76 @@ export interface DatedTickerRunReport {
   probe?: DatedTickerProbeSummary;
 }
 
+/** Concise dated-index section for history R2 report / tenMinHistorySummary / Actions logs. */
+export interface DatedTickerRunSummary {
+  enabled: boolean;
+  mode: "probe" | "full";
+  datesPlanned: number;
+  firstPlanned?: string;
+  lastPlanned?: string;
+  sealed: number;
+  alreadySealed: number;
+  partial: number;
+  probe: number;
+  skippedWindow: number;
+  skippedGuard: number;
+  corrupt: number;
+  failed: number;
+  requests: number;
+  dates: Array<{
+    date: string;
+    status: DatedTickerDateReport["status"];
+    requests: number;
+    indexAsOf?: string;
+    indexSealed?: boolean;
+  }>;
+  yieldedForScan?: string;
+}
+
+export function tenMinDatedTickerSummary(report: DatedTickerRunReport): DatedTickerRunSummary {
+  const counts = {
+    sealed: 0,
+    alreadySealed: 0,
+    partial: 0,
+    probe: 0,
+    skippedWindow: 0,
+    skippedGuard: 0,
+    corrupt: 0,
+    failed: 0,
+  };
+  for (const d of report.dates) {
+    if (d.status === "SEALED") counts.sealed += 1;
+    else if (d.status === "ALREADY_SEALED") counts.alreadySealed += 1;
+    else if (d.status === "PARTIAL") counts.partial += 1;
+    else if (d.status === "PROBE") counts.probe += 1;
+    else if (d.status === "SKIPPED_WINDOW") counts.skippedWindow += 1;
+    else if (d.status === "SKIPPED_GUARD") counts.skippedGuard += 1;
+    else if (d.status === "CORRUPT") counts.corrupt += 1;
+    else if (d.status === "FAILED") counts.failed += 1;
+  }
+  const first = report.datesPlanned[0];
+  const last = report.datesPlanned.length
+    ? report.datesPlanned[report.datesPlanned.length - 1]
+    : undefined;
+  return {
+    enabled: report.enabled,
+    mode: report.mode,
+    datesPlanned: report.datesPlanned.length,
+    ...(first ? { firstPlanned: first } : {}),
+    ...(last ? { lastPlanned: last } : {}),
+    ...counts,
+    requests: report.requests,
+    dates: report.dates.map((d) => ({
+      date: d.date,
+      status: d.status,
+      requests: d.requests,
+      ...(d.indexAsOf ? { indexAsOf: d.indexAsOf } : {}),
+      ...(d.indexSealed !== undefined ? { indexSealed: d.indexSealed } : {}),
+    })),
+    ...(report.yieldedForScan ? { yieldedForScan: report.yieldedForScan } : {}),
+  };
+}
+
 function parseReply(body: Uint8Array): {
   results: unknown[];
   nextUrl?: string;
@@ -697,7 +767,10 @@ async function buildOneDatedDate(input: {
     pagesAdopted += 1;
   }
 
-  let complete = manifest?.complete === true;
+  // If the dated manifest was already complete, do not rewrite the live ticker
+  // reference index (that would rewind asOf when a later FULL run yields early).
+  const alreadyComplete = manifest?.complete === true;
+  let complete = alreadyComplete;
   let resumeCursor = manifest?.resumeCursor;
 
   const maxPagesThisRun = full ? Number.MAX_SAFE_INTEGER : 1;
@@ -809,34 +882,40 @@ async function buildOneDatedDate(input: {
     probe = buildProbeSummary(date, fakeFetch, pages[0]!, complete, masterLoad);
   }
 
-  // Seal index only when the date's list is complete.
+  // Seal index only on first-time completion. Already-complete dated manifests
+  // return ALREADY_SEALED without calling writeTickerReferenceIndex (avoids
+  // rewinding the live index when a later FULL run yields after an early month).
   let indexSealed = false;
   let fingerprints: TickerReferenceIndexFingerprints | undefined;
   if (complete && pages.length > 0) {
-    const capture = await captureFromDatedTickerPages(store, date, pages, backend);
-    fingerprints = {
-      source: "dated-list",
-      requestedDate: date,
-      pages: pages.map((p) => ({ key: p.key, sha256: p.replySha256 })),
-      knownGap: "mid-month-listings-appear-in-next-month-index",
-    };
-    await writeTickerReferenceIndex(store, capture, {
-      provider: providerName,
-      asOf: date,
-      fingerprints,
-    });
-    indexSealed = true;
+    if (alreadyComplete) {
+      indexSealed = true;
+    } else {
+      const capture = await captureFromDatedTickerPages(store, date, pages, backend);
+      fingerprints = {
+        source: "dated-list",
+        requestedDate: date,
+        pages: pages.map((p) => ({ key: p.key, sha256: p.replySha256 })),
+        knownGap: "mid-month-listings-appear-in-next-month-index",
+      };
+      await writeTickerReferenceIndex(store, capture, {
+        provider: providerName,
+        asOf: date,
+        fingerprints,
+      });
+      indexSealed = true;
+    }
   }
 
   const status: DatedTickerDateReport["status"] = yieldedForScan
     ? "SKIPPED_GUARD"
     : !full
       ? "PROBE"
-      : indexSealed
-        ? pagesAdopted && !pagesStored
-          ? "ALREADY_SEALED"
-          : "SEALED"
-        : "PARTIAL";
+      : alreadyComplete && indexSealed
+        ? "ALREADY_SEALED"
+        : indexSealed
+          ? "SEALED"
+          : "PARTIAL";
 
   return {
     report: {

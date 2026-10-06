@@ -18,10 +18,14 @@ import {
   requestContainsApiKey,
   runDatedTickerIndexBuild,
   stripApiKeyFromUrl,
+  tenMinDatedTickerSummary,
   tickerIndexDatedEnabled,
   tickerIndexDatedFullEnabled,
 } from "./ticker-reference-dated";
-import { listTickerReferenceIndexHistory } from "./ticker-reference-index";
+import {
+  TICKER_REFERENCE_INDEX_MANIFEST_KEY,
+  listTickerReferenceIndexHistory,
+} from "./ticker-reference-index";
 
 const SETTLED = new Date("2026-10-06T18:00:00.000Z");
 const clock = (): Date => SETTLED;
@@ -623,4 +627,166 @@ test("disabled switch makes zero requests", async () => {
   assert.equal(report.enabled, false);
   assert.equal(fetches, 0);
   assert.equal(report.requests, 0);
+});
+
+test("full mode: plans months from 2024-11; probe-only does not seal; FULL alone is off", async () => {
+  const now = new Date("2026-10-06T18:00:00.000Z");
+  let fetches = 0;
+
+  // FULL without DATED → phase off.
+  const off = await runDatedTickerIndexBuild({
+    store: new MemoryObjectClient(),
+    env: { TICKER_INDEX_DATED_FULL: "true" },
+    now,
+    clock: () => now,
+    fetchPage: async () => {
+      fetches += 1;
+      throw new Error("SHOULD_NOT_FETCH");
+    },
+  });
+  assert.equal(off.enabled, false);
+  assert.equal(fetches, 0);
+  assert.deepEqual(off.datesPlanned, []);
+
+  // Probe-only: single planned date, incomplete → no index seal.
+  const probeStore = new MemoryObjectClient();
+  const probe = await runDatedTickerIndexBuild({
+    store: probeStore,
+    env: { TICKER_INDEX_DATED: "true" },
+    now,
+    clock: () => now,
+    fetchPage: async ({ date }) => ({
+      status: 200,
+      body: pageBody({
+        tickers: [rec("AAA", "CS")],
+        nextUrl: "https://api.massive.com/v3/reference/tickers?cursor=p2&apiKey=x",
+      }),
+      request: `/v3/reference/tickers?date=${date}`,
+      nextUrl: "/v3/reference/tickers?cursor=p2",
+      fetchedAt: now.toISOString(),
+    }),
+  });
+  assert.equal(probe.mode, "probe");
+  assert.deepEqual(probe.datesPlanned, [TICKER_INDEX_DATED_PROBE_DATE]);
+  assert.equal(probe.dates[0]!.status, "PROBE");
+  assert.equal(probe.dates[0]!.indexSealed, false);
+  assert.equal((await listTickerReferenceIndexHistory(probeStore)).length, 0);
+
+  // FULL: datesPlanned from 2024-11-01 through current month (no monthStarts override).
+  // Yield immediately so we do not fetch every month in the unit test.
+  const fullStore = new MemoryObjectClient();
+  const full = await runDatedTickerIndexBuild({
+    store: fullStore,
+    env: { TICKER_INDEX_DATED: "true", TICKER_INDEX_DATED_FULL: "true" },
+    now,
+    clock: () => now,
+    shouldYield: async () => "TEST_YIELD_AFTER_PLAN",
+    fetchPage: async () => {
+      fetches += 1;
+      throw new Error("SHOULD_NOT_FETCH");
+    },
+  });
+  assert.equal(full.mode, "full");
+  assert.equal(full.datesPlanned[0], "2024-11-01");
+  assert.equal(full.datesPlanned[full.datesPlanned.length - 1], "2026-10-01");
+  assert.ok(full.datesPlanned.length >= 20);
+  assert.ok(!full.datesPlanned.includes("2024-10-01"));
+  assert.equal(full.dates[0]!.status, "SKIPPED_GUARD");
+  assert.equal(full.requests, 0);
+  assert.equal(fetches, 0);
+  assert.equal((await listTickerReferenceIndexHistory(fullStore)).length, 0);
+
+  const summary = tenMinDatedTickerSummary(full);
+  assert.equal(summary.mode, "full");
+  assert.equal(summary.firstPlanned, "2024-11-01");
+  assert.equal(summary.lastPlanned, "2026-10-01");
+  assert.equal(summary.datesPlanned, full.datesPlanned.length);
+  assert.equal(summary.skippedGuard, 1);
+  assert.equal(summary.sealed, 0);
+  assert.equal(summary.requests, 0);
+});
+
+test("ALREADY_SEALED: second FULL run does not rewrite index or rewind asOf", async () => {
+  const store = new MemoryObjectClient();
+  const months = ["2024-11-01", "2024-12-01", "2025-01-01"] as const;
+
+  async function sealMonth(date: string, tickers: ReturnType<typeof rec>[]) {
+    const report = await runDatedTickerIndexBuild({
+      store,
+      env: { TICKER_INDEX_DATED: "true", TICKER_INDEX_DATED_FULL: "true" },
+      now: SETTLED,
+      clock,
+      monthStarts: [date],
+      fetchPage: async ({ date: d }) => ({
+        status: 200,
+        body: pageBody({ tickers }),
+        request: `/v3/reference/tickers?date=${d}`,
+        fetchedAt: "2026-10-06T18:00:00.000Z",
+      }),
+    });
+    assert.equal(report.dates[0]!.status, "SEALED", date);
+    assert.equal(report.dates[0]!.indexAsOf, date);
+  }
+
+  await sealMonth("2024-11-01", [rec("NOV", "CS"), rec("SPY", "ETF")]);
+  await sealMonth("2024-12-01", [rec("DEC", "CS"), rec("SPY", "ETF")]);
+  await sealMonth("2025-01-01", [rec("JAN", "CS"), rec("SPY", "ETF")]);
+
+  const before = await loadTickerReferenceIndexAsOf(store, "2025-01-15");
+  assert.ok(before);
+  assert.equal(before!.asOf, "2025-01-01");
+  assert.ok(before!.entries.some((e) => e.ticker === "JAN"));
+
+  let liveManifestPuts = 0;
+  const countingStore = {
+    async get(key: string) {
+      return store.get(key);
+    },
+    async put(key: string, body: Uint8Array, metadata?: object) {
+      if (key === TICKER_REFERENCE_INDEX_MANIFEST_KEY) liveManifestPuts += 1;
+      return store.put(key, body, metadata as never);
+    },
+    async head(key: string) {
+      return store.head(key);
+    },
+    async delete(key: string) {
+      return store.delete(key);
+    },
+    async list(prefix: string) {
+      return store.list(prefix);
+    },
+  };
+
+  // Yield after Nov is processed (second outer shouldYield = before Dec).
+  let yieldCalls = 0;
+  const report = await runDatedTickerIndexBuild({
+    store: countingStore as never,
+    env: { TICKER_INDEX_DATED: "true", TICKER_INDEX_DATED_FULL: "true" },
+    now: SETTLED,
+    clock,
+    monthStarts: [...months],
+    shouldYield: async () => {
+      yieldCalls += 1;
+      // 1 = before Nov; 2 = before Dec → stop so we only re-process Nov.
+      if (yieldCalls >= 2) return "TIME_BUDGET";
+      return undefined;
+    },
+    fetchPage: async () => {
+      throw new Error("SHOULD_NOT_FETCH_ALREADY_COMPLETE");
+    },
+  });
+
+  assert.equal(report.dates.length, 2); // Nov ALREADY_SEALED + Dec SKIPPED_GUARD
+  assert.equal(report.dates[0]!.date, "2024-11-01");
+  assert.equal(report.dates[0]!.status, "ALREADY_SEALED");
+  assert.equal(report.dates[0]!.indexSealed, true);
+  assert.equal(report.dates[0]!.indexAsOf, "2024-11-01");
+  assert.equal(report.dates[1]!.status, "SKIPPED_GUARD");
+  assert.equal(liveManifestPuts, 0, "must not rewrite live ticker reference index for ALREADY_SEALED");
+
+  const after = await loadTickerReferenceIndexAsOf(store, "2025-01-15");
+  assert.ok(after);
+  assert.equal(after!.asOf, "2025-01-01", "asOf must not rewind to 2024-11-01");
+  assert.ok(after!.entries.some((e) => e.ticker === "JAN"));
+  assert.ok(after!.entries.some((e) => e.ticker === "SPY"));
 });

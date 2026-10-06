@@ -22,7 +22,9 @@ import {
 } from "./tenmin-daily-runner";
 import {
   type DatedTickerRunReport,
+  type DatedTickerRunSummary,
   runDatedTickerIndexBuild,
+  tenMinDatedTickerSummary,
   tickerIndexDatedEnabled,
 } from "./ticker-reference-dated";
 import type { SessionCalendar } from "./scanner";
@@ -749,6 +751,11 @@ export interface TenMinHistoryRunReport {
   /** Seal progress for the range this run worked (absent when every range was skipped sealed). */
   rangeRemaining?: TenMinRangeRemaining;
   /**
+   * Concise dated ticker-index section when TICKER_INDEX_DATED === "true" this run.
+   * Written to R2 with the history run report and echoed in tenMinHistorySummary.
+   */
+  datedTickerIndex?: DatedTickerRunSummary;
+  /**
    * Concise daily-picks section when TENMIN_DAILY_PICKS === "true" this run.
    * Written to R2 with the history run report and echoed in tenMinHistorySummary.
    */
@@ -889,6 +896,7 @@ export async function runTenMinHistory(options: {
         warnings: [],
         zstdVersion,
         massiveRequests: datedTickerIndex.requests,
+        datedTickerIndex: tenMinDatedTickerSummary(datedTickerIndex),
         completedAt: (options.nowIso ?? (() => new Date().toISOString()))(),
       };
       return {
@@ -1231,6 +1239,7 @@ export async function runTenMinHistory(options: {
     zstdVersion,
     massiveRequests,
     ...(rangeRemaining ? { rangeRemaining } : {}),
+    ...(datedTickerIndex ? { datedTickerIndex: tenMinDatedTickerSummary(datedTickerIndex) } : {}),
     ...(dailyPicks ? { dailyPicks: tenMinDailyPicksSummary(dailyPicks) } : {}),
     completedAt: stamp(),
   };
@@ -1287,6 +1296,7 @@ export function tenMinHistorySummary(report: TenMinHistoryRunReport): Record<str
     massiveRequests: report.massiveRequests,
     groupedDailyRequests: report.groupedDailyRequests,
     ...(report.rangeRemaining ? { rangeRemaining: report.rangeRemaining } : {}),
+    ...(report.datedTickerIndex ? { datedTickerIndex: report.datedTickerIndex } : {}),
     ...(report.dailyPicks ? { dailyPicks: report.dailyPicks } : {}),
     yieldedForScan: report.yieldedForScan,
     outageStop: report.outageStop,
