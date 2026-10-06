@@ -175,6 +175,46 @@ test("former tickers from the provider are recorded in the security's symbol his
   }
 });
 
+test("a dated former ticker keeps its own delisting date, for new and existing securities", async () => {
+  const root = await fixtureRoot();
+  try {
+    const storage = new MarketStorage(root);
+    const dated = { symbol: "OLDN", listingDate: "2019-03-01", delistedDate: "2024-05-20" };
+    const fresh = await refreshUniverse(
+      new FixtureProvider([{ ...providerRecord("issuer-7", "NEWN"), formerSymbols: [dated] }], []),
+      storage,
+      "2026-01-05",
+    );
+    assert.deepEqual(fresh.securities.find((item) => item.currentSymbol === "NEWN")?.historicalSymbols, [
+      { symbol: "OLDN", effectiveFrom: "2019-03-01", effectiveTo: "2024-05-20", source: "fixture-provider" },
+      { symbol: "NEWN", effectiveFrom: "2026-01-05", source: "fixture-provider" },
+    ]);
+    await refreshUniverse(new FixtureProvider([providerRecord("issuer-8", "AAA")], []), storage, "2026-01-05");
+    const renamed = await refreshUniverse(
+      new FixtureProvider(
+        [
+          { ...providerRecord("issuer-7", "NEWN"), formerSymbols: [dated] },
+          { ...providerRecord("issuer-8", "BBB"), formerSymbols: [{ symbol: "ZZZ", delistedDate: "2020-02-03" }] },
+        ],
+        [],
+      ),
+      storage,
+      "2026-01-06",
+    );
+    assert.deepEqual(renamed.securities.find((item) => item.currentSymbol === "BBB")?.historicalSymbols, [
+      { symbol: "ZZZ", effectiveFrom: "2026-01-06", effectiveTo: "2020-02-03", source: "fixture-provider" },
+      { symbol: "AAA", effectiveFrom: "2026-01-05", effectiveTo: "2026-01-06", source: "fixture-provider" },
+      { symbol: "BBB", effectiveFrom: "2026-01-06", source: "fixture-provider" },
+    ]);
+    assert.deepEqual(
+      renamed.securities.find((item) => item.currentSymbol === "NEWN")?.historicalSymbols.map((item) => item.effectiveTo),
+      ["2024-05-20", undefined],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("universe refresh is idempotent and preserves inactive history", async () => {
   const root = await fixtureRoot();
   try {

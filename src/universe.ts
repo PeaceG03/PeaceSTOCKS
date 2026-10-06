@@ -70,8 +70,19 @@ export async function refreshUniverse(
       );
     const previous = byId.get(id);
     const history = previous?.historicalSymbols ?? [];
+    if (!history.length || history[history.length - 1]?.symbol !== providerRecord.symbol) {
+      const last = history[history.length - 1];
+      if (last) history[history.length - 1] = { ...last, effectiveTo: asOf };
+      history.push({
+        symbol: providerRecord.symbol,
+        effectiveFrom: asOf,
+        source: providerRecord.provider,
+      });
+    }
     // Former tickers of the same identity (from the provider's inactive pass) go in front of the
-    // history if they are not already recorded. Without a provider date the refresh date is used.
+    // history if they are not already recorded. This runs after the current-symbol step above so
+    // that step only ever closes a symbol from earlier history, never a former ticker's own dates.
+    // Without a provider date the refresh date is used.
     const missingFormer = (providerRecord.formerSymbols ?? [])
       .filter((item) => !history.some((entry) => entry.symbol === item.symbol))
       .map((item) => ({
@@ -82,15 +93,6 @@ export async function refreshUniverse(
       }))
       .sort((a, b) => a.effectiveTo.localeCompare(b.effectiveTo) || a.symbol.localeCompare(b.symbol));
     if (missingFormer.length) history.unshift(...missingFormer);
-    if (!history.length || history[history.length - 1]?.symbol !== providerRecord.symbol) {
-      const last = history[history.length - 1];
-      if (last) history[history.length - 1] = { ...last, effectiveTo: asOf };
-      history.push({
-        symbol: providerRecord.symbol,
-        effectiveFrom: asOf,
-        source: providerRecord.provider,
-      });
-    }
     const record: SecurityMasterRecord = {
       securityId: id,
       currentSymbol: providerRecord.symbol,
