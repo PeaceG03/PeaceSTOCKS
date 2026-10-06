@@ -24,9 +24,14 @@ const edge = Object.entries(
   (JSON.parse(readFileSync(join(FIXTURES, "reply-dust-edge-cases.json"), "utf8")) as { cases: Record<string, string> }).cases,
 ).map(([name, b64]) => ({ name, body: new Uint8Array(Buffer.from(b64, "base64")) }));
 
+const auditor = Object.entries(
+  (JSON.parse(readFileSync(join(FIXTURES, "reply-dust-auditor-cases.json"), "utf8")) as { cases: Record<string, string> }).cases,
+).map(([name, b64]) => ({ name, body: new Uint8Array(Buffer.from(b64, "base64")) }));
+
 test("fixtures are the frozen Massive replies and the full synthetic edge set", () => {
   assert.equal(real.length, 32);
   assert.equal(edge.length, 32);
+  assert.equal(auditor.length, 25);
   for (const r of real) assert.equal(sha256(r.body), r.sha256, r.symbol);
 });
 
@@ -52,6 +57,15 @@ test("all 32 synthetic edge cases round-trip byte-exact, including non-JSON and 
     const encoded = encodeReplyDust(x.body);
     assert.equal(encoded[0], REPLY_DUST_VERSION, x.name);
     assert.deepEqual(decodeReplyDust(encoded), x.body, x.name);
+  }
+});
+
+test("all 25 Auditor adversarial cases round-trip byte-exact and deterministically", () => {
+  for (const x of auditor) {
+    const encoded = encodeReplyDust(x.body);
+    assert.ok(encoded[0] === REPLY_DUST_VERSION || encoded[0] === REPLY_DUST_FALLBACK_VERSION, x.name);
+    assert.deepEqual(decodeReplyDust(encoded), x.body, x.name);
+    assert.deepEqual(encodeReplyDust(x.body), encoded, `${x.name} deterministic`);
   }
 });
 
