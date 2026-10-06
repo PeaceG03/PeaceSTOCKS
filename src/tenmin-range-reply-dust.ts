@@ -19,7 +19,7 @@ import { REPLY_DUST_FALLBACK_WARNING, type ZstdVersionProbe, assertPinnedZstdFor
 import { prepareSafeStoreFile } from "./store-path";
 
 // Two-month 10-minute range replies as Reply Dust. Folder identity is the fixed calendar pair
-// (e.g. 2024-10-01_2024-11-30) so a later window clamp still resumes the same folder. Each
+// (e.g. 2024-11-01_2024-12-31) so a later window clamp still resumes the same folder. Each
 // (security, ticker, fetch-span) has its own file set:
 //   permanent/tenmin-reply-dust/<calFrom>_<calTo>/
 //     <b64url(securityId)>.<b64url(symbol)>.<fetchFrom>_<fetchTo>.rdust
@@ -37,6 +37,12 @@ export const TENMIN_RANGE_OUTAGE_STOP = "MASSIVE_OUTAGE";
  * the writer treats it as not sealed (and never seals one itself).
  */
 export const TENMIN_UNIVERSE_EMPTY = "TENMIN_UNIVERSE_EMPTY";
+
+/**
+ * Range-level gap (securityId and symbol empty, fetchFrom/fetchTo = the dropped calendar days)
+ * for days of an unsealed range that left the history window. Never retried, never blocks sealing.
+ */
+export const TENMIN_AGED_OUT = "AGED_OUT";
 
 export function isEmptyTenMinRangeManifest(manifest: TenMinRangeManifest): boolean {
   return manifest.securityCount === 0 || manifest.securities.length === 0;
@@ -964,6 +970,14 @@ export async function writeTenMinRangeReplyDust(options: {
       }
     }
   }
+
+  // One AGED_OUT record per range: the newest span (from this run's plan) replaces older ones.
+  const agedOutKeys = new Set(
+    (options.initialGaps ?? []).filter((gap) => gap.reason === TENMIN_AGED_OUT).map(gapKey),
+  );
+  if (agedOutKeys.size)
+    for (const [key, gap] of [...gaps.entries()])
+      if (gap.reason === TENMIN_AGED_OUT && !agedOutKeys.has(key)) gaps.delete(key);
 
   const hints = new Map(
     (await loadTenMinRangeProgress(root, from, to)).map((entry) => [

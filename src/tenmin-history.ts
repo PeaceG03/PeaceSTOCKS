@@ -13,6 +13,7 @@ import type { MarketStore } from "./storage";
 import { MarketStorage } from "./storage";
 import { prepareSafeStoreFile } from "./store-path";
 import {
+  TENMIN_AGED_OUT,
   TENMIN_UNIVERSE_EMPTY,
   isEmptyTenMinRangeManifest,
   readTenMinRangeManifest,
@@ -75,6 +76,16 @@ export function effectiveHistoryWindowStart(
   return configuredWindowStart > retention ? configuredWindowStart : retention;
 }
 
+/**
+ * First calendar day of the first history range. Ranges are two calendar months anchored here
+ * (2024-11-01_2024-12-31, 2025-01-01_2025-02-28, ...); nothing before it is planned. Window days
+ * before it are reported as SKIPPED_BEFORE_FIRST_RANGE (a choice, not an error). Change it here.
+ */
+export const TENMIN_HISTORY_FIRST_RANGE_START = "2024-11-01";
+export const TENMIN_SKIPPED_BEFORE_FIRST_RANGE = "SKIPPED_BEFORE_FIRST_RANGE" as const;
+/** Range-level gap for days of an unsealed range that fell out of the window before it sealed. */
+export { TENMIN_AGED_OUT };
+
 function lastDayOfMonth(year: number, month: number): string {
   const day = new Date(Date.UTC(year, month, 0)).getUTCDate();
   return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
@@ -84,37 +95,33 @@ function firstDayOfMonth(year: number, month: number): string {
   return `${year}-${String(month).padStart(2, "0")}-01`;
 }
 
-function pairStartMonth(month: number): number {
-  if (month === 11) return 10;
-  if (month === 1) return 12;
-  if (month % 2 === 0) return month;
-  return month - 1;
-}
-
-function pairEndMonth(startMonth: number): number {
-  return startMonth === 12 ? 1 : startMonth + 1;
-}
-
-export function pairRangeForDate(date: string): { calendarFrom: string; calendarTo: string } {
+/** The two-calendar-month pair containing date, with pairs anchored on firstRangeStart's month. */
+export function pairRangeForDate(
+  date: string,
+  firstRangeStart: string = TENMIN_HISTORY_FIRST_RANGE_START,
+): { calendarFrom: string; calendarTo: string } {
   requireDate(date);
-  const year = Number(date.slice(0, 4));
-  const month = Number(date.slice(5, 7));
-  const startMonth = pairStartMonth(month);
-  const startYear = month === 1 ? year - 1 : year;
-  const endMonth = pairEndMonth(startMonth);
-  const endYear = startMonth === 12 ? startYear + 1 : startYear;
-  return {
-    calendarFrom: firstDayOfMonth(startYear, startMonth),
-    calendarTo: lastDayOfMonth(endYear, endMonth),
-  };
+  requireDate(firstRangeStart);
+  const anchorMonth = Number(firstRangeStart.slice(5, 7));
+  let year = Number(date.slice(0, 4));
+  let month = Number(date.slice(5, 7));
+  if ((((month - anchorMonth) % 2) + 2) % 2 === 1) {
+    month -= 1;
+    if (month === 0) {
+      month = 12;
+      year -= 1;
+    }
+  }
+  const endYear = month === 12 ? year + 1 : year;
+  const endMonth = month === 12 ? 1 : month + 1;
+  return { calendarFrom: firstDayOfMonth(year, month), calendarTo: lastDayOfMonth(endYear, endMonth) };
 }
 
-function nextPairRange(calendarTo: string): { calendarFrom: string; calendarTo: string } {
-  requireDate(calendarTo);
-  const year = Number(calendarTo.slice(0, 4));
-  const month = Number(calendarTo.slice(5, 7));
-  const nextStart = month === 12 ? { year: year + 1, month: 1 } : { year, month: month + 1 };
-  return pairRangeForDate(firstDayOfMonth(nextStart.year, nextStart.month));
+function nextPairRange(
+  calendarTo: string,
+  firstRangeStart: string,
+): { calendarFrom: string; calendarTo: string } {
+  return pairRangeForDate(addCalendarDays(calendarTo, 1), firstRangeStart);
 }
 
 export function lastCompletedSessionDate(
@@ -141,85 +148,93 @@ export function lastCompletedSessionDate(
 
 /**
  * One two-month history range. Folder keys use calendarFrom/calendarTo (stable). fetchFrom is
- * clamped to the effective window start on the first overlapping range.
+ * clamped to the effective window start when the window starts inside the range.
  */
 export interface TenMinHistoryRange {
-  /** Stable folder identity start (e.g. 2024-10-01). */
+  /** Stable folder identity start (e.g. 2024-11-01). */
   calendarFrom: string;
-  /** Stable folder identity end (e.g. 2024-11-30). */
+  /** Stable folder identity end (e.g. 2024-12-31). */
   calendarTo: string;
   /** Actual earliest date this run fetches inside the range (>= calendarFrom). */
   fetchFrom: string;
   fetchTo: string;
+  /**
+   * Calendar-day span [calendarFrom, fetchFrom - 1] that left the window before the range sealed
+   * (a calendar date span, not a trading-session list). Recorded as one range-level AGED_OUT gap.
+   */
+  agedOut?: { from: string; to: string };
+}
+
+export interface TenMinSkippedBeforeFirstRange {
+  /** Window start (inclusive). */
+  from: string;
+  /** Day before TENMIN_HISTORY_FIRST_RANGE_START (inclusive). */
+  to: string;
+  reason: typeof TENMIN_SKIPPED_BEFORE_FIRST_RANGE;
 }
 
 export interface TenMinHistoryPlan {
   windowStart: string;
   ranges: TenMinHistoryRange[];
-  /** Calendar ranges entirely before the effective window (skipped). */
+  /** Anchored ranges entirely before the effective window (aged out; not planned). */
   skippedBefore: Array<{ calendarFrom: string; calendarTo: string }>;
+  /** Window days before the first range start, skipped on purpose. */
+  skippedBeforeFirstRange?: TenMinSkippedBeforeFirstRange;
 }
 
 /**
- * Two-calendar-month ranges oldest first. Folder identity is always the full calendar pair.
- * Effective window = max(configured, lastCompleted − 2y + 2d). Ranges entirely before the window
- * are skipped; the first overlapping range clamps fetchFrom to the window start.
+ * Two-calendar-month ranges oldest first, anchored on TENMIN_HISTORY_FIRST_RANGE_START; nothing
+ * before it is planned. Effective window = max(configured, lastCompleted - 2y + 2d), applied
+ * inside each range's fetch span. Only ranges that ended before lastCompleted are planned.
  */
 export function planTenMinHistoryRanges(options: {
   windowStart?: string;
   lastCompletedSession: string;
+  firstRangeStart?: string;
 }): TenMinHistoryPlan {
   const configured = options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START;
+  const firstRangeStart = options.firstRangeStart ?? TENMIN_HISTORY_FIRST_RANGE_START;
   requireDate(options.lastCompletedSession);
+  requireDate(firstRangeStart);
+  if (firstRangeStart.slice(8) !== "01") throw new Error("TENMIN_FIRST_RANGE_START_NOT_MONTH_START");
   const windowStart = effectiveHistoryWindowStart(options.lastCompletedSession, configured);
-  if (windowStart >= options.lastCompletedSession)
-    return { windowStart, ranges: [], skippedBefore: [] };
-
-  const first = pairRangeForDate(windowStart);
-  // Walk from a range that could contain the configured floor, recording skips.
-  let cursor = pairRangeForDate(
-    configured < windowStart ? configured : windowStart,
-  );
-  // If configured is much earlier, start from a range near windowStart's pair.
-  if (cursor.calendarTo < windowStart) cursor = first;
-
-  // Also walk any earlier calendar pairs from configured for skippedBefore reporting.
-  const skippedBefore: Array<{ calendarFrom: string; calendarTo: string }> = [];
-  let skipCursor = pairRangeForDate(configured);
-  while (skipCursor.calendarTo < windowStart) {
-    skippedBefore.push({
-      calendarFrom: skipCursor.calendarFrom,
-      calendarTo: skipCursor.calendarTo,
-    });
-    const next = nextPairRange(skipCursor.calendarTo);
-    if (next.calendarTo <= skipCursor.calendarTo) break;
-    skipCursor = next;
-    if (skippedBefore.length > 48) break;
-  }
+  const skippedBeforeFirstRange: TenMinSkippedBeforeFirstRange | undefined =
+    windowStart < firstRangeStart
+      ? {
+          from: windowStart,
+          to: addCalendarDays(firstRangeStart, -1),
+          reason: TENMIN_SKIPPED_BEFORE_FIRST_RANGE,
+        }
+      : undefined;
+  const result = (ranges: TenMinHistoryRange[], skippedBefore: TenMinHistoryPlan["skippedBefore"]) => ({
+    windowStart,
+    ranges,
+    skippedBefore,
+    ...(skippedBeforeFirstRange ? { skippedBeforeFirstRange } : {}),
+  });
+  if (windowStart >= options.lastCompletedSession) return result([], []);
 
   const ranges: TenMinHistoryRange[] = [];
-  let { calendarFrom, calendarTo } = first;
-  for (;;) {
-    if (calendarTo < options.lastCompletedSession && calendarTo >= windowStart) {
+  const skippedBefore: Array<{ calendarFrom: string; calendarTo: string }> = [];
+  let cursor = pairRangeForDate(firstRangeStart, firstRangeStart);
+  for (let i = 0; i < 240 && cursor.calendarTo < options.lastCompletedSession; i += 1) {
+    const { calendarFrom, calendarTo } = cursor;
+    if (calendarTo < windowStart) skippedBefore.push({ calendarFrom, calendarTo });
+    else {
       const fetchFrom = windowStart > calendarFrom ? windowStart : calendarFrom;
-      if (fetchFrom <= calendarTo)
-        ranges.push({
-          calendarFrom,
-          calendarTo,
-          fetchFrom,
-          fetchTo: calendarTo,
-        });
-    } else if (calendarTo < windowStart) {
-      // already in skippedBefore
+      ranges.push({
+        calendarFrom,
+        calendarTo,
+        fetchFrom,
+        fetchTo: calendarTo,
+        ...(fetchFrom > calendarFrom
+          ? { agedOut: { from: calendarFrom, to: addCalendarDays(fetchFrom, -1) } }
+          : {}),
+      });
     }
-    const next = nextPairRange(calendarTo);
-    if (next.calendarFrom >= options.lastCompletedSession) break;
-    if (next.calendarTo <= calendarTo) break;
-    calendarFrom = next.calendarFrom;
-    calendarTo = next.calendarTo;
-    if (ranges.length > 48) break;
+    cursor = nextPairRange(calendarTo, firstRangeStart);
   }
-  return { windowStart, ranges, skippedBefore };
+  return result(ranges, skippedBefore);
 }
 
 export interface TenMinUniverseSecurity {
@@ -474,6 +489,8 @@ export interface TenMinHistoryRangeReport {
   fallbackFiles: number;
   massiveRequests: number;
   zstdVersion: string;
+  /** Calendar days of this range that left the window before it sealed (AGED_OUT gap). */
+  agedOut?: { from: string; to: string };
   /** Present when the range was planned this run (not skipped as already sealed). */
   securityLink?: typeof TENMIN_SECURITY_LINK;
   coverage?: { tradingSessions: number; missingSessions: string[]; medianSecuritiesPerSession: number };
@@ -490,6 +507,8 @@ export interface TenMinHistoryRunReport {
   windowStart: string;
   lastCompletedSession: string;
   skippedBefore: Array<{ calendarFrom: string; calendarTo: string }>;
+  /** Window days before TENMIN_HISTORY_FIRST_RANGE_START, skipped on purpose (not an error). */
+  skippedBeforeFirstRange?: TenMinSkippedBeforeFirstRange;
   reopen: boolean;
   /** securityId -> ticker links come from today's master. */
   securityLink: typeof TENMIN_SECURITY_LINK;
@@ -612,7 +631,20 @@ export async function runTenMinHistory(options: {
       calendarTo: range.calendarTo,
       fetchFrom: range.fetchFrom,
       fetchTo: range.fetchTo,
+      ...(range.agedOut ? { agedOut: range.agedOut } : {}),
     };
+    const agedOutGaps: TenMinRangeGapEntry[] = range.agedOut
+      ? [
+          {
+            securityId: "",
+            symbol: "",
+            reason: TENMIN_AGED_OUT,
+            at: stamp(),
+            fetchFrom: range.agedOut.from,
+            fetchTo: range.agedOut.to,
+          },
+        ]
+      : [];
     let universe: TenMinUniversePlan | undefined;
     try {
       // A non-empty sealed range is skipped without reading ~200 MB of daily bars. (A manifest
@@ -678,7 +710,7 @@ export async function runTenMinHistory(options: {
         from: range.calendarFrom,
         to: range.calendarTo,
         fetches: universe?.fetches ?? [],
-        initialGaps: universe?.gaps ?? [],
+        initialGaps: [...agedOutGaps, ...(universe?.gaps ?? [])],
         ...(reopen ? { reopen: true } : {}),
         ...(universe
           ? { securityLink: { status: universe.securityLink, source: universe.linkSource } }
@@ -739,6 +771,7 @@ export async function runTenMinHistory(options: {
     windowStart: plan.windowStart,
     lastCompletedSession: lastCompleted,
     skippedBefore: plan.skippedBefore,
+    ...(plan.skippedBeforeFirstRange ? { skippedBeforeFirstRange: plan.skippedBeforeFirstRange } : {}),
     reopen,
     securityLink: TENMIN_SECURITY_LINK,
     ranges: rangeReports,
@@ -783,8 +816,10 @@ export function tenMinHistorySummary(report: TenMinHistoryRunReport): Record<str
       status: range.status,
       securitiesPlanned: range.securitiesPlanned,
       fetchesPlanned: range.fetchesPlanned,
+      ...(range.agedOut ? { agedOut: range.agedOut } : {}),
       ...(range.error ? { error: range.error } : {}),
     })),
+    ...(report.skippedBeforeFirstRange ? { skippedBeforeFirstRange: report.skippedBeforeFirstRange } : {}),
     massiveRequests: report.massiveRequests,
     yieldedForScan: report.yieldedForScan,
     outageStop: report.outageStop,
