@@ -316,6 +316,7 @@ export interface PredictionStatus {
   reason:
     | "SOURCE_COLLECTION_FAILED"
     | "EVIDENCE_ONLY"
+    | "FREEZE_AFTER_OPEN"
     | "NO_QUALIFYING_CANDIDATES"
     | "PREDICTIONS_FROZEN";
   scannerVersion: string;
@@ -326,6 +327,19 @@ export interface PredictionStatus {
    * several UNAVAILABLE records share the same recordedAt. Absent on pre-S2 / old-style records.
    */
   attemptedAt?: string;
+  /**
+   * Freeze-time clock reading (ISO UTC). Set when the scanner decides FROZEN or FREEZE_AFTER_OPEN.
+   */
+  predictedAt?: string;
+  /** ISO UTC of the next trading session's 09:30 ET open that the freeze check used. */
+  nextSessionOpen?: string;
+  /** Calendar date of that next trading session. */
+  nextSessionDate?: string;
+  /**
+   * sha256 of the US equity calendar holiday/half-day table (see usEquityCalendarRulesTable).
+   * Absent on pre-S4 records.
+   */
+  calendarSha256?: string;
   sourceRunId?: string;
   supersedesPredictionIds: string[];
 }
@@ -396,6 +410,11 @@ export interface ScannerRunReport {
   completedAt: string;
   predictionStatus?: PredictionAvailability;
   predictionReason?: PredictionStatus["reason"];
+  /** Freeze-time clock (ISO UTC); set on FROZEN and FREEZE_AFTER_OPEN outcomes. */
+  predictedAt?: string;
+  nextSessionOpen?: string;
+  nextSessionDate?: string;
+  calendarSha256?: string;
   /** HTTP 429 responses the provider received during this run, including ones a retry recovered. */
   rateLimitedResponses?: number;
   /**

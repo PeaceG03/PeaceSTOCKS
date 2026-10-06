@@ -17,6 +17,7 @@ import { refreshEligibility, refreshUniverse } from "./universe";
 import { DEFAULT_SCANNER_CONFIG, rankSecurities } from "./ranking";
 import { MarketStorage } from "./storage";
 import { finalizeDailyPartition, MarketsScanner, US_EQUITY_CALENDAR } from "./scanner";
+import { beforeNextSessionOpen } from "./session-open";
 import { FileMarketProvider } from "./file-provider";
 
 const oldId = "old-stock";
@@ -94,6 +95,10 @@ class FailingProvider extends FixtureProvider {
 async function fixtureRoot(): Promise<string> {
   return mkdtemp(join(tmpdir(), "peaceai-markets-"));
 }
+
+/** Freeze-safe clock: 1 minute before the next session open after `sessionDate`. */
+const freezeNow = (sessionDate: string) => () => beforeNextSessionOpen(sessionDate);
+
 
 test("security identity is stable across ticker changes and scope excludes non-US assets", async () => {
   const root = await fixtureRoot();
@@ -347,7 +352,7 @@ test("daily scanner run finalizes the permanent partition manifest", async () =>
     const records = [providerRecord("issuer-1", "AAA")];
     const trackedId = securityId("fixture-provider", "issuer-1", "STOCK");
     const bars = [bar(trackedId, "2026-01-22", 121)];
-    const report = await new MarketsScanner(new FixtureProvider(records, bars), storage).run(
+    const report = await new MarketsScanner(new FixtureProvider(records, bars), storage, undefined, undefined, freezeNow("2026-01-22")).run(
       "2026-01-22",
     );
     assert.equal(report.status, "COMPLETE");
@@ -367,6 +372,9 @@ test("failed/partial provider runs are not reported as complete", async () => {
     const scanner = new MarketsScanner(
       new FixtureProvider([providerRecord("issuer-1", "AAA")], []),
       storage,
+      undefined,
+      undefined,
+      freezeNow("2026-01-05"),
     );
     const report = await scanner.run("2026-01-05");
     assert.equal(report.status, "FAILED");
@@ -491,7 +499,7 @@ test("failed source collection records unavailable prediction status and no ordi
   const root = await fixtureRoot();
   try {
     const provider = new FailingProvider([providerRecord("issuer-1", "AAA")], []);
-    const report = await new MarketsScanner(provider, new MarketStorage(root)).run("2026-01-02");
+    const report = await new MarketsScanner(provider, new MarketStorage(root), undefined, undefined, freezeNow("2026-01-02")).run("2026-01-02");
     assert.equal(report.status, "FAILED");
     assert.equal(report.predictionStatus, "UNAVAILABLE");
     assert.equal(report.predictionReason, "SOURCE_COLLECTION_FAILED");
@@ -516,7 +524,7 @@ test("valid scan with no qualifying candidates is frozen as a valid empty result
       [providerRecord("issuer-1", "AAA")],
       [bar(id, "2026-01-02", 100)],
     );
-    const report = await new MarketsScanner(provider, new MarketStorage(root)).run("2026-01-02");
+    const report = await new MarketsScanner(provider, new MarketStorage(root), undefined, undefined, freezeNow("2026-01-02")).run("2026-01-02");
     assert.equal(report.predictionStatus, "FROZEN");
     assert.equal(report.predictionReason, "NO_QUALIFYING_CANDIDATES");
     const status = JSON.parse(
@@ -554,6 +562,9 @@ test("scanner uses the SPY security id as the market benchmark", async () => {
         bar(spy, session, 121),
       ]),
       storage,
+      undefined,
+      undefined,
+      freezeNow(session),
     ).run(session);
     assert.equal(report.status, "COMPLETE");
     assert.equal(report.skips, undefined);
@@ -578,6 +589,9 @@ test("short or missing SPY history records a relative-strength skip without fail
     const missing = await new MarketsScanner(
       new FixtureProvider([providerRecord("issuer-1", "AAA")], [bar(id, "2026-01-02", 100)]),
       new MarketStorage(root),
+      undefined,
+      undefined,
+      freezeNow("2026-01-02"),
     ).run("2026-01-02");
     assert.equal(missing.status, "COMPLETE");
     assert.deepEqual(missing.skips, ["RELATIVE_STRENGTH_SKIP:SPY_NOT_IN_SECURITY_MASTER"]);
@@ -598,6 +612,9 @@ test("short or missing SPY history records a relative-strength skip without fail
           [bar(id, session, 104), bar(spy, session, 104)],
         ),
         storage,
+        undefined,
+        undefined,
+        freezeNow(session),
       ).run(session);
       assert.equal(report.status, "COMPLETE");
       assert.deepEqual(report.skips, ["RELATIVE_STRENGTH_SKIP:SPY_HISTORY_SHORT"]);
@@ -620,15 +637,15 @@ test("each run report records only the 429s received during that run", async () 
         return super.getDailyBars(sessionDate, securityIds);
       }
     }
-    const scanner = new MarketsScanner(
-      new CountingProvider([providerRecord("issuer-1", "AAA")], [bar(id, "2026-01-02", 100), bar(id, "2026-01-05", 101)]),
-      new MarketStorage(root),
-    );
-    assert.equal((await scanner.run("2026-01-02")).rateLimitedResponses, 2);
-    assert.equal((await scanner.run("2026-01-05")).rateLimitedResponses, 0);
+    const counting = new CountingProvider([providerRecord("issuer-1", "AAA")], [bar(id, "2026-01-02", 100), bar(id, "2026-01-05", 101)]);
+    assert.equal((await new MarketsScanner(counting, new MarketStorage(root), undefined, undefined, freezeNow("2026-01-02")).run("2026-01-02")).rateLimitedResponses, 2);
+    assert.equal((await new MarketsScanner(counting, new MarketStorage(root), undefined, undefined, freezeNow("2026-01-05")).run("2026-01-05")).rateLimitedResponses, 0);
     const plain = await new MarketsScanner(
       new FixtureProvider([providerRecord("issuer-1", "AAA")], [bar(id, "2026-01-02", 100)]),
       new MarketStorage(root),
+      undefined,
+      undefined,
+      freezeNow("2026-01-02"),
     ).run("2026-01-02");
     assert.equal(plain.rateLimitedResponses, 0);
   } finally {

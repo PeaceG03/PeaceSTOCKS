@@ -16,9 +16,10 @@ import { rankSecurities } from "./ranking";
 import { fingerprint } from "./identity";
 import { sessionCollectionDue } from "./et-time";
 import { makePredictionStatus, sessionAlreadyFrozen } from "./prediction-status";
+import { forwardFreezeAllowed, nextSessionOpen } from "./session-open";
 import { refreshEligibility, refreshUniverse } from "./universe";
 import type { MarketStore } from "./storage";
-import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
+import { US_EQUITY_MARKET_CALENDAR, usEquityCalendarSha256 } from "./us-calendar";
 import type { DustReader } from "./reader";
 import type { ReplyDustStore } from "./intraday-reply-dust";
 import type { ReplyDustBackend } from "./reply-dust";
@@ -279,16 +280,39 @@ export class MarketsScanner {
     const sourceCollectionFailed =
       providerNotReady ||
       failures.some((failure) => failure.startsWith("EVIDENCE_PROVIDER_ERROR:"));
-    const predictionUnavailableReason: PredictionStatus["reason"] | undefined =
-      sourceCollectionFailed
-        ? "SOURCE_COLLECTION_FAILED"
-        : mode === "EVIDENCE_ONLY"
-          ? "EVIDENCE_ONLY"
-          : undefined;
     const predictionIds = result.predictions.map((prediction) => prediction.predictionId);
     const emptyPredictionSets = result.predictions.every(
       (prediction) => prediction.securityIds.length === 0,
     );
+    // S4: authoritative freeze-time check — re-read the injected clock right before writes.
+    const freezeAt = this.now();
+    const freezeIso = freezeAt.toISOString();
+    const nextOpen = nextSessionOpen(sessionDate, this.calendar);
+    const calendarSha256 = usEquityCalendarSha256();
+    const freezeMeta = {
+      predictedAt: freezeIso,
+      attemptedAt: freezeIso,
+      ...(nextOpen
+        ? {
+            nextSessionDate: nextOpen.nextSessionDate,
+            nextSessionOpen: nextOpen.nextSessionOpen.toISOString(),
+          }
+        : {}),
+      calendarSha256,
+    };
+    const freezeAfterOpen =
+      mode === "FORWARD" &&
+      !sourceCollectionFailed &&
+      !forwardFreezeAllowed(sessionDate, freezeAt, this.calendar);
+
+    let predictionUnavailableReason: PredictionStatus["reason"] | undefined = sourceCollectionFailed
+      ? "SOURCE_COLLECTION_FAILED"
+      : mode === "EVIDENCE_ONLY"
+        ? "EVIDENCE_ONLY"
+        : freezeAfterOpen
+          ? "FREEZE_AFTER_OPEN"
+          : undefined;
+
     if (predictionUnavailableReason) {
       // Use the matching reason code — do not stamp SOURCE_COLLECTION_FAILED when collection ok.
       failures.push(
@@ -305,9 +329,13 @@ export class MarketsScanner {
             scannerVersion: SCANNER_VERSION,
             configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
             recordedAt: `${sessionDate}T23:59:59.999Z`,
-            attemptedAt: this.now().toISOString(),
             sourceRunId: runId,
             supersedesPredictionIds: predictionIds,
+            // FREEZE_AFTER_OPEN and EVIDENCE_ONLY carry freeze-check provenance when known.
+            ...(predictionUnavailableReason === "FREEZE_AFTER_OPEN" ||
+            predictionUnavailableReason === "EVIDENCE_ONLY"
+              ? freezeMeta
+              : { attemptedAt: freezeIso }),
           }),
         );
       } catch (statusError) {
@@ -315,8 +343,12 @@ export class MarketsScanner {
       }
     } else {
       try {
+        const predictions = result.predictions.map((set) => ({
+          ...set,
+          frozenAt: freezeIso,
+        }));
         await this.storage.writeBeliefs(result.beliefs);
-        await this.storage.writePredictions(result.predictions);
+        await this.storage.writePredictions(predictions);
         await this.storage.writeDecisions(result.beliefs);
         await this.storage.writePredictionStatus(
           makePredictionStatus(runId, {
@@ -326,9 +358,9 @@ export class MarketsScanner {
             scannerVersion: SCANNER_VERSION,
             configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
             recordedAt: `${sessionDate}T23:59:59.999Z`,
-            attemptedAt: this.now().toISOString(),
             sourceRunId: runId,
             supersedesPredictionIds: [],
+            ...freezeMeta,
           }),
         );
       } catch (error) {
@@ -342,6 +374,33 @@ export class MarketsScanner {
         : received.size > 0
           ? "COMPLETE_WITH_WARNINGS"
           : "FAILED";
+    const reportFreezeFields = {
+      predictedAt: freezeMeta.predictedAt,
+      calendarSha256: freezeMeta.calendarSha256,
+      ...(freezeMeta.nextSessionDate
+        ? {
+            nextSessionDate: freezeMeta.nextSessionDate,
+            nextSessionOpen: freezeMeta.nextSessionOpen!,
+          }
+        : {}),
+    };
+    const reportPrediction =
+      predictionUnavailableReason
+        ? {
+            predictionStatus: "UNAVAILABLE" as const,
+            predictionReason: predictionUnavailableReason,
+            ...(predictionUnavailableReason === "FREEZE_AFTER_OPEN" ||
+            predictionUnavailableReason === "EVIDENCE_ONLY"
+              ? reportFreezeFields
+              : {}),
+          }
+        : {
+            predictionStatus: "FROZEN" as const,
+            predictionReason: emptyPredictionSets
+              ? ("NO_QUALIFYING_CANDIDATES" as const)
+              : ("PREDICTIONS_FROZEN" as const),
+            ...reportFreezeFields,
+          };
     return this.finish({
       runId,
       session,
@@ -353,17 +412,7 @@ export class MarketsScanner {
       unresolvedFailures: failures,
       ...(skips.length ? { skips } : {}),
       scannerVersion: SCANNER_VERSION,
-      ...(predictionUnavailableReason
-        ? {
-            predictionStatus: "UNAVAILABLE" as const,
-            predictionReason: predictionUnavailableReason,
-          }
-        : {
-            predictionStatus: "FROZEN" as const,
-            predictionReason: emptyPredictionSets
-              ? ("NO_QUALIFYING_CANDIDATES" as const)
-              : ("PREDICTIONS_FROZEN" as const),
-          }),
+      ...reportPrediction,
       ...(groupedReplyDust ? { groupedReplyDust } : {}),
     });
   }

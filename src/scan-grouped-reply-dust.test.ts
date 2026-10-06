@@ -17,6 +17,7 @@ import { MassiveMarketProvider } from "./massive-provider";
 import { MemoryObjectClient, type ObjectMetadata } from "./object-store";
 import { ObjectMarketStorage } from "./object-storage";
 import { MarketsScanner, US_EQUITY_CALENDAR } from "./scanner";
+import { beforeNextSessionOpen } from "./session-open";
 import {
   SCAN_GROUPED_REPLY_DUST_HASH_CONFLICT,
   SCAN_GROUPED_REPLY_DUST_WRITE_FAILED,
@@ -244,7 +245,7 @@ test("write failure is a warning; scan core report byte-identical to feature-off
     const body = groupedBody("x");
     const offH = harness([body]);
     const offStorage = new ObjectMarketStorage(new MemoryObjectClient());
-    const off = await new MarketsScanner(offH.provider, offStorage, US_EQUITY_CALENDAR).run(DAY);
+    const off = await new MarketsScanner(offH.provider, offStorage, US_EQUITY_CALENDAR, undefined, () => beforeNextSessionOpen(DAY)).run(DAY);
 
     const onH = harness([body]);
     const onStorage = new ObjectMarketStorage(new MemoryObjectClient());
@@ -252,7 +253,7 @@ test("write failure is a warning; scan core report byte-identical to feature-off
       enabled: true,
       store: new FailPut(),
       zstdVersionProbe: pinnedZstd,
-    }).run(DAY);
+    }, () => beforeNextSessionOpen(DAY)).run(DAY);
 
     assert.deepEqual(coreReport(on), coreReport(off));
     assert.equal(on.groupedReplyDust?.enabled, true);
@@ -270,7 +271,7 @@ test("feature on: zero extra Massive requests vs feature off", async () => {
   const body = groupedBody("same");
   const offH = harness([body]);
   const offStorage = new ObjectMarketStorage(new MemoryObjectClient());
-  await new MarketsScanner(offH.provider, offStorage, US_EQUITY_CALENDAR).run(DAY);
+  await new MarketsScanner(offH.provider, offStorage, US_EQUITY_CALENDAR, undefined, () => beforeNextSessionOpen(DAY)).run(DAY);
   const offRequests = offH.requests();
 
   const onH = harness([body]);
@@ -280,7 +281,7 @@ test("feature on: zero extra Massive requests vs feature off", async () => {
     enabled: true,
     store,
     zstdVersionProbe: pinnedZstd,
-  }).run(DAY);
+  }, () => beforeNextSessionOpen(DAY)).run(DAY);
   assert.equal(onH.requests(), offRequests);
   assert.equal(report.groupedReplyDust?.extraMassiveRequests, 0);
   assert.equal(report.groupedReplyDust?.copies[0]?.status, "stored");
@@ -431,7 +432,7 @@ test("corporate-actions failure: grouped reply still stored; core report matches
 
   const offProvider = makeProvider();
   const offStorage = new ObjectMarketStorage(new MemoryObjectClient());
-  const off = await new MarketsScanner(offProvider, offStorage, US_EQUITY_CALENDAR).run(DAY);
+  const off = await new MarketsScanner(offProvider, offStorage, US_EQUITY_CALENDAR, undefined, () => beforeNextSessionOpen(DAY)).run(DAY);
 
   actionsCalls = 0;
   const onProvider = makeProvider();
@@ -441,7 +442,7 @@ test("corporate-actions failure: grouped reply still stored; core report matches
     enabled: true,
     store: dustStore,
     zstdVersionProbe: pinnedZstd,
-  }).run(DAY);
+  }, () => beforeNextSessionOpen(DAY)).run(DAY);
 
   assert.deepEqual(coreReport(on), coreReport(off));
   assert.equal(on.groupedReplyDust?.copies[0]?.status, "stored");

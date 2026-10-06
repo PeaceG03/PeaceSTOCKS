@@ -15,8 +15,13 @@ import {
   type IntradayBackfillResult,
 } from "./intraday-backfill";
 import type { MarketProvider } from "./contracts";
-import { etWallClockToUtc } from "./et-time";
 import { collectionDue } from "./scheduler";
+import {
+  forwardFreezeAllowed,
+  nextEligibleSession,
+  previousEligibleSession,
+} from "./session-open";
+export { forwardFreezeAllowed, nextEligibleSession, previousEligibleSession };
 import { MarketsScanner, type SessionCalendar } from "./scanner";
 import type { MarketStore } from "./storage";
 import { openMarketStore } from "./object-storage";
@@ -85,44 +90,6 @@ function sessionDate(now: Date): string {
 
 function eligible(kind: SessionKind): boolean {
   return kind === "NORMAL" || kind === "HALF_DAY";
-}
-
-/** Previous NORMAL/HALF_DAY session strictly before `sessionDate` (walks back up to 14 calendar days). */
-export function previousEligibleSession(
-  sessionDate: string,
-  calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
-): string | undefined {
-  for (let i = 1; i <= 14; i++) {
-    const candidate = addDays(sessionDate, -i);
-    if (eligible(calendar.getSession(candidate).kind)) return candidate;
-  }
-  return undefined;
-}
-
-/** Next NORMAL/HALF_DAY session strictly after `sessionDate` (walks forward up to 14 calendar days). */
-export function nextEligibleSession(
-  sessionDate: string,
-  calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
-): string | undefined {
-  for (let i = 1; i <= 14; i++) {
-    const candidate = addDays(sessionDate, i);
-    if (eligible(calendar.getSession(candidate).kind)) return candidate;
-  }
-  return undefined;
-}
-
-/**
- * Interim S2 guard (until S4 freeze-time): FORWARD only when run-start `now` is strictly before
- * the next trading session's 09:30 America/New_York open. After that open, collect EVIDENCE_ONLY.
- */
-export function forwardFreezeAllowed(
-  dueSessionDate: string,
-  now: Date,
-  calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
-): boolean {
-  const next = nextEligibleSession(dueSessionDate, calendar);
-  if (!next) return true;
-  return now.getTime() < etWallClockToUtc(next, 9, 30).getTime();
 }
 
 export function findMissedEligibleSessions(
@@ -324,7 +291,7 @@ export async function runScannerHost(
     !collectedSessions.has(due.session.sessionDate) &&
     !collected.some((report) => credentialRejected(report) || report.status === "PROVIDER_NOT_READY")
   ) {
-    // Interim until S4: FORWARD only before the next trading session's 09:30 ET open.
+    // S2 early gate (run start): FORWARD only before next session 09:30 ET open; S4 re-checks at freeze.
     const mode = forwardFreezeAllowed(due.session.sessionDate, now, calendar)
       ? "FORWARD"
       : "EVIDENCE_ONLY";

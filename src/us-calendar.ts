@@ -1,4 +1,5 @@
 import type { SessionKind, SessionRecord } from "./contracts";
+import { sha256, stableJson } from "./identity";
 import type { SessionCalendar } from "./scanner";
 
 function dateUtc(date: string): Date {
@@ -99,3 +100,37 @@ export const US_EQUITY_MARKET_CALENDAR: SessionCalendar = {
     };
   },
 };
+
+/**
+ * Stable holiday/half-day table used for calendarSha256 on freeze records.
+ * Hashed fields: source label, NYSE_SPECIAL_CLOSURES, and for each year in
+ * [fromYear, toYear] the sorted closed dates and half-day dates produced by the
+ * same rules as US_EQUITY_MARKET_CALENDAR (weekends are not listed — only rule
+ * holidays and scheduled early closes).
+ */
+export function usEquityCalendarRulesTable(fromYear = 2020, toYear = 2035): {
+  source: string;
+  specialClosures: Readonly<Record<string, string>>;
+  years: readonly [number, number];
+  closedByYear: Record<string, string[]>;
+  halfDaysByYear: Record<string, string[]>;
+} {
+  const closedByYear: Record<string, string[]> = {};
+  const halfDaysByYear: Record<string, string[]> = {};
+  for (let year = fromYear; year <= toYear; year++) {
+    closedByYear[String(year)] = [...nyseClosedDates(year)].sort();
+    halfDaysByYear[String(year)] = [...nyseHalfDayDates(year)].sort();
+  }
+  return {
+    source: "nyse-calendar-rules-v1",
+    specialClosures: { ...NYSE_SPECIAL_CLOSURES },
+    years: [fromYear, toYear],
+    closedByYear,
+    halfDaysByYear,
+  };
+}
+
+/** sha256 hex of stableJson(usEquityCalendarRulesTable(...)). */
+export function usEquityCalendarSha256(fromYear = 2020, toYear = 2035): string {
+  return sha256(stableJson(usEquityCalendarRulesTable(fromYear, toYear)));
+}

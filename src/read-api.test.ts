@@ -7,6 +7,7 @@ import type { CanonicalDailyBar, MarketProvider, ProviderSecurityRecord } from "
 import { securityId } from "./identity";
 import { readScannerRoute } from "./read-api";
 import { MarketsScanner } from "./scanner";
+import { beforeNextSessionOpen } from "./session-open";
 import { MarketStorage } from "./storage";
 
 const record = (providerSecurityId: string, symbol: string): ProviderSecurityRecord => ({
@@ -78,7 +79,7 @@ test("a rerun keeps one belief and the read API returns tickers", async () => {
       },
     };
     const storage = new MarketStorage(root);
-    const scanner = new MarketsScanner(provider, storage);
+    const scanner = new MarketsScanner(provider, storage, undefined, undefined, () => beforeNextSessionOpen("2026-01-22"));
     const first = await scanner.run("2026-01-22");
     const beliefs = await storage.loadBeliefs("2026-01-22");
     const predictions = await storage.loadPredictions("2026-01-22");
