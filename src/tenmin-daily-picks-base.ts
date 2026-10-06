@@ -5,8 +5,10 @@
  *
  * Error taxonomy (day stays UNSEALED; backlog steps past):
  * - Absent input → BASE_INPUT_MISSING (skip)
- * - Present but unverified / checksum / decode failure → CORRUPT (with key)
- * - Transient store read error → FAILED (with key)
+ * - Clear integrity failure from our readers (checksum/sha/length/version/decode/
+ *   zstd/JSON) → CORRUPT (with key). Detected via StoreReadIntegrityError or known
+ *   reader codes; walks error.cause. Everything else (R2 5xx, timeouts, unknown) →
+ *   FAILED (retry). 404 stays MISSING via get() returning undefined.
  * Newest asOf ≤ D never falls back to an older index on corrupt/unverified/fail.
  */
 
@@ -86,11 +88,107 @@ export class TenMinDailyBaseFailedError extends Error {
   }
 }
 
+/**
+ * Marker for clear integrity failures raised by our own store read/decode paths.
+ * Prefer throwing this (or setting `.code` to a known integrity code) over relying
+ * on message text alone.
+ */
+export class StoreReadIntegrityError extends Error {
+  readonly code: string;
+  constructor(code: string, message?: string, options?: ErrorOptions) {
+    super(message ?? code, options);
+    this.name = "StoreReadIntegrityError";
+    this.code = code;
+  }
+}
+
+/**
+ * Known integrity codes / message prefixes from daily-reply-dust, reply-dust, and
+ * ticker-reference-index readers (checksum, sha, length, version, decode, zstd, shape).
+ */
+const STORE_READ_INTEGRITY_CODES = new Set<string>([
+  "REPLY_DUST_MANIFEST_CHECKSUM_MISMATCH",
+  "REPLY_DUST_FILE_CHECKSUM_MISMATCH",
+  "REPLY_DUST_REPLY_CHECKSUM_MISMATCH",
+  "REPLY_DUST_HASH_MISMATCH",
+  "REPLY_DUST_DICTIONARY_HASH_MISMATCH",
+  "REPLY_DUST_VERSION_UNSUPPORTED",
+  "REPLY_DUST_TRUNCATED",
+  "REPLY_DUST_ZSTD_MAGIC",
+  "REPLY_DUST_ZSTD_FAILED",
+  "REPLY_DUST_VERIFY_FAILED",
+  "REPLY_DUST_NEGATIVE_UVARINT",
+  "REPLY_DUST_BAR_SHAPE",
+  "REPLY_DUST_UNKNOWN_FIELD",
+  "REPLY_DUST_T_NOT_INTEGER",
+  "REPLY_DUST_KEY_TABLE_MISS",
+  "REPLY_DUST_ORDER_TABLE_MISS",
+  "REPLY_DUST_TRAILING_BYTES",
+  "REPLY_DUST_REPLY_COUNT",
+  "TICKER_REFERENCE_INDEX_FILE_MISMATCH",
+  "TICKER_REFERENCE_INDEX_BODY_MISMATCH",
+  "TICKER_REFERENCE_INDEX_MANIFEST_INVALID",
+  "TICKER_REFERENCE_INDEX_ARCHIVE_SHA_MISMATCH",
+  "TICKER_REFERENCE_INDEX_ARCHIVE_MONTH_MISMATCH",
+  "TICKER_REFERENCE_INDEX_COUNT_MISMATCH",
+  "TICKER_REFERENCE_INDEX_READBACK_MISMATCH",
+  "TICKER_REFERENCE_INDEX_MANIFEST_READBACK_MISMATCH",
+  "TICKER_REFERENCE_INDEX_ENTRY_INVALID",
+  "TICKER_REFERENCE_INDEX_ORDER_INVALID",
+  "TICKER_REFERENCE_INDEX_STATE_INVALID",
+  "TICKER_REFERENCE_INDEX_VERIFY_FAILED",
+  "TICKER_REFERENCE_DELTA_BASE_MISMATCH",
+  "TICKER_REFERENCE_DELTA_INVALID",
+  "TICKER_REFERENCE_DELTA_RECORD_INVALID",
+  "TICKER_REFERENCE_DELTA_VERIFY_FAILED",
+  "TICKER_REFERENCE_REPLY_INVALID",
+  "TICKER_REFERENCE_RECORD_NOT_OBJECT",
+]);
+
+function storeReadErrorChain(error: unknown): unknown[] {
+  const out: unknown[] = [];
+  const seen = new Set<unknown>();
+  let cur: unknown = error;
+  while (cur !== undefined && cur !== null && !seen.has(cur)) {
+    out.push(cur);
+    seen.add(cur);
+    if (cur instanceof Error && "cause" in cur && cur.cause !== undefined) {
+      cur = cur.cause;
+    } else {
+      break;
+    }
+  }
+  return out;
+}
+
+function integrityCodeFromMessage(message: string): string | undefined {
+  const head = /^([A-Z][A-Z0-9_]*)/u.exec(message)?.[1];
+  return head && STORE_READ_INTEGRITY_CODES.has(head) ? head : undefined;
+}
+
+/**
+ * True only for clear integrity failures from our readers (checksum/sha/length/
+ * version/decode/zstd/JSON). Walks `error.cause`. Unknown / R2 / network / HTTP
+ * errors are not integrity failures.
+ */
+export function isIntegrityStoreReadError(error: unknown): boolean {
+  for (const node of storeReadErrorChain(error)) {
+    if (node instanceof StoreReadIntegrityError) return true;
+    if (node instanceof SyntaxError) return true; // JSON.parse from our readers
+    if (!(node instanceof Error)) continue;
+    const coded = (node as NodeJS.ErrnoException).code;
+    if (typeof coded === "string" && STORE_READ_INTEGRITY_CODES.has(coded)) return true;
+    if (integrityCodeFromMessage(node.message)) return true;
+  }
+  return false;
+}
+
+/**
+ * Store read should be retried later (FAILED). Default true: only clear integrity
+ * failures are non-transient (CORRUPT). Inverted from the old R2_-prefix allowlist.
+ */
 export function isTransientStoreReadError(error: unknown): boolean {
-  const msg = error instanceof Error ? error.message : String(error);
-  return /R2_|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|FETCH_|_GET_500|_LIST_500|_HEAD_500|socket hang up/i.test(
-    msg,
-  );
+  return !isIntegrityStoreReadError(error);
 }
 
 export interface TickerIndexAsOf {
@@ -122,14 +220,14 @@ export async function loadTickerReferenceIndexAsOf(
   try {
     history = await listTickerReferenceIndexHistory(store);
   } catch (error) {
-    if (isTransientStoreReadError(error)) {
-      throw new TenMinDailyBaseFailedError(
+    if (isIntegrityStoreReadError(error)) {
+      throw new TenMinDailyBaseCorruptError(
         TICKER_REFERENCE_INDEX_MANIFEST_KEY,
         sessionDate,
         error instanceof Error ? error.message : String(error),
       );
     }
-    throw new TenMinDailyBaseCorruptError(
+    throw new TenMinDailyBaseFailedError(
       TICKER_REFERENCE_INDEX_MANIFEST_KEY,
       sessionDate,
       error instanceof Error ? error.message : String(error),
@@ -165,14 +263,14 @@ export async function loadTickerReferenceIndexAsOf(
         entries: loaded.entries,
       };
     } catch (error) {
-      if (isTransientStoreReadError(error)) {
-        throw new TenMinDailyBaseFailedError(
+      if (isIntegrityStoreReadError(error)) {
+        throw new TenMinDailyBaseCorruptError(
           entry.key,
           sessionDate,
           error instanceof Error ? error.message : String(error),
         );
       }
-      throw new TenMinDailyBaseCorruptError(
+      throw new TenMinDailyBaseFailedError(
         entry.key,
         sessionDate,
         error instanceof Error ? error.message : String(error),
@@ -272,14 +370,14 @@ export async function buildTenMinDailyPicksBaseFromStored(
     hasManifest = !!(await options.store.get(manifestKey));
     hasFile = !!(await options.store.get(fileKey));
   } catch (error) {
-    if (isTransientStoreReadError(error)) {
-      throw new TenMinDailyBaseFailedError(
+    if (isIntegrityStoreReadError(error)) {
+      throw new TenMinDailyBaseCorruptError(
         manifestKey,
         D,
         error instanceof Error ? error.message : String(error),
       );
     }
-    throw new TenMinDailyBaseCorruptError(
+    throw new TenMinDailyBaseFailedError(
       manifestKey,
       D,
       error instanceof Error ? error.message : String(error),
@@ -294,15 +392,15 @@ export async function buildTenMinDailyPicksBaseFromStored(
   try {
     manifest = await readDailyReplyDustManifest(options.store, D);
   } catch (error) {
-    if (isTransientStoreReadError(error)) {
-      throw new TenMinDailyBaseFailedError(
+    if (isIntegrityStoreReadError(error)) {
+      // Present but checksum / parse failure.
+      throw new TenMinDailyBaseCorruptError(
         manifestKey,
         D,
         error instanceof Error ? error.message : String(error),
       );
     }
-    // Present but checksum / parse failure.
-    throw new TenMinDailyBaseCorruptError(
+    throw new TenMinDailyBaseFailedError(
       manifestKey,
       D,
       error instanceof Error ? error.message : String(error),
@@ -320,14 +418,14 @@ export async function buildTenMinDailyPicksBaseFromStored(
   try {
     reply = await readDailyReplyDustReply(options.store, manifest);
   } catch (error) {
-    if (isTransientStoreReadError(error)) {
-      throw new TenMinDailyBaseFailedError(
+    if (isIntegrityStoreReadError(error)) {
+      throw new TenMinDailyBaseCorruptError(
         fileKey,
         D,
         error instanceof Error ? error.message : String(error),
       );
     }
-    throw new TenMinDailyBaseCorruptError(
+    throw new TenMinDailyBaseFailedError(
       fileKey,
       D,
       error instanceof Error ? error.message : String(error),

@@ -12,10 +12,13 @@ import {
   TENMIN_DAILY_BASE_INPUT_FAILED,
   TENMIN_DAILY_BASE_INPUT_MISSING,
   TENMIN_DAILY_MASSIVE_PROVIDER,
+  StoreReadIntegrityError,
   TenMinDailyBaseCorruptError,
   TenMinDailyBaseFailedError,
   TenMinDailyBaseInputError,
   buildTenMinDailyPicksBaseFromStored,
+  isIntegrityStoreReadError,
+  isTransientStoreReadError,
   loadTickerReferenceIndexAsOf,
   mapsFromTickerReferenceEntries,
 } from "./tenmin-daily-picks-base";
@@ -658,5 +661,217 @@ test("runner: no ticker index at all → every settled day SKIPPED_BASE_INPUT, z
     assert.equal(day?.requests, 0);
     assert.equal((await readTenMinDayPicks(dust, d)).status, "TENMIN_DAY_NOT_SEALED");
   }
+});
+
+test("isTransientStoreReadError: inverted — only clear integrity is non-transient", () => {
+  // Auditor cases: R2_ + timeout → FAILED (transient); integrity-in-cause → CORRUPT;
+  // status 500 → FAILED; plain unknown → FAILED.
+  const r2Timeout = new Error("R2_GET timed out waiting for upstream");
+  assert.equal(isTransientStoreReadError(r2Timeout), true);
+  assert.equal(isIntegrityStoreReadError(r2Timeout), false);
+
+  const wrappedChecksum = new Error("store get failed", {
+    cause: new Error("REPLY_DUST_MANIFEST_CHECKSUM_MISMATCH"),
+  });
+  assert.equal(isIntegrityStoreReadError(wrappedChecksum), true);
+  assert.equal(isTransientStoreReadError(wrappedChecksum), false);
+
+  const typedWrapped = new Error("wrapper", {
+    cause: new StoreReadIntegrityError("REPLY_DUST_FILE_CHECKSUM_MISMATCH"),
+  });
+  assert.equal(isIntegrityStoreReadError(typedWrapped), true);
+
+  const status500 = Object.assign(new Error("upstream"), { status: 500 });
+  assert.equal(isTransientStoreReadError(status500), true);
+  assert.equal(isIntegrityStoreReadError(status500), false);
+
+  assert.equal(isTransientStoreReadError(new Error("something")), true);
+  assert.equal(isIntegrityStoreReadError(new Error("something")), false);
+
+  // Transient table (must be true / not integrity).
+  const transientCases: unknown[] = [
+    new Error("R2_GET_500"),
+    new Error("R2_HEAD_503"),
+    new Error("R2_GET_429"),
+    new Error("SlowDown"),
+    new Error("ETIMEDOUT"),
+    Object.assign(new Error("aborted"), { name: "AbortError" }),
+    Object.assign(new Error("reset"), { code: "ECONNRESET" }),
+    new Error("fetch failed"),
+    Object.assign(new Error("connect"), { code: "UND_ERR_CONNECT_TIMEOUT" }),
+    new Error("R2_LIST_TRUNCATED_WITHOUT_TOKEN"),
+    new Error("R2_CONFIG_REQUIRED"),
+  ];
+  for (const err of transientCases) {
+    assert.equal(
+      isTransientStoreReadError(err),
+      true,
+      `expected transient: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // Integrity table (must be false for transient / true for integrity).
+  const integrityCases: unknown[] = [
+    new Error("REPLY_DUST_MANIFEST_CHECKSUM_MISMATCH"),
+    new Error("REPLY_DUST_FILE_CHECKSUM_MISMATCH:grouped-daily:2024-11-04"),
+    new Error("REPLY_DUST_VERSION_UNSUPPORTED:99"),
+    new Error("REPLY_DUST_ZSTD_FAILED"),
+    new Error("TICKER_REFERENCE_INDEX_BODY_MISMATCH:base"),
+    new Error("TICKER_REFERENCE_INDEX_FILE_MISMATCH:permanent/x"),
+    new Error("TICKER_REFERENCE_INDEX_ARCHIVE_SHA_MISMATCH:permanent/y"),
+    new Error("TICKER_REFERENCE_INDEX_MANIFEST_INVALID"),
+    new SyntaxError("Unexpected token } in JSON at position 0"),
+    new StoreReadIntegrityError("REPLY_DUST_HASH_MISMATCH"),
+    // R2-prefixed wrapper must not hide integrity in cause:
+    new Error("R2_GET_200 body invalid", {
+      cause: new Error("TICKER_REFERENCE_INDEX_BODY_MISMATCH"),
+    }),
+  ];
+  for (const err of integrityCases) {
+    assert.equal(
+      isIntegrityStoreReadError(err),
+      true,
+      `expected integrity: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    assert.equal(isTransientStoreReadError(err), false);
+  }
+});
+
+test("buildBase: R2 5xx on ticker index read → FAILED; unknown → FAILED; checksum → CORRUPT", async () => {
+  const inner = new MemoryObjectClient();
+  await plantIndex(inner, D, UNIVERSE);
+  await plantGrouped(inner, D, UNIVERSE.map((u) => u.ticker));
+
+  const history = await listTickerReferenceIndexHistory(inner);
+  const baseKey = history[0]!.manifest!.base.key;
+
+  const flaky5xx = {
+    async get(key: string) {
+      if (key === baseKey) throw new Error("R2_GET_503");
+      return inner.get(key);
+    },
+    async put(key: string, body: Uint8Array, metadata?: object) {
+      return inner.put(key, body, metadata as never);
+    },
+    async head(key: string) {
+      return inner.head(key);
+    },
+    async delete(key: string) {
+      return inner.delete(key);
+    },
+    async list(prefix: string) {
+      return inner.list(prefix);
+    },
+  };
+
+  await assert.rejects(
+    () => buildTenMinDailyPicksBaseFromStored({ store: flaky5xx as never, sessionDate: D }),
+    (e: unknown) =>
+      e instanceof TenMinDailyBaseFailedError &&
+      e.message.includes("R2_GET_503"),
+  );
+
+  const flakyUnknown = {
+    ...flaky5xx,
+    async get(key: string) {
+      if (key === baseKey) throw new Error("something");
+      return inner.get(key);
+    },
+  };
+  await assert.rejects(
+    () => buildTenMinDailyPicksBaseFromStored({ store: flakyUnknown as never, sessionDate: D }),
+    (e: unknown) =>
+      e instanceof TenMinDailyBaseFailedError && e.message.includes("something"),
+  );
+
+  // Integrity via cause still CORRUPT even when outer message looks like R2_.
+  const flakyIntegrity = {
+    ...flaky5xx,
+    async get(key: string) {
+      if (key === baseKey) {
+        throw new Error("R2_GET failed", {
+          cause: new Error("TICKER_REFERENCE_INDEX_FILE_MISMATCH:" + baseKey),
+        });
+      }
+      return inner.get(key);
+    },
+  };
+  await assert.rejects(
+    () => buildTenMinDailyPicksBaseFromStored({ store: flakyIntegrity as never, sessionDate: D }),
+    (e: unknown) => e instanceof TenMinDailyBaseCorruptError,
+  );
+});
+
+test("runner: R2 5xx on grouped reply → FAILED; checksum mismatch → CORRUPT; unknown → FAILED", async () => {
+  const inner = new MemoryObjectClient();
+  const dust = immutableReplyDustStore(inner);
+  const day5xx = "2024-11-04";
+  const dayCorrupt = "2024-11-05";
+  const dayUnknown = "2024-11-06";
+  const dayOk = "2024-11-07";
+
+  for (const d of [day5xx, dayCorrupt, dayUnknown, dayOk]) {
+    await plantIndex(inner, d, UNIVERSE);
+    await plantGrouped(inner, d, UNIVERSE.map((u) => u.ticker));
+  }
+
+  const file5xx = dailyReplyDustFileKey(day5xx);
+  const manifestCorrupt = dailyReplyDustManifestKey(dayCorrupt);
+  const fileUnknown = dailyReplyDustFileKey(dayUnknown);
+
+  const goodCorrupt = await inner.get(manifestCorrupt);
+  assert.ok(goodCorrupt);
+  const parsed = JSON.parse(new TextDecoder().decode(goodCorrupt!)) as Record<string, unknown>;
+  parsed.checksum = "b".repeat(64);
+  await inner.put(manifestCorrupt, new TextEncoder().encode(JSON.stringify(parsed)));
+
+  const proxy = {
+    async get(key: string) {
+      if (key === file5xx) throw new Error("R2_GET_500");
+      if (key === fileUnknown) throw new Error("something");
+      return inner.get(key);
+    },
+    async put(key: string, body: Uint8Array, metadata?: object) {
+      return inner.put(key, body, metadata as never);
+    },
+    async head(key: string) {
+      return inner.head(key);
+    },
+    async delete(key: string) {
+      return inner.delete(key);
+    },
+    async list(prefix: string) {
+      return inner.list(prefix);
+    },
+  };
+  const store = immutableReplyDustStore(proxy as never);
+
+  const report = await runTenMinDailyPicks({
+    store,
+    storage: memoryStorage(),
+    days: [day5xx, dayCorrupt, dayUnknown, dayOk],
+    env: { TENMIN_DAILY_PICKS: "true" },
+    now: SETTLED_NOW,
+    clock: settledClock,
+    limit: 4,
+    fetchReply: async (sec) =>
+      new TextEncoder().encode(
+        JSON.stringify({
+          ticker: sec.symbol,
+          results: [{ t: 1, o: 1, h: 1, l: 1, c: 1, v: 1, n: 1 }],
+          status: "OK",
+          request_id: `req-${sec.symbol}`,
+        }),
+      ),
+  });
+
+  const outcome = (d: string) => report.days.find((x) => x.sessionDate === d)?.outcome;
+  assert.equal(outcome(day5xx), "FAILED", JSON.stringify(report.days));
+  assert.equal(outcome(dayCorrupt), "CORRUPT", JSON.stringify(report.days));
+  assert.equal(outcome(dayUnknown), "FAILED", JSON.stringify(report.days));
+  assert.ok(report.sealed.includes(dayOk), JSON.stringify(report));
+  assert.ok(
+    report.corrupt.some((c) => c.sessionDate === dayCorrupt && c.key === manifestCorrupt),
+  );
 });
 
