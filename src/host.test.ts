@@ -55,8 +55,9 @@ test("scheduler cursor stays before a provider-not-ready session", async () => {
           { status: 403 },
         ),
     });
+    // 05:00Z on Jan 23 = 00:00 ET Jan 23 → collectionDue targets prior ET day 2026-01-22.
     const result = await runScannerHost({
-      now: new Date("2026-01-22T21:45:00.000Z"),
+      now: new Date("2026-01-23T05:00:00.000Z"),
       storageRoot: root,
       provider,
       completionDelayMinutes: 30,
@@ -66,6 +67,7 @@ test("scheduler cursor stays before a provider-not-ready session", async () => {
     const state = JSON.parse(await readFile(join(root, "scheduler-host-state.json"), "utf8")) as {
       lastObservedSessionDate: string;
     };
+    // Cursor stays before the NOT_READY session (2026-01-22).
     assert.equal(state.lastObservedSessionDate, "2026-01-21");
   } finally {
     if (previous === undefined) delete process.env.MASSIVE_API_KEY;

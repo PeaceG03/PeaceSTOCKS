@@ -147,9 +147,14 @@ test("NYSE calendar recognizes holidays and common early closes", () => {
   assert.equal(US_EQUITY_MARKET_CALENDAR.getSession("2025-01-10").kind, "NORMAL");
 });
 
-test("scheduler waits through close plus provider publication delay", () => {
-  const before = collectionDue({ now: new Date("2026-08-26T19:00:00.000Z") });
-  const after = collectionDue({ now: new Date("2026-08-26T21:00:00.000Z") });
-  assert.equal(before.reason, "BEFORE_CLOSE");
-  assert.equal(after.due, true);
+test("collectionDue targets the previous ET calendar session (due only after midnight ET)", () => {
+  // 2026-08-26 19:00Z = 15:00 ET on Wed 8/26 → due session is 8/25 (trading day).
+  const afternoon = collectionDue({ now: new Date("2026-08-26T19:00:00.000Z") });
+  assert.equal(afternoon.due, true);
+  assert.equal(afternoon.session.sessionDate, "2026-08-25");
+  assert.equal(afternoon.reason, "READY");
+  // 2026-08-27 04:00Z = 00:00 ET on Thu 8/27 → due session is 8/26.
+  const afterMidnight = collectionDue({ now: new Date("2026-08-27T04:00:00.000Z") });
+  assert.equal(afterMidnight.due, true);
+  assert.equal(afterMidnight.session.sessionDate, "2026-08-26");
 });

@@ -1,9 +1,11 @@
 import type { ScannerRunReport, SessionRecord } from "./contracts";
+import { etCalendarDate } from "./et-time";
 import type { MarketsScanner, SessionCalendar } from "./scanner";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 
 export interface CollectionScheduleOptions {
   calendar?: SessionCalendar;
+  /** @deprecated Ignored: collection is due on ET D+1, not close+delay on D. Kept for call-site compat. */
   completionDelayMinutes?: number;
   now?: Date;
 }
@@ -12,36 +14,30 @@ export interface CollectionDueResult {
   session: SessionRecord;
   reason: "BEFORE_CLOSE" | "WAITING_FOR_DATA" | "CLOSED" | "READY";
 }
-function nyTime(now: Date): { date: string; minutes: number } {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(now);
-  const value = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
-  return {
-    date: `${value("year")}-${value("month")}-${value("day")}`,
-    minutes: Number(value("hour")) * 60 + Number(value("minute")),
-  };
+
+function addEtDays(isoDate: string, days: number): string {
+  const date = new Date(`${isoDate}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
 }
-/** Returns a deterministic due/not-due decision for a scheduler-owned invocation. */
+
+/**
+ * Session D is due for collection only when the current America/New_York calendar date is
+ * strictly after D. The host's natural target is therefore yesterday's ET session (when it was
+ * a trading day). Same-ET-day runs are not due (scanner also returns NOT_DUE).
+ */
 export function collectionDue(options: CollectionScheduleOptions = {}): CollectionDueResult {
   const calendar = options.calendar ?? US_EQUITY_MARKET_CALENDAR;
-  const delay = options.completionDelayMinutes ?? 30;
-  if (delay < 0 || delay > 24 * 60) throw new Error("INVALID_COLLECTION_DELAY");
-  const local = nyTime(options.now ?? new Date()),
-    session = calendar.getSession(local.date);
+  const now = options.now ?? new Date();
+  const etToday = etCalendarDate(now);
+  const targetDate = addEtDays(etToday, -1);
+  const session = calendar.getSession(targetDate);
   if (session.kind === "CLOSED" || session.kind === "HOLIDAY")
     return { due: false, session, reason: "CLOSED" };
-  const close = session.kind === "HALF_DAY" ? 13 * 60 : 16 * 60;
-  if (local.minutes < close) return { due: false, session, reason: "BEFORE_CLOSE" };
-  if (local.minutes < close + delay) return { due: false, session, reason: "WAITING_FOR_DATA" };
+  // Target is always a prior ET day, so it is due.
   return { due: true, session, reason: "READY" };
 }
+
 /** One idempotent invocation; a governed host owns cadence and missed-session recovery. */
 export async function runDueCollection(
   scanner: MarketsScanner,

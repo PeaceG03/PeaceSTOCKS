@@ -14,6 +14,7 @@ import type {
 import { MARKET_SCHEMA_VERSION, SCANNER_VERSION } from "./contracts";
 import { rankSecurities } from "./ranking";
 import { fingerprint } from "./identity";
+import { sessionCollectionDue } from "./et-time";
 import { makePredictionStatus, sessionAlreadyFrozen } from "./prediction-status";
 import { refreshEligibility, refreshUniverse } from "./universe";
 import type { MarketStore } from "./storage";
@@ -70,6 +71,8 @@ export class MarketsScanner {
     private readonly storage: MarketStore,
     private readonly calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
     private readonly groupedReplyDust: MarketsScannerGroupedReplyDustOptions | undefined = undefined,
+    /** Injectable clock for the collection-due gate (defaults to Date). */
+    private readonly now: () => Date = () => new Date(),
   ) {}
 
   private rateLimitedAtRunStart = 0;
@@ -79,6 +82,23 @@ export class MarketsScanner {
     await this.storage.initialize();
     const session = this.calendar.getSession(sessionDate);
     const runId = `scan_${fingerprint({ sessionDate, provider: this.provider.providerName, version: SCANNER_VERSION, ...(mode === "EVIDENCE_ONLY" ? { mode } : {}) }).slice(0, 24)}`;
+    // Session D is due only when the current America/New_York date is strictly after D.
+    if (!sessionCollectionDue(sessionDate, this.now())) {
+      return this.finish({
+        runId,
+        session,
+        status: "NOT_DUE",
+        expectedSecurities: 0,
+        processedSecurities: 0,
+        validSecurities: 0,
+        incompleteSecurities: 0,
+        unresolvedFailures: [],
+        scannerVersion: SCANNER_VERSION,
+        ...(this.groupedReplyDust
+          ? { groupedReplyDust: disabledScanGroupedReplyDustReport("NOT_DUE") }
+          : {}),
+      });
+    }
     if (session.kind === "CLOSED" || session.kind === "HOLIDAY")
       return this.finish({
         runId,
@@ -164,6 +184,7 @@ export class MarketsScanner {
             scannerVersion: SCANNER_VERSION,
             configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
             recordedAt: `${sessionDate}T23:59:59.999Z`,
+            attemptedAt: this.now().toISOString(),
             sourceRunId: runId,
             supersedesPredictionIds: [],
           }),
@@ -284,6 +305,7 @@ export class MarketsScanner {
             scannerVersion: SCANNER_VERSION,
             configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
             recordedAt: `${sessionDate}T23:59:59.999Z`,
+            attemptedAt: this.now().toISOString(),
             sourceRunId: runId,
             supersedesPredictionIds: predictionIds,
           }),
@@ -304,6 +326,7 @@ export class MarketsScanner {
             scannerVersion: SCANNER_VERSION,
             configFingerprint: fingerprint({ version: "scanner-config-v0.1" }),
             recordedAt: `${sessionDate}T23:59:59.999Z`,
+            attemptedAt: this.now().toISOString(),
             sourceRunId: runId,
             supersedesPredictionIds: [],
           }),
@@ -345,15 +368,25 @@ export class MarketsScanner {
     });
   }
 
+  private readProviderReadiness(sessionDate: string): ScannerRunReport["providerReadiness"] {
+    const provider = this.provider as MarketProvider & {
+      providerReadinessFor?: (sessionDate: string) => ScannerRunReport["providerReadiness"];
+    };
+    return provider.providerReadinessFor?.(sessionDate);
+  }
+
   private async finish(
     input: Omit<ScannerRunReport, "completedAt" | "storage" | "sourceCommit" | "rateLimitedResponses">,
   ): Promise<ScannerRunReport> {
+    const readiness =
+      input.providerReadiness ?? this.readProviderReadiness(input.session.sessionDate);
     const report: ScannerRunReport = {
       ...input,
       sourceCommit: process.env.PEACESTOCKS_SOURCE_COMMIT?.trim() || "UNKNOWN",
       rateLimitedResponses: (this.provider.rateLimitedResponses ?? 0) - this.rateLimitedAtRunStart,
       completedAt: new Date().toISOString(),
       storage: await this.storage.measureStorage(),
+      ...(readiness ? { providerReadiness: readiness } : {}),
     };
     await this.storage.writeRunReport(report);
     return report;

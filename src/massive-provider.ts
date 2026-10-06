@@ -11,13 +11,28 @@ import type {
   MarketProvider,
   MassiveAggregateBar,
   ProviderRawReply,
+  ProviderReadinessReport,
   ProviderSecurityRecord,
   TenMinuteRangeReply,
 } from "./contracts";
 import { MARKET_SCHEMA_VERSION } from "./contracts";
 import { securityId } from "./identity";
+import { etIsoWithOffset } from "./et-time";
 import { ScanYieldError } from "./scan-yield";
 import { intradaySessionSpec, normalizeMassiveTenMinuteBars } from "./intraday";
+
+
+/** Pathname only (no query, never apiKey) for error messages and readiness logs. */
+export function massiveRequestPathOnly(pathOrUrl: string, baseUrl: URL): string {
+  const url = new URL(pathOrUrl, baseUrl);
+  return url.pathname;
+}
+
+function isGroupedDailyPath(pathname: string): { sessionDate: string } | undefined {
+  const m = /^\/v2\/aggs\/grouped\/locale\/us\/market\/stocks\/(\d{4}-\d{2}-\d{2})$/u.exec(pathname);
+  if (!m) return undefined;
+  return { sessionDate: m[1]! };
+}
 
 const DEFAULT_BASE_URL = "https://api.massive.com";
 const DEFAULT_MIN_REQUEST_INTERVAL_MS = 12_500;
@@ -288,6 +303,10 @@ export class MassiveMarketProvider implements MarketProvider {
   private lastRequestAt = 0;
   private pace: Promise<void> = Promise.resolve();
   private readonly symbolBySecurityId = new Map<string, string>();
+  /** ET ISO times of 403-before-end-of-day on grouped-daily, keyed by sessionDate. */
+  private readonly groupedDailyRefusals = new Map<string, string[]>();
+  /** First successful grouped-daily ET ISO time per sessionDate. */
+  private readonly groupedDailyFirstAllowed = new Map<string, string>();
   private readonly maxTransientAttempts = 3;
   private rateLimitedCount = 0;
   private rawReplies: ProviderRawReply[] = [];
@@ -356,6 +375,18 @@ export class MassiveMarketProvider implements MarketProvider {
     return taken;
   }
 
+  /** Grouped-daily readiness probes recorded for `sessionDate` during this provider lifetime. */
+  providerReadinessFor(sessionDate: string): ProviderReadinessReport | undefined {
+    const refused = this.groupedDailyRefusals.get(sessionDate) ?? [];
+    const first = this.groupedDailyFirstAllowed.get(sessionDate);
+    if (!refused.length && !first) return undefined;
+    return {
+      sessionDate,
+      refusedGroupedDailyAt: [...refused],
+      ...(first ? { firstAllowedGroupedDailyAt: first } : {}),
+    };
+  }
+
   private async get(pathOrUrl: string, params?: Record<string, string>): Promise<JsonRecord> {
     return (await this.getWithBody(pathOrUrl, params)).record;
   }
@@ -384,6 +415,8 @@ export class MassiveMarketProvider implements MarketProvider {
     params?: Record<string, string>,
   ): Promise<{ record: JsonRecord; body: Uint8Array }> {
     this.requireApiKey();
+    const requestPath = massiveRequestPathOnly(pathOrUrl, this.baseUrl);
+    const grouped = isGroupedDailyPath(requestPath);
     let transientAttempt = 0;
     for (;;) {
       await this.waitForRateLimit();
@@ -403,6 +436,11 @@ export class MassiveMarketProvider implements MarketProvider {
         continue;
       }
       if (response.ok) {
+        if (grouped && !this.groupedDailyFirstAllowed.has(grouped.sessionDate)) {
+          // this.now() returns ISO UTC string from provider clock; readiness wants ET with offset.
+          const clock = this.clock();
+          this.groupedDailyFirstAllowed.set(grouped.sessionDate, etIsoWithOffset(new Date(clock)));
+        }
         const body = new Uint8Array(await response.arrayBuffer());
         return { record: responseRecord(JSON.parse(new TextDecoder().decode(body))), body };
       }
@@ -418,7 +456,13 @@ export class MassiveMarketProvider implements MarketProvider {
         }
       }
       if (response.status === 403 && /before end of day/iu.test(safeBody)) {
-        throw new Error(`PROVIDER_NOT_READY:${safeBody}`);
+        if (grouped) {
+          const list = this.groupedDailyRefusals.get(grouped.sessionDate) ?? [];
+          list.push(etIsoWithOffset(new Date(this.clock())));
+          this.groupedDailyRefusals.set(grouped.sessionDate, list);
+        }
+        // Path only — no query string / apiKey.
+        throw new Error(`PROVIDER_NOT_READY:${requestPath}:${safeBody}`);
       }
       if (
         response.status === 401 ||

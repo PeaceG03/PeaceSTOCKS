@@ -112,7 +112,7 @@ test("Massive end-of-day 403 is provider-not-ready and is not retried", async ()
   });
   await assert.rejects(
     provider.listApprovedSecurities(),
-    /PROVIDER_NOT_READY:.*before end of day/,
+    /PROVIDER_NOT_READY:\/v3\/reference\/tickers:.*before end of day/,
   );
   assert.equal(calls, 1);
 });

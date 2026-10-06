@@ -14,6 +14,8 @@ import {
   backfillHistoricalIntradayEvidence,
   type IntradayBackfillResult,
 } from "./intraday-backfill";
+import type { MarketProvider } from "./contracts";
+import { etWallClockToUtc } from "./et-time";
 import { collectionDue } from "./scheduler";
 import { MarketsScanner, type SessionCalendar } from "./scanner";
 import type { MarketStore } from "./storage";
@@ -83,6 +85,44 @@ function sessionDate(now: Date): string {
 
 function eligible(kind: SessionKind): boolean {
   return kind === "NORMAL" || kind === "HALF_DAY";
+}
+
+/** Previous NORMAL/HALF_DAY session strictly before `sessionDate` (walks back up to 14 calendar days). */
+export function previousEligibleSession(
+  sessionDate: string,
+  calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
+): string | undefined {
+  for (let i = 1; i <= 14; i++) {
+    const candidate = addDays(sessionDate, -i);
+    if (eligible(calendar.getSession(candidate).kind)) return candidate;
+  }
+  return undefined;
+}
+
+/** Next NORMAL/HALF_DAY session strictly after `sessionDate` (walks forward up to 14 calendar days). */
+export function nextEligibleSession(
+  sessionDate: string,
+  calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
+): string | undefined {
+  for (let i = 1; i <= 14; i++) {
+    const candidate = addDays(sessionDate, i);
+    if (eligible(calendar.getSession(candidate).kind)) return candidate;
+  }
+  return undefined;
+}
+
+/**
+ * Interim S2 guard (until S4 freeze-time): FORWARD only when run-start `now` is strictly before
+ * the next trading session's 09:30 America/New_York open. After that open, collect EVIDENCE_ONLY.
+ */
+export function forwardFreezeAllowed(
+  dueSessionDate: string,
+  now: Date,
+  calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
+): boolean {
+  const next = nextEligibleSession(dueSessionDate, calendar);
+  if (!next) return true;
+  return now.getTime() < etWallClockToUtc(next, 9, 30).getTime();
 }
 
 export function findMissedEligibleSessions(
@@ -162,7 +202,7 @@ export async function runScannerHost(
     readonly storageRoot?: string;
     readonly calendar?: SessionCalendar;
     readonly completionDelayMinutes?: number;
-    readonly provider?: MassiveMarketProvider;
+    readonly provider?: MarketProvider;
     readonly env?: NodeJS.ProcessEnv;
     /** Tests inject the Reply Dust object store when SCAN_GROUPED_REPLY_DUST is on. */
     readonly groupedReplyDustStore?: ReplyDustStore;
@@ -195,10 +235,16 @@ export async function runScannerHost(
   const storage = openMarketStore(root);
   await storage.initialize();
   const reports = await storage.loadRunReports();
-  // ALREADY_FROZEN counts as completed (not FAILED / PROVIDER_NOT_READY).
+  // ALREADY_FROZEN counts as completed. NOT_DUE / FAILED / PROVIDER_NOT_READY do not
+  // (NOT_DUE must be retried by a later slot).
   const completed = new Set(
     reports
-      .filter((report) => report.status !== "FAILED" && report.status !== "PROVIDER_NOT_READY")
+      .filter(
+        (report) =>
+          report.status !== "FAILED" &&
+          report.status !== "PROVIDER_NOT_READY" &&
+          report.status !== "NOT_DUE",
+      )
       .map((report) => report.session.sessionDate),
   );
   const today = sessionDate(now);
@@ -224,13 +270,17 @@ export async function runScannerHost(
       ? {}
       : { completionDelayMinutes: options.completionDelayMinutes }),
   });
-  const catchUpThrough = due.due || due.reason === "CLOSED" ? today : addDays(today, -1);
-  const missed = findMissedEligibleSessions(
-    state.lastObservedSessionDate,
-    catchUpThrough,
-    completed,
-    calendar,
-  );
+  // Catch-up never includes the due session (or today): only sessions through the previous
+  // eligible session before due.session. The due session is collected once below.
+  const catchUpThrough = previousEligibleSession(due.session.sessionDate, calendar);
+  const missed = catchUpThrough
+    ? findMissedEligibleSessions(
+        state.lastObservedSessionDate,
+        catchUpThrough,
+        completed,
+        calendar,
+      )
+    : [];
   if (process.env.PEACEAI_MARKETS_SCHEDULER_PROBE === "1") {
     const probed = makeResult("NOT_DUE", "PROBE_ONLY");
     await writeHostResult(root, probed);
@@ -256,21 +306,31 @@ export async function runScannerHost(
     groupedDustOn
       ? { enabled: true, ...(groupedReplyDustStore ? { store: groupedReplyDustStore } : {}) }
       : undefined,
+    () => now,
   );
   const collected: ScannerRunReport[] = [];
+  const collectedSessions = new Set<string>();
   const credentialRejected = (report: ScannerRunReport) =>
     report.unresolvedFailures.some((failure) => failure.includes("MASSIVE_CREDENTIAL_REJECTED"));
   for (const missedSession of missed) {
     const report = await scanner.run(missedSession, "EVIDENCE_ONLY");
     collected.push(report);
+    collectedSessions.add(report.session.sessionDate);
     if (credentialRejected(report) || report.status === "PROVIDER_NOT_READY") break;
   }
   if (
     due.due &&
     !completed.has(due.session.sessionDate) &&
+    !collectedSessions.has(due.session.sessionDate) &&
     !collected.some((report) => credentialRejected(report) || report.status === "PROVIDER_NOT_READY")
   ) {
-    collected.push(await scanner.run(due.session.sessionDate, "FORWARD"));
+    // Interim until S4: FORWARD only before the next trading session's 09:30 ET open.
+    const mode = forwardFreezeAllowed(due.session.sessionDate, now, calendar)
+      ? "FORWARD"
+      : "EVIDENCE_ONLY";
+    const report = await scanner.run(due.session.sessionDate, mode);
+    collected.push(report);
+    collectedSessions.add(report.session.sessionDate);
   }
 
   const unresolved = collected

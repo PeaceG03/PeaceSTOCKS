@@ -22,7 +22,8 @@ export type RunStatus =
   | "FAILED"
   | "CORRECTED_RECONCILED"
   | "PROVIDER_NOT_READY"
-  | "ALREADY_FROZEN";
+  | "ALREADY_FROZEN"
+  | "NOT_DUE";
 export type StorageClass = "PERMANENT_EVIDENCE" | "DERIVED_CACHE" | "TRANSIENT_WORKSPACE";
 export const INTRADAY_SCHEMA_VERSION = "foundation-d.1-10m-v1" as const;
 export const DUST_SCHEMA_VERSION = "dust-v1" as const;
@@ -320,6 +321,11 @@ export interface PredictionStatus {
   scannerVersion: string;
   configFingerprint: string;
   recordedAt: string;
+  /**
+   * Real attempt time (ISO UTC) from the scanner clock. Used to resolve non-FROZEN status when
+   * several UNAVAILABLE records share the same recordedAt. Absent on pre-S2 / old-style records.
+   */
+  attemptedAt?: string;
   sourceRunId?: string;
   supersedesPredictionIds: string[];
 }
@@ -365,6 +371,15 @@ export interface StorageReport {
   categoryBytes: Record<string, number>;
 }
 
+/** Grouped-daily readiness probes for session D (ET wall times with offset). */
+export interface ProviderReadinessReport {
+  sessionDate: string;
+  /** ET ISO timestamps of every refused grouped-daily attempt (403 before end of day). */
+  refusedGroupedDailyAt: string[];
+  /** ET ISO timestamp of the first allowed (HTTP OK) grouped-daily request, if any. */
+  firstAllowedGroupedDailyAt?: string;
+}
+
 export interface ScannerRunReport {
   runId: string;
   session: SessionRecord;
@@ -389,6 +404,8 @@ export interface ScannerRunReport {
    * other report fields.
    */
   groupedReplyDust?: import("./scan-grouped-reply-dust").ScanGroupedReplyDustReport;
+  /** Present when the Massive provider recorded grouped-daily readiness probes for this run. */
+  providerReadiness?: ProviderReadinessReport;
 }
 
 export interface ListSecuritiesOptions {

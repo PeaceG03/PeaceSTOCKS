@@ -124,10 +124,11 @@ function oldStyleUnavailable(runId: string, sessionDate: string): PredictionStat
   };
 }
 
-test("resolveSessionPredictionStatus: any FROZEN wins; else newest recordedAt", () => {
+test("resolveSessionPredictionStatus: any FROZEN wins; else newest attemptedAt", () => {
   const older: PredictionStatus = {
     ...oldStyleUnavailable("scan_a", SESSION),
-    recordedAt: "2026-10-05T02:06:00.000Z",
+    recordedAt: `${SESSION}T23:59:59.999Z`,
+    // no attemptedAt — old-style
   };
   const newerUnavailable: PredictionStatus = makePredictionStatus("scan_b", {
     sessionDate: SESSION,
@@ -135,7 +136,8 @@ test("resolveSessionPredictionStatus: any FROZEN wins; else newest recordedAt", 
     reason: "EVIDENCE_ONLY",
     scannerVersion: SCANNER_VERSION,
     configFingerprint: "cfg",
-    recordedAt: "2026-10-05T07:56:00.000Z",
+    recordedAt: `${SESSION}T23:59:59.999Z`,
+    attemptedAt: "2026-10-05T07:56:00.000Z",
     sourceRunId: "scan_b",
     supersedesPredictionIds: [],
   });
@@ -145,16 +147,46 @@ test("resolveSessionPredictionStatus: any FROZEN wins; else newest recordedAt", 
     reason: "PREDICTIONS_FROZEN",
     scannerVersion: SCANNER_VERSION,
     configFingerprint: "cfg",
-    recordedAt: "2026-10-05T03:00:00.000Z", // older than newerUnavailable
+    recordedAt: `${SESSION}T23:59:59.999Z`,
+    attemptedAt: "2026-10-05T03:00:00.000Z",
     sourceRunId: "scan_c",
     supersedesPredictionIds: [],
   });
   assert.equal(resolveSessionPredictionStatus([older, newerUnavailable, frozen])?.status, "FROZEN");
-  assert.equal(resolveSessionPredictionStatus([older, newerUnavailable])?.predictionStatusId, newerUnavailable.predictionStatusId);
-  // Tie on recordedAt → predictionStatusId ascending
-  const a = { ...frozen, predictionStatusId: "prediction-status_scan_z_aaaaaaaaaaaaaaaa", recordedAt: "2026-10-05T03:00:00.000Z" };
-  const b = { ...frozen, predictionStatusId: "prediction-status_scan_a_bbbbbbbbbbbbbbbb", recordedAt: "2026-10-05T03:00:00.000Z" };
-  assert.equal(resolveSessionPredictionStatus([a, b])?.predictionStatusId, b.predictionStatusId);
+  assert.equal(
+    resolveSessionPredictionStatus([older, newerUnavailable])?.reason,
+    "EVIDENCE_ONLY",
+  );
+});
+
+test("resolve: old 412ee SOURCE_COLLECTION_FAILED + new EVIDENCE_ONLY → EVIDENCE_ONLY either order", () => {
+  const legacy: PredictionStatus = {
+    predictionStatusId: `prediction-status_${OLD_RUN}`,
+    sessionDate: SESSION,
+    status: "UNAVAILABLE",
+    reason: "SOURCE_COLLECTION_FAILED",
+    scannerVersion: SCANNER_VERSION,
+    configFingerprint: "cfg",
+    recordedAt: `${SESSION}T23:59:59.999Z`,
+    // no attemptedAt
+    sourceRunId: OLD_RUN,
+    supersedesPredictionIds: [],
+  };
+  const newer = makePredictionStatus("scan_evidence", {
+    sessionDate: SESSION,
+    status: "UNAVAILABLE",
+    reason: "EVIDENCE_ONLY",
+    scannerVersion: SCANNER_VERSION,
+    configFingerprint: "cfg",
+    recordedAt: `${SESSION}T23:59:59.999Z`,
+    attemptedAt: "2026-10-05T07:56:00.000Z",
+    sourceRunId: "scan_evidence",
+    supersedesPredictionIds: [],
+  });
+  assert.equal(resolveSessionPredictionStatus([legacy, newer])?.reason, "EVIDENCE_ONLY");
+  assert.equal(resolveSessionPredictionStatus([newer, legacy])?.reason, "EVIDENCE_ONLY");
+  // Without attemptedAt fix, legacy id is a prefix of content ids and would win on id tie-break.
+  assert.ok(legacy.predictionStatusId < newer.predictionStatusId);
 });
 
 test("S1.1: NOT_READY then successful FROZEN — both status records, one frozen set, reader says FROZEN", async () => {

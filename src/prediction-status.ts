@@ -24,10 +24,10 @@ export function makePredictionStatus(runId: string, body: PredictionStatusBody):
 
 /**
  * Resolve the effective prediction status for a session.
- * - If any record is FROZEN, pick among FROZEN only.
- * - Otherwise pick among all records.
- * Tie-break: newest `recordedAt` (lexicographic ISO descending), then `predictionStatusId`
- * ascending (code-unit order) for a stable choice when timestamps match.
+ * - If any record is FROZEN, pick among FROZEN only (newest attemptedAt / recordedAt).
+ * - Otherwise pick among all records by real attempt time:
+ *   newest `attemptedAt` (ISO UTC) wins; records missing `attemptedAt` (old-style) count as oldest.
+ * Tie-break when times equal: `predictionStatusId` ascending (stable).
  * Accepts both content-addressed ids and legacy `prediction-status_<runId>` ids.
  */
 export function resolveSessionPredictionStatus(
@@ -37,8 +37,13 @@ export function resolveSessionPredictionStatus(
   const frozen = records.filter((r) => r.status === "FROZEN");
   const pool = frozen.length ? frozen : records;
   return [...pool].sort((a, b) => {
-    const byTime = b.recordedAt.localeCompare(a.recordedAt);
-    if (byTime !== 0) return byTime;
+    const aAt = a.attemptedAt ?? "";
+    const bAt = b.attemptedAt ?? "";
+    // Missing attemptedAt sorts as oldest (empty string < any ISO timestamp).
+    if (aAt !== bAt) return bAt.localeCompare(aAt);
+    // Fallback for frozen-only ties that also lack attemptedAt: recordedAt then id.
+    const byRecorded = b.recordedAt.localeCompare(a.recordedAt);
+    if (byRecorded !== 0) return byRecorded;
     return a.predictionStatusId.localeCompare(b.predictionStatusId);
   })[0];
 }
