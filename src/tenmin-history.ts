@@ -15,6 +15,9 @@ import { prepareSafeStoreFile } from "./store-path";
 import {
   tenMinMassiveRequestsOf,
   TENMIN_AGED_OUT,
+  TENMIN_DELISTED_COVERAGE_MISSING,
+  type TenMinDelistedCoverage,
+  tenMinRangeDelistedCoverage,
   TENMIN_UNIVERSE_EMPTY,
   isEmptyTenMinRangeManifest,
   readTenMinRangeManifest,
@@ -490,6 +493,8 @@ export interface TenMinHistoryRangeReport {
   fallbackFiles: number;
   massiveRequests: number;
   zstdVersion: string;
+  /** MISSING while the universe comes only from stored daily bars / today's master. */
+  delistedCoverage: TenMinDelistedCoverage;
   /** Calendar days of this range that left the window before it sealed (AGED_OUT gap). */
   agedOut?: { from: string; to: string };
   /** Present when the range was planned this run (not skipped as already sealed). */
@@ -633,6 +638,9 @@ export async function runTenMinHistory(options: {
       fetchFrom: range.fetchFrom,
       fetchTo: range.fetchTo,
       ...(range.agedOut ? { agedOut: range.agedOut } : {}),
+      // The universe comes only from stored daily bars and today's master (backfill linked
+      // ACTIVE tickers only), so names delisted since are missing.
+      delistedCoverage: TENMIN_DELISTED_COVERAGE_MISSING,
     };
     const agedOutGaps: TenMinRangeGapEntry[] = range.agedOut
       ? [
@@ -716,6 +724,7 @@ export async function runTenMinHistory(options: {
         ...(universe
           ? { securityLink: { status: universe.securityLink, source: universe.linkSource } }
           : {}),
+        delistedCoverage: TENMIN_DELISTED_COVERAGE_MISSING,
         shouldYield,
         fetchPages,
         ...(options.zstdVersionProbe ? { zstdVersionProbe: options.zstdVersionProbe } : {}),
@@ -738,6 +747,7 @@ export async function runTenMinHistory(options: {
               : "SEALED";
       rangeReports.push({
         ...base,
+        ...(result.manifest ? { delistedCoverage: tenMinRangeDelistedCoverage(result.manifest) } : {}),
         status,
         ...plannedCounts,
         securitiesWritten: result.securitiesWritten.length,
@@ -831,6 +841,7 @@ export function tenMinHistorySummary(report: TenMinHistoryRunReport): Record<str
     ranges: report.ranges.map((range) => ({
       range: `${range.calendarFrom}_${range.calendarTo}`,
       status: range.status,
+      delistedCoverage: range.delistedCoverage,
       securitiesPlanned: range.securitiesPlanned,
       fetchesPlanned: range.fetchesPlanned,
       ...(range.agedOut ? { agedOut: range.agedOut } : {}),

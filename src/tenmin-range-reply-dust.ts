@@ -72,6 +72,24 @@ export interface TenMinRangeTickerFetch {
   sessionDates: string[];
 }
 
+/**
+ * Whether a range's universe includes names delisted since. MISSING: the universe came only from
+ * stored daily bars / today's master, and the backfill only linked tickers ACTIVE today, so
+ * delisted names are absent. COMPLETE is reserved for a universe built from grouped-daily replies.
+ */
+export type TenMinDelistedCoverage = "MISSING" | "COMPLETE";
+export const TENMIN_DELISTED_COVERAGE_MISSING: TenMinDelistedCoverage = "MISSING";
+export const TENMIN_DELISTED_COVERAGE_COMPLETE: TenMinDelistedCoverage = "COMPLETE";
+
+/** A manifest written before the field existed is MISSING. */
+export function tenMinRangeDelistedCoverage(
+  manifest: Pick<TenMinRangeManifest, "delistedCoverage">,
+): TenMinDelistedCoverage {
+  return manifest.delistedCoverage === TENMIN_DELISTED_COVERAGE_COMPLETE
+    ? TENMIN_DELISTED_COVERAGE_COMPLETE
+    : TENMIN_DELISTED_COVERAGE_MISSING;
+}
+
 /** securityId -> ticker link quality. PROVISIONAL: taken from today's master, not point-in-time. */
 export type TenMinSecurityLink = "PROVISIONAL";
 
@@ -114,6 +132,8 @@ export interface TenMinRangeManifest {
   /** Present when the run planned from a provisional master link (see rd-link). */
   securityLink?: TenMinSecurityLink;
   securityLinkSource?: string;
+  /** Absent in manifests written before this field existed; read as MISSING. */
+  delistedCoverage?: TenMinDelistedCoverage;
   checksum: string;
 }
 
@@ -649,6 +669,7 @@ export function buildTenMinRangeManifest(options: {
   securities: readonly TenMinRangeSecurityEntry[];
   gaps?: readonly TenMinRangeGapEntry[];
   securityLink?: { status: TenMinSecurityLink; source: string };
+  delistedCoverage?: TenMinDelistedCoverage;
 }): TenMinRangeManifest {
   requireRange(options.from, options.to);
   const link = options.securityLink;
@@ -701,6 +722,7 @@ export function buildTenMinRangeManifest(options: {
     days,
     gaps,
     ...(link ? { securityLink: link.status, securityLinkSource: link.source } : {}),
+    ...(options.delistedCoverage ? { delistedCoverage: options.delistedCoverage } : {}),
   };
   return { ...body, checksum: manifestChecksum(body) };
 }
@@ -741,7 +763,8 @@ export async function readTenMinRangeManifest(
     throw new Error("REPLY_DUST_MANIFEST_CHECKSUM_MISMATCH");
   if (isEmptyTenMinRangeManifest(manifest) && options.allowEmpty !== true)
     throw new Error(`${TENMIN_UNIVERSE_EMPTY}:${from}_${to}:sealed-manifest-has-0-securities`);
-  return manifest;
+  // Older manifests have no delistedCoverage: expose it as MISSING (checksum already verified).
+  return { ...manifest, delistedCoverage: tenMinRangeDelistedCoverage(manifest) };
 }
 
 export interface TenMinRangeProgressEntry {
@@ -876,6 +899,8 @@ export async function writeTenMinRangeReplyDust(options: {
    * rd-link = source, and the manifest marks every security entry securityLink: PROVISIONAL.
    */
   securityLink?: { status: TenMinSecurityLink; source: string };
+  /** Written on every seal; defaults to MISSING until grouped replies supply the universe. */
+  delistedCoverage?: TenMinDelistedCoverage;
   shouldYield?: () => Promise<string | undefined>;
   backend?: ReplyDustBackend;
   zstdVersionProbe?: ZstdVersionProbe;
@@ -1201,6 +1226,7 @@ export async function writeTenMinRangeReplyDust(options: {
     securities: groupSecurities(doneFetches),
     gaps: [...gaps.values()],
     ...(options.securityLink ? { securityLink: options.securityLink } : {}),
+    delistedCoverage: options.delistedCoverage ?? TENMIN_DELISTED_COVERAGE_MISSING,
   });
   if (isEmptyTenMinRangeManifest(manifest))
     throw new Error(

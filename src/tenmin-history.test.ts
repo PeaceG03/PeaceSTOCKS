@@ -32,6 +32,8 @@ import {
   readRangeReplies,
   readRangeSecurityDay,
   readTenMinRangeManifest,
+  TENMIN_DELISTED_COVERAGE_MISSING,
+  tenMinRangeDelistedCoverage,
   tenMinRangeManifestKey,
   writeTenMinRangeManifest,
   writeTenMinRangeReplyDust,
@@ -775,6 +777,7 @@ test("empty universe or no daily coverage never seals: run stops with the error 
       assert.deepEqual((summary.ranges as unknown[])[0], {
         range: "2024-11-01_2024-12-31",
         status: "ERROR",
+        delistedCoverage: "MISSING",
         securitiesPlanned: planned,
         fetchesPlanned: 0,
         error: result.report.ranges[0]?.error,
@@ -1305,5 +1308,146 @@ test("requests made before an abort are counted in the range and run reports", a
     assert.equal(result.report.ranges[0]?.status, "ERROR");
     assert.equal(result.report.ranges[0]?.massiveRequests, 1);
     assert.equal(tenMinHistorySummary(result.report).massiveRequests, 1);
+  });
+});
+
+// ---- delistedCoverage ----
+
+test("delistedCoverage MISSING is on each range report entry and the sealed manifest", async () => {
+  await withRoot(async (root) => {
+    const store = new MemoryObjectClient();
+    const result = await runTenMinHistory({
+      root,
+      store,
+      securities: [master("AAA")],
+      loadDailyBarSessions: everyDay("AAA"),
+      lastCompletedSession: "2026-10-05",
+      maxRanges: 2,
+      writeReport: false,
+      zstdVersionProbe: pinnedZstd,
+      env: {},
+      fetchPages: (s, f, t) => Promise.resolve(pagesFor(s, f, t)),
+    });
+    assert.deepEqual(result.report.ranges.map((r) => [r.status, r.delistedCoverage]), [
+      ["SEALED", "MISSING"],
+      ["SEALED", "MISSING"],
+    ]);
+    assert.equal((tenMinHistorySummary(result.report).ranges as Array<{ delistedCoverage: string }>)[0]?.delistedCoverage, "MISSING");
+    const raw = JSON.parse(
+      new TextDecoder().decode(await store.get(tenMinRangeManifestKey("2024-11-01", "2024-12-31"))),
+    ) as { delistedCoverage?: string };
+    assert.equal(raw.delistedCoverage, TENMIN_DELISTED_COVERAGE_MISSING);
+    assert.equal((await readTenMinRangeManifest(store, "2024-11-01", "2024-12-31"))!.delistedCoverage, "MISSING");
+  });
+});
+
+/** Rewrite a sealed manifest the way the pre-field writer (6b57850) left it: no delistedCoverage. */
+async function rewriteAsOldFormat(store: MemoryObjectClient, from: string, to: string): Promise<void> {
+  const current = (await readTenMinRangeManifest(store, from, to))!;
+  const old = buildTenMinRangeManifest({
+    provider: current.provider,
+    from,
+    to,
+    securities: current.securities,
+    gaps: current.gaps,
+    ...(current.securityLink
+      ? { securityLink: { status: current.securityLink, source: current.securityLinkSource! } }
+      : {}),
+  });
+  assert.equal("delistedCoverage" in old, false);
+  await writeTenMinRangeManifest(store, old);
+}
+
+test("an old-format manifest without delistedCoverage reads as MISSING, resumes with 0 refetches, and gains the field on its next write", async () => {
+  await withRoot(async (root) => {
+    const store = new MemoryObjectClient();
+    let fetches = 0;
+    const run = (reopen: boolean) =>
+      runTenMinHistory({
+        root,
+        store,
+        securities: [master("AAA"), master("BBB")],
+        loadDailyBarSessions: everyDay("AAA", "BBB"),
+        lastCompletedSession: "2025-01-06",
+        maxRanges: 1,
+        reopen,
+        writeReport: false,
+        zstdVersionProbe: pinnedZstd,
+        env: {},
+        fetchPages: async (s, f, t) => {
+          fetches += 1;
+          return pagesFor(s, f, t);
+        },
+      });
+    await run(false);
+    assert.equal(fetches, 2);
+    await rewriteAsOldFormat(store, "2024-11-01", "2024-12-31");
+    const key = tenMinRangeManifestKey("2024-11-01", "2024-12-31");
+    const oldBytes = await store.get(key);
+    assert.ok(!new TextDecoder().decode(oldBytes).includes("delistedCoverage"));
+    // Readers keep reading it and expose MISSING.
+    const read = (await readTenMinRangeManifest(store, "2024-11-01", "2024-12-31"))!;
+    assert.equal(tenMinRangeDelistedCoverage(read), "MISSING");
+    assert.equal(read.delistedCoverage, "MISSING");
+    assert.equal((await readRangeReplies(store, "2024-11-01", "2024-12-31", id("AAA"))).length, 1);
+    // A normal run leaves the sealed range alone and reports MISSING.
+    fetches = 0;
+    const skipped = await run(false);
+    assert.equal(skipped.report.ranges[0]?.status, "ALREADY_SEALED");
+    assert.equal(skipped.report.ranges[0]?.delistedCoverage, "MISSING");
+    assert.equal(fetches, 0);
+    assert.deepEqual(await store.get(key), oldBytes);
+    // Reopen resumes every stored fetch (0 refetches) and the rewritten manifest has the field.
+    const reopened = await run(true);
+    assert.equal(reopened.report.ranges[0]?.status, "REOPENED");
+    assert.equal(fetches, 0);
+    const raw = JSON.parse(new TextDecoder().decode(await store.get(key))) as { delistedCoverage?: string; securityCount: number };
+    assert.equal(raw.delistedCoverage, "MISSING");
+    assert.equal(raw.securityCount, 2);
+  });
+});
+
+test("an in-progress range written before the field existed resumes with 0 refetches and seals with it", async () => {
+  await withRoot(async (root) => {
+    const store = new MemoryObjectClient();
+    // Objects and local progress from a partial run, no manifest yet (like the run on 6b57850).
+    const partial = await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: "2024-11-01",
+      to: "2024-12-31",
+      fetches: [
+        { securityId: id("AAA"), symbol: "AAA", fetchFrom: "2024-11-01", fetchTo: "2024-12-31" },
+        { securityId: id("BBB"), symbol: "BBB", fetchFrom: "2024-11-01", fetchTo: "2024-12-31" },
+      ],
+      zstdVersionProbe: pinnedZstd,
+      shouldYield: (() => {
+        let n = 0;
+        return async () => (++n > 1 ? "SCAN_GUARD_WINDOW:test" : undefined);
+      })(),
+      fetchPages: (s, f, t) => Promise.resolve(pagesFor(s, f, t)),
+    });
+    assert.equal(partial.sealed, false);
+    const fetched: string[] = [];
+    const result = await runTenMinHistory({
+      root,
+      store,
+      securities: [master("AAA"), master("BBB")],
+      loadDailyBarSessions: everyDay("AAA", "BBB"),
+      lastCompletedSession: "2025-01-06",
+      maxRanges: 1,
+      writeReport: false,
+      zstdVersionProbe: pinnedZstd,
+      env: {},
+      fetchPages: async (s, f, t) => {
+        fetched.push(s.symbol);
+        return pagesFor(s, f, t);
+      },
+    });
+    assert.deepEqual(fetched, ["BBB"]);
+    assert.equal(result.report.ranges[0]?.securitiesResumed, 1);
+    assert.equal(result.report.ranges[0]?.delistedCoverage, "MISSING");
+    assert.equal((await readTenMinRangeManifest(store, "2024-11-01", "2024-12-31"))!.delistedCoverage, "MISSING");
   });
 });
