@@ -1549,3 +1549,73 @@ test("an in-progress range written before the field existed resumes with 0 refet
     assert.equal((await readTenMinRangeManifest(store, "2024-11-01", "2024-12-31"))!.delistedCoverage, "MISSING");
   });
 });
+
+test("history: TENMIN_DAILY_PICKS writes concise dailyPicks onto R2 report and summary", async () => {
+  await withRoot(async (root) => {
+    const store = new MemoryObjectClient();
+    // Settled candidate days with grouped dust but NO ticker index → all SKIPPED_BASE_INPUT.
+    const { writeDailyReplyDust } = await import("./daily-reply-dust");
+    for (const d of ["2024-11-04", "2024-11-05"]) {
+      await writeDailyReplyDust(
+        store,
+        {
+          dataset: "stocks-grouped-daily",
+          sessionDate: d,
+          request: `/v2/aggs/grouped/locale/us/market/stocks/${d}`,
+          fetchedAt: `${d}T21:00:00.000Z`,
+          body: encoder.encode(
+            JSON.stringify({
+              status: "OK",
+              results: [{ T: "AAA", v: 1, o: 1, c: 1, h: 1, l: 1, t: 1 }],
+            }),
+          ),
+        },
+        { provider: PROVIDER, observedAt: `${d}T21:05:00.000Z` },
+      );
+    }
+    let tenMinCalls = 0;
+    const result = await runTenMinHistory({
+      root,
+      store,
+      securities: [master("AAA")],
+      loadDailyBarSessions: async () => new Map(),
+      windowStart: "2024-10-07",
+      lastCompletedSession: "2026-10-05",
+      maxRanges: 0, // skip range work; this test is about the picks phase only
+      zstdVersionProbe: pinnedZstd,
+      env: { TENMIN_DAILY_PICKS: "true" },
+      now: new Date("2026-10-06T18:00:00.000Z"),
+      clock: () => new Date("2026-10-06T18:00:00.000Z"),
+      nowIso: () => AT,
+      fetchPages: async () => {
+        tenMinCalls += 1;
+        throw new Error("SHOULD_NOT_FETCH");
+      },
+      fetchGroupedDaily: async () => {
+        throw new Error("SHOULD_NOT_GROUPED");
+      },
+    });
+    assert.equal(tenMinCalls, 0);
+    assert.ok(result.dailyPicks);
+    assert.equal(result.dailyPicks!.totalRequests, 0);
+    assert.ok(result.report.dailyPicks, "concise section on history run report");
+    assert.equal(result.report.dailyPicks!.totalRequests, 0);
+    assert.ok(result.report.dailyPicks!.skippedBaseInput >= 1);
+    assert.ok(
+      result.report.dailyPicks!.days.every(
+        (d) => d.outcome === "SKIPPED_BASE_INPUT" || d.outcome === "SKIPPED_NOT_SETTLED",
+      ),
+    );
+    const summary = tenMinHistorySummary(result.report);
+    assert.ok(summary.dailyPicks);
+    assert.equal((summary.dailyPicks as { totalRequests: number }).totalRequests, 0);
+    // Stored R2/transient report carries the concise section.
+    const reportKey = (await store.list("transient/tenmin-history-runs/"))[0]!;
+    const stored = JSON.parse(new TextDecoder().decode((await store.get(reportKey))!)) as {
+      dailyPicks?: { totalRequests: number; skippedBaseInput: number };
+    };
+    assert.ok(stored.dailyPicks);
+    assert.equal(stored.dailyPicks!.totalRequests, 0);
+  });
+});
+

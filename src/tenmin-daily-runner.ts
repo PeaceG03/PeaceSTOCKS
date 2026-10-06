@@ -108,6 +108,62 @@ export interface TenMinDailyPicksRunReport {
   yieldedForScan?: string;
 }
 
+/** Concise picks section for history summary / R2 run report / Actions logs. */
+export interface TenMinDailyPicksSummary {
+  enabled: boolean;
+  backlogConsidered: number;
+  sealed: number;
+  top50Added: number;
+  skippedBaseInput: number;
+  skippedNotSettled: number;
+  skippedOutOfWindow: number;
+  corrupt: number;
+  failed: number;
+  /** Massive 10-minute requests made by the picks phase this run. */
+  totalRequests: number;
+  days: Array<{
+    sessionDate: string;
+    outcome: TenMinDailyDayOutcome;
+    requests: number;
+    baseInput?: string;
+    groupedWithoutIndexEntry?: { count: number; sample: string[] };
+  }>;
+  yieldedForScan?: string;
+}
+
+export function tenMinDailyPicksSummary(
+  report: TenMinDailyPicksRunReport,
+): TenMinDailyPicksSummary {
+  let top50Added = 0;
+  let failed = 0;
+  for (const d of report.days) {
+    if (d.outcome === "TOP50_ADDED") top50Added += 1;
+    if (d.outcome === "FAILED") failed += 1;
+  }
+  return {
+    enabled: report.enabled,
+    backlogConsidered: report.backlogConsidered,
+    sealed: report.sealed.length,
+    top50Added,
+    skippedBaseInput: report.skippedBaseInput.length,
+    skippedNotSettled: report.skippedNotSettled.length,
+    skippedOutOfWindow: report.skippedOutOfWindow.length,
+    corrupt: report.corrupt.length,
+    failed,
+    totalRequests: report.totalRequests,
+    days: report.days.map((d) => ({
+      sessionDate: d.sessionDate,
+      outcome: d.outcome,
+      requests: d.requests,
+      ...(d.baseInput ? { baseInput: d.baseInput } : {}),
+      ...(d.groupedWithoutIndexEntry
+        ? { groupedWithoutIndexEntry: d.groupedWithoutIndexEntry }
+        : {}),
+    })),
+    ...(report.yieldedForScan ? { yieldedForScan: report.yieldedForScan } : {}),
+  };
+}
+
 export function tenMinDailyPicksEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env[TENMIN_DAILY_PICKS_KILL_SWITCH] === "true";
 }

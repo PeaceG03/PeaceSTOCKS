@@ -603,3 +603,60 @@ test("buildBase: groupedWithoutIndexEntry counts tickers absent from asOf≤D in
   assert.ok(base.counts.unlinkedExcluded >= 1);
 });
 
+test("runner: no ticker index at all → every settled day SKIPPED_BASE_INPUT, zero Massive requests", async () => {
+  const inner = new MemoryObjectClient();
+  const dust = immutableReplyDustStore(inner);
+  const days = ["2024-11-04", "2024-11-05", "2024-11-06"];
+  for (const d of days) {
+    await plantGrouped(inner, d, UNIVERSE.map((u) => u.ticker));
+  }
+  // Intentionally no plantIndex — production state before dated indexes seal.
+
+  let providerCalls = 0;
+  let fetchCalls = 0;
+  const report = await runTenMinDailyPicks({
+    store: dust,
+    storage: memoryStorage(),
+    days,
+    env: { TENMIN_DAILY_PICKS: "true" },
+    now: SETTLED_NOW,
+    clock: settledClock,
+    limit: 5,
+    provider: {
+      providerName: "massive-stocks",
+      async getTenMinuteRangeReplies() {
+        providerCalls += 1;
+        throw new Error("SHOULD_NOT_FETCH_TENMIN");
+      },
+      async getGroupedDailyReply() {
+        providerCalls += 1;
+        throw new Error("SHOULD_NOT_CALL_GROUPED");
+      },
+      async listApprovedSecurities() {
+        providerCalls += 1;
+        throw new Error("SHOULD_NOT_LIST");
+      },
+    } as never,
+    fetchReply: async () => {
+      fetchCalls += 1;
+      throw new Error("SHOULD_NOT_FETCH_REPLY");
+    },
+  });
+
+  assert.equal(providerCalls, 0);
+  assert.equal(fetchCalls, 0);
+  assert.equal(report.totalRequests, 0);
+  assert.equal(report.sealed.length, 0);
+  assert.equal(report.days.length, days.length);
+  for (const d of days) {
+    assert.ok(
+      report.skippedBaseInput.some((s) => s.sessionDate === d && s.input === "ticker_index"),
+      `expected ticker_index skip for ${d}: ${JSON.stringify(report.skippedBaseInput)}`,
+    );
+    const day = report.days.find((x) => x.sessionDate === d);
+    assert.equal(day?.outcome, "SKIPPED_BASE_INPUT");
+    assert.equal(day?.requests, 0);
+    assert.equal((await readTenMinDayPicks(dust, d)).status, "TENMIN_DAY_NOT_SEALED");
+  }
+});
+

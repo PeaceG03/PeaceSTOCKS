@@ -31,6 +31,7 @@ import { candidateDailyPickDays } from "./tenmin-history";
 import {
   resolveDaySettlement,
   runTenMinDailyPicks,
+  tenMinDailyPicksSummary,
   tenMinDailyPicksEnabled,
 } from "./tenmin-daily-runner";
 import type { MarketStore } from "./storage";
@@ -689,5 +690,35 @@ test("resolveClock: omitting clock uses live Date (now alone does not freeze fet
     // Outside guard: may seal; just ensure we did not freeze to `now` (18:00) incorrectly by checking completedAt tracks live-ish clock.
     assert.ok(report.completedAt);
   }
+});
+
+test("tenMinDailyPicksSummary: compact per-day outcomes and request total", () => {
+  const summary = tenMinDailyPicksSummary({
+    schemaVersion: "tenmin-daily-picks-run-v1",
+    enabled: true,
+    killSwitch: "true",
+    startedAt: "2026-10-06T18:00:00.000Z",
+    completedAt: "2026-10-06T18:01:00.000Z",
+    backlogConsidered: 3,
+    days: [
+      { sessionDate: "2024-11-04", outcome: "SKIPPED_BASE_INPUT", requests: 0, baseInput: "ticker_index" },
+      { sessionDate: "2024-11-05", outcome: "SEALED", requests: 2, groupedWithoutIndexEntry: { count: 1, sample: ["ZZZ"] } },
+      { sessionDate: "2024-11-06", outcome: "SKIPPED_NOT_SETTLED", requests: 0 },
+    ],
+    sealed: ["2024-11-05"],
+    corrupt: [],
+    skippedOutOfWindow: [],
+    skippedNotSettled: ["2024-11-06"],
+    skippedBaseInput: [{ sessionDate: "2024-11-04", input: "ticker_index", key: "k" }],
+    totalRequests: 2,
+  });
+  assert.equal(summary.enabled, true);
+  assert.equal(summary.sealed, 1);
+  assert.equal(summary.skippedBaseInput, 1);
+  assert.equal(summary.skippedNotSettled, 1);
+  assert.equal(summary.totalRequests, 2);
+  assert.equal(summary.days[0]!.outcome, "SKIPPED_BASE_INPUT");
+  assert.equal(summary.days[0]!.baseInput, "ticker_index");
+  assert.deepEqual(summary.days[1]!.groupedWithoutIndexEntry, { count: 1, sample: ["ZZZ"] });
 });
 

@@ -471,8 +471,9 @@ async function main(): Promise<void> {
   if (history) {
     if (history.datedTickerIndex)
       process.stdout.write(`${JSON.stringify({ datedTickerIndex: history.datedTickerIndex })}\n`);
-    if (history.dailyPicks)
-      process.stdout.write(`${JSON.stringify({ dailyPicks: history.dailyPicks })}\n`);
+    // Concise picks section (also on R2 history report + tenMinHistorySummary).
+    if (history.report.dailyPicks)
+      process.stdout.write(`${JSON.stringify({ dailyPicks: history.report.dailyPicks })}\n`);
     process.stdout.write(
       `${JSON.stringify(tenMinHistorySummary(history.report))}\n`,
     );
