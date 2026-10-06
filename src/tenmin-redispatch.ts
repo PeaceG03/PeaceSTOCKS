@@ -22,6 +22,16 @@ export const TENMIN_STOP_RANGE_END_CAP = "STOP_RANGE_END_CAP" as const;
 /** Post-dispatch: a scheduled scanner.yml run created this recently and cancelled fails the step. */
 export const TENMIN_SCAN_CANCELLED_WINDOW_MINUTES = 10;
 export const TENMIN_REDISPATCH_SCAN_CANCELLED = "TENMIN_REDISPATCH_SCAN_CANCELLED" as const;
+/** Hard stop written into the run record when a post-dispatch cancelled-scan check fires. */
+export const TENMIN_STOP_SCAN_CANCELLED = "STOP_SCAN_CANCELLED" as const;
+/** Dispatched tenmin_history run statuses that must be cancelled on SCAN_CANCELLED (incl. in_progress). */
+export const TENMIN_CANCELABLE_DISPATCH_STATUSES = new Set([
+  "queued",
+  "waiting",
+  "pending",
+  "requested",
+  "in_progress",
+]);
 
 /** Error codes that are refusals: the plan is wrong, a human must look. */
 export const TENMIN_REFUSAL_CODES = [
@@ -212,6 +222,107 @@ export function cancelledScheduledScan(
   });
 }
 
+/** Pure: statuses where the just-dispatched tenmin_history run may still be cancelled. */
+export function isCancelableDispatchStatus(status: string): boolean {
+  return TENMIN_CANCELABLE_DISPATCH_STATUSES.has(status);
+}
+
+/**
+ * Pure: newest workflow_dispatch scanner.yml run created at/after afterIso, excluding excludeRunId.
+ * Used to find the tenmin_history run a dispatch just created (GitHub's dispatch API returns no id).
+ */
+export function findDispatchedTenMinRun(
+  runs: readonly ScannerRunSummary[],
+  opts: { afterIso: string; excludeRunId?: number },
+): ScannerRunSummary | undefined {
+  const afterMs = Date.parse(opts.afterIso);
+  if (!Number.isFinite(afterMs)) return undefined;
+  // 2s slack: clock skew between the local stamp and GitHub's created_at.
+  const since = afterMs - 2000;
+  let best: ScannerRunSummary | undefined;
+  for (const run of runs) {
+    if (run.event !== "workflow_dispatch") continue;
+    if (opts.excludeRunId !== undefined && run.id === opts.excludeRunId) continue;
+    const created = Date.parse(run.created_at);
+    if (!Number.isFinite(created) || created < since) continue;
+    if (!best) {
+      best = run;
+      continue;
+    }
+    const bestCreated = Date.parse(best.created_at);
+    if (created > bestCreated || (created === bestCreated && run.id > best.id)) best = run;
+  }
+  return best;
+}
+
+export type DispatchedRunCancelPlan =
+  | { action: "cancel"; runId: number }
+  | { action: "none"; detail: string };
+
+/**
+ * Pure: cancel the dispatched run while it is still active (queued/waiting/pending/requested/
+ * in_progress). Cancelling in_progress is safe: its always() chain step sees the history step
+ * cancelled, records STOP_JOB_CANCELLED, and uploads a stop (never dispatches). Already-completed
+ * runs are skipped and reported.
+ */
+export function planCancelDispatchedRun(run: ScannerRunSummary | undefined): DispatchedRunCancelPlan {
+  if (!run) return { action: "none", detail: "dispatched-run-not-found" };
+  if (isCancelableDispatchStatus(run.status)) return { action: "cancel", runId: run.id };
+  return { action: "none", detail: `status=${run.status}:conclusion=${run.conclusion ?? "none"}` };
+}
+
+/** The record the chain step stores as the run's artifact (read by the fallback). */
+export interface TenMinRunRecord {
+  outcome: TenMinRunOutcome | undefined;
+  jobResult: string;
+  chain: number;
+  githubRunId: string;
+  finishedAt: string;
+  decision: TenMinRedispatchDecision;
+}
+
+/**
+ * Pure: rewrite a run record into a hard stop so the fallback never restarts this chain
+ * (not even via CONTINUE_RANGE_END_CAP_RAISED; only a new manual unbounded dispatch restarts).
+ */
+export function stopRecordForScanCancelled(
+  record: TenMinRunRecord,
+  scanRunId: number | string,
+  finishedAt: string,
+): TenMinRunRecord {
+  const reason = `${TENMIN_STOP_SCAN_CANCELLED}:run=${scanRunId}`;
+  const outcome: TenMinRunOutcome = record.outcome
+    ? { ...record.outcome, nextAction: "stop", reason }
+    : {
+        schemaVersion: TENMIN_OUTCOME_SCHEMA,
+        runId: record.githubRunId || "unknown",
+        nextAction: "stop",
+        reason,
+        rangesPlanned: 0,
+        rangesSealed: 0,
+        rangesRemaining: 0,
+        madeProgress: false,
+      };
+  return {
+    ...record,
+    outcome,
+    finishedAt,
+    decision: {
+      dispatch: false,
+      nextAction: "stop",
+      reason,
+      nextChain: record.decision.nextChain,
+    },
+  };
+}
+
+/** Pure: GitHub's cancel-run API accepts 202; anything else is a loud failure. */
+export function assertCancelRunAccepted(httpStatus: number, runId: number): void {
+  if (httpStatus !== 202 && httpStatus !== 204) {
+    throw new Error(`TENMIN_REDISPATCH_CANCEL_FAILED:run=${runId}:http-${httpStatus}`);
+  }
+}
+
 // ---- CLI (thin I/O around the pure functions) ----
 
 const ACTIVE = new Set(["queued", "in_progress", "waiting", "pending", "requested"]);
@@ -254,16 +365,58 @@ function output(name: string, value: string): void {
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value.replaceAll("\n", " ")}\n`);
 }
 
-/** After the dispatch call: list scanner.yml runs and fail loudly if a recent scheduled scan was cancelled. */
-async function checkNoScheduledScanCancelled(): Promise<void> {
+/**
+ * After a dispatch: wait, list scanner.yml runs, and if a recent scheduled scan was cancelled:
+ * rewrite the run record to STOP_SCAN_CANCELLED (so the fallback never restarts), cancel the
+ * just-dispatched tenmin_history run while it is still queued/waiting/pending/requested/in_progress
+ * (skip and report if it already completed), then fail the step. Cancel API failure fails loudly.
+ * Cancelling in_progress is safe: that run's always() chain step records STOP_JOB_CANCELLED.
+ */
+async function checkNoScheduledScanCancelled(opts: {
+  record: TenMinRunRecord;
+  recordFile: string | undefined;
+  dispatchedAfterIso: string;
+  excludeRunId?: number;
+}): Promise<void> {
   const delayMs = Number(process.env.TENMIN_POST_DISPATCH_CHECK_DELAY_MS ?? "15000");
   if (Number.isFinite(delayMs) && delayMs > 0) await new Promise((done) => setTimeout(done, delayMs));
   const { runs, checkFailed } = await scannerRuns();
   if (checkFailed) throw new Error(`${TENMIN_REDISPATCH_SCAN_CANCELLED}:check-failed:${checkFailed}`);
   const cancelled = cancelledScheduledScan(runs, new Date());
-  if (cancelled)
-    throw new Error(`${TENMIN_REDISPATCH_SCAN_CANCELLED}:run=${cancelled.id}:created=${cancelled.created_at}`);
-  process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", postDispatchCheck: "OK", runsListed: runs.length })}\n`);
+  if (!cancelled) {
+    process.stdout.write(
+      `${JSON.stringify({ mode: "tenmin-redispatch", postDispatchCheck: "OK", runsListed: runs.length })}\n`,
+    );
+    return;
+  }
+  const finishedAt = new Date().toISOString();
+  const stopRecord = stopRecordForScanCancelled(opts.record, cancelled.id, finishedAt);
+  if (opts.recordFile) writeFileSync(opts.recordFile, `${JSON.stringify(stopRecord, null, 2)}\n`);
+  process.stdout.write(
+    `${JSON.stringify({
+      mode: "tenmin-redispatch",
+      postDispatchCheck: TENMIN_REDISPATCH_SCAN_CANCELLED,
+      scanRunId: cancelled.id,
+      stopReason: stopRecord.decision.reason,
+    })}\n`,
+  );
+  const dispatched = findDispatchedTenMinRun(runs, {
+    afterIso: opts.dispatchedAfterIso,
+    ...(opts.excludeRunId !== undefined ? { excludeRunId: opts.excludeRunId } : {}),
+  });
+  const plan = planCancelDispatchedRun(dispatched);
+  if (plan.action === "cancel") {
+    const response = await gh(`/actions/runs/${plan.runId}/cancel`, { method: "POST" });
+    assertCancelRunAccepted(response.status, plan.runId);
+    process.stdout.write(
+      `${JSON.stringify({ mode: "tenmin-redispatch", cancelledDispatchedRun: plan.runId, status: dispatched?.status })}\n`,
+    );
+  } else {
+    process.stdout.write(
+      `${JSON.stringify({ mode: "tenmin-redispatch", dispatchedRunCancelSkipped: plan.detail })}\n`,
+    );
+  }
+  throw new Error(`${TENMIN_REDISPATCH_SCAN_CANCELLED}:run=${cancelled.id}:created=${cancelled.created_at}`);
 }
 
 async function dispatch(chain: number): Promise<void> {
@@ -286,16 +439,6 @@ function readJson<T>(path: string | undefined): T | undefined {
   } catch {
     return undefined;
   }
-}
-
-/** The record the chain step stores as the run's artifact (read by the fallback). */
-export interface TenMinRunRecord {
-  outcome: TenMinRunOutcome | undefined;
-  jobResult: string;
-  chain: number;
-  githubRunId: string;
-  finishedAt: string;
-  decision: TenMinRedispatchDecision;
 }
 
 async function main(mode: string | undefined): Promise<void> {
@@ -332,8 +475,14 @@ async function main(mode: string | undefined): Promise<void> {
     output("reason", decision.reason);
     process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", trigger: "chain", ...decision })}\n`);
     if (decision.dispatch) {
+      const dispatchedAfterIso = new Date().toISOString();
       await dispatch(decision.nextChain);
-      await checkNoScheduledScanCancelled();
+      await checkNoScheduledScanCancelled({
+        record,
+        recordFile: env.TENMIN_RECORD_FILE,
+        dispatchedAfterIso,
+        ...(Number.isFinite(self) ? { excludeRunId: self } : {}),
+      });
     }
     return;
   }
@@ -369,8 +518,22 @@ async function main(mode: string | undefined): Promise<void> {
     output("reason", decision.reason);
     process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", trigger: "fallback", lastRun: record?.githubRunId, ...decision })}\n`);
     if (decision.dispatch) {
+      // Build a record so a cancelled-scan stop can be written for the next fallback to read.
+      const fallbackRecord: TenMinRunRecord = record ?? {
+        outcome: undefined,
+        jobResult: "unknown",
+        chain: 0,
+        githubRunId: env.GITHUB_RUN_ID ?? "",
+        finishedAt: now.toISOString(),
+        decision,
+      };
+      const dispatchedAfterIso = new Date().toISOString();
       await dispatch(decision.nextChain);
-      await checkNoScheduledScanCancelled();
+      await checkNoScheduledScanCancelled({
+        record: { ...fallbackRecord, decision },
+        recordFile: env.TENMIN_RECORD_FILE,
+        dispatchedAfterIso,
+      });
     }
     return;
   }

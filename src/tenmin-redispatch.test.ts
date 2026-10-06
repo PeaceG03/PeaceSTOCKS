@@ -3,12 +3,19 @@ import test from "node:test";
 import type { TenMinHistoryRangeReport, TenMinHistoryRunReport } from "./tenmin-history";
 import {
   TENMIN_REDISPATCH_DEFAULT_MAX_CHAIN,
+  TENMIN_STOP_SCAN_CANCELLED,
   type TenMinRedispatchInput,
   type TenMinRunOutcome,
+  type TenMinRunRecord,
+  assertCancelRunAccepted,
   cancelledScheduledScan,
   decideTenMinRedispatch,
+  findDispatchedTenMinRun,
   guardWindowState,
+  isCancelableDispatchStatus,
   maxChainOf,
+  planCancelDispatchedRun,
+  stopRecordForScanCancelled,
   tenMinRunOutcome,
 } from "./tenmin-redispatch";
 
@@ -161,7 +168,10 @@ test("decision: kill switch off, job failure, missing outcome, ranges done, a ne
       [false, "KILL_SWITCH_OFF"],
     );
   assert.equal(decideTenMinRedispatch(input({ jobResult: "failure" })).reason, "STOP_JOB_FAILURE");
-  assert.equal(decideTenMinRedispatch(input({ jobResult: "cancelled" })).reason, "STOP_JOB_CANCELLED");
+  assert.deepEqual(
+    [decideTenMinRedispatch(input({ jobResult: "cancelled" })).dispatch, decideTenMinRedispatch(input({ jobResult: "cancelled" })).reason],
+    [false, "STOP_JOB_CANCELLED"],
+  );
   assert.equal(decideTenMinRedispatch(input({ outcome: undefined })).reason, "STOP_NO_OUTCOME");
   assert.equal(
     decideTenMinRedispatch(input({ outcome: { ...continueOutcome, rangesRemaining: 0 } })).reason,
@@ -259,4 +269,135 @@ test("post-dispatch check: only a recent cancelled scheduled scanner.yml run fai
   );
   // None.
   assert.equal(cancelledScheduledScan([], now), undefined);
+});
+
+
+// ---- post-dispatch SCAN_CANCELLED: cancel dispatched run + hard stop record ----
+
+const sampleContinueRecord = (): TenMinRunRecord => ({
+  outcome: continueOutcome,
+  jobResult: "success",
+  chain: 2,
+  githubRunId: "100",
+  finishedAt: "2026-10-06T10:00:00.000Z",
+  decision: {
+    dispatch: true,
+    nextAction: "continue",
+    reason: "CONTINUE_TIME_BUDGET",
+    nextChain: 3,
+  },
+});
+
+const dispatchRun = (id: number, status: string, created: string, event = "workflow_dispatch") => ({
+  id,
+  event,
+  status,
+  conclusion: status === "completed" ? "success" : null,
+  created_at: `2026-10-06T${created}Z`,
+});
+
+test("scan-cancelled stop record: chain-path cancel of a waiting run + stop record", () => {
+  const record = sampleContinueRecord();
+  const stopped = stopRecordForScanCancelled(record, 55, "2026-10-06T10:00:20.000Z");
+  assert.equal(stopped.outcome?.nextAction, "stop");
+  assert.equal(stopped.outcome?.reason, `${TENMIN_STOP_SCAN_CANCELLED}:run=55`);
+  assert.deepEqual(stopped.decision, {
+    dispatch: false,
+    nextAction: "stop",
+    reason: `${TENMIN_STOP_SCAN_CANCELLED}:run=55`,
+    nextChain: 3,
+  });
+  assert.equal(stopped.finishedAt, "2026-10-06T10:00:20.000Z");
+  // Original continue fields that identify the history run stay put.
+  assert.equal(stopped.githubRunId, "100");
+  assert.equal(stopped.chain, 2);
+  assert.equal(stopped.jobResult, "success");
+  // Waiting/queued/pending/requested/in_progress => cancel.
+  for (const status of ["queued", "waiting", "pending", "requested", "in_progress"]) {
+    assert.equal(isCancelableDispatchStatus(status), true, status);
+    assert.deepEqual(planCancelDispatchedRun(dispatchRun(9, status, "10:00:05")), { action: "cancel", runId: 9 }, status);
+  }
+  const after = "2026-10-06T10:00:00.000Z";
+  const found = findDispatchedTenMinRun(
+    [dispatchRun(7, "queued", "09:59:00"), dispatchRun(8, "waiting", "10:00:01"), dispatchRun(100, "in_progress", "09:50:00", "schedule")],
+    { afterIso: after, excludeRunId: 100 },
+  );
+  assert.equal(found?.id, 8);
+  assert.deepEqual(planCancelDispatchedRun(found), { action: "cancel", runId: 8 });
+});
+
+test("scan-cancelled stop record: in_progress dispatched run gets the cancel plan; completed is skipped", () => {
+  const stopped = stopRecordForScanCancelled(sampleContinueRecord(), 77, "2026-10-06T10:00:20.000Z");
+  assert.equal(stopped.decision.reason, `${TENMIN_STOP_SCAN_CANCELLED}:run=77`);
+  // Fallback path: the just-dispatched run is typically already in_progress — still cancel it.
+  assert.equal(isCancelableDispatchStatus("in_progress"), true);
+  assert.deepEqual(planCancelDispatchedRun(dispatchRun(12, "in_progress", "10:00:02")), {
+    action: "cancel",
+    runId: 12,
+  });
+  // Already-completed / missing: skip and report (do not cancel).
+  assert.deepEqual(planCancelDispatchedRun(dispatchRun(13, "completed", "10:00:02")), {
+    action: "none",
+    detail: "status=completed:conclusion=success",
+  });
+  assert.deepEqual(planCancelDispatchedRun(undefined), { action: "none", detail: "dispatched-run-not-found" });
+});
+
+test("cancelled history step: chain decision is STOP_JOB_CANCELLED and never dispatches", () => {
+  // When we cancel an in_progress tenmin_history run, its always() chain step sees
+  // steps.history.outcome === "cancelled" and must stop (never re-dispatch).
+  const cancelled = decideTenMinRedispatch(input({ jobResult: "cancelled", killSwitch: "true", chain: 4 }));
+  assert.deepEqual(cancelled, {
+    dispatch: false,
+    nextAction: "stop",
+    reason: "STOP_JOB_CANCELLED",
+    nextChain: 5,
+  });
+  // Even with a continue outcome on disk, a cancelled history step wins.
+  assert.equal(decideTenMinRedispatch(input({ jobResult: "cancelled", outcome: continueOutcome })).dispatch, false);
+});
+
+test("scan-cancelled stop record: fallback path writes stop; following decision stays stop even with a raised cap", () => {
+  const stopped = stopRecordForScanCancelled(sampleContinueRecord(), 42, "2026-10-06T10:00:20.000Z");
+  // What the next fallback would read from the uploaded artifact.
+  const again = decideTenMinRedispatch(
+    input({
+      trigger: "fallback",
+      outcome: stopped.outcome,
+      jobResult: stopped.jobResult,
+      chain: stopped.chain,
+      currentMaxRangeEnd: "2099-12-31",
+    }),
+  );
+  assert.deepEqual([again.dispatch, again.nextAction, again.reason], [false, "stop", `${TENMIN_STOP_SCAN_CANCELLED}:run=42`]);
+  // Contrast: a real STOP_RANGE_END_CAP still restarts when the cap is raised.
+  const atCap = capOutcome(10);
+  assert.equal(
+    decideTenMinRedispatch(input({ trigger: "fallback", outcome: atCap, currentMaxRangeEnd: "2025-12-31" })).reason,
+    "CONTINUE_RANGE_END_CAP_RAISED:2024-12-31->2025-12-31",
+  );
+});
+
+test("scan-cancelled: cancel API failure fails loudly; no cancelled scan is unchanged", () => {
+  assert.throws(() => assertCancelRunAccepted(500, 99), /TENMIN_REDISPATCH_CANCEL_FAILED:run=99:http-500/);
+  assert.throws(() => assertCancelRunAccepted(403, 99), /TENMIN_REDISPATCH_CANCEL_FAILED:run=99:http-403/);
+  // 202 Accepted (and 204) are fine.
+  assertCancelRunAccepted(202, 99);
+  assertCancelRunAccepted(204, 99);
+  // No cancelled scheduled scan => cancelledScheduledScan stays undefined (unchanged behavior).
+  const now = at("10:00:00");
+  assert.equal(
+    cancelledScheduledScan(
+      [
+        dispatchRun(1, "queued", "09:59:50"),
+        { id: 2, event: "schedule", status: "completed", conclusion: "success", created_at: "2026-10-06T09:58:00Z" },
+      ],
+      now,
+    ),
+    undefined,
+  );
+  // A continue record is left alone when there is nothing to stop for.
+  const record = sampleContinueRecord();
+  assert.equal(record.decision.nextAction, "continue");
+  assert.equal(record.outcome?.nextAction, "continue");
 });

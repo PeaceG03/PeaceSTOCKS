@@ -276,8 +276,13 @@ jobs:
       # Decision logic is decideTenMinRedispatch (src/tenmin-redispatch.ts, unit-tested); it stops
       # on any refusal, error, outage, failure, bounded manual run, chain cap, or kill switch off,
       # and waits (no dispatch) in or just before a guard window or while another run is queued.
-      # Right after a dispatch it lists scanner.yml runs and fails loudly with
-      # TENMIN_REDISPATCH_SCAN_CANCELLED if a scheduled run created in the last 10 min was cancelled.
+      # Right after a dispatch it lists scanner.yml runs; if a scheduled run created in the last 10 min
+      # was cancelled it rewrites this run's record to STOP_SCAN_CANCELLED (hard stop for the
+      # fallback), cancels the just-dispatched tenmin_history run while still queued/waiting/pending/
+      # requested/in_progress (skips and reports if already completed), and fails with
+      # TENMIN_REDISPATCH_SCAN_CANCELLED. Cancelling in_progress is safe: that run's always() chain
+      # step sees the history step cancelled and records STOP_JOB_CANCELLED. The upload step below
+      # runs after this (if: always), so the rewritten stop record is what the fallback reads.
       - name: Auto re-dispatch (chain)
         id: redispatch
         if: ${{ always() }}
