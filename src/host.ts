@@ -28,7 +28,19 @@ import { openMarketStore } from "./object-storage";
 import { R2ObjectClient } from "./object-store";
 import { FileReplyDustStore, type ReplyDustStore } from "./intraday-reply-dust";
 import { scanGroupedReplyDustEnabled } from "./scan-grouped-reply-dust";
-import { runTenMinHistoryFromEnv, tenMinHistorySummary } from "./tenmin-history";
+import {
+  candidateDailyPickDays,
+  DEFAULT_TENMIN_HISTORY_WINDOW_START,
+  lastCompletedSessionDate,
+  runTenMinHistoryFromEnv,
+  tenMinHistorySummary,
+} from "./tenmin-history";
+import {
+  type TenMinDailyPicksRunReport,
+  runTenMinDailyPicks,
+  tenMinDailyPicksEnabled,
+} from "./tenmin-daily-runner";
+import type { PicksBaseV1, PicksTop50V1 } from "./tenmin-daily-picks";
 import { tenMinRunOutcome } from "./tenmin-redispatch";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 
@@ -377,14 +389,88 @@ export async function runScannerHost(
   return final;
 }
 
+export interface RunTenMinDailyHostOptions {
+  env?: NodeJS.ProcessEnv;
+  /** Live clock (defaults to () => new Date()). Injected in tests. */
+  clock?: () => Date;
+  root?: string;
+  store?: ReplyDustStore;
+  storage?: MarketStore;
+  provider?: MassiveMarketProvider;
+  days?: readonly string[];
+  buildBase?: (sessionDate: string) => Promise<PicksBaseV1> | PicksBaseV1;
+  buildTop50?: (sessionDate: string) => Promise<PicksTop50V1 | undefined> | PicksTop50V1 | undefined;
+  fetchReply?: (
+    security: { securityId: string; symbol: string },
+    sessionDate: string,
+  ) => Promise<Uint8Array>;
+  shouldYield?: () => Promise<string | undefined>;
+  limit?: number;
+}
+
+/**
+ * Standalone `tenmin_daily` entry (PEACESTOCKS_TENMIN_DAILY=1).
+ * Always passes a live `clock` into the runner (tests may inject one).
+ */
+export async function runTenMinDailyHost(
+  options: RunTenMinDailyHostOptions = {},
+): Promise<TenMinDailyPicksRunReport> {
+  const env = options.env ?? process.env;
+  const clock = options.clock ?? (() => new Date());
+  const now = clock();
+  const root =
+    options.root ??
+    env.PEACEAI_MARKETS_ROOT ??
+    env.MARKETS_STORAGE_ROOT ??
+    DEFAULT_MARKETS_ROOT;
+  const storage = options.storage ?? openMarketStore(root, env);
+  if (!options.storage) await storage.initialize();
+  const store =
+    options.store ??
+    (env.PEACESTOCKS_R2_BUCKET?.trim()
+      ? R2ObjectClient.fromEnv(env)
+      : new FileReplyDustStore(root));
+  const provider =
+    options.provider ?? new MassiveMarketProvider({ keepRawReplies: true });
+  return runTenMinDailyPicks({
+    store,
+    storage,
+    days:
+      options.days ??
+      candidateDailyPickDays(
+        DEFAULT_TENMIN_HISTORY_WINDOW_START,
+        lastCompletedSessionDate(now),
+      ),
+    now,
+    clock,
+    env,
+    provider,
+    ...(options.buildBase ? { buildBase: options.buildBase } : {}),
+    ...(options.buildTop50 ? { buildTop50: options.buildTop50 } : {}),
+    ...(options.fetchReply ? { fetchReply: options.fetchReply } : {}),
+    ...(options.shouldYield ? { shouldYield: options.shouldYield } : {}),
+    ...(options.limit !== undefined ? { limit: options.limit } : {}),
+  });
+}
+
 async function main(): Promise<void> {
+  // Standalone daily picks mode (workflow mode tenmin_daily). Kill switch TENMIN_DAILY_PICKS
+  // must still be exactly "true"; PEACESTOCKS_TENMIN_DAILY=1 selects this path.
+  if (process.env.PEACESTOCKS_TENMIN_DAILY === "1") {
+    const report = await runTenMinDailyHost({ env: process.env, clock: () => new Date() });
+    process.stdout.write(`${JSON.stringify(report)}\n`);
+    process.exitCode = report.corrupt.length ? 2 : 0;
+    return;
+  }
   // OFF by default. Explicit PEACESTOCKS_TENMIN_HISTORY=1 runs the 10-minute history runner only
   // (keep-all-Massive-fields Reply Dust ranges). Optional: PEACESTOCKS_TENMIN_HISTORY_REOPEN=1,
   // PEACESTOCKS_TENMIN_HISTORY_MAX_RANGES, PEACESTOCKS_TENMIN_HISTORY_BUDGET_MS. Refuses without
-  // pinned zstd 1.5.7 and without a store when PEACESTOCKS_REQUIRE_OBJECT_STORE=1. Not scheduled
-  // in workflows in this commit — invoke via host env only.
+  // pinned zstd 1.5.7 and without a store when PEACESTOCKS_REQUIRE_OBJECT_STORE=1. Daily picks
+  // run as the first phase when TENMIN_DAILY_PICKS === "true".
   const history = await runTenMinHistoryFromEnv(process.env);
   if (history) {
+    if (history.dailyPicks)
+      process.stdout.write(`${JSON.stringify({ dailyPicks: history.dailyPicks })}\n`);
     process.stdout.write(
       `${JSON.stringify(tenMinHistorySummary(history.report))}\n`,
     );

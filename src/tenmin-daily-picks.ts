@@ -504,3 +504,17 @@ export function mergeDailyTenMinPicksV1(
     .sort((a, b) => (a.securityId < b.securityId ? -1 : a.securityId > b.securityId ? 1 : 0))
     .map((acc) => finalizePick(acc));
 }
+
+/**
+ * Fetch order for a day: holding → index → top50 → random, then securityId.
+ * Priority names (SPY/QQQ index, holdings, top50) are requested before the random group
+ * so a mid-day cutoff still leaves them stored.
+ */
+export function orderPicksForFetch(picks: readonly PickV1Pick[]): PickV1Pick[] {
+  return [...picks].sort((a, b) => {
+    const byReason = REASON_PRIORITY[a.reason] - REASON_PRIORITY[b.reason];
+    if (byReason !== 0) return byReason;
+    return a.securityId < b.securityId ? -1 : a.securityId > b.securityId ? 1 : 0;
+  });
+}
+

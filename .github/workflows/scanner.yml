@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "scan (online scheduler), backfill (daily historical evidence), or tenmin_history (10-minute range history; off unless chosen)"
+        description: "scan (online scheduler), backfill (daily historical evidence), tenmin_history (10-minute range history), or tenmin_daily (daily 10-minute picks; kill switch TENMIN_DAILY_PICKS)"
         required: true
         default: scan
         type: choice
@@ -14,6 +14,7 @@ on:
           - scan
           - backfill
           - tenmin_history
+          - tenmin_daily
       from:
         description: "Backfill from date (YYYY-MM-DD inclusive)"
         required: false
@@ -219,6 +220,8 @@ jobs:
       PEACESTOCKS_SOURCE_COMMIT: ${{ github.sha }}
       PEACESTOCKS_REQUIRE_OBJECT_STORE: "1"
       PEACESTOCKS_TENMIN_HISTORY: "1"
+      # Daily picks first phase: must be exactly "true" (repo var). Default off when unset.
+      TENMIN_DAILY_PICKS: ${{ vars.TENMIN_DAILY_PICKS }}
       # Repo variable (YYYY-MM-DD): ranges ending after it are not planned; at the cap the chain
       # stops with STOP_RANGE_END_CAP. Empty = no cap. Invalid = the run fails before any request.
       # Raising it later is a variable change only (the fallback restarts the chain).
@@ -308,3 +311,69 @@ jobs:
           path: ${{ runner.temp }}/tenmin-history-record.json
           retention-days: 14
           if-no-files-found: warn
+
+  # Standalone daily 10-minute picks. Shares peacestocks-r2-writer. Kill switch TENMIN_DAILY_PICKS
+  # must be exactly "true" (repo var); workflow does not force it on.
+  tenmin_daily:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'tenmin_daily' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: write
+    timeout-minutes: 120
+    env:
+      MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+      PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+      PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+      PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+      PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+      PEACESTOCKS_SOURCE_COMMIT: ${{ github.sha }}
+      PEACESTOCKS_REQUIRE_OBJECT_STORE: "1"
+      PEACESTOCKS_TENMIN_DAILY: "1"
+      TENMIN_DAILY_PICKS: ${{ vars.TENMIN_DAILY_PICKS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Restore pinned zstd 1.5.7
+        id: zstd-cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/zstd-1.5.7
+          key: zstd-1.5.7-eb33e51f49a15e02-${{ runner.os }}-ubuntu-24.04
+      - name: Build pinned zstd 1.5.7
+        if: ${{ steps.zstd-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+          echo "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3  zstd-1.5.7.tar.gz" | sha256sum -c -
+          tar xzf zstd-1.5.7.tar.gz
+          make -C zstd-1.5.7 -j"$(nproc)" zstd-release
+          install -D -m 0755 zstd-1.5.7/programs/zstd ~/.local/zstd-1.5.7/bin/zstd
+      - name: Use pinned zstd 1.5.7
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ~/.local/zstd-1.5.7/bin/zstd --version | grep -F ' v1.5.7,'
+          echo "$HOME/.local/zstd-1.5.7/bin" >> "$GITHUB_PATH"
+      - name: Refuse a run that would write the store to the runner disk
+        run: |
+          test -n "$PEACESTOCKS_R2_BUCKET"
+          test -n "$PEACESTOCKS_R2_ACCOUNT_ID"
+          test -n "$PEACESTOCKS_R2_ACCESS_KEY_ID"
+          test -n "$PEACESTOCKS_R2_SECRET_ACCESS_KEY"
+          test -n "$MASSIVE_API_KEY"
+      - name: Daily 10-minute picks runner
+        env:
+          PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
+          GITHUB_TOKEN: ${{ github.token }}
+        run: pnpm scheduler

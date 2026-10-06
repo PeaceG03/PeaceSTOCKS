@@ -13,6 +13,11 @@ import { R2ObjectClient } from "./object-store";
 import { openMarketStore } from "./object-storage";
 import { type ZstdVersionProbe, assertPinnedZstdForWriting } from "./reply-dust-pin";
 import { scanYieldReason } from "./scan-yield";
+import {
+  type TenMinDailyPicksRunReport,
+  runTenMinDailyPicks,
+  tenMinDailyPicksEnabled,
+} from "./tenmin-daily-runner";
 import type { SessionCalendar } from "./scanner";
 import type { MarketStore } from "./storage";
 import { MarketStorage } from "./storage";
@@ -290,6 +295,28 @@ function nextPairRange(
   firstRangeStart: string,
 ): { calendarFrom: string; calendarTo: string } {
   return pairRangeForDate(addCalendarDays(calendarTo, 1), firstRangeStart);
+}
+
+/**
+ * Inclusive NORMAL/HALF_DAY session list from windowStart through lastCompleted (oldest first).
+ * Weekends and CLOSED holidays are excluded via the trading calendar.
+ */
+export function candidateDailyPickDays(
+  windowStart: string,
+  lastCompleted: string,
+  calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
+): string[] {
+  if (windowStart > lastCompleted) return [];
+  const out: string[] = [];
+  let cur = windowStart;
+  while (cur <= lastCompleted) {
+    const kind = calendar.getSession(cur).kind;
+    if (kind === "NORMAL" || kind === "HALF_DAY") out.push(cur);
+    const d = new Date(`${cur}T00:00:00.000Z`);
+    d.setUTCDate(d.getUTCDate() + 1);
+    cur = d.toISOString().slice(0, 10);
+  }
+  return out;
 }
 
 export function lastCompletedSessionDate(
@@ -719,6 +746,8 @@ export interface TenMinHistoryRunReport {
 
 export interface TenMinHistoryRunResult {
   report: TenMinHistoryRunReport;
+  /** Present when TENMIN_DAILY_PICKS === "true"; runs before range history. */
+  dailyPicks?: TenMinDailyPicksRunReport;
   rangeResults: TenMinRangeWriteResult[];
 }
 
@@ -757,6 +786,8 @@ export async function runTenMinHistory(options: {
   shouldYield?: () => Promise<string | undefined>;
   env?: NodeJS.ProcessEnv;
   now?: Date;
+  /** Live clock for daily picks phase (defaults to () => new Date()). */
+  clock?: () => Date;
   nowIso?: () => string;
   zstdVersionProbe?: ZstdVersionProbe;
   fetchPages?: (
@@ -810,6 +841,23 @@ export async function runTenMinHistory(options: {
         });
 
   const lastCompleted = options.lastCompletedSession ?? lastCompletedSessionDate(now);
+  // First phase: daily 10-minute picks when TENMIN_DAILY_PICKS === "true".
+  let dailyPicks: TenMinDailyPicksRunReport | undefined;
+  if (tenMinDailyPicksEnabled(env)) {
+    dailyPicks = await runTenMinDailyPicks({
+      store,
+      storage,
+      days: candidateDailyPickDays(
+        options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START,
+        lastCompleted,
+      ),
+      now,
+      clock: options.clock ?? (() => new Date()),
+      env,
+      provider,
+      shouldYield,
+    });
+  }
   const configuredWindowStart = options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START;
   const plan = planTenMinHistoryRanges({
     windowStart: configuredWindowStart,
@@ -1144,7 +1192,7 @@ export async function runTenMinHistory(options: {
     }
   }
 
-  return { report, rangeResults };
+  return { report, rangeResults, ...(dailyPicks ? { dailyPicks } : {}) };
 }
 
 /**

@@ -380,7 +380,8 @@ test("failed/partial provider runs are not reported as complete", async () => {
     assert.equal(report.status, "FAILED");
     assert.equal(report.incompleteSecurities, 1);
     assert.equal(report.validSecurities, 0);
-    assert.ok(report.storage.permanentBytesToday > 0);
+    // Total permanent bytes (not mtime-filtered "today") so faketime wall clocks cannot zero this out.
+    assert.ok((report.storage.categoryBytes.permanent ?? 0) > 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

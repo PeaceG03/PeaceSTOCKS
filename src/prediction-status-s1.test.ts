@@ -19,11 +19,13 @@ import {
   resolveSessionPredictionStatus,
 } from "./prediction-status";
 import { MarketsScanner } from "./scanner";
+import { beforeNextSessionOpen } from "./session-open";
 import { MarketStorage } from "./storage";
 import { ObjectMarketStorage } from "./object-storage";
 import { MemoryObjectClient } from "./object-store";
 
 const SESSION = "2026-10-05";
+const freezeNow = (sessionDate: string) => () => beforeNextSessionOpen(sessionDate);
 const OLD_RUN = "scan_412ee524980b106d93cd0d29";
 
 function providerRecord(
@@ -196,7 +198,7 @@ test("S1.1: NOT_READY then successful FROZEN — both status records, one frozen
     await storage.initialize();
     const id = securityId("fixture-provider", "issuer-1", "STOCK");
     const notReady = new CountingProvider([providerRecord("issuer-1", "AAA")], [], [], "PROVIDER_NOT_READY:MASSIVE");
-    const first = await new MarketsScanner(notReady, storage).run(SESSION);
+    const first = await new MarketsScanner(notReady, storage, undefined, undefined, freezeNow(SESSION)).run(SESSION);
     assert.equal(first.status, "PROVIDER_NOT_READY");
     const afterNotReady = await storage.loadPredictionStatuses(SESSION);
     assert.equal(afterNotReady.length, 1);
@@ -212,7 +214,7 @@ test("S1.1: NOT_READY then successful FROZEN — both status records, one frozen
       [bar(id, SESSION, 100, stamps)],
     );
     // FORWARD freeze after NOT_READY (EVIDENCE_ONLY still records UNAVAILABLE/EVIDENCE_ONLY by design).
-    const second = await new MarketsScanner(ok, storage).run(SESSION, "FORWARD");
+    const second = await new MarketsScanner(ok, storage, undefined, undefined, freezeNow(SESSION)).run(SESSION, "FORWARD");
     assert.ok(
       second.status === "COMPLETE" || second.status === "COMPLETE_WITH_WARNINGS",
       second.status,
@@ -247,7 +249,7 @@ test("S1.2: FROZEN then retry → ALREADY_FROZEN, zero provider calls, no new de
       [providerRecord("issuer-1", "AAA")],
       [bar(id, SESSION, 100, stamps)],
     );
-    const first = await new MarketsScanner(provider, storage).run(SESSION);
+    const first = await new MarketsScanner(provider, storage, undefined, undefined, freezeNow(SESSION)).run(SESSION);
     assert.equal(first.predictionStatus, "FROZEN");
     const callsAfterFirst = provider.totalCalls();
     assert.ok(callsAfterFirst > 0);
@@ -255,7 +257,7 @@ test("S1.2: FROZEN then retry → ALREADY_FROZEN, zero provider calls, no new de
     const preds1 = await storage.loadPredictions(SESSION);
     const statuses1 = await storage.loadPredictionStatuses(SESSION);
 
-    const retry = await new MarketsScanner(provider, storage).run(SESSION, "EVIDENCE_ONLY");
+    const retry = await new MarketsScanner(provider, storage, undefined, undefined, freezeNow(SESSION)).run(SESSION, "EVIDENCE_ONLY");
     assert.equal(retry.status, "ALREADY_FROZEN");
     assert.equal(provider.totalCalls(), callsAfterFirst); // zero new provider calls
     assert.deepEqual(await storage.loadBeliefs(SESSION), beliefs1);

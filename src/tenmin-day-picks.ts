@@ -43,6 +43,7 @@ import {
   nodeReplyDustBackend,
 } from "./reply-dust";
 import { resolveSessionPredictionStatus } from "./prediction-status";
+import { type EligibleSessionCalendar, nextSessionOpen } from "./session-open";
 
 export const TENMIN_DAY_REPLY_DUST_PREFIX = "permanent/tenmin-day-reply-dust" as const;
 export const TENMIN_DAY_MANIFEST_SCHEMA = "tenmin-day-reply-dust-manifest-v1" as const;
@@ -199,20 +200,27 @@ export function tenMinDayTop50ManifestChecksum(
   return sha256Hex(JSON.stringify(body));
 }
 
+export interface ClassifyTop50AbsenceSettlement {
+  sessionDate: string;
+  now: Date;
+  calendar?: EligibleSessionCalendar;
+}
+
 /**
  * Classify resolved prediction status for top50 absence.
  * - FROZEN → should not be absent (caller writes present)
- * - EVIDENCE_ONLY / FREEZE_AFTER_OPEN (and any other terminal non-FROZEN) → no_forward_scan
- * - missing / SOURCE_COLLECTION_FAILED / etc. that may still become FROZEN → not_yet_frozen
+ * - When settlement is provided and the next session's 09:30 ET open has passed,
+ *   any non-FROZEN day (including no records) → no_forward_scan
+ * - Before that open (with settlement): non-FROZEN → not_yet_frozen
+ * - Without settlement (compat): EVIDENCE_ONLY / FREEZE_AFTER_OPEN → no_forward_scan;
+ *   missing / SOURCE_COLLECTION_FAILED → not_yet_frozen
  */
 export function classifyTop50Absence(
   statuses: readonly PredictionStatus[],
+  settlement?: ClassifyTop50AbsenceSettlement,
 ): Extract<TenMinDayTop50State, { state: "absent" }> {
   const resolved = resolveSessionPredictionStatus(statuses);
-  if (!resolved) {
-    return { state: "absent", reason: "not_yet_frozen" };
-  }
-  if (resolved.status === "FROZEN") {
+  if (resolved?.status === "FROZEN") {
     // Caller should treat as present; keep a defensive absent classification unused.
     return {
       state: "absent",
@@ -220,6 +228,39 @@ export function classifyTop50Absence(
       resolvedStatusId: resolved.predictionStatusId,
       resolvedReason: resolved.reason,
     };
+  }
+
+  if (settlement) {
+    const next = nextSessionOpen(settlement.sessionDate, settlement.calendar);
+    const openPassed =
+      !next || settlement.now.getTime() >= next.nextSessionOpen.getTime();
+    if (openPassed) {
+      return {
+        state: "absent",
+        reason: "no_forward_scan",
+        ...(resolved
+          ? {
+              resolvedStatusId: resolved.predictionStatusId,
+              resolvedReason: resolved.reason,
+            }
+          : {}),
+      };
+    }
+    // Before next open: not settled yet.
+    return {
+      state: "absent",
+      reason: "not_yet_frozen",
+      ...(resolved
+        ? {
+            resolvedStatusId: resolved.predictionStatusId,
+            resolvedReason: resolved.reason,
+          }
+        : {}),
+    };
+  }
+
+  if (!resolved) {
+    return { state: "absent", reason: "not_yet_frozen" };
   }
   const terminalNoForward =
     resolved.reason === "EVIDENCE_ONLY" || resolved.reason === "FREEZE_AFTER_OPEN";
@@ -314,7 +355,12 @@ export interface TenMinDaySecurityInput {
   securityId: string;
   symbol: string;
   status: TenMinDayObjectStatus;
-  /** Raw Massive 10-minute reply body (required when status is STORED). */
+  /**
+   * Raw Massive 10-minute reply body for a fresh STORED write.
+   * Omit on resume when the .rdust already exists: the writer adopts it if it
+   * decodes cleanly and sha256 matches its own rd-file-sha256 metadata.
+   * Never compare a new Massive reply to existing bytes (request_id differs).
+   */
   replyBody?: Uint8Array;
   gapReason?: string;
 }
@@ -330,6 +376,12 @@ export interface WriteTenMinDayPicksInput {
   predictionStatuses?: readonly PredictionStatus[];
   securities: readonly TenMinDaySecurityInput[];
   observedAt: string;
+  /**
+   * When set, absence classification uses the Architect settlement rule
+   * (after next session 09:30 ET open → no_forward_scan for any non-FROZEN).
+   * Omit for storage-layer tests that assert the status-only classifier.
+   */
+  settlementNow?: Date;
   provider?: string;
   backend?: ReplyDustBackend;
 }
@@ -339,6 +391,54 @@ export interface WriteTenMinDayPicksInput {
  * then manifest.json LAST. Resumable: identical existing objects are reused;
  * corrupted leftovers throw TENMIN_DAY_OBJECT_CORRUPT.
  */
+/**
+ * Load existing picks.json bytes for resume (byte-for-byte reuse). Missing → undefined.
+ */
+export async function loadExistingPicksBaseBytes(
+  store: ReplyDustStore,
+  sessionDate: string,
+): Promise<Uint8Array | undefined> {
+  requireSessionDate(sessionDate);
+  return store.get(tenMinDayPicksKey(sessionDate));
+}
+
+/** Parse picks.json file bytes (optional trailing newline) into PicksBaseV1. */
+export function parsePicksBaseBytes(bytes: Uint8Array): PicksBaseV1 {
+  const text = textDecoder.decode(bytes).replace(/\n$/u, "");
+  const doc = JSON.parse(text) as PicksBaseV1;
+  if (doc?.ruleVersion !== PICK_V1_RULE_VERSION)
+    throw new Error(`TENMIN_DAY_PICKS_PARSE:ruleVersion:${String(doc?.ruleVersion)}`);
+  if (typeof doc.sessionDate !== "string" || !Array.isArray(doc.picks))
+    throw new Error("TENMIN_DAY_PICKS_PARSE:shape");
+  return doc;
+}
+
+/**
+ * Adopt an existing day .rdust: object must exist, decode cleanly, and its sha256
+ * must match its own `rd-file-sha256` metadata. Never compares a new Massive reply
+ * (request_id would differ). Missing/corrupt → TENMIN_DAY_OBJECT_CORRUPT with key.
+ */
+async function adoptExistingDayObject(
+  store: ReplyDustStore,
+  key: string,
+  backend: ReplyDustBackend,
+): Promise<Uint8Array> {
+  const bytes = await store.get(key);
+  if (!bytes) throw new Error(`${TENMIN_DAY_OBJECT_CORRUPT}:${key}:missing`);
+  const head = await store.head(key);
+  const metaSha = head?.metadata?.["rd-file-sha256"];
+  if (typeof metaSha !== "string" || !/^[0-9a-f]{64}$/iu.test(metaSha))
+    throw new Error(`${TENMIN_DAY_OBJECT_CORRUPT}:${key}:metadata`);
+  if (sha256Hex(bytes) !== metaSha.toLowerCase())
+    throw new Error(`${TENMIN_DAY_OBJECT_CORRUPT}:${key}:metadata`);
+  try {
+    decodeReplyDust(bytes, backend);
+  } catch {
+    throw new Error(`${TENMIN_DAY_OBJECT_CORRUPT}:${key}:decode`);
+  }
+  return bytes;
+}
+
 export async function writeTenMinDayPicks(
   store: ReplyDustStore,
   input: WriteTenMinDayPicksInput,
@@ -376,7 +476,12 @@ export async function writeTenMinDayPicks(
     });
     top50State = { state: "present" };
   } else {
-    top50State = classifyTop50Absence(input.predictionStatuses ?? []);
+    top50State = classifyTop50Absence(
+      input.predictionStatuses ?? [],
+      input.settlementNow
+        ? { sessionDate: D, now: input.settlementNow }
+        : undefined,
+    );
   }
 
   const merged = mergeDailyTenMinPicksV1(input.picksBase, input.picksTop50);
@@ -415,17 +520,19 @@ export async function writeTenMinDayPicks(
       );
       continue;
     }
-    // STORED
-    if (!sec.replyBody)
-      throw new Error(`TENMIN_DAY_STORED_WITHOUT_BODY:${pick.securityId}`);
+    // STORED: write new replyBody, or adopt an existing .rdust (resume).
     const key = tenMinDayObjectKey(D, pick.securityId, pick.symbol);
-    const encoded = encodeAndVerifyExisting(store, key, sec.replyBody, backend, {
-      provider,
-      sessionDate: D,
-      securityId: pick.securityId,
-      symbol: pick.symbol,
-    });
-    const fileBytes = await encoded;
+    let fileBytes: Uint8Array;
+    if (sec.replyBody) {
+      fileBytes = await encodeAndVerifyExisting(store, key, sec.replyBody, backend, {
+        provider,
+        sessionDate: D,
+        securityId: pick.securityId,
+        symbol: pick.symbol,
+      });
+    } else {
+      fileBytes = await adoptExistingDayObject(store, key, backend);
+    }
     securities.push(
       securityEntryFromPick(D, pick, {
         status: "STORED",
@@ -705,15 +812,15 @@ export async function writeTenMinDayTop50AddOn(
       );
       continue;
     }
-    if (!sec.replyBody)
-      throw new Error(`TENMIN_DAY_STORED_WITHOUT_BODY:${pick.securityId}`);
     const key = tenMinDayObjectKey(D, pick.securityId, pick.symbol);
-    const fileBytes = await encodeAndVerifyExisting(store, key, sec.replyBody, backend, {
-      provider,
-      sessionDate: D,
-      securityId: pick.securityId,
-      symbol: pick.symbol,
-    });
+    const fileBytes = sec.replyBody
+      ? await encodeAndVerifyExisting(store, key, sec.replyBody, backend, {
+          provider,
+          sessionDate: D,
+          securityId: pick.securityId,
+          symbol: pick.symbol,
+        })
+      : await adoptExistingDayObject(store, key, backend);
     newSecurities.push(
       securityEntryFromPick(D, pick, {
         status: "STORED",
