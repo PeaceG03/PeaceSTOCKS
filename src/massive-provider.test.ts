@@ -249,10 +249,12 @@ test("Massive ticker listing checks shouldStop at each later page boundary and r
 });
 
 test("an inactive ticker never replaces an active ticker with the same FIGI", async () => {
+  let calls = 0;
   const provider = new MassiveMarketProvider({
     apiKey: "test-key",
     minRequestIntervalMs: 0,
     fetchImpl: async (input) => {
+      calls += 1;
       const active = new URL(String(input)).searchParams.get("active");
       const ticker = (symbol: string, isActive: boolean, figi: string, extra: object = {}) => ({
         ticker: symbol,
@@ -286,6 +288,15 @@ test("an inactive ticker never replaces an active ticker with the same FIGI", as
   assert.deepEqual(renamed?.formerSymbols, [{ symbol: "OLDN", listingDate: "2019-03-01", delistedDate: "2024-05-20" }]);
   assert.equal(universe.find((item) => item.symbol === "GONE")?.delistedDate, "2023-01-03");
   assert.equal(universe.find((item) => item.symbol === "LIVE")?.formerSymbols, undefined);
+  // The ticker reference capture adds no request: one page per pass, as before.
+  assert.equal(calls, 2);
+  const capture = provider.takeTickerReferenceCapture();
+  assert.deepEqual(capture?.entries.map((e) => [e.pass, e.ticker]), [
+    ["active", "NEWN"],
+    ["active", "LIVE"],
+    ["inactive", "OLDN"],
+    ["inactive", "GONE"],
+  ]);
 });
 
 test("same-identity merge: active wins in either order, same status keeps the later record", () => {

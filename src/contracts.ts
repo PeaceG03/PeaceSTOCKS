@@ -174,6 +174,10 @@ export interface UniverseRefreshResult {
   rejected: number;
   securities: SecurityMasterRecord[];
   membershipEvents: UniverseMembershipEvidence[];
+  /** Present when the ticker reference index was written with the master (same run). */
+  tickerReferenceIndex?: { pages: { active: number; inactive: number }; records: { active: number; inactive: number } };
+  /** Non-fatal problems, e.g. the ticker reference index could not be written. */
+  warnings?: string[];
 }
 
 export interface SourceProvenance {

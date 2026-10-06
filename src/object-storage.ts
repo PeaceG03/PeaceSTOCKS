@@ -14,6 +14,12 @@ import type {
 } from "./contracts";
 import { type DailyBarSessionIndex, indexDailyBarSessions, requireMonth } from "./daily-bar-sessions";
 import { stableJson } from "./identity";
+import {
+  loadTickerReferenceIndex,
+  type TickerReferenceCapture,
+  type TickerReferenceIndexManifest,
+  writeTickerReferenceIndex,
+} from "./ticker-reference-index";
 import type { ObjectClient } from "./object-store";
 import { R2ObjectClient } from "./object-store";
 import { MarketStorage, type MarketStore } from "./storage";
@@ -79,6 +85,17 @@ export class ObjectMarketStorage implements MarketStore {
       "permanent/security-master.json",
       JSON.stringify(records.sort((a, b) => a.securityId.localeCompare(b.securityId)), null, 2) + "\n",
     );
+  }
+
+  async saveTickerReferenceIndex(
+    capture: TickerReferenceCapture,
+    options: { provider: string; asOf: string },
+  ): Promise<TickerReferenceIndexManifest> {
+    return writeTickerReferenceIndex(this.client, capture, options);
+  }
+
+  async loadTickerReferenceIndex() {
+    return loadTickerReferenceIndex(this.client);
   }
 
   async loadMembership(): Promise<UniverseMembershipEvidence[]> {

@@ -8,6 +8,7 @@ import type {
   UniverseRefreshResult,
 } from "./contracts";
 import { securityId } from "./identity";
+import type { TickerReferenceCapture } from "./ticker-reference-index";
 import type { MarketStore } from "./storage";
 
 export function eligibilityForBarCount(barCount: number): HistoryEligibility {
@@ -169,6 +170,32 @@ export async function refreshUniverse(
   const securities = [...byId.values()];
   await storage.saveSecurities(securities);
   await storage.appendMembership(membershipEvents);
+  // Same run, after the master is saved: the ticker reference index from the passes just made.
+  // Its failure is a warning, never a master failure: the master is already written and is what
+  // the scan needs; the index only feeds the ten-minute union's type filter, which treats a
+  // missing index as "type unknown" (fetch and count), so nothing is silently excluded.
+  const warnings: string[] = [];
+  let tickerReferenceIndex: UniverseRefreshResult["tickerReferenceIndex"];
+  const capturing = provider as MarketProvider & {
+    takeTickerReferenceCapture?: () => TickerReferenceCapture | undefined;
+    takeTickerReferenceCaptureError?: () => string | undefined;
+  };
+  const captureError = capturing.takeTickerReferenceCaptureError?.();
+  const capture = capturing.takeTickerReferenceCapture?.();
+  if (captureError) warnings.push(`TICKER_REFERENCE_INDEX_NOT_WRITTEN:${captureError}`);
+  else if (capture && storage.saveTickerReferenceIndex) {
+    try {
+      const manifest = await storage.saveTickerReferenceIndex(capture, {
+        provider: provider.providerName,
+        asOf,
+      });
+      tickerReferenceIndex = { pages: manifest.pages, records: manifest.records };
+    } catch (error) {
+      warnings.push(
+        `TICKER_REFERENCE_INDEX_WRITE_FAILED:${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
   return {
     added,
     updated,
@@ -176,6 +203,8 @@ export async function refreshUniverse(
     rejected,
     securities,
     membershipEvents,
+    ...(tickerReferenceIndex ? { tickerReferenceIndex } : {}),
+    ...(warnings.length ? { warnings } : {}),
   };
 }
 

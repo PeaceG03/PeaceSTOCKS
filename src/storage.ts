@@ -22,6 +22,14 @@ import type {
 } from "./contracts";
 import { type DailyBarSessionIndex, indexDailyBarSessions, requireMonth } from "./daily-bar-sessions";
 import { stableJson } from "./identity";
+import { FileReplyDustStore } from "./intraday-reply-dust";
+import {
+  loadTickerReferenceIndex,
+  type TickerReferenceCapture,
+  type TickerReferenceEntry,
+  type TickerReferenceIndexManifest,
+  writeTickerReferenceIndex,
+} from "./ticker-reference-index";
 
 export const MARKET_STORAGE_PATH_ERROR = "MARKET_STORAGE_PATH_INVALID";
 
@@ -29,6 +37,14 @@ export interface MarketStore {
   initialize(): Promise<void>;
   loadSecurities(): Promise<SecurityMasterRecord[]>;
   saveSecurities(records: SecurityMasterRecord[]): Promise<void>;
+  /** Ticker reference index (every /v3/reference/tickers record), written with the master. */
+  saveTickerReferenceIndex?(
+    capture: TickerReferenceCapture,
+    options: { provider: string; asOf: string },
+  ): Promise<TickerReferenceIndexManifest>;
+  loadTickerReferenceIndex?(): Promise<
+    { manifest: TickerReferenceIndexManifest; entries: TickerReferenceEntry[] } | undefined
+  >;
   loadMembership(): Promise<UniverseMembershipEvidence[]>;
   appendMembership(records: UniverseMembershipEvidence[]): Promise<void>;
   loadBars(sessionDate?: string): Promise<CanonicalDailyBar[]>;
@@ -181,6 +197,19 @@ export class MarketStorage implements MarketStore {
         2,
       ) + "\n",
     );
+  }
+
+  async saveTickerReferenceIndex(
+    capture: TickerReferenceCapture,
+    options: { provider: string; asOf: string },
+  ): Promise<TickerReferenceIndexManifest> {
+    this.guardRoot();
+    return writeTickerReferenceIndex(new FileReplyDustStore(this.root), capture, options);
+  }
+
+  async loadTickerReferenceIndex() {
+    this.guardRoot();
+    return loadTickerReferenceIndex(new FileReplyDustStore(this.root));
   }
 
   async loadMembership(): Promise<UniverseMembershipEvidence[]> {

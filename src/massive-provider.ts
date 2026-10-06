@@ -1,3 +1,8 @@
+import {
+  type TickerReferenceCapture,
+  type TickerReferencePass,
+  tickerReferenceEntriesFromPage,
+} from "./ticker-reference-index";
 import type {
   ListSecuritiesOptions,
   CanonicalDailyBar,
@@ -286,6 +291,8 @@ export class MassiveMarketProvider implements MarketProvider {
   private readonly maxTransientAttempts = 3;
   private rateLimitedCount = 0;
   private rawReplies: ProviderRawReply[] = [];
+  private tickerReferenceCapture: TickerReferenceCapture | undefined;
+  private tickerReferenceCaptureError: string | undefined;
   private readonly keepRawReplies: boolean;
   private readonly retryBackoffMs: number;
 
@@ -456,10 +463,34 @@ export class MassiveMarketProvider implements MarketProvider {
     };
   }
 
+  /**
+   * Hands over (and forgets) the ticker reference capture of the last listApprovedSecurities call
+   * that completed both passes: every record of every type, in order, with its exact raw JSON.
+   * Undefined if no call completed or the capture failed (see takeTickerReferenceCaptureError).
+   */
+  takeTickerReferenceCapture(): TickerReferenceCapture | undefined {
+    const taken = this.tickerReferenceCapture;
+    this.tickerReferenceCapture = undefined;
+    return taken;
+  }
+
+  takeTickerReferenceCaptureError(): string | undefined {
+    const taken = this.tickerReferenceCaptureError;
+    this.tickerReferenceCaptureError = undefined;
+    return taken;
+  }
+
   async listApprovedSecurities(options: ListSecuritiesOptions = {}): Promise<ProviderSecurityRecord[]> {
     const output = new Map<string, ProviderSecurityRecord>();
     let pagesFetched = 0;
+    // Same requests as before; the capture only reads the reply bodies already received. A capture
+    // failure never changes the listing (it is reported, and the index is not written).
+    this.tickerReferenceCapture = undefined;
+    this.tickerReferenceCaptureError = undefined;
+    const capture: TickerReferenceCapture = { pages: { active: 0, inactive: 0 }, entries: [] };
+    let captureError: string | undefined;
     for (const active of ["true", "false"]) {
+      const pass: TickerReferencePass = active === "true" ? "active" : "inactive";
       let next: string | undefined = "/v3/reference/tickers";
       let first = true;
       while (next) {
@@ -470,7 +501,7 @@ export class MassiveMarketProvider implements MarketProvider {
           if (reason) throw new ScanYieldError(reason);
         }
         pagesFetched += 1;
-        const response = await this.get(
+        const { record: response, body } = await this.getWithBody(
           next,
           first
             ? {
@@ -484,6 +515,16 @@ export class MassiveMarketProvider implements MarketProvider {
             : undefined,
         );
         first = false;
+        capture.pages[pass] += 1;
+        if (!captureError)
+          try {
+            const entries = tickerReferenceEntriesFromPage(pass, capture.pages[pass], body);
+            if (entries.length !== records(response.results).length)
+              throw new Error(`TICKER_REFERENCE_CAPTURE_COUNT_MISMATCH:${pass}:${capture.pages[pass]}`);
+            capture.entries.push(...entries);
+          } catch (error) {
+            captureError = error instanceof Error ? error.message : String(error);
+          }
         for (const record of records(response.results)) {
           const normalized = this.normalize(record);
           if (normalized) mergeSameIdentity(output, normalized);
@@ -493,6 +534,8 @@ export class MassiveMarketProvider implements MarketProvider {
       }
     }
     const result = [...output.values()].sort((a, b) => a.symbol.localeCompare(b.symbol));
+    if (captureError) this.tickerReferenceCaptureError = captureError;
+    else this.tickerReferenceCapture = capture;
     this.bindUniverse(result);
     return result;
   }

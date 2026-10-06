@@ -78,6 +78,7 @@ export class MarketsScanner {
     let refresh;
     try {
       refresh = await refreshUniverse(this.provider, this.storage, sessionDate);
+      for (const warning of refresh.warnings ?? []) process.stderr.write(`${warning}\n`);
       const bindUniverse = (
         this.provider as MarketProvider & {
           bindUniverse?: (records: ProviderSecurityRecord[]) => void;
