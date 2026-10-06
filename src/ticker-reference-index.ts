@@ -19,6 +19,14 @@
 // carry their content hash, so no committed object is ever overwritten: an existing key with
 // identical bytes is reused, one with different bytes throws. Objects are written and read back
 // before the manifest, which is the only mutable object.
+//
+// Month history: when a build writes a NEW base (any reason), it first archives the OUTGOING live
+// manifest bytes as an immutable object and links the new manifest to it:
+//   permanent/ticker-reference-index/manifest-YYYY-MM-<sha256 of the bytes>.json   (verified)
+//   permanent/ticker-reference-index/manifest-unverified-<sha256>.json              (unreadable)
+// YYYY-MM is the outgoing base's month. previousManifest is null (with previousManifestReason)
+// when no manifest existed. Deltas carry the link forward unchanged. Walking previousManifest
+// from the live manifest reaches every past month.
 
 import { createHash } from "node:crypto";
 import { nodeReplyDustBackend, type ReplyDustBackend } from "./reply-dust";
@@ -190,7 +198,22 @@ export interface TickerReferenceIndexManifest {
   bodyByteLength: number;
   base: TickerReferenceObjectRef;
   deltas: TickerReferenceObjectRef[];
+  /**
+   * The archived live manifest this one's base replaced. verified: false means the archived bytes
+   * did not parse or checksum as a manifest (kept as evidence only). null: there was none. Absent
+   * in manifests written before this field existed (treated as the end of history).
+   */
+  previousManifest?: TickerReferenceManifestLink | null;
+  previousManifestReason?: string;
   checksum: string;
+}
+
+export interface TickerReferenceManifestLink {
+  key: string;
+  sha256: string;
+  verified: boolean;
+  /** Outgoing base month (YYYY-MM); absent when unverified. */
+  month?: string;
 }
 
 /** Ordered edit script from one state to the next, plus raw text of only the new records. */
@@ -395,7 +418,17 @@ async function getVerified(store: Pick<IndexStore, "get">, ref: TickerReferenceO
 async function readManifest(store: Pick<IndexStore, "get">): Promise<TickerReferenceIndexManifest | undefined> {
   const bytes = await store.get(TICKER_REFERENCE_INDEX_MANIFEST_KEY);
   if (!bytes) return undefined;
-  const manifest = JSON.parse(new TextDecoder().decode(bytes)) as TickerReferenceIndexManifest;
+  return parseManifest(bytes);
+}
+
+function parseManifest(bytes: Uint8Array): TickerReferenceIndexManifest {
+  let manifest: TickerReferenceIndexManifest;
+  try {
+    manifest = JSON.parse(new TextDecoder().decode(bytes)) as TickerReferenceIndexManifest;
+  } catch {
+    throw new Error("TICKER_REFERENCE_INDEX_MANIFEST_INVALID");
+  }
+  if (!manifest || typeof manifest !== "object") throw new Error("TICKER_REFERENCE_INDEX_MANIFEST_INVALID");
   const { checksum, ...rest } = manifest;
   if (
     manifest.schemaVersion !== TICKER_REFERENCE_INDEX_SCHEMA ||
@@ -429,6 +462,23 @@ async function rebuildCommitted(
   return { state, body };
 }
 
+/** Immutable plain object: identical bytes reused, different bytes throw, else put + read back. */
+async function putImmutable(store: IndexStore, key: string, bytes: Uint8Array): Promise<void> {
+  const existing = await store.get(key);
+  if (existing) {
+    if (!sameBytes(existing, bytes)) throw new Error(`TICKER_REFERENCE_INDEX_OBJECT_CONFLICT:${key}`);
+    return;
+  }
+  await store.put(key, bytes);
+  const stored = await store.get(key);
+  if (!stored || !sameBytes(stored, bytes)) throw new Error("TICKER_REFERENCE_INDEX_READBACK_MISMATCH");
+}
+
+export const tickerReferenceManifestArchiveKey = (month: string, sha256: string) =>
+  `${TICKER_REFERENCE_INDEX_PREFIX}manifest-${month}-${sha256}.json`;
+export const tickerReferenceUnverifiedManifestArchiveKey = (sha256: string) =>
+  `${TICKER_REFERENCE_INDEX_PREFIX}manifest-unverified-${sha256}.json`;
+
 async function putVerified(
   store: IndexStore,
   key: string,
@@ -455,6 +505,9 @@ async function putVerified(
  * Commit this build's index: a delta against the index the current manifest commits, or a full
  * base snapshot when there is no usable manifest or its base is not from asOf's month. Objects
  * are written and read back first; the manifest last. Throws on any mismatch.
+ * A new base first archives the outgoing live manifest bytes (hash-named, immutable, read back),
+ * then writes the base, then the live manifest linking to the archive via previousManifest; a
+ * failure at any step leaves the previous live manifest in place.
  */
 export async function writeTickerReferenceIndex(
   store: IndexStore,
@@ -469,6 +522,8 @@ export async function writeTickerReferenceIndex(
   let current: TickerReferenceIndexManifest | undefined;
   let committed: { state: IndexState; body: Uint8Array } | undefined;
   let baseReason: string | undefined;
+  // Raw live manifest bytes, kept to archive them if this build writes a new base.
+  const outgoingBytes = await store.get(TICKER_REFERENCE_INDEX_MANIFEST_KEY);
   try {
     current = await readManifest(store);
     if (!current) baseReason = "NO_MANIFEST";
@@ -480,7 +535,29 @@ export async function writeTickerReferenceIndex(
   }
   let base: TickerReferenceObjectRef;
   let deltas: TickerReferenceObjectRef[];
+  let history: Pick<TickerReferenceIndexManifest, "previousManifest" | "previousManifestReason">;
   if (!committed || !current) {
+    // 1. Archive the outgoing live manifest (immutable, hash-named) before anything else.
+    if (!outgoingBytes) history = { previousManifest: null, previousManifestReason: "NO_MANIFEST" };
+    else {
+      const sha256 = sha256Hex(outgoingBytes);
+      let month: string | undefined;
+      try {
+        const parsed = parseManifest(outgoingBytes);
+        if (/^\d{4}-\d{2}-\d{2}$/u.test(parsed.base.asOf)) month = parsed.base.asOf.slice(0, 7);
+      } catch {
+        month = undefined;
+      }
+      const key = month
+        ? tickerReferenceManifestArchiveKey(month, sha256)
+        : tickerReferenceUnverifiedManifestArchiveKey(sha256);
+      await putImmutable(store, key, outgoingBytes);
+      history = {
+        previousManifest: { key, sha256, verified: month !== undefined, ...(month ? { month } : {}) },
+        ...(month ? {} : { previousManifestReason: "OUTGOING_MANIFEST_UNVERIFIED" }),
+      };
+    }
+    // 2. The new base.
     base = await putVerified(store, tickerReferenceBaseKey(options.asOf, bodySha256), body, options.asOf, bodySha256, backend);
     deltas = [];
   } else {
@@ -490,6 +567,11 @@ export async function writeTickerReferenceIndex(
       throw new Error("TICKER_REFERENCE_DELTA_VERIFY_FAILED");
     const raw = new TextEncoder().encode(JSON.stringify(delta));
     base = current.base;
+    // Deltas carry the month link forward unchanged.
+    history = {
+      ...(current.previousManifest !== undefined ? { previousManifest: current.previousManifest } : {}),
+      ...(current.previousManifestReason !== undefined ? { previousManifestReason: current.previousManifestReason } : {}),
+    };
     deltas = [
       ...current.deltas,
       await putVerified(
@@ -513,7 +595,9 @@ export async function writeTickerReferenceIndex(
     bodyByteLength: body.length,
     base,
     deltas,
+    ...history,
   };
+  // 3. The live manifest, last.
   const manifest: TickerReferenceIndexManifest = { ...manifestBody, checksum: checksumOf(manifestBody) };
   const manifestBytes = new TextEncoder().encode(`${JSON.stringify(manifest, null, 2)}\n`);
   await store.put(TICKER_REFERENCE_INDEX_MANIFEST_KEY, manifestBytes);
@@ -539,4 +623,69 @@ export async function loadTickerReferenceIndex(
   if (count("active") !== manifest.records.active || count("inactive") !== manifest.records.inactive)
     throw new Error("TICKER_REFERENCE_INDEX_COUNT_MISMATCH");
   return { manifest, entries, body };
+}
+
+export interface TickerReferenceHistoryEntry {
+  /** TICKER_REFERENCE_INDEX_MANIFEST_KEY for the live manifest, else the archive key. */
+  key: string;
+  sha256: string;
+  verified: boolean;
+  /** Base month (YYYY-MM) of this manifest; absent when unverified. */
+  month?: string;
+  manifest?: TickerReferenceIndexManifest;
+}
+
+/**
+ * Walk previousManifest links from the live manifest, newest first, checking each archived
+ * object's sha256. Stops cleanly at the first manifest with no link (null or absent) or at an
+ * unverified archive (its bytes are listed but not followed). Throws on a sha mismatch, a missing
+ * archive, or a loop.
+ */
+export async function listTickerReferenceIndexHistory(
+  store: Pick<IndexStore, "get">,
+): Promise<TickerReferenceHistoryEntry[]> {
+  const liveBytes = await store.get(TICKER_REFERENCE_INDEX_MANIFEST_KEY);
+  if (!liveBytes) return [];
+  const live = parseManifest(liveBytes);
+  const out: TickerReferenceHistoryEntry[] = [
+    { key: TICKER_REFERENCE_INDEX_MANIFEST_KEY, sha256: sha256Hex(liveBytes), verified: true, month: live.base.asOf.slice(0, 7), manifest: live },
+  ];
+  const seen = new Set<string>();
+  let link = live.previousManifest;
+  while (link) {
+    if (seen.has(link.key) || seen.size > 1000) throw new Error(`TICKER_REFERENCE_INDEX_HISTORY_LOOP:${link.key}`);
+    seen.add(link.key);
+    const bytes = await store.get(link.key);
+    if (!bytes) throw new Error(`TICKER_REFERENCE_INDEX_ARCHIVE_MISSING:${link.key}`);
+    if (sha256Hex(bytes) !== link.sha256) throw new Error(`TICKER_REFERENCE_INDEX_ARCHIVE_SHA_MISMATCH:${link.key}`);
+    if (!link.verified) {
+      out.push({ key: link.key, sha256: link.sha256, verified: false });
+      break;
+    }
+    const manifest = parseManifest(bytes);
+    const month = manifest.base.asOf.slice(0, 7);
+    if (link.month !== undefined && link.month !== month)
+      throw new Error(`TICKER_REFERENCE_INDEX_ARCHIVE_MONTH_MISMATCH:${link.key}`);
+    out.push({ key: link.key, sha256: link.sha256, verified: true, month, manifest });
+    link = manifest.previousManifest;
+  }
+  return out;
+}
+
+/**
+ * The final committed state of one month (YYYY-MM): the newest manifest in the history whose base
+ * is from that month, rebuilt from its base and deltas and checked like the live index.
+ * Undefined when the history has no manifest for that month.
+ */
+export async function loadTickerReferenceIndexAt(
+  store: Pick<IndexStore, "get">,
+  month: string,
+  backend: ReplyDustBackend = nodeReplyDustBackend,
+): Promise<{ manifest: TickerReferenceIndexManifest; entries: TickerReferenceEntry[]; body: Uint8Array; key: string } | undefined> {
+  if (!/^\d{4}-\d{2}$/u.test(month)) throw new Error("TICKER_REFERENCE_INDEX_MONTH_INVALID");
+  const found = (await listTickerReferenceIndexHistory(store)).find((entry) => entry.manifest && entry.month === month);
+  if (!found?.manifest) return undefined;
+  const { body } = await rebuildCommitted(store, found.manifest, backend);
+  const entries = parseTickerReferenceBody(body);
+  return { manifest: found.manifest, entries, body, key: found.key };
 }

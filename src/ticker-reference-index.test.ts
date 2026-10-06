@@ -13,7 +13,9 @@ import {
   type TickerReferenceCapture,
   type TickerReferenceDelta,
   type TickerReferencePass,
+  listTickerReferenceIndexHistory,
   loadTickerReferenceIndex,
+  loadTickerReferenceIndexAt,
   parseTickerReferenceBody,
   rawResultsElements,
   tickerReferenceEntry,
@@ -367,6 +369,146 @@ test("content-hash keys: an existing key with different bytes is a conflict and 
   );
   assert.deepEqual(await store.get(planned.base.key), junk);
   assert.equal(await store.get(TICKER_REFERENCE_INDEX_MANIFEST_KEY), undefined);
+});
+
+// ---- month history (archived outgoing manifests) ----
+
+/** Store whose puts fail when failOn(key) is true; reads can be tampered via inner. */
+function stepStore() {
+  const inner = new MemoryObjectClient();
+  let failOn: (key: string) => boolean = () => false;
+  return {
+    inner,
+    failWhen(predicate: (key: string) => boolean) {
+      failOn = predicate;
+    },
+    get: (key: string) => inner.get(key),
+    put: async (key: string, body: Uint8Array) => {
+      if (failOn(key)) throw new Error(`R2_PUT_FAILED:${key}`);
+      return inner.put(key, body);
+    },
+  };
+}
+const live = (store: { get(key: string): Promise<Uint8Array | undefined> }) => store.get(TICKER_REFERENCE_INDEX_MANIFEST_KEY);
+const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+const write = (store: Parameters<typeof writeTickerReferenceIndex>[0], records: Array<[TickerReferencePass, string]>, asOf: string) =>
+  writeTickerReferenceIndex(store, captureOf(records), { provider: "massive-stocks", asOf });
+const rawsOf = (records: Array<[TickerReferencePass, string]>) =>
+  (["active", "inactive"] as const).flatMap((pass) => records.filter(([p]) => p === pass).map(([, r]) => r));
+const OCT2: Array<[TickerReferencePass, string]> = [...DAY1, ["active", rec("OCT2", "CS")]];
+const OCT3: Array<[TickerReferencePass, string]> = [...OCT2, ["active", rec("OCT3", "UNIT")]];
+
+test("rollover: the outgoing manifest is archived, the new one links to it, and October rebuilds byte for byte", async () => {
+  const store = stepStore();
+  const first = await write(store, DAY1, "2026-10-01");
+  assert.equal(first.previousManifest, null);
+  assert.equal(first.previousManifestReason, "NO_MANIFEST");
+  await write(store, OCT2, "2026-10-02");
+  const oct = await write(store, OCT3, "2026-10-03");
+  assert.equal(oct.deltas.length, 2);
+  assert.equal(oct.previousManifest, null);
+  const octManifestBytes = (await live(store))!;
+  const octBody = (await loadTickerReferenceIndex(store))!.body;
+  const nov = await write(store, DAY1.slice(1), "2026-11-02");
+  assert.equal(nov.wrote, "BASE");
+  const archiveKey = `permanent/ticker-reference-index/manifest-2026-10-${sha(octManifestBytes)}.json`;
+  assert.deepEqual(nov.previousManifest, { key: archiveKey, sha256: sha(octManifestBytes), verified: true, month: "2026-10" });
+  assert.deepEqual(await store.inner.get(archiveKey), octManifestBytes);
+  const atOct = (await loadTickerReferenceIndexAt(store, "2026-10"))!;
+  assert.equal(atOct.key, archiveKey);
+  assert.deepEqual(atOct.body, octBody);
+  assert.deepEqual(atOct.entries.map((e) => e.raw), rawsOf(OCT3));
+  assert.deepEqual((await loadTickerReferenceIndexAt(store, "2026-11"))!.body, (await loadTickerReferenceIndex(store))!.body);
+  assert.equal(await loadTickerReferenceIndexAt(store, "2026-09"), undefined);
+  // A delta in November keeps the link.
+  const nov3 = await write(store, DAY1, "2026-11-03");
+  assert.equal(nov3.wrote, "DELTA");
+  assert.deepEqual(nov3.previousManifest, nov.previousManifest);
+});
+
+test("rollover: a failure at the archive, base, or manifest step leaves the previous live manifest loading", async () => {
+  for (const step of ["manifest-2026-10-", "base-2026-11-", "ticker-reference-index.json"]) {
+    const store = stepStore();
+    await write(store, DAY1, "2026-10-01");
+    await write(store, OCT2, "2026-10-02");
+    const before = (await live(store))!;
+    const beforeBody = (await loadTickerReferenceIndex(store))!.body;
+    store.failWhen((key) => key.includes(step));
+    await assert.rejects(write(store, OCT3, "2026-11-02"), /R2_PUT_FAILED/, step);
+    store.failWhen(() => false);
+    assert.deepEqual(await live(store), before, step);
+    assert.deepEqual((await loadTickerReferenceIndex(store))!.body, beforeBody, step);
+  }
+});
+
+test("rollover: a same-day retry after a failed rollover reuses the identical archive object", async () => {
+  const store = stepStore();
+  await write(store, DAY1, "2026-10-01");
+  await write(store, OCT2, "2026-10-02");
+  store.failWhen((key) => key.includes("base-2026-11-"));
+  await assert.rejects(write(store, OCT3, "2026-11-02"), /R2_PUT_FAILED/);
+  const archives = await store.inner.list("permanent/ticker-reference-index/manifest-2026-10-");
+  assert.equal(archives.length, 1);
+  const archived = (await store.inner.get(archives[0]!))!;
+  store.failWhen(() => false);
+  const retry = await write(store, OCT3, "2026-11-02");
+  assert.equal(retry.previousManifest?.key, archives[0]);
+  assert.deepEqual(await store.inner.list("permanent/ticker-reference-index/manifest-2026-10-"), archives);
+  assert.deepEqual(await store.inner.get(archives[0]!), archived);
+});
+
+test("history: a chain of three months walks back and stops at the first manifest with no link", async () => {
+  const store = stepStore();
+  await write(store, DAY1, "2026-10-01");
+  await write(store, OCT2, "2026-10-02");
+  await write(store, OCT3, "2026-11-02");
+  await write(store, DAY1, "2026-11-03");
+  await write(store, OCT2, "2026-12-01");
+  const history = await listTickerReferenceIndexHistory(store);
+  assert.deepEqual(history.map((h) => [h.month, h.verified, h.key === TICKER_REFERENCE_INDEX_MANIFEST_KEY]), [
+    ["2026-12", true, true],
+    ["2026-11", true, false],
+    ["2026-10", true, false],
+  ]);
+  assert.equal(history.at(-1)!.manifest!.previousManifest, null);
+  assert.deepEqual((await loadTickerReferenceIndexAt(store, "2026-10"))!.entries.map((e) => e.raw), rawsOf(OCT2));
+  assert.deepEqual((await loadTickerReferenceIndexAt(store, "2026-11"))!.entries.map((e) => e.raw), rawsOf(DAY1));
+  assert.deepEqual((await loadTickerReferenceIndexAt(store, "2026-12"))!.entries.map((e) => e.raw), rawsOf(OCT2));
+});
+
+test("history: a corrupt archive is detected by sha; the live index still loads", async () => {
+  const store = stepStore();
+  await write(store, DAY1, "2026-10-01");
+  const nov = await write(store, OCT2, "2026-11-02");
+  const key = nov.previousManifest!.key;
+  const bytes = (await store.inner.get(key))!;
+  await store.inner.put(key, Uint8Array.from(bytes, (b, i) => (i === 10 ? b ^ 1 : b)));
+  await assert.rejects(listTickerReferenceIndexHistory(store), /TICKER_REFERENCE_INDEX_ARCHIVE_SHA_MISMATCH/);
+  await assert.rejects(loadTickerReferenceIndexAt(store, "2026-10"), /TICKER_REFERENCE_INDEX_ARCHIVE_SHA_MISMATCH/);
+  assert.equal((await loadTickerReferenceIndex(store))!.entries.length, OCT2.length);
+});
+
+test("history: an unreadable outgoing manifest is archived unverified and never blocks the new base", async () => {
+  const store = stepStore();
+  const garbage = new TextEncoder().encode("{not json");
+  await store.inner.put(TICKER_REFERENCE_INDEX_MANIFEST_KEY, garbage);
+  const fresh = await write(store, DAY1, "2026-10-06");
+  assert.equal(fresh.wrote, "BASE");
+  assert.match(fresh.baseReason ?? "", /^COMMITTED_INDEX_UNREADABLE:/);
+  const key = `permanent/ticker-reference-index/manifest-unverified-${sha(garbage)}.json`;
+  assert.deepEqual(fresh.previousManifest, { key, sha256: sha(garbage), verified: false });
+  assert.equal(fresh.previousManifestReason, "OUTGOING_MANIFEST_UNVERIFIED");
+  assert.deepEqual(await store.inner.get(key), garbage);
+  const history = await listTickerReferenceIndexHistory(store);
+  assert.deepEqual(history.map((h) => [h.verified, h.key]), [[true, TICKER_REFERENCE_INDEX_MANIFEST_KEY], [false, key]]);
+  // A conflicting object already at the archive key is never overwritten.
+  const other = stepStore();
+  await write(other, DAY1, "2026-10-01");
+  const outgoing = (await live(other))!;
+  const conflictKey = `permanent/ticker-reference-index/manifest-2026-10-${sha(outgoing)}.json`;
+  await other.inner.put(conflictKey, new Uint8Array([9]));
+  await assert.rejects(write(other, OCT2, "2026-11-02"), /TICKER_REFERENCE_INDEX_OBJECT_CONFLICT/);
+  assert.deepEqual(await live(other), outgoing);
 });
 
 test("a failed index write is a warning: the master build still succeeds", async () => {
