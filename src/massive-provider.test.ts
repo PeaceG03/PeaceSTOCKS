@@ -8,6 +8,26 @@ import { ScanYieldError } from "./scan-yield";
 function securityIdForTest(): string {
   return securityId("massive-stocks", "SPY", "ETF");
 }
+
+/** Deterministic clock/sleep for shared-pace tests (no real wall-clock waits). */
+function fakePaceClock(startMs = 1_000_000): {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  sleeps: number[];
+} {
+  let now = startMs;
+  const sleeps: number[] = [];
+  return {
+    now: () => now,
+    sleep: async (ms: number) => {
+      sleeps.push(ms);
+      // Yield so a prior paced request can stamp before this wait advances the clock.
+      await Promise.resolve();
+      now += ms;
+    },
+    sleeps,
+  };
+}
 test("Massive HTTP failures preserve safe provider diagnostics", async () => {
   const provider = new MassiveMarketProvider({
     apiKey: "test-key",
@@ -141,13 +161,21 @@ test("Massive 429 and network failures back off, then surface", async () => {
 });
 
 test("concurrent Massive calls share one pace", async () => {
+  const clock = fakePaceClock();
   const stamps: number[] = [];
+  let inFlight = 0;
+  let overlapped = false;
   const provider = new MassiveMarketProvider({
     apiKey: "test-key",
     minRequestIntervalMs: 40,
     retryBackoffMs: 0,
+    clock: clock.now,
+    sleep: clock.sleep,
     fetchImpl: async () => {
-      stamps.push(Date.now());
+      inFlight += 1;
+      if (inFlight > 1) overlapped = true;
+      stamps.push(clock.now());
+      inFlight -= 1;
       return new Response(JSON.stringify({ results: [] }), { status: 200 });
     },
   });
@@ -163,9 +191,12 @@ test("concurrent Massive calls share one pace", async () => {
       tradable: true,
     },
   ]);
+  // Splits + dividends run concurrently but must share one pace chain.
   await provider.getCorporateActions("2026-01-22", [securityIdForTest()]);
-  assert.equal(stamps.length >= 2, true);
-  assert.equal(stamps[1]! - stamps[0]! >= 40, true);
+  assert.equal(stamps.length, 2);
+  assert.equal(overlapped, false);
+  assert.deepEqual(clock.sleeps, [40]);
+  assert.equal(stamps[1]! - stamps[0]!, 40);
 });
 
 test("an invalid Massive credential is rejected without retry", async () => {
@@ -481,13 +512,16 @@ test("ten-minute range fetch refuses a next_url on a different origin", async ()
 });
 
 test("ten-minute range pages share the provider pace", async () => {
+  const clock = fakePaceClock();
   const stamps: number[] = [];
   const provider = new MassiveMarketProvider({
     apiKey: "test-key",
     minRequestIntervalMs: 40,
     retryBackoffMs: 0,
+    clock: clock.now,
+    sleep: clock.sleep,
     fetchImpl: async (input) => {
-      stamps.push(Date.now());
+      stamps.push(clock.now());
       const url = String(input);
       if (url.includes("cursor=p2"))
         return new Response(JSON.stringify({ results: [] }), { status: 200 });
@@ -506,7 +540,8 @@ test("ten-minute range pages share the provider pace", async () => {
     "2026-02-28",
   );
   assert.equal(stamps.length, 2);
-  assert.equal(stamps[1]! - stamps[0]! >= 40, true);
+  assert.deepEqual(clock.sleeps, [40]);
+  assert.equal(stamps[1]! - stamps[0]!, 40);
 });
 
 test("ten-minute range fetch stops a next_url cycle at the page cap with a named error", async () => {

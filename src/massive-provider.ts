@@ -28,6 +28,10 @@ export interface MassiveProviderOptions {
   minRequestIntervalMs?: number;
   retryBackoffMs?: number;
   now?: () => string;
+  /** Test hook: monotonic clock in ms for pacing (defaults to Date.now). */
+  clock?: () => number;
+  /** Test hook: delay used by the shared pace and retry backoff (defaults to setTimeout). */
+  sleep?: (ms: number) => Promise<void>;
   /** Keep each bar reply's exact bytes until takeRawReplies(); off by default so nothing piles up unread. */
   keepRawReplies?: boolean;
 }
@@ -268,6 +272,8 @@ export class MassiveMarketProvider implements MarketProvider {
   private readonly fetchImpl: typeof fetch;
   private readonly minRequestIntervalMs: number;
   private readonly now: () => string;
+  private readonly clock: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
   private lastRequestAt = 0;
   private pace: Promise<void> = Promise.resolve();
   private readonly symbolBySecurityId = new Map<string, string>();
@@ -287,6 +293,10 @@ export class MassiveMarketProvider implements MarketProvider {
     this.retryBackoffMs = options.retryBackoffMs ?? 250;
     if (this.retryBackoffMs < 0) throw new Error("MASSIVE_INVALID_RATE_LIMIT");
     this.now = options.now ?? (() => new Date().toISOString());
+    this.clock = options.clock ?? Date.now;
+    this.sleep =
+      options.sleep ??
+      ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     this.keepRawReplies = options.keepRawReplies ?? false;
   }
 
@@ -301,9 +311,9 @@ export class MassiveMarketProvider implements MarketProvider {
 
   private async waitForRateLimit(): Promise<void> {
     const run = this.pace.then(async () => {
-      const wait = this.lastRequestAt + this.minRequestIntervalMs - Date.now();
-      if (wait > 0) await new Promise<void>((resolve) => setTimeout(resolve, wait));
-      this.lastRequestAt = Date.now();
+      const wait = this.lastRequestAt + this.minRequestIntervalMs - this.clock();
+      if (wait > 0) await this.sleep(wait);
+      this.lastRequestAt = this.clock();
     });
     this.pace = run.then(
       () => undefined,
@@ -314,7 +324,7 @@ export class MassiveMarketProvider implements MarketProvider {
 
   private async backoff(attempt: number): Promise<void> {
     const wait = this.retryBackoffMs * attempt;
-    if (wait > 0) await new Promise<void>((resolve) => setTimeout(resolve, wait));
+    if (wait > 0) await this.sleep(wait);
   }
 
   private url(pathOrUrl: string, params?: Record<string, string>): URL {
