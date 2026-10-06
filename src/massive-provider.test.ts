@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { securityId } from "./identity";
-import { MassiveMarketProvider, mergeSameIdentity } from "./massive-provider";
+import { MassiveMarketProvider, TENMIN_RANGE_PAGE_CAP, mergeSameIdentity } from "./massive-provider";
 import type { ProviderSecurityRecord } from "./contracts";
 import { ScanYieldError } from "./scan-yield";
 
@@ -507,4 +507,48 @@ test("ten-minute range pages share the provider pace", async () => {
   );
   assert.equal(stamps.length, 2);
   assert.equal(stamps[1]! - stamps[0]! >= 40, true);
+});
+
+test("ten-minute range fetch stops a next_url cycle at the page cap with a named error", async () => {
+  const base = "https://api.massive.com/v2/aggs/ticker/SPY/range/10/minute/2026-01-02/2026-02-28";
+  const urls: string[] = [];
+  const provider = new MassiveMarketProvider({
+    apiKey: "test-key",
+    minRequestIntervalMs: 0,
+    retryBackoffMs: 0,
+    fetchImpl: async (input) => {
+      const url = String(input);
+      urls.push(url);
+      // A -> B -> A -> B ... : each page points at the other, so the same-page stop never fires.
+      const next = url.includes("cursor=B") ? `${base}?cursor=A` : `${base}?cursor=B`;
+      return new Response(JSON.stringify({ results: [], next_url: next }), { status: 200 });
+    },
+  });
+  await assert.rejects(
+    provider.getTenMinuteRangeReplies({ securityId: securityIdForTest(), symbol: "SPY" }, "2026-01-02", "2026-02-28"),
+    /^Error: MASSIVE_RANGE_PAGE_CAP:SPY:2026-01-02:2026-02-28$/u,
+  );
+  assert.equal(TENMIN_RANGE_PAGE_CAP, 8);
+  assert.equal(urls.length, 8);
+});
+
+test("ten-minute range fetch accepts exactly the page cap", async () => {
+  const base = "https://api.massive.com/v2/aggs/ticker/SPY/range/10/minute/2026-01-02/2026-02-28";
+  let fetches = 0;
+  const provider = new MassiveMarketProvider({
+    apiKey: "test-key",
+    minRequestIntervalMs: 0,
+    fetchImpl: async () => {
+      fetches += 1;
+      const body = fetches < 8 ? { results: [], next_url: `${base}?cursor=${fetches + 1}` } : { results: [] };
+      return new Response(JSON.stringify(body), { status: 200 });
+    },
+  });
+  const pages = await provider.getTenMinuteRangeReplies(
+    { securityId: securityIdForTest(), symbol: "SPY" },
+    "2026-01-02",
+    "2026-02-28",
+  );
+  assert.equal(pages.length, 8);
+  assert.equal(fetches, 8);
 });

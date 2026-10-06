@@ -17,6 +17,8 @@ import { intradaySessionSpec, normalizeMassiveTenMinuteBars } from "./intraday";
 const DEFAULT_BASE_URL = "https://api.massive.com";
 const DEFAULT_MIN_REQUEST_INTERVAL_MS = 12_500;
 const PAGE_LIMIT = 1_000;
+/** Most pages one 10-minute range request may take; more is an error, never a silent truncation. */
+export const TENMIN_RANGE_PAGE_CAP = 8;
 type JsonRecord = Record<string, unknown>;
 
 export interface MassiveProviderOptions {
@@ -547,6 +549,7 @@ export class MassiveMarketProvider implements MarketProvider {
    * this method does not look it up from the bound universe. Pages are returned directly (not
    * buffered in takeRawReplies). Pagination reuses getWithBody (shared pace, 429/network backoff,
    * and MASSIVE_UNTRUSTED_NEXT_URL origin check); apiKey is never stored in recorded requests.
+   * More than TENMIN_RANGE_PAGE_CAP pages throws MASSIVE_RANGE_PAGE_CAP:<symbol>:<from>:<to>.
    */
   async getTenMinuteRangeReplies(
     security: { securityId: string; symbol: string },
@@ -562,6 +565,9 @@ export class MassiveMarketProvider implements MarketProvider {
     let first = true;
     let page = 0;
     while (next) {
+      // A next_url cycle (A -> B -> A) or a runaway cursor stops here, before page 9 is fetched.
+      if (page >= TENMIN_RANGE_PAGE_CAP)
+        throw new Error(`MASSIVE_RANGE_PAGE_CAP:${security.symbol}:${from}:${to}`);
       page += 1;
       const pathOrUrl: string = next;
       const pageParams = first ? params : undefined;
