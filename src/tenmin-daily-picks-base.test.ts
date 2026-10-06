@@ -720,6 +720,10 @@ test("isTransientStoreReadError: inverted — only clear integrity is non-transi
     new Error("TICKER_REFERENCE_INDEX_FILE_MISMATCH:permanent/x"),
     new Error("TICKER_REFERENCE_INDEX_ARCHIVE_SHA_MISMATCH:permanent/y"),
     new Error("TICKER_REFERENCE_INDEX_MANIFEST_INVALID"),
+    new Error("TICKER_REFERENCE_INDEX_ARCHIVE_MISSING:permanent/archive.json"),
+    new Error("TICKER_REFERENCE_INDEX_HISTORY_LOOP:permanent/archive.json"),
+    new Error("TICKER_REFERENCE_DELTA_UNKNOWN_RECORD"),
+    new Error("REPLY_DUST_FILE_MISSING:grouped-daily:2024-11-04"),
     new SyntaxError("Unexpected token } in JSON at position 0"),
     new StoreReadIntegrityError("REPLY_DUST_HASH_MISMATCH"),
     // R2-prefixed wrapper must not hide integrity in cause:
@@ -734,6 +738,37 @@ test("isTransientStoreReadError: inverted — only clear integrity is non-transi
       `expected integrity: ${err instanceof Error ? err.message : String(err)}`,
     );
     assert.equal(isTransientStoreReadError(err), false);
+  }
+
+  // Each new code: direct + wrapped in cause → integrity (CORRUPT).
+  for (const code of [
+    "TICKER_REFERENCE_INDEX_ARCHIVE_MISSING",
+    "TICKER_REFERENCE_INDEX_HISTORY_LOOP",
+    "TICKER_REFERENCE_DELTA_UNKNOWN_RECORD",
+    "REPLY_DUST_FILE_MISSING",
+  ]) {
+    const direct = new Error(`${code}:detail`);
+    assert.equal(isIntegrityStoreReadError(direct), true, code);
+    assert.equal(isTransientStoreReadError(direct), false, code);
+    const wrapped = new Error("wrap", { cause: new Error(`${code}:via-cause`) });
+    assert.equal(isIntegrityStoreReadError(wrapped), true, `${code} cause`);
+    assert.equal(isTransientStoreReadError(wrapped), false, `${code} cause`);
+  }
+});
+
+test("isTransientStoreReadError: zstd environment codes stay FAILED (not integrity)", () => {
+  // Decode failures stay integrity; missing/wrong-version/unavailable CLI are env → FAILED.
+  assert.equal(isIntegrityStoreReadError(new Error("REPLY_DUST_ZSTD_MAGIC")), true);
+  assert.equal(isIntegrityStoreReadError(new Error("REPLY_DUST_ZSTD_FAILED")), true);
+
+  const envCases = [
+    new Error("REPLY_DUST_ZSTD_MISSING"),
+    new Error("REPLY_DUST_ZSTD_VERSION:1.5.8"),
+    new Error("REPLY_DUST_ZSTD_UNAVAILABLE"),
+  ];
+  for (const err of envCases) {
+    assert.equal(isIntegrityStoreReadError(err), false, err.message);
+    assert.equal(isTransientStoreReadError(err), true, err.message);
   }
 });
 
@@ -875,3 +910,43 @@ test("runner: R2 5xx on grouped reply → FAILED; checksum mismatch → CORRUPT;
   );
 });
 
+test("buildBase/runner: REPLY_DUST_FILE_MISSING (manifest present, file gone) → CORRUPT", async () => {
+  const inner = new MemoryObjectClient();
+  const dust = immutableReplyDustStore(inner);
+  await plantIndex(inner, D, UNIVERSE);
+  await plantGrouped(inner, D, UNIVERSE.map((u) => u.ticker));
+
+  const fileKey = dailyReplyDustFileKey(D);
+  const manifestKey = dailyReplyDustManifestKey(D);
+  assert.ok(await inner.get(manifestKey));
+  assert.ok(await inner.get(fileKey));
+  await inner.delete(fileKey);
+  assert.equal(await inner.get(fileKey), undefined);
+
+  await assert.rejects(
+    () => buildTenMinDailyPicksBaseFromStored({ store: inner, sessionDate: D }),
+    (e: unknown) =>
+      e instanceof TenMinDailyBaseCorruptError &&
+      e.key === fileKey &&
+      e.message.includes("REPLY_DUST_FILE_MISSING"),
+  );
+
+  const report = await runTenMinDailyPicks({
+    store: dust,
+    storage: memoryStorage(),
+    days: [D],
+    env: { TENMIN_DAILY_PICKS: "true" },
+    now: SETTLED_NOW,
+    clock: settledClock,
+    limit: 1,
+    fetchReply: async () => {
+      throw new Error("SHOULD_NOT_FETCH");
+    },
+  });
+  assert.equal(report.days[0]?.outcome, "CORRUPT", JSON.stringify(report.days));
+  assert.ok(
+    report.corrupt.some((c) => c.sessionDate === D && c.key === fileKey),
+    JSON.stringify(report.corrupt),
+  );
+  assert.equal((await readTenMinDayPicks(dust, D)).status, "TENMIN_DAY_NOT_SEALED");
+});
