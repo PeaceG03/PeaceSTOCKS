@@ -7,7 +7,7 @@ import {
   storeVerifiedReplyDust,
 } from "./intraday-reply-dust";
 import { TENMIN_RANGE_PAGE_CAP, massiveTenMinuteBarsFromReply } from "./massive-provider";
-import type { ObjectMetadata } from "./object-store";
+import { decodeRfc2047Value, type ObjectMetadata } from "./object-store";
 import {
   REPLY_DUST_FALLBACK_VERSION,
   REPLY_DUST_FORMAT,
@@ -32,6 +32,8 @@ export const TENMIN_RANGE_MANIFEST_SCHEMA = "tenmin-range-reply-dust-manifest-v2
 export const TENMIN_RANGE_PATH_ERROR = "TENMIN_RANGE_PATH_INVALID";
 export const TENMIN_RANGE_OUTAGE_STREAK = 5;
 export const TENMIN_RANGE_OUTAGE_STOP = "MASSIVE_OUTAGE";
+/** Page object HEAD lacks rd-observed-at (or fetch has no files) when resolving v2 observedAt. */
+export const TENMIN_RANGE_OBSERVED_AT_MISSING = "TENMIN_RANGE_OBSERVED_AT_MISSING" as const;
 /**
  * A range manifest sealed with 0 securities is never "complete, no data": readers refuse it, and
  * the writer treats it as not sealed (and never seals one itself).
@@ -1393,6 +1395,36 @@ function requireManifest(manifest: TenMinRangeManifest | undefined): TenMinRange
   return manifest;
 }
 
+
+/**
+ * Resolve fetch.observedAt for bar builders. v1 fat manifests already carry the real value.
+ * Compact v2 hydrate leaves observedAt ""; fill it from page-object HEAD `rd-observed-at`
+ * (v1 resume semantics: page 1). Values are passed through decodeRfc2047Value so R2-encoded
+ * metadata matches what S3ObjectClient.head already returns. Missing metadata fails clearly —
+ * v1 resume treats missing rd-observed-at as "not a complete fetch" (returns undefined);
+ * on the read path we cannot invent "" timestamps, so we throw TENMIN_RANGE_OBSERVED_AT_MISSING.
+ */
+export async function resolveTenMinRangeFetchObservedAt(
+  store: ReplyDustStore,
+  manifest: Pick<TenMinRangeManifest, "rangeFrom" | "rangeTo">,
+  securityId: string,
+  fetch: TenMinRangeTickerFetch,
+): Promise<string> {
+  if (fetch.observedAt) return fetch.observedAt;
+  const file = [...fetch.files].sort((a, b) => a.page - b.page)[0];
+  if (!file)
+    throw new Error(`${TENMIN_RANGE_OBSERVED_AT_MISSING}:${securityId}:${fetch.symbol}:no-files`);
+  const key = `${tenMinRangePrefix(manifest.rangeFrom, manifest.rangeTo)}/${file.relativePath}`;
+  const head = await store.head(key);
+  const raw = head?.metadata["rd-observed-at"];
+  if (!raw)
+    throw new Error(`${TENMIN_RANGE_OBSERVED_AT_MISSING}:${securityId}:${fetch.symbol}:p${file.page}`);
+  const observedAt = decodeRfc2047Value(raw);
+  if (!observedAt)
+    throw new Error(`${TENMIN_RANGE_OBSERVED_AT_MISSING}:${securityId}:${fetch.symbol}:p${file.page}`);
+  return observedAt;
+}
+
 async function readFetchPages(
   store: ReplyDustStore,
   manifest: TenMinRangeManifest,
@@ -1400,8 +1432,11 @@ async function readFetchPages(
   fetch: TenMinRangeTickerFetch,
   backend: ReplyDustBackend,
 ): Promise<TenMinRangeVerifiedPage[]> {
+  // Fill observedAt for v2 (hydrate leaves ""); v1 already has it. Same value used for all pages.
+  const observedAt = await resolveTenMinRangeFetchObservedAt(store, manifest, securityId, fetch);
+  const fetchWithAt = observedAt === fetch.observedAt ? fetch : { ...fetch, observedAt };
   const output: TenMinRangeVerifiedPage[] = [];
-  for (const file of fetch.files) {
+  for (const file of fetchWithAt.files) {
     const bytes = await store.get(
       `${tenMinRangePrefix(manifest.rangeFrom, manifest.rangeTo)}/${file.relativePath}`,
     );
@@ -1410,7 +1445,7 @@ async function readFetchPages(
       page: file.page,
       file,
       reply: verifyRangeBytes(bytes, file, backend, `${securityId}:${fetch.symbol}`),
-      fetch,
+      fetch: fetchWithAt,
     });
   }
   return output;
@@ -1459,13 +1494,14 @@ export async function readRangeSecurityDay(
     // Listed security with no fetch covering the day: empty-day bars via first fetch's symbol if any.
     const any = security.fetches[0];
     if (!any) return [];
+    const observedAt = await resolveTenMinRangeFetchObservedAt(store, manifest, securityId, any);
     return massiveTenMinuteBarsFromReply({
       provider: manifest.provider,
       sessionDate,
       securityId,
       symbol: any.symbol,
       reply: { results: [] },
-      observedAt: any.observedAt,
+      observedAt,
     });
   }
   const pages = await readFetchPages(store, manifest, securityId, fetch, backend);
@@ -1480,12 +1516,16 @@ export async function readRangeSecurityDay(
     results.push(...dayBars);
   }
   if (requestId === undefined && pages[0]) requestId = parseReply(pages[0].reply).request_id;
+  // Prefer the filled fetch from readFetchPages (v2); fall back to resolving again if no pages.
+  const observedAt =
+    pages[0]?.fetch.observedAt ||
+    (await resolveTenMinRangeFetchObservedAt(store, manifest, securityId, fetch));
   return massiveTenMinuteBarsFromReply({
     provider: manifest.provider,
     sessionDate,
     securityId,
     symbol: fetch.symbol,
     reply: { results, ...(requestId === undefined ? {} : { request_id: requestId }) },
-    observedAt: fetch.observedAt,
+    observedAt,
   });
 }

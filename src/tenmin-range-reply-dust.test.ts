@@ -12,6 +12,8 @@ import { TENMIN_RANGE_MANIFEST_COMPACT_SCHEMA } from "./tenmin-range-entries";
 import {
   TENMIN_RANGE_MANIFEST_SCHEMA,
   TENMIN_RANGE_OBJECT_SCHEMA,
+  TENMIN_RANGE_OBSERVED_AT_MISSING,
+  buildTenMinRangeManifest,
   easternSessionDate,
   loadTenMinRangeProgress,
   readRangeReplies,
@@ -22,6 +24,7 @@ import {
   tenMinRangeFileName,
   tenMinRangeManifestKey,
   tenMinRangeProgressPath,
+  writeTenMinRangeManifest,
   writeTenMinRangeReplyDust,
   type TenMinRangePlannedFetch,
 } from "./tenmin-range-reply-dust";
@@ -986,5 +989,84 @@ test("range writer readback passes and resume accepts objects when R2 HEAD retur
     assert.equal(requests, 0);
     assert.equal(resumed.fetchesResumed, 1);
     assert.equal(resumed.sealed, true);
+  });
+});
+
+test("v2 bar readback: observedAt/ingestedAt/providerTimestamp match v1 for the same fixture", async () => {
+  await withRoot(async (root) => {
+    const store = new MemoryObjectClient();
+    await write(store, root, {});
+    const v2Manifest = (await readTenMinRangeManifest(store, FROM, TO))!;
+    assert.equal(v2Manifest.schemaVersion, TENMIN_RANGE_MANIFEST_COMPACT_SCHEMA);
+    // Hydrated view still has empty observedAt — reader must fill from page HEAD.
+    assert.equal(v2Manifest.securities[0]?.fetches[0]?.observedAt, "");
+    const v2Bars = await readRangeSecurityDay(store, FROM, TO, id("BBB"), "2026-01-06");
+    assert.ok(v2Bars.length >= 1);
+    assert.equal(v2Bars[0]!.observedAt, FETCHED_AT);
+    assert.equal(v2Bars[0]!.ingestedAt, FETCHED_AT);
+    assert.equal(v2Bars[0]!.provenance.providerTimestamp, FETCHED_AT);
+
+    // Same objects, fat v1 manifest with the real observedAt (as v1 seal would have stored).
+    const filled = structuredClone(v2Manifest);
+    for (const sec of filled.securities)
+      for (const f of sec.fetches) f.observedAt = FETCHED_AT;
+    const fat = buildTenMinRangeManifest({
+      provider: PROVIDER,
+      from: FROM,
+      to: TO,
+      securities: filled.securities,
+      gaps: filled.gaps,
+    });
+    assert.equal(fat.schemaVersion, TENMIN_RANGE_MANIFEST_SCHEMA);
+    await writeTenMinRangeManifest(store, fat);
+    assert.equal((await readTenMinRangeManifest(store, FROM, TO))!.schemaVersion, TENMIN_RANGE_MANIFEST_SCHEMA);
+    const v1Bars = await readRangeSecurityDay(store, FROM, TO, id("BBB"), "2026-01-06");
+    assert.equal(v1Bars.length, v2Bars.length);
+    for (let i = 0; i < v2Bars.length; i++) {
+      assert.equal(v1Bars[i]!.observedAt, v2Bars[i]!.observedAt);
+      assert.equal(v1Bars[i]!.ingestedAt, v2Bars[i]!.ingestedAt);
+      assert.equal(v1Bars[i]!.provenance.providerTimestamp, v2Bars[i]!.provenance.providerTimestamp);
+    }
+  });
+});
+
+test("v2 empty-day path fills observedAt from page HEAD metadata", async () => {
+  await withRoot(async (root) => {
+    const store = new MemoryObjectClient();
+    // Fetch only covers Jan 6; reading Jan 2 hits empty-day (no covering fetch).
+    await write(store, root, {}, {
+      fetches: [{ securityId: id("BBB"), symbol: "BBB", fetchFrom: "2026-01-06", fetchTo: "2026-01-06" }],
+      pages: {
+        BBB: [page("BBB", 1, [bar("2026-01-06T15:10:00Z", 5.5, 10)], undefined, "2026-01-06", "2026-01-06")],
+      },
+    });
+    const manifest = (await readTenMinRangeManifest(store, FROM, TO))!;
+    assert.equal(manifest.schemaVersion, TENMIN_RANGE_MANIFEST_COMPACT_SCHEMA);
+    assert.equal(manifest.securities[0]?.fetches[0]?.observedAt, "");
+    const empty = await readRangeSecurityDay(store, FROM, TO, id("BBB"), "2026-01-02");
+    // Empty-day bars exist (session scaffold) with real timestamps from page metadata.
+    assert.ok(empty.length >= 1);
+    assert.equal(empty[0]!.observedAt, FETCHED_AT);
+    assert.equal(empty[0]!.ingestedAt, FETCHED_AT);
+    assert.equal(empty[0]!.provenance.providerTimestamp, FETCHED_AT);
+  });
+});
+
+test("v2 missing rd-observed-at on page HEAD throws TENMIN_RANGE_OBSERVED_AT_MISSING", async () => {
+  await withRoot(async (root) => {
+    const store = new MemoryObjectClient();
+    await write(store, root, {}, {
+      fetches: [{ securityId: id("BBB"), symbol: "BBB", fetchFrom: FROM, fetchTo: TO }],
+    });
+    const key = tenMinRangeFileKey(FROM, TO, id("BBB"), "BBB", FROM, TO, 1);
+    const bytes = (await store.get(key))!;
+    const head = (await store.head(key))!;
+    const { ["rd-observed-at"]: _drop, ...rest } = head.metadata;
+    await store.put(key, bytes, rest);
+    await assert.rejects(
+      () => readRangeSecurityDay(store, FROM, TO, id("BBB"), "2026-01-06"),
+      (err: unknown) =>
+        err instanceof Error && err.message.startsWith(`${TENMIN_RANGE_OBSERVED_AT_MISSING}:`),
+    );
   });
 });
