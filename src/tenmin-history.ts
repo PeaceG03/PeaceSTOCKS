@@ -29,6 +29,7 @@ import {
   type TenMinRangeGapEntry,
   type TenMinRangePlannedFetch,
   type TenMinRangeWriteResult,
+  fetchIdentityKey,
   writeTenMinRangeReplyDust,
 } from "./tenmin-range-reply-dust";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
@@ -37,6 +38,96 @@ import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 export const DEFAULT_TENMIN_HISTORY_WINDOW_START = "2024-10-07";
 
 export const TENMIN_HISTORY_RUN_SCHEMA = "tenmin-history-run-v1" as const;
+/** Default wall-clock budget (110 min) matching scanner.yml tenmin_history_budget_ms. */
+export const TENMIN_HISTORY_DEFAULT_BUDGET_MS = 6_600_000;
+/** Massive shared pace used for seal ETA (architect: ~5 req/min). */
+export const TENMIN_HISTORY_REQUESTS_PER_MINUTE = 5;
+
+/**
+ * Progress toward sealing the range this run is working.
+ * estimatedRemainingRequests is a *lower bound*: 1 Massive request per remaining fetch
+ * (planner has no per-fetch page forecast; a fetch may need up to TENMIN_RANGE_PAGE_CAP pages)
+ * plus one request per grouped-daily session not yet stored.
+ */
+export interface TenMinRangeRemaining {
+  range: string;
+  plannedFetches: number;
+  storedFetches: number;
+  gappedFetches: number;
+  remainingFetches: number;
+  groupedDailyRemaining: number;
+  estimatedRemainingRequests: number;
+  estimatedRunsToSeal: number;
+}
+
+/** Pure: count planned fetches that currently have a durable per-fetch gap. */
+export function countGappedPlannedFetches(
+  planned: readonly TenMinRangePlannedFetch[],
+  gaps: readonly TenMinRangeGapEntry[],
+): number {
+  const keys = new Set(planned.map(fetchIdentityKey));
+  let n = 0;
+  for (const gap of gaps) {
+    if (!gap.symbol || !gap.fetchFrom || !gap.fetchTo) continue;
+    if (
+      keys.has(
+        fetchIdentityKey({
+          securityId: gap.securityId,
+          symbol: gap.symbol,
+          fetchFrom: gap.fetchFrom,
+          fetchTo: gap.fetchTo,
+        }),
+      )
+    )
+      n += 1;
+  }
+  return n;
+}
+
+/**
+ * Pure: remaining work + seal ETA for the active range.
+ * requestsPerRun = hitTimeBudget && actualRequests > 0
+ *   ? actualRequests
+ *   : floor(budgetMinutes × requestsPerMinute), at least 1.
+ */
+export function estimateTenMinRangeRemaining(input: {
+  range: string;
+  plannedFetches: number;
+  storedFetches: number;
+  gappedFetches: number;
+  groupedDailyRemaining: number;
+  budgetMs?: number;
+  requestsPerMinute?: number;
+  hitTimeBudget?: boolean;
+  actualRequestsThisRun?: number;
+}): TenMinRangeRemaining {
+  const plannedFetches = Math.max(0, input.plannedFetches);
+  const storedFetches = Math.max(0, input.storedFetches);
+  const gappedFetches = Math.max(0, input.gappedFetches);
+  const remainingFetches = Math.max(0, plannedFetches - storedFetches - gappedFetches);
+  const groupedDailyRemaining = Math.max(0, input.groupedDailyRemaining);
+  // Lower bound: 1 request per remaining fetch + 1 per unstored grouped day.
+  const estimatedRemainingRequests = remainingFetches + groupedDailyRemaining;
+  const budgetMs = input.budgetMs ?? TENMIN_HISTORY_DEFAULT_BUDGET_MS;
+  const rpm = input.requestsPerMinute ?? TENMIN_HISTORY_REQUESTS_PER_MINUTE;
+  const budgetMinutes = budgetMs / 60_000;
+  let requestsPerRun = Math.max(1, Math.floor(budgetMinutes * rpm));
+  if (input.hitTimeBudget && (input.actualRequestsThisRun ?? 0) > 0)
+    requestsPerRun = input.actualRequestsThisRun!;
+  const estimatedRunsToSeal =
+    estimatedRemainingRequests === 0 ? 0 : Math.ceil(estimatedRemainingRequests / requestsPerRun);
+  return {
+    range: input.range,
+    plannedFetches,
+    storedFetches,
+    gappedFetches,
+    remainingFetches,
+    groupedDailyRemaining,
+    estimatedRemainingRequests,
+    estimatedRunsToSeal,
+  };
+}
+
 
 /** A range whose plan has no fetches is never sealed; the run stops with this error. */
 export { TENMIN_UNIVERSE_EMPTY };
@@ -572,6 +663,8 @@ export interface TenMinHistoryRunReport {
   groupedDailyRequests: number;
   groupedDailyStored: number;
   groupedDailyResumed: number;
+  /** Seal progress for the range this run worked (absent when every range was skipped sealed). */
+  rangeRemaining?: TenMinRangeRemaining;
   completedAt: string;
 }
 
@@ -610,6 +703,8 @@ export async function runTenMinHistory(options: {
   maxRangeEnd?: string;
   reopen?: boolean;
   deadlineMs?: number;
+  /** Wall-clock budget for seal ETA (defaults to TENMIN_HISTORY_DEFAULT_BUDGET_MS). */
+  budgetMs?: number;
   shouldYield?: () => Promise<string | undefined>;
   env?: NodeJS.ProcessEnv;
   now?: Date;
@@ -687,6 +782,11 @@ export async function runTenMinHistory(options: {
   let stoppedOnError = false;
   let error: string | undefined;
   const groupedTotals = { requests: 0, stored: 0, resumed: 0 };
+  const budgetMs =
+    options.budgetMs !== undefined && Number.isFinite(options.budgetMs)
+      ? options.budgetMs
+      : TENMIN_HISTORY_DEFAULT_BUDGET_MS;
+  let rangeRemaining: TenMinRangeRemaining | undefined;
   const fetchGroupedDaily =
     options.fetchGroupedDaily ??
     ((sessionDate: string) => {
@@ -778,6 +878,15 @@ export async function runTenMinHistory(options: {
           zstdVersion,
           ...planFields,
         });
+        rangeRemaining = estimateTenMinRangeRemaining({
+          range: `${range.calendarFrom}_${range.calendarTo}`,
+          plannedFetches: universe.fetches.length,
+          storedFetches: 0,
+          gappedFetches: 0,
+          groupedDailyRemaining: universe.tradingSessions.length,
+          budgetMs,
+          actualRequestsThisRun: massiveRequests,
+        });
         stoppedOnError = true;
         error = universe.refusal.message;
         break;
@@ -813,6 +922,19 @@ export async function runTenMinHistory(options: {
             zstdVersion,
             ...groupedFields(grouped),
             ...planFields,
+          });
+          rangeRemaining = estimateTenMinRangeRemaining({
+            range: `${range.calendarFrom}_${range.calendarTo}`,
+            plannedFetches: universe.fetches.length,
+            storedFetches: 0,
+            gappedFetches: 0,
+            groupedDailyRemaining: Math.max(
+              0,
+              universe.tradingSessions.length - grouped.stored - grouped.resumed,
+            ),
+            budgetMs,
+            hitTimeBudget: !!grouped.yieldedForScan?.startsWith("TIME_BUDGET"),
+            actualRequestsThisRun: massiveRequests,
           });
           if (grouped.outageStop) outageStop = grouped.outageStop;
           else yieldedForScan = grouped.yieldedForScan;
@@ -870,6 +992,22 @@ export async function runTenMinHistory(options: {
         ...(grouped ? groupedFields(grouped) : {}),
         ...planFields,
       });
+      if (universe) {
+        const gappedFetches = countGappedPlannedFetches(universe.fetches, result.gaps);
+        rangeRemaining = estimateTenMinRangeRemaining({
+          range: `${range.calendarFrom}_${range.calendarTo}`,
+          plannedFetches: universe.fetches.length,
+          storedFetches: result.fetchesStored,
+          gappedFetches,
+          groupedDailyRemaining: Math.max(
+            0,
+            universe.tradingSessions.length - (grouped?.stored ?? 0) - (grouped?.resumed ?? 0),
+          ),
+          budgetMs,
+          hitTimeBudget: !!result.yieldedForScan?.startsWith("TIME_BUDGET"),
+          actualRequestsThisRun: massiveRequests,
+        });
+      }
       if (result.outageStop) {
         outageStop = result.outageStop;
         break;
@@ -935,6 +1073,7 @@ export async function runTenMinHistory(options: {
     warnings: [...new Set(warnings)],
     zstdVersion,
     massiveRequests,
+    ...(rangeRemaining ? { rangeRemaining } : {}),
     completedAt: stamp(),
   };
 
@@ -984,6 +1123,7 @@ export function tenMinHistorySummary(report: TenMinHistoryRunReport): Record<str
     ...(report.rangeEndCap ? { rangeEndCap: report.rangeEndCap } : {}),
     massiveRequests: report.massiveRequests,
     groupedDailyRequests: report.groupedDailyRequests,
+    ...(report.rangeRemaining ? { rangeRemaining: report.rangeRemaining } : {}),
     yieldedForScan: report.yieldedForScan,
     outageStop: report.outageStop,
     stoppedOnError: report.stoppedOnError,
@@ -1017,6 +1157,7 @@ export async function runTenMinHistoryFromEnv(
     reopen: env.PEACESTOCKS_TENMIN_HISTORY_REOPEN === "1",
     ...(maxRangeEnd ? { maxRangeEnd } : {}),
     ...(maxRanges !== undefined && Number.isFinite(maxRanges) ? { maxRanges } : {}),
+    ...(budgetMs !== undefined && Number.isFinite(budgetMs) ? { budgetMs } : {}),
     ...(deadlineMs !== undefined ? { deadlineMs } : {}),
     ...overrides,
   });

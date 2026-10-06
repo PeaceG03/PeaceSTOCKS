@@ -9,7 +9,11 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SCAN_GUARD_WINDOWS_UTC } from "./scan-yield";
-import { type TenMinHistoryRunReport, parseTenMinMaxRangeEnd } from "./tenmin-history";
+import {
+  type TenMinHistoryRunReport,
+  type TenMinRangeRemaining,
+  parseTenMinMaxRangeEnd,
+} from "./tenmin-history";
 
 export const TENMIN_OUTCOME_SCHEMA = "tenmin-history-outcome-v1" as const;
 /** Don't start a run this close before a guard window: a pending run could start inside it. */
@@ -50,6 +54,8 @@ export interface TenMinRunOutcome {
   rangesSealed: number;
   rangesRemaining: number;
   madeProgress: boolean;
+  /** Seal progress for the range this run worked (tolerated when absent on older records). */
+  rangeRemaining?: TenMinRangeRemaining;
 }
 
 const SEALED = new Set(["SEALED", "ALREADY_SEALED", "REOPENED"]);
@@ -78,6 +84,7 @@ export function tenMinRunOutcome(report: TenMinHistoryRunReport): TenMinRunOutco
     rangesSealed,
     rangesRemaining,
     madeProgress,
+    ...(report.rangeRemaining ? { rangeRemaining: report.rangeRemaining } : {}),
   });
   if (report.stoppedOnError || report.error) {
     const message = report.error ?? "UNKNOWN";

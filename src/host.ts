@@ -362,8 +362,14 @@ async function main(): Promise<void> {
     const outcome = tenMinRunOutcome(history.report);
     if (process.env.TENMIN_OUTCOME_FILE)
       writeFileSync(process.env.TENMIN_OUTCOME_FILE, `${JSON.stringify(outcome, null, 2)}\n`);
-    if (process.env.GITHUB_OUTPUT)
+    if (process.env.GITHUB_OUTPUT) {
       appendFileSync(process.env.GITHUB_OUTPUT, `next_action=${outcome.nextAction}\nreason=${outcome.reason}\n`);
+      if (history.report.rangeRemaining)
+        appendFileSync(
+          process.env.GITHUB_OUTPUT,
+          `range_remaining=${JSON.stringify(history.report.rangeRemaining)}\n`,
+        );
+    }
     process.exitCode = history.report.stoppedOnError ? 2 : 0;
     return;
   }

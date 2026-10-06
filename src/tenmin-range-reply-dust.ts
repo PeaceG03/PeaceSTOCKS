@@ -820,6 +820,8 @@ export interface TenMinRangeWriteResult {
   securitiesResumed: string[];
   fetchesWritten: number;
   fetchesResumed: number;
+  /** Total planned fetches present in doneFetches at return (prior + this run). */
+  fetchesStored: number;
   gaps: TenMinRangeGapEntry[];
   filesWritten: number;
   fallbackFiles: number;
@@ -936,6 +938,7 @@ export async function writeTenMinRangeReplyDust(options: {
       securitiesResumed: [],
       fetchesWritten: 0,
       fetchesResumed: 0,
+      fetchesStored: existing.securities.reduce((n, s) => n + s.fetches.length, 0),
       gaps: [...(existing.gaps ?? [])],
       filesWritten: 0,
       fallbackFiles: 0,
@@ -1212,6 +1215,7 @@ export async function writeTenMinRangeReplyDust(options: {
       securitiesResumed: [...securitiesResumed],
       fetchesWritten,
       fetchesResumed,
+      fetchesStored: doneFetches.size,
       gaps: [...gaps.values()].sort(
         (a, b) => byCodeUnit(a.securityId, b.securityId) || byCodeUnit(a.symbol, b.symbol),
       ),
@@ -1255,6 +1259,7 @@ export async function writeTenMinRangeReplyDust(options: {
     securitiesResumed: [...securitiesResumed],
     fetchesWritten,
     fetchesResumed,
+    fetchesStored: doneFetches.size,
     gaps: [...manifest.gaps],
     filesWritten,
     fallbackFiles,
