@@ -1,26 +1,65 @@
 import { createHash, createHmac } from "node:crypto";
 
+/** Custom object metadata: lowercase names, printable-ASCII values (S3 x-amz-meta-*). */
+export type ObjectMetadata = Record<string, string>;
+
+export interface ObjectHead {
+  size: number;
+  metadata: ObjectMetadata;
+}
+
 export interface ObjectClient {
   get(key: string): Promise<Uint8Array | undefined>;
-  put(key: string, body: Uint8Array): Promise<void>;
+  put(key: string, body: Uint8Array, metadata?: ObjectMetadata): Promise<void>;
+  /** Size and custom metadata without the body, or undefined if the key does not exist. */
+  head(key: string): Promise<ObjectHead | undefined>;
   delete(key: string): Promise<void>;
+  /** Every key under the prefix (all pages), sorted. */
   list(prefix: string): Promise<string[]>;
+}
+
+/** Kept at S3's 2 KB user-metadata limit (R2 allows more) so objects stay portable. */
+export const OBJECT_METADATA_MAX_BYTES = 2048;
+const METADATA_PREFIX = "x-amz-meta-";
+
+/**
+ * Check metadata before any write: names are lowercase [a-z0-9-], values printable ASCII, and the
+ * total (header names with x-amz-meta- plus values) is at most 2 KB. Never truncates.
+ */
+export function assertObjectMetadata(metadata: ObjectMetadata): void {
+  let bytes = 0;
+  for (const [name, value] of Object.entries(metadata)) {
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/u.test(name)) throw new Error(`OBJECT_METADATA_NAME_INVALID:${name}`);
+    if (typeof value !== "string" || !/^[\x20-\x7e]*$/u.test(value))
+      throw new Error(`OBJECT_METADATA_VALUE_NOT_ASCII:${name}`);
+    bytes += METADATA_PREFIX.length + name.length + value.length;
+  }
+  if (bytes > OBJECT_METADATA_MAX_BYTES) throw new Error(`OBJECT_METADATA_TOO_LARGE:${bytes}`);
 }
 
 export class MemoryObjectClient implements ObjectClient {
   private readonly objects = new Map<string, Uint8Array>();
+  private readonly metadata = new Map<string, ObjectMetadata>();
 
   async get(key: string): Promise<Uint8Array | undefined> {
     const found = this.objects.get(key);
     return found ? new Uint8Array(found) : undefined;
   }
 
-  async put(key: string, body: Uint8Array): Promise<void> {
+  async put(key: string, body: Uint8Array, metadata: ObjectMetadata = {}): Promise<void> {
+    assertObjectMetadata(metadata);
     this.objects.set(key, new Uint8Array(body));
+    this.metadata.set(key, { ...metadata });
+  }
+
+  async head(key: string): Promise<ObjectHead | undefined> {
+    const found = this.objects.get(key);
+    return found ? { size: found.length, metadata: { ...(this.metadata.get(key) ?? {}) } } : undefined;
   }
 
   async delete(key: string): Promise<void> {
     this.objects.delete(key);
+    this.metadata.delete(key);
   }
 
   async list(prefix: string): Promise<string[]> {
@@ -45,6 +84,15 @@ function hmac(key: string | Buffer, value: string): Buffer {
   return createHmac("sha256", key).update(value).digest();
 }
 
+function xmlText(value: string): string {
+  return value
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&amp;", "&");
+}
+
 function encodeKey(key: string): string {
   return key
     .split("/")
@@ -59,6 +107,8 @@ export function authorizationHeader(input: {
   accessKeyId: string;
   secretAccessKey: string;
   now: Date;
+  /** Extra x-amz-* headers (lowercase names) to sign; S3 requires every x-amz-* header signed. */
+  amzHeaders?: Record<string, string>;
 }): { authorization: string; amzDate: string; payloadHash: string } {
   const amzDate = input.now.toISOString().replace(/[:-]|\.\d{3}/gu, "");
   const dateStamp = amzDate.slice(0, 8);
@@ -67,8 +117,16 @@ export function authorizationHeader(input: {
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
     .join("&");
-  const canonicalHeaders = `host:${input.url.host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`;
-  const signedHeaders = "host;x-amz-content-sha256;x-amz-date";
+  const headers: Array<[string, string]> = [
+    ["host", input.url.host],
+    ["x-amz-content-sha256", payloadHash],
+    ["x-amz-date", amzDate],
+  ];
+  for (const [name, value] of Object.entries(input.amzHeaders ?? {}))
+    headers.push([name.toLowerCase(), value.trim().replaceAll(/\s+/gu, " ")]);
+  headers.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const canonicalHeaders = headers.map(([name, value]) => `${name}:${value}\n`).join("");
+  const signedHeaders = headers.map(([name]) => name).join(";");
   const canonicalRequest = [
     input.method,
     input.url.pathname,
@@ -114,7 +172,12 @@ export class R2ObjectClient implements ObjectClient {
     return url;
   }
 
-  private async request(method: string, url: URL, body: Uint8Array = new Uint8Array()): Promise<Response> {
+  private async request(
+    method: string,
+    url: URL,
+    body: Uint8Array = new Uint8Array(),
+    amzHeaders: Record<string, string> = {},
+  ): Promise<Response> {
     const signed = authorizationHeader({
       method,
       url,
@@ -122,16 +185,18 @@ export class R2ObjectClient implements ObjectClient {
       accessKeyId: this.config.accessKeyId,
       secretAccessKey: this.config.secretAccessKey,
       now: this.now(),
+      amzHeaders,
     });
     const init: RequestInit = {
       method,
       headers: {
+        ...amzHeaders,
         authorization: signed.authorization,
         "x-amz-date": signed.amzDate,
         "x-amz-content-sha256": signed.payloadHash,
       },
     };
-    if (method !== "GET" && method !== "DELETE") init.body = body;
+    if (method !== "GET" && method !== "DELETE" && method !== "HEAD") init.body = body;
     return this.fetchImpl(url, init);
   }
 
@@ -142,9 +207,25 @@ export class R2ObjectClient implements ObjectClient {
     return new Uint8Array(await response.arrayBuffer());
   }
 
-  async put(key: string, body: Uint8Array): Promise<void> {
-    const response = await this.request("PUT", this.endpoint(key), body);
+  async put(key: string, body: Uint8Array, metadata: ObjectMetadata = {}): Promise<void> {
+    assertObjectMetadata(metadata);
+    const amzHeaders = Object.fromEntries(
+      Object.entries(metadata).map(([name, value]) => [`${METADATA_PREFIX}${name}`, value]),
+    );
+    const response = await this.request("PUT", this.endpoint(key), body, amzHeaders);
     if (!response.ok) throw new Error(`R2_PUT_${response.status}`);
+  }
+
+  async head(key: string): Promise<ObjectHead | undefined> {
+    const response = await this.request("HEAD", this.endpoint(key));
+    if (response.status === 404) return undefined;
+    if (!response.ok) throw new Error(`R2_HEAD_${response.status}`);
+    const metadata: ObjectMetadata = {};
+    response.headers.forEach((value, name) => {
+      const lower = name.toLowerCase();
+      if (lower.startsWith(METADATA_PREFIX)) metadata[lower.slice(METADATA_PREFIX.length)] = value;
+    });
+    return { size: Number(response.headers.get("content-length") ?? "0"), metadata };
   }
 
   async delete(key: string): Promise<void> {
@@ -153,9 +234,24 @@ export class R2ObjectClient implements ObjectClient {
   }
 
   async list(prefix: string): Promise<string[]> {
-    const response = await this.request("GET", this.endpoint("", { "list-type": "2", prefix }));
-    if (!response.ok) throw new Error(`R2_LIST_${response.status}`);
-    const xml = await response.text();
-    return [...xml.matchAll(/<Key>([^<]+)<\/Key>/gu)].map((match) => match[1] ?? "").filter(Boolean);
+    // ListObjectsV2 returns at most 1000 keys per page; follow continuation tokens to the end.
+    const keys: string[] = [];
+    let token: string | undefined;
+    for (let page = 0; page < 100_000; page += 1) {
+      const query: Record<string, string> = { "list-type": "2", prefix };
+      if (token) query["continuation-token"] = token;
+      const response = await this.request("GET", this.endpoint("", query));
+      if (!response.ok) throw new Error(`R2_LIST_${response.status}`);
+      const xml = await response.text();
+      keys.push(
+        ...[...xml.matchAll(/<Key>([^<]+)<\/Key>/gu)].map((match) => xmlText(match[1] ?? "")).filter(Boolean),
+      );
+      const truncated = /<IsTruncated>true<\/IsTruncated>/u.test(xml);
+      token = /<NextContinuationToken>([^<]+)<\/NextContinuationToken>/u.exec(xml)?.[1];
+      if (!truncated) return keys.sort();
+      if (!token) throw new Error("R2_LIST_TRUNCATED_WITHOUT_TOKEN");
+      token = xmlText(token);
+    }
+    throw new Error("R2_LIST_TOO_MANY_PAGES");
   }
 }

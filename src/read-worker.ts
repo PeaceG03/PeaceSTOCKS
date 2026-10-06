@@ -1,5 +1,5 @@
 import { ObjectMarketStorage } from "./object-storage";
-import type { ObjectClient } from "./object-store";
+import type { ObjectClient, ObjectHead } from "./object-store";
 import { readScannerRoute } from "./read-api";
 
 export interface ReadOnlyObjectBody {
@@ -14,6 +14,8 @@ export interface ReadOnlyObjectList {
 
 export interface ReadOnlyBucket {
   get(key: string): Promise<ReadOnlyObjectBody | null>;
+  /** R2 binding head(): customMetadata is the same data the S3 API returns as x-amz-meta-*. */
+  head?(key: string): Promise<{ size: number; customMetadata?: Record<string, string> } | null>;
   list(options: { prefix: string; cursor?: string }): Promise<ReadOnlyObjectList>;
 }
 
@@ -28,6 +30,12 @@ class BindingObjectClient implements ObjectClient {
 
   async put(): Promise<void> {
     throw new Error("READ_ONLY");
+  }
+
+  async head(key: string): Promise<ObjectHead | undefined> {
+    if (!this.bucket.head) throw new Error("READ_BUCKET_HEAD_UNSUPPORTED");
+    const object = await this.bucket.head(key);
+    return object ? { size: object.size, metadata: { ...(object.customMetadata ?? {}) } } : undefined;
   }
 
   async delete(): Promise<void> {

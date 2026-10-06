@@ -12,7 +12,9 @@ import {
   type ReplyDustFileEntry,
   type ReplyDustStore,
   canonicalBarsFromReply,
-  readReplyDustReply,
+  listStoredReplyDust,
+  readReplyDustManifest,
+  verifyStoredReplyDust,
   writeReplyDustFile,
   writeReplyDustManifest,
 } from "./intraday-reply-dust";
@@ -271,14 +273,45 @@ export async function backfillHistoricalIntradayEvidence(options: {
     const getIntradayBars = provider.getIntradayBars!.bind(provider);
     const takeRawReplies = provider.takeRawReplies!.bind(provider);
     if (takeRawReplies().length) throw new Error("REPLY_DUST_UNEXPECTED_HELD_REPLIES");
-    const written = await loadReplyDustProgress(options.root, sessionDate);
-    const done = new Map(written.map((entry) => [entry.securityId, entry]));
+    // What is done comes from the store itself: the session manifest (read once per session) if
+    // sealed, else the .rdust objects listed under the session and verified one by one against
+    // their metadata. The local progress log only saves metadata reads; it is never the record.
+    const manifest = await readReplyDustManifest(store, sessionDate);
+    const hints = new Map(
+      (manifest?.files ?? (await loadReplyDustProgress(options.root, sessionDate))).map((entry) => [
+        entry.securityId,
+        entry,
+      ]),
+    );
+    const stored = manifest ? new Set(hints.keys()) : await listStoredReplyDust(store, sessionDate);
+    const written = new Map<string, ReplyDustFileEntry>();
     const bars: CanonicalTenMinuteBar[] = [];
     for (const securityId of activeIds) {
-      const prior = done.get(securityId);
-      if (prior) {
-        const reply = await readReplyDustReply(store, sessionDate, prior, options.replyDustBackend);
-        bars.push(...canonicalBarsFromReply(provider.providerName, sessionDate, prior, reply));
+      if (stored.has(securityId)) {
+        const hint = hints.get(securityId);
+        const verified =
+          (hint &&
+            (await verifyStoredReplyDust(store, sessionDate, securityId, {
+              provider: provider.providerName,
+              hint,
+              ...(options.replyDustBackend ? { backend: options.replyDustBackend } : {}),
+            }))) ||
+          (manifest
+            ? undefined
+            : await verifyStoredReplyDust(store, sessionDate, securityId, {
+                provider: provider.providerName,
+                ...(options.replyDustBackend ? { backend: options.replyDustBackend } : {}),
+              }));
+        if (verified) {
+          written.set(securityId, verified.entry);
+          bars.push(
+            ...canonicalBarsFromReply(provider.providerName, sessionDate, verified.entry, verified.reply),
+          );
+          continue;
+        }
+        // A sealed session's files are immutable; a bad one there is an error, not a refetch.
+        if (manifest) throw new Error(`REPLY_DUST_SEALED_FILE_INVALID:${sessionDate}:${securityId}`);
+      } else if (manifest) {
         continue;
       }
       const securityBars = await getIntradayBars(sessionDate, [securityId]);
@@ -295,17 +328,23 @@ export async function backfillHistoricalIntradayEvidence(options: {
         throw new Error(`REPLY_DUST_REPLY_MISSING_OR_UNEXPECTED:${securityId}:${replies.length}`);
       const observedAt = securityBars[0]?.observedAt;
       if (!observedAt) throw new Error(`REPLY_DUST_NO_BARS_FOR_REPLY:${securityId}`);
-      const entry = await writeReplyDustFile(store, reply, observedAt, options.replyDustBackend);
+      const entry = await writeReplyDustFile(
+        store,
+        reply,
+        { provider: provider.providerName, observedAt },
+        options.replyDustBackend,
+      );
       replyDustFilesWritten += 1;
       if (entry.version === REPLY_DUST_FALLBACK_VERSION) replyDustFallbackFiles += 1;
       await appendReplyDustProgress(options.root, sessionDate, entry);
-      written.push(entry);
+      written.set(securityId, entry);
       bars.push(...securityBars);
     }
     await writeReplyDustManifest(store, {
       provider: provider.providerName,
       sessionDate,
-      files: written,
+      files: [...written.values()],
+      existing: manifest,
     });
     return bars.sort(
       (a, b) => a.securityId.localeCompare(b.securityId) || a.intervalIndex - b.intervalIndex,

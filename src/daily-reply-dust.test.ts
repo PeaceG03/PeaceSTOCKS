@@ -11,7 +11,7 @@ import {
 } from "./daily-reply-dust";
 import { securityId } from "./identity";
 import { MassiveMarketProvider, groupedDailySymbolIndex, symbolBySecurityIdFor } from "./massive-provider";
-import { MemoryObjectClient } from "./object-store";
+import { MemoryObjectClient, type ObjectMetadata } from "./object-store";
 import { ObjectMarketStorage } from "./object-storage";
 import {
   REPLY_DUST_FALLBACK_VERSION,
@@ -66,9 +66,9 @@ const bySymbol = () => groupedDailySymbolIndex(symbolBySecurityIdFor(universe), 
 
 class FailingClient extends MemoryObjectClient {
   failRdustFor: string | undefined;
-  override async put(key: string, body: Uint8Array): Promise<void> {
+  override async put(key: string, body: Uint8Array, metadata?: ObjectMetadata): Promise<void> {
     if (this.failRdustFor && key.endsWith(`${this.failRdustFor}/grouped-daily.rdust`)) throw new Error("STORE_DOWN");
-    await super.put(key, body);
+    await super.put(key, body, metadata);
   }
 }
 
@@ -306,4 +306,31 @@ test("daily zstd pin is checked once per run and never with the switch off", asy
     },
   });
   assert.deepEqual(off.completedSessions, [DAYS[0]]);
+});
+
+test("the grouped daily object carries its manifest fields as object metadata", async () => {
+  const client = new MemoryObjectClient();
+  await backfillHistoricalEvidence({
+    root: "/unused", from: DAYS[0]!, to: DAYS[0]!, provider: harness({}).provider,
+    storage: new ObjectMarketStorage(client), env: {}, replyDust: true, zstdVersionProbe: pinnedZstd,
+    replyDustStore: client,
+  });
+  const manifest = (await readDailyReplyDustManifest(client, DAYS[0]!))!;
+  const head = await client.head(dailyReplyDustFileKey(DAYS[0]!));
+  assert.deepEqual(head, {
+    size: manifest.byteLength,
+    metadata: {
+      "rd-schema": "daily-reply-dust-object-v1",
+      "rd-provider": "massive-stocks",
+      "rd-session-date": DAYS[0],
+      "rd-dataset": "stocks-grouped-daily",
+      "rd-request": manifest.request,
+      "rd-fetched-at": manifest.fetchedAt,
+      "rd-observed-at": manifest.observedAt,
+      "rd-retrieval-id": manifest.retrievalId,
+      "rd-version": String(manifest.version),
+      "rd-reply-sha256": manifest.replySha256,
+      "rd-reply-length": String(manifest.replyByteLength),
+    },
+  });
 });

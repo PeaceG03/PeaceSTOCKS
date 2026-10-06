@@ -17,7 +17,7 @@ import {
   writeReplyDustFile,
 } from "./intraday-reply-dust";
 import { MassiveMarketProvider } from "./massive-provider";
-import { MemoryObjectClient } from "./object-store";
+import { MemoryObjectClient, type ObjectMetadata } from "./object-store";
 import { DustReader } from "./reader";
 import {
   REPLY_DUST_FALLBACK_VERSION,
@@ -85,10 +85,10 @@ const exists = (path: string) => stat(path).then(() => true, () => false);
 
 class FailingStore extends MemoryObjectClient {
   failNextRdust = 0;
-  override async put(key: string, body: Uint8Array): Promise<void> {
+  override async put(key: string, body: Uint8Array, metadata?: ObjectMetadata): Promise<void> {
     if (key.endsWith(".rdust") && this.failNextRdust > 0 && --this.failNextRdust === 0)
       throw new Error("STORE_DOWN");
-    await super.put(key, body);
+    await super.put(key, body, metadata);
   }
 }
 
@@ -258,7 +258,7 @@ test("a failed final decode-compare stops that file before anything is written",
         request: "/v2/aggs/ticker/AAA/range/10/minute/2026-01-02/2026-01-02", fetchedAt: "2026-01-02T22:00:00.000Z",
         body: new TextEncoder().encode(replies.AAA),
       },
-      "2026-01-02T22:00:00.000Z",
+      { provider: "massive-stocks", observedAt: "2026-01-02T22:00:00.000Z" },
       lyingAfterEncode,
     ),
     /REPLY_DUST_WRITE_VERIFY_FAILED/u,
@@ -323,4 +323,136 @@ test("10-minute zstd pin is checked once per run and never with the switch off",
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+class CountingStore extends FailingStore {
+  manifestGets = 0;
+  override async get(key: string): Promise<Uint8Array | undefined> {
+    if (key.endsWith("/manifest.json")) this.manifestGets += 1;
+    return super.get(key);
+  }
+}
+
+async function uninterruptedManifest(): Promise<Uint8Array | undefined> {
+  const root = await marketRoot(["AAA", "BBB"]);
+  try {
+    const store = new MemoryObjectClient();
+    await backfillHistoricalIntradayEvidence({
+      root, from: SESSION, to: SESSION, provider: fakeMassive({}),
+      replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: store,
+    });
+    return store.get(`permanent/intraday-reply-dust/${SESSION}/manifest.json`);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("a fresh runner with no local log resumes from the store and fetches only missing securities", async () => {
+  const first = await marketRoot(["AAA", "BBB"]);
+  const fresh = await marketRoot(["AAA", "BBB"]);
+  try {
+    const store = new FailingStore();
+    store.failNextRdust = 2;
+    const fetches: Record<string, number> = {};
+    const failed = await backfillHistoricalIntradayEvidence({
+      root: first, from: SESSION, to: SESSION, provider: fakeMassive(fetches),
+      replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: store,
+    });
+    assert.equal(failed.stoppedOnError, true);
+    const aaa = securityId("massive-stocks", "AAA", "STOCK");
+    const head = await store.head(replyDustFileKey(SESSION, aaa));
+    assert.equal(head?.metadata["rd-security-id"], aaa);
+    assert.equal(head?.metadata["rd-symbol"], "AAA");
+    assert.equal(head?.metadata["rd-request"], `/v2/aggs/ticker/AAA/range/10/minute/${SESSION}/${SESSION}?adjusted=false&sort=asc&limit=50000`);
+    assert.equal(head?.metadata["rd-fetched-at"], "2026-01-02T22:00:00.000Z");
+    assert.equal(head?.metadata["rd-observed-at"], "2026-01-02T22:00:00.000Z");
+    assert.equal(head?.metadata["rd-reply-length"], String(replies.AAA!.length));
+    // A different machine: new root, no progress log, no state file; only the store is shared.
+    assert.deepEqual(await loadReplyDustProgress(fresh, SESSION), []);
+    const resumed = await backfillHistoricalIntradayEvidence({
+      root: fresh, from: SESSION, to: SESSION, provider: fakeMassive(fetches),
+      replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: store,
+    });
+    assert.deepEqual(resumed.completedSessions, [SESSION]);
+    assert.equal(resumed.replyDustFilesWritten, 1);
+    assert.deepEqual(fetches, { AAA: 1, BBB: 2 });
+    const manifest = await store.get(`permanent/intraday-reply-dust/${SESSION}/manifest.json`);
+    assert.ok(manifest);
+    assert.deepEqual(manifest, await uninterruptedManifest());
+    assert.deepEqual(
+      await readReplyDustSecurityDay(store, SESSION, aaa),
+      await new DustReader(fresh).readSecurityDay(SESSION, aaa),
+    );
+  } finally {
+    await rm(first, { recursive: true, force: true });
+    await rm(fresh, { recursive: true, force: true });
+  }
+});
+
+test("a corrupted or metadata-less stored object is refetched on resume", async () => {
+  const root = await marketRoot(["AAA", "BBB"]);
+  try {
+    const store = new FailingStore();
+    const fetches: Record<string, number> = {};
+    const aaa = securityId("massive-stocks", "AAA", "STOCK");
+    const bbb = securityId("massive-stocks", "BBB", "STOCK");
+    store.failNextRdust = 2; // AAA is stored, BBB's write fails
+    await backfillHistoricalIntradayEvidence({
+      root, from: SESSION, to: SESSION, provider: fakeMassive(fetches),
+      replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: store,
+    });
+    assert.deepEqual(fetches, { AAA: 1, BBB: 1 });
+    // Corrupt AAA's bytes but keep its metadata; plant a BBB object with no metadata at all.
+    const key = replyDustFileKey(SESSION, aaa);
+    const good = (await store.get(key))!;
+    const bad = new Uint8Array(good);
+    bad[bad.length - 1] = bad[bad.length - 1]! ^ 0xff;
+    await store.put(key, bad, (await store.head(key))!.metadata);
+    await store.put(replyDustFileKey(SESSION, bbb), good);
+    await rm(join(root, "transient", "reply-dust-progress"), { recursive: true, force: true });
+    const resumed = await backfillHistoricalIntradayEvidence({
+      root, from: SESSION, to: SESSION, provider: fakeMassive(fetches),
+      replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: store,
+    });
+    assert.deepEqual(resumed.completedSessions, [SESSION]);
+    assert.equal(resumed.replyDustFilesWritten, 2);
+    assert.deepEqual(fetches, { AAA: 2, BBB: 2 });
+    assert.deepEqual(await store.get(`permanent/intraday-reply-dust/${SESSION}/manifest.json`), await uninterruptedManifest());
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the session manifest is read once per session, not once per file", async () => {
+  const root = await marketRoot(["AAA", "BBB"]);
+  try {
+    const store = new CountingStore();
+    const result = await backfillHistoricalIntradayEvidence({
+      root, from: SESSION, to: "2026-01-06", provider: fakeMassive({}),
+      replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: store,
+    });
+    assert.equal(result.completedSessions.length, 3);
+    assert.equal(result.replyDustFilesWritten, 6);
+    assert.equal(store.manifestGets, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("object metadata over 2 KB is rejected before anything is written", async () => {
+  const store = new MemoryObjectClient();
+  const id = securityId("massive-stocks", "AAA", "STOCK");
+  await assert.rejects(
+    writeReplyDustFile(
+      store,
+      {
+        dataset: "stocks-aggregates-10m", sessionDate: SESSION, securityId: id, symbol: "AAA",
+        request: `/v2/aggs/ticker/AAA/range/10/minute/${SESSION}/${SESSION}?pad=${"x".repeat(2100)}`,
+        fetchedAt: "2026-01-02T22:00:00.000Z", body: new TextEncoder().encode(replies.AAA),
+      },
+      { provider: "massive-stocks", observedAt: "2026-01-02T22:00:00.000Z" },
+    ),
+    /OBJECT_METADATA_TOO_LARGE:\d+/u,
+  );
+  assert.deepEqual(await store.list(""), []);
 });

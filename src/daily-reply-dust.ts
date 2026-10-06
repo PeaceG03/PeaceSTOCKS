@@ -24,6 +24,7 @@ import {
 export const DAILY_REPLY_DUST_PREFIX = "permanent/daily-reply-dust";
 export const DAILY_REPLY_DUST_MANIFEST_SCHEMA = "daily-reply-dust-manifest-v1" as const;
 export const DAILY_REPLY_DUST_FILE_NAME = "grouped-daily.rdust";
+export const DAILY_REPLY_DUST_OBJECT_SCHEMA = "daily-reply-dust-object-v1";
 
 export interface DailyReplyDustManifest {
   schemaVersion: typeof DAILY_REPLY_DUST_MANIFEST_SCHEMA;
@@ -101,6 +102,10 @@ export async function writeDailyReplyDust(
   const manifestKey = dailyReplyDustManifestKey(reply.sessionDate);
   if (await store.get(manifestKey))
     throw new Error(`REPLY_DUST_SESSION_ALREADY_SEALED:${reply.sessionDate}`);
+  const requestId = parseReply(reply.body).request_id;
+  const retrievalId =
+    typeof requestId === "string" && requestId.length > 0 ? requestId : `grouped-${reply.sessionDate}`;
+  const replySha256 = sha256Hex(reply.body);
   // A file here without a manifest is a leftover from a crashed attempt and is replaced.
   const encoded = await storeVerifiedReplyDust(
     store,
@@ -108,8 +113,20 @@ export async function writeDailyReplyDust(
     reply.body,
     `grouped-daily:${reply.sessionDate}`,
     backend,
+    (bytes) => ({
+      "rd-schema": DAILY_REPLY_DUST_OBJECT_SCHEMA,
+      "rd-provider": options.provider,
+      "rd-session-date": reply.sessionDate,
+      "rd-dataset": "stocks-grouped-daily",
+      "rd-request": reply.request,
+      "rd-fetched-at": reply.fetchedAt,
+      "rd-observed-at": options.observedAt,
+      "rd-retrieval-id": retrievalId,
+      "rd-version": String(bytes[0]),
+      "rd-reply-sha256": replySha256,
+      "rd-reply-length": String(reply.body.length),
+    }),
   );
-  const requestId = parseReply(reply.body).request_id;
   const body: Omit<DailyReplyDustManifest, "checksum"> = {
     schemaVersion: DAILY_REPLY_DUST_MANIFEST_SCHEMA,
     format: REPLY_DUST_FORMAT,
@@ -120,12 +137,11 @@ export async function writeDailyReplyDust(
     request: reply.request,
     fetchedAt: reply.fetchedAt,
     observedAt: options.observedAt,
-    retrievalId:
-      typeof requestId === "string" && requestId.length > 0 ? requestId : `grouped-${reply.sessionDate}`,
+    retrievalId,
     version: encoded[0]!,
     byteLength: encoded.length,
     fileSha256: sha256Hex(encoded),
-    replySha256: sha256Hex(reply.body),
+    replySha256,
     replyByteLength: reply.body.length,
   };
   const manifest: DailyReplyDustManifest = { ...body, checksum: checksumOf(body) };
