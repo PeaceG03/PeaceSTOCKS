@@ -866,8 +866,12 @@ export interface TenMinRangeWriteResult {
   securitiesResumed: string[];
   fetchesWritten: number;
   fetchesResumed: number;
-  /** Total planned fetches present in doneFetches at return (prior + this run). */
+  /** Total identities in doneFetches at return (prior + this run), including orphans. */
   fetchesStored: number;
+  /** Subset of fetchesStored whose identity is in this run's plan. */
+  fetchesStoredInPlan: number;
+  /** Stored or gapped identities not in this run's plan (leftovers from an older plan). */
+  orphanFetches: number;
   gaps: TenMinRangeGapEntry[];
   filesWritten: number;
   fallbackFiles: number;
@@ -931,6 +935,32 @@ function groupSecurities(
  * Write one calendar range. Work units are planned (security, ticker, sub-span) fetches.
  * Folder keys use calendar from/to; each file's metadata carries the actual fetch span.
  */
+
+function countPlanStoredAndOrphans(
+  planned: readonly TenMinRangePlannedFetch[],
+  doneFetches: ReadonlyMap<string, { securityId: string; fetch: TenMinRangeTickerFetch }>,
+  gaps: Iterable<TenMinRangeGapEntry>,
+): { fetchesStoredInPlan: number; orphanFetches: number } {
+  const plannedKeys = new Set(planned.map(fetchIdentityKey));
+  let fetchesStoredInPlan = 0;
+  let orphanFetches = 0;
+  for (const key of doneFetches.keys()) {
+    if (plannedKeys.has(key)) fetchesStoredInPlan += 1;
+    else orphanFetches += 1;
+  }
+  for (const gap of gaps) {
+    if (!gap.symbol || !gap.fetchFrom || !gap.fetchTo) continue;
+    const key = fetchIdentityKey({
+      securityId: gap.securityId,
+      symbol: gap.symbol,
+      fetchFrom: gap.fetchFrom,
+      fetchTo: gap.fetchTo,
+    });
+    if (!plannedKeys.has(key)) orphanFetches += 1;
+  }
+  return { fetchesStoredInPlan, orphanFetches };
+}
+
 export async function writeTenMinRangeReplyDust(options: {
   store: ReplyDustStore;
   root: string;
@@ -985,6 +1015,16 @@ export async function writeTenMinRangeReplyDust(options: {
       fetchesWritten: 0,
       fetchesResumed: 0,
       fetchesStored: existing.securities.reduce((n, s) => n + s.fetches.length, 0),
+      ...(() => {
+        const done = new Map<string, { securityId: string; fetch: TenMinRangeTickerFetch }>();
+        for (const security of existing.securities)
+          for (const fetch of security.fetches)
+            done.set(fetchIdentityKey({ securityId: security.securityId, ...fetch }), {
+              securityId: security.securityId,
+              fetch,
+            });
+        return countPlanStoredAndOrphans(options.fetches, done, existing.gaps ?? []);
+      })(),
       gaps: [...(existing.gaps ?? [])],
       filesWritten: 0,
       fallbackFiles: 0,
@@ -1262,6 +1302,7 @@ export async function writeTenMinRangeReplyDust(options: {
       fetchesWritten,
       fetchesResumed,
       fetchesStored: doneFetches.size,
+      ...countPlanStoredAndOrphans(options.fetches, doneFetches, gaps.values()),
       gaps: [...gaps.values()].sort(
         (a, b) => byCodeUnit(a.securityId, b.securityId) || byCodeUnit(a.symbol, b.symbol),
       ),
@@ -1323,6 +1364,7 @@ export async function writeTenMinRangeReplyDust(options: {
     fetchesWritten,
     fetchesResumed,
     fetchesStored: doneFetches.size,
+    ...countPlanStoredAndOrphans(options.fetches, doneFetches, gaps.values()),
     gaps: [...manifest.gaps],
     filesWritten,
     fallbackFiles,

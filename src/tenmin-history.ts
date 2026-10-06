@@ -52,8 +52,15 @@ export const TENMIN_HISTORY_REQUESTS_PER_MINUTE = 5;
 export interface TenMinRangeRemaining {
   range: string;
   plannedFetches: number;
+  /** Stored fetches that are in this plan (orphans excluded). */
   storedFetches: number;
+  /** Durable gaps that match a planned fetch identity. */
   gappedFetches: number;
+  /**
+   * Stored or gapped fetch identities that are *not* in this plan (leftovers from an older
+   * plan). Reported so remainingFetches is not silently understated; not subtracted from remaining.
+   */
+  orphanFetches: number;
   remainingFetches: number;
   groupedDailyRemaining: number;
   estimatedRemainingRequests: number;
@@ -84,6 +91,41 @@ export function countGappedPlannedFetches(
   return n;
 }
 
+/** Pure: how many of `storedKeys` (fetchIdentityKey) are in the plan. */
+export function countStoredPlannedFetches(
+  planned: readonly TenMinRangePlannedFetch[],
+  storedKeys: readonly string[],
+): number {
+  const keys = new Set(planned.map(fetchIdentityKey));
+  let n = 0;
+  for (const key of storedKeys) if (keys.has(key)) n += 1;
+  return n;
+}
+
+/**
+ * Pure: stored keys and/or gaps whose identity is not in this plan (leftovers from an older plan).
+ */
+export function countOrphanFetches(
+  planned: readonly TenMinRangePlannedFetch[],
+  storedKeys: readonly string[],
+  gaps: readonly TenMinRangeGapEntry[],
+): number {
+  const keys = new Set(planned.map(fetchIdentityKey));
+  let n = 0;
+  for (const key of storedKeys) if (!keys.has(key)) n += 1;
+  for (const gap of gaps) {
+    if (!gap.symbol || !gap.fetchFrom || !gap.fetchTo) continue;
+    const key = fetchIdentityKey({
+      securityId: gap.securityId,
+      symbol: gap.symbol,
+      fetchFrom: gap.fetchFrom,
+      fetchTo: gap.fetchTo,
+    });
+    if (!keys.has(key)) n += 1;
+  }
+  return n;
+}
+
 /**
  * Pure: remaining work + seal ETA for the active range.
  * requestsPerRun = hitTimeBudget && actualRequests > 0
@@ -93,8 +135,12 @@ export function countGappedPlannedFetches(
 export function estimateTenMinRangeRemaining(input: {
   range: string;
   plannedFetches: number;
+  /** In-plan stored only (orphans must not be included). */
   storedFetches: number;
+  /** In-plan gapped only. */
   gappedFetches: number;
+  /** Stored/gapped identities not in this plan; not subtracted from remaining. */
+  orphanFetches?: number;
   groupedDailyRemaining: number;
   budgetMs?: number;
   requestsPerMinute?: number;
@@ -104,6 +150,8 @@ export function estimateTenMinRangeRemaining(input: {
   const plannedFetches = Math.max(0, input.plannedFetches);
   const storedFetches = Math.max(0, input.storedFetches);
   const gappedFetches = Math.max(0, input.gappedFetches);
+  const orphanFetches = Math.max(0, input.orphanFetches ?? 0);
+  // Clamp only after using in-plan counts — orphans must not shrink remaining to 0.
   const remainingFetches = Math.max(0, plannedFetches - storedFetches - gappedFetches);
   const groupedDailyRemaining = Math.max(0, input.groupedDailyRemaining);
   // Lower bound: 1 request per remaining fetch + 1 per unstored grouped day.
@@ -121,6 +169,7 @@ export function estimateTenMinRangeRemaining(input: {
     plannedFetches,
     storedFetches,
     gappedFetches,
+    orphanFetches,
     remainingFetches,
     groupedDailyRemaining,
     estimatedRemainingRequests,
@@ -883,6 +932,7 @@ export async function runTenMinHistory(options: {
           plannedFetches: universe.fetches.length,
           storedFetches: 0,
           gappedFetches: 0,
+          orphanFetches: 0,
           groupedDailyRemaining: universe.tradingSessions.length,
           budgetMs,
           actualRequestsThisRun: massiveRequests,
@@ -928,6 +978,7 @@ export async function runTenMinHistory(options: {
             plannedFetches: universe.fetches.length,
             storedFetches: 0,
             gappedFetches: 0,
+            orphanFetches: 0,
             groupedDailyRemaining: Math.max(
               0,
               universe.tradingSessions.length - grouped.stored - grouped.resumed,
@@ -997,8 +1048,9 @@ export async function runTenMinHistory(options: {
         rangeRemaining = estimateTenMinRangeRemaining({
           range: `${range.calendarFrom}_${range.calendarTo}`,
           plannedFetches: universe.fetches.length,
-          storedFetches: result.fetchesStored,
+          storedFetches: result.fetchesStoredInPlan,
           gappedFetches,
+          orphanFetches: result.orphanFetches,
           groupedDailyRemaining: Math.max(
             0,
             universe.tradingSessions.length - (grouped?.stored ?? 0) - (grouped?.resumed ?? 0),

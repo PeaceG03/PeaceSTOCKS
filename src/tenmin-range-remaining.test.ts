@@ -4,9 +4,11 @@ import {
   TENMIN_HISTORY_DEFAULT_BUDGET_MS,
   TENMIN_HISTORY_REQUESTS_PER_MINUTE,
   countGappedPlannedFetches,
+  countOrphanFetches,
+  countStoredPlannedFetches,
   estimateTenMinRangeRemaining,
 } from "./tenmin-history";
-import type { TenMinRangeGapEntry, TenMinRangePlannedFetch } from "./tenmin-range-reply-dust";
+import { fetchIdentityKey, type TenMinRangeGapEntry, type TenMinRangePlannedFetch } from "./tenmin-range-reply-dust";
 
 const RANGE = "2024-11-01_2024-12-31";
 
@@ -39,6 +41,7 @@ test("mid-range resume: stored + gapped reduce remaining", () => {
     plannedFetches: 100,
     storedFetches: 60,
     gappedFetches: 10,
+    orphanFetches: 0,
     remainingFetches: 30,
     groupedDailyRemaining: 0,
     estimatedRemainingRequests: 30,
@@ -125,4 +128,35 @@ test("countGappedPlannedFetches matches planned identities only", () => {
     { securityId: "s9", symbol: "ZZZ", reason: "X", at: "x", fetchFrom: "2024-11-01", fetchTo: "2024-12-31" },
   ];
   assert.equal(countGappedPlannedFetches(planned, gaps), 1);
+});
+
+test("orphan stored key does not reduce remainingFetches; shows in orphanFetches", () => {
+  const planned: TenMinRangePlannedFetch[] = [
+    { securityId: "s1", symbol: "AAA", fetchFrom: "2024-11-01", fetchTo: "2024-12-31" },
+    { securityId: "s2", symbol: "BBB", fetchFrom: "2024-11-01", fetchTo: "2024-12-31" },
+  ];
+  const storedKeys = [
+    fetchIdentityKey(planned[0]!),
+    fetchIdentityKey({
+      securityId: "orphan_sec",
+      symbol: "OLD",
+      fetchFrom: "2024-09-01",
+      fetchTo: "2024-10-31",
+    }),
+  ];
+  const storedInPlan = countStoredPlannedFetches(planned, storedKeys);
+  const orphans = countOrphanFetches(planned, storedKeys, []);
+  assert.equal(storedInPlan, 1);
+  assert.equal(orphans, 1);
+  const r = estimateTenMinRangeRemaining({
+    range: RANGE,
+    plannedFetches: planned.length,
+    storedFetches: storedInPlan,
+    gappedFetches: 0,
+    orphanFetches: orphans,
+    groupedDailyRemaining: 0,
+  });
+  assert.equal(r.remainingFetches, 1); // s2 still remaining — orphan did not clamp to 0
+  assert.equal(r.orphanFetches, 1);
+  assert.equal(r.storedFetches, 1);
 });
