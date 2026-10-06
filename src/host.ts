@@ -1,3 +1,4 @@
+import { appendFileSync, writeFileSync } from "node:fs";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
@@ -18,6 +19,7 @@ import { MarketsScanner, type SessionCalendar } from "./scanner";
 import type { MarketStore } from "./storage";
 import { openMarketStore } from "./object-storage";
 import { runTenMinHistoryFromEnv, tenMinHistorySummary } from "./tenmin-history";
+import { tenMinRunOutcome } from "./tenmin-redispatch";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 
 export const DEFAULT_MARKETS_ROOT = "C:\\ProgramData\\PeaceAI\\Markets";
@@ -335,6 +337,12 @@ async function main(): Promise<void> {
     process.stdout.write(
       `${JSON.stringify(tenMinHistorySummary(history.report))}\n`,
     );
+    // Machine-readable outcome for the auto re-dispatch step (continue|stop plus a reason).
+    const outcome = tenMinRunOutcome(history.report);
+    if (process.env.TENMIN_OUTCOME_FILE)
+      writeFileSync(process.env.TENMIN_OUTCOME_FILE, `${JSON.stringify(outcome, null, 2)}\n`);
+    if (process.env.GITHUB_OUTPUT)
+      appendFileSync(process.env.GITHUB_OUTPUT, `next_action=${outcome.nextAction}\nreason=${outcome.reason}\n`);
     process.exitCode = history.report.stoppedOnError ? 2 : 0;
     return;
   }

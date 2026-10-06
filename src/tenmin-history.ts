@@ -528,6 +528,10 @@ export interface TenMinHistoryRunReport {
   /** securityId -> ticker links come from today's master. */
   securityLink: typeof TENMIN_SECURITY_LINK;
   ranges: TenMinHistoryRangeReport[];
+  /** Ranges in the window plan (before maxRanges): the denominator for "ranges left to do". */
+  rangesPlanned: number;
+  /** Was maxRanges set for this run (a deliberately bounded run). */
+  maxRanges?: number;
   yieldedForScan?: string;
   outageStop?: string;
   stoppedOnError: boolean;
@@ -887,6 +891,8 @@ export async function runTenMinHistory(options: {
     reopen,
     securityLink: TENMIN_SECURITY_LINK,
     ranges: rangeReports,
+    rangesPlanned: plan.ranges.length,
+    ...(options.maxRanges !== undefined ? { maxRanges: options.maxRanges } : {}),
     ...(yieldedForScan ? { yieldedForScan } : {}),
     ...(outageStop ? { outageStop } : {}),
     stoppedOnError,

@@ -39,6 +39,10 @@ on:
         description: "tenmin_history only: wall-clock budget in ms; default 110 min so the run stops cleanly before the 120 min job timeout"
         required: false
         default: "6600000"
+      tenmin_history_chain:
+        description: "tenmin_history only: run number in an auto re-dispatch chain (0 = started by a human; set by the chain)"
+        required: false
+        default: "0"
   schedule:
     # 21:30 UTC is 4:30 PM ET in winter and 5:30 PM ET in summer, after the close plus the 30 minute delay.
     - cron: "30 21 * * 1-5"
@@ -189,14 +193,18 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: pnpm backfill --from "$MARKETS_BACKFILL_FROM" --to "$MARKETS_BACKFILL_TO" --max-sessions "${{ github.event.inputs.max_sessions }}"
 
-  # Manual only: never on schedule. Shares peacestocks-r2-writer concurrency with scan/backfill
-  # so it queues behind (or ahead of) them; the host also yields via scanYieldReason.
+  # Dispatch only: never on this workflow's schedule. Shares peacestocks-r2-writer concurrency with
+  # scan/backfill so it queues behind (or ahead of) them; the host also yields via scanYieldReason.
+  # Auto re-dispatch (repo variable TENMIN_AUTO_REDISPATCH == "true"): the last step dispatches the
+  # next run on a clean partial; tenmin-history-fallback.yml restarts a chain a guard window broke.
   tenmin_history:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'tenmin_history' }}
     runs-on: ubuntu-24.04
+    # actions: write lets the last step dispatch the next run (GITHUB_TOKEN workflow_dispatch does
+    # start a new run) and read the queue so it never dispatches while another run is waiting.
     permissions:
       contents: read
-      actions: read
+      actions: write
     timeout-minutes: 120
     env:
       MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
@@ -252,10 +260,36 @@ jobs:
           test -n "$MASSIVE_API_KEY"
           test -n "$PEACESTOCKS_SOURCE_COMMIT"
       - name: Ten-minute history runner (Reply Dust ranges)
+        id: history
         env:
           PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
           GITHUB_TOKEN: ${{ github.token }}
+          TENMIN_OUTCOME_FILE: ${{ runner.temp }}/tenmin-history-outcome.json
           PEACESTOCKS_TENMIN_HISTORY_REOPEN: ${{ github.event.inputs.tenmin_history_reopen == 'true' && '1' || '' }}
           PEACESTOCKS_TENMIN_HISTORY_MAX_RANGES: ${{ github.event.inputs.tenmin_history_max_ranges }}
           PEACESTOCKS_TENMIN_HISTORY_BUDGET_MS: ${{ github.event.inputs.tenmin_history_budget_ms }}
         run: pnpm scheduler
+      # Decision logic is decideTenMinRedispatch (src/tenmin-redispatch.ts, unit-tested); it stops
+      # on any refusal, error, outage, failure, bounded manual run, chain cap, or kill switch off,
+      # and waits (no dispatch) in or just before a guard window or while another run is queued.
+      - name: Auto re-dispatch (chain)
+        id: redispatch
+        if: ${{ always() }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TENMIN_AUTO_REDISPATCH: ${{ vars.TENMIN_AUTO_REDISPATCH }}
+          TENMIN_AUTO_REDISPATCH_MAX_CHAIN: ${{ vars.TENMIN_AUTO_REDISPATCH_MAX_CHAIN }}
+          TENMIN_CHAIN: ${{ github.event.inputs.tenmin_history_chain }}
+          TENMIN_STEP_OUTCOME: ${{ steps.history.outcome }}
+          TENMIN_OUTCOME_FILE: ${{ runner.temp }}/tenmin-history-outcome.json
+          TENMIN_RECORD_FILE: ${{ runner.temp }}/tenmin-history-record.json
+        run: pnpm exec tsx src/tenmin-redispatch.ts chain
+      # The fallback workflow reads the newest record to decide whether to restart the chain.
+      - name: Keep this run's record for the fallback
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tenmin-history-record
+          path: ${{ runner.temp }}/tenmin-history-record.json
+          retention-days: 14
+          if-no-files-found: warn
