@@ -265,6 +265,12 @@ export function massiveTenMinuteBarsFromReply(input: {
   });
 }
 
+/** Grouped daily (whole US stock market, one session): the only params getDailyBars uses. */
+export const GROUPED_DAILY_PARAMS: Readonly<Record<string, string>> = { adjusted: "false", include_otc: "false" };
+export function groupedDailyPath(sessionDate: string): string {
+  return `/v2/aggs/grouped/locale/us/market/stocks/${sessionDate}`;
+}
+
 export class MassiveMarketProvider implements MarketProvider {
   readonly providerName = "massive-stocks";
   private readonly apiKey: string;
@@ -502,8 +508,8 @@ export class MassiveMarketProvider implements MarketProvider {
     if (!this.symbolBySecurityId.size) throw new Error("MASSIVE_UNIVERSE_REQUIRED_BEFORE_BARS");
     const response = await this.getBars(
       { dataset: "stocks-grouped-daily", sessionDate },
-      `/v2/aggs/grouped/locale/us/market/stocks/${sessionDate}`,
-      { adjusted: "false", include_otc: "false" },
+      groupedDailyPath(sessionDate),
+      { ...GROUPED_DAILY_PARAMS },
     );
     const bySymbol = groupedDailySymbolIndex(this.symbolBySecurityId, securityIds);
     return massiveGroupedDailyBarsFromReply({
@@ -513,6 +519,26 @@ export class MassiveMarketProvider implements MarketProvider {
       observedAt: this.now(),
       bySymbol,
     });
+  }
+
+  /**
+   * The exact whole-market grouped-daily reply for one session (same path and params as
+   * getDailyBars, no universe needed). The request kept has no API key.
+   */
+  async getGroupedDailyReply(sessionDate: string): Promise<ProviderRawReply> {
+    requireDate(sessionDate);
+    const path = groupedDailyPath(sessionDate);
+    const params = { ...GROUPED_DAILY_PARAMS };
+    const { body } = await this.getWithBody(path, params);
+    const request = new URL(path, this.baseUrl);
+    for (const [key, value] of Object.entries(params)) request.searchParams.set(key, value);
+    return {
+      dataset: "stocks-grouped-daily",
+      sessionDate,
+      request: `${request.pathname}${request.search}`,
+      fetchedAt: this.now(),
+      body,
+    };
   }
 
   async getIntradayBars(

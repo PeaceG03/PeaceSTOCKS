@@ -901,6 +901,13 @@ export async function writeTenMinRangeReplyDust(options: {
   securityLink?: { status: TenMinSecurityLink; source: string };
   /** Written on every seal; defaults to MISSING until grouped replies supply the universe. */
   delistedCoverage?: TenMinDelistedCoverage;
+  /** Consecutive network/5xx failures carried in from an earlier step of the same range. */
+  initialOutageStreak?: number;
+  /**
+   * Range-level gap reasons this run re-checked in full (e.g. GROUPED_DAILY_MISSING): on reopen,
+   * stored gaps with these reasons are replaced by the ones in initialGaps.
+   */
+  authoritativeGapReasons?: readonly string[];
   shouldYield?: () => Promise<string | undefined>;
   backend?: ReplyDustBackend;
   zstdVersionProbe?: ZstdVersionProbe;
@@ -1014,6 +1021,12 @@ export async function writeTenMinRangeReplyDust(options: {
   if (agedOutKeys.size)
     for (const [key, gap] of [...gaps.entries()])
       if (gap.reason === TENMIN_AGED_OUT && !agedOutKeys.has(key)) gaps.delete(key);
+  const authoritative = new Set(options.authoritativeGapReasons ?? []);
+  if (authoritative.size) {
+    const keep = new Set((options.initialGaps ?? []).map(gapKey));
+    for (const [key, gap] of [...gaps.entries()])
+      if (authoritative.has(gap.reason) && !keep.has(key)) gaps.delete(key);
+  }
 
   const hints = new Map(
     (await loadTenMinRangeProgress(root, from, to)).map((entry) => [
@@ -1032,7 +1045,7 @@ export async function writeTenMinRangeReplyDust(options: {
   let massiveRequests = 0;
   let yieldedForScan: string | undefined;
   let outageStop: string | undefined;
-  let outageStreak = 0;
+  let outageStreak = options.initialOutageStreak ?? 0;
   const outageKeys: string[] = [];
 
   const clearOutageStreakGaps = (): void => {

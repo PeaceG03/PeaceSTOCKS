@@ -96,6 +96,20 @@ function master(
   };
 }
 
+/** A fake grouped-daily reply for one session (one ticker), as the provider would return it. */
+function groupedReply(sessionDate: string): import("./contracts").ProviderRawReply {
+  return {
+    dataset: "stocks-grouped-daily",
+    sessionDate,
+    request: `/v2/aggs/grouped/locale/us/market/stocks/${sessionDate}?adjusted=false&include_otc=false`,
+    fetchedAt: AT,
+    body: encoder.encode(
+      `{"queryCount":1,"resultsCount":1,"adjusted":false,"results":[{"T":"AAA","v":1,"o":1,"c":1,"h":1,"l":1,"t":${Date.parse(`${sessionDate}T21:00:00Z`)},"n":1}],"status":"OK","request_id":"G-${sessionDate}","count":1}`,
+    ),
+  };
+}
+const groupedOk = async (sessionDate: string) => groupedReply(sessionDate);
+
 /** Trading sessions in [from, to] by the repo calendar. */
 function sessions(from: string, to: string): string[] {
   return tradingSessionsBetween(from, to);
@@ -278,6 +292,7 @@ test("resume on a later day reuses the same calendar folder and skips completed 
     };
     // Day 1: window starts 2024-10-07 (before the first range)
     const first = await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store,
       securities,
@@ -297,6 +312,7 @@ test("resume on a later day reuses the same calendar folder and skips completed 
     ordered.length = 0;
     // Day 2: clamp moved to 2024-11-22 — same folder, already sealed → zero fetches.
     const second = await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store,
       securities,
@@ -435,6 +451,7 @@ test("history runner processes oldest calendar range first", async () => {
     const store = new MemoryObjectClient();
     const order: string[] = [];
     await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store,
       securities: [master("AAA")],
@@ -632,6 +649,7 @@ test("history runner skips a sealed range with zero fetches", async () => {
       return pagesFor(s, from, to);
     };
     await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store,
       securities,
@@ -647,6 +665,7 @@ test("history runner skips a sealed range with zero fetches", async () => {
     assert.equal(fetches, 1);
     fetches = 0;
     const second = await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store,
       securities,
@@ -670,6 +689,7 @@ test("history runner: store error during resume throws with zero new fetches", a
     const store = new MemoryObjectClient();
     const securities = [master("AAA"), master("BBB")];
     await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store,
       securities,
@@ -695,6 +715,7 @@ test("history runner: store error during resume throws with zero new fetches", a
       },
     };
     const result = await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store: failing,
       securities,
@@ -734,6 +755,7 @@ test("empty universe or no daily coverage never seals: run stops with the error 
       const store = new MemoryObjectClient();
       let fetches = 0;
       const result = await runTenMinHistory({
+        fetchGroupedDaily: groupedOk,
         root,
         store,
         securities,
@@ -845,6 +867,7 @@ test("a range sealed earlier with 0 securities is not a seal: runs (and reopen) 
       await sealEmptyManifest(store, "2024-11-01", "2024-12-31");
       const fetched: string[] = [];
       const result = await runTenMinHistory({
+        fetchGroupedDaily: groupedOk,
         root,
         store,
         securities: [master("AAA"), master("BBB")],
@@ -978,6 +1001,7 @@ test("coverage hole: a trading session with zero stored bars refuses to fetch or
     const store = new MemoryObjectClient();
     let fetches = 0;
     const result = await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store,
       securities: [master("AAA"), master("BBB")],
@@ -1034,6 +1058,7 @@ test("NO_DAILY_BAR: master securities without a stored bar are a counted known g
     const extra = Array.from({ length: 60 }, (_, i) => master(`ND${String(i).padStart(2, "0")}`));
     const securities = [master("AAA"), ...extra];
     const result = await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store: new MemoryObjectClient(),
       securities,
@@ -1076,6 +1101,7 @@ test("provisional link: rd-link on written objects, securityLink in manifest and
     await store.delete(tenMinRangeManifestKey("2024-11-01", "2024-12-31"));
     const fetched: string[] = [];
     const result = await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store,
       securities: [master("AAA"), master("OLDW")],
@@ -1156,6 +1182,7 @@ test("a run on 2026-10-06 starts at 2024-11-01_2024-12-31 and records the skippe
     const store = new MemoryObjectClient();
     const fetched: string[] = [];
     const result = await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store,
       securities: [master("AAA")],
@@ -1206,6 +1233,7 @@ test("the old 2024-10-01_2024-11-30 folder (empty sealed manifest) is never read
     };
     for (const reopen of [false, true])
       await runTenMinHistory({
+        fetchGroupedDaily: groupedOk,
         root,
         store,
         securities: [master("AAA")],
@@ -1229,6 +1257,7 @@ test("AGED_OUT: window start inside an unsealed range clamps the fetch, records 
     const fetched: string[] = [];
     const run = (reopen: boolean) =>
       runTenMinHistory({
+        fetchGroupedDaily: groupedOk,
         root,
         store,
         securities: [master("AAA"), master("BBB")],
@@ -1281,12 +1310,13 @@ test("requests made before an abort are counted in the range and run reports", a
       head: (key: string) => inner.head(key),
       list: (prefix: string) => inner.list(prefix),
       put: async (key: string, body: Uint8Array, metadata?: import("./object-store").ObjectMetadata) => {
-        if (key.endsWith(".rdust")) throw new Error("REPLY_DUST_METADATA_READBACK_MISMATCH:test");
+        if (key.startsWith("permanent/tenmin-reply-dust/") && key.endsWith(".rdust")) throw new Error("REPLY_DUST_METADATA_READBACK_MISMATCH:test");
         return inner.put(key, body, metadata);
       },
     };
     let fetches = 0;
     const result = await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store,
       securities: [master("AAA"), master("BBB")],
@@ -1304,10 +1334,13 @@ test("requests made before an abort are counted in the range and run reports", a
     assert.equal(fetches, 1);
     assert.equal(result.report.stoppedOnError, true);
     assert.match(result.report.error ?? "", /REPLY_DUST_METADATA_READBACK_MISMATCH/);
-    assert.equal(result.report.massiveRequests, 1);
+    // 41 grouped-daily requests (Nov-Dec 2024 sessions) stored first, then 1 ten-minute request.
+    assert.equal(result.report.groupedDailyRequests, 41);
+    assert.equal(result.report.massiveRequests, 42);
     assert.equal(result.report.ranges[0]?.status, "ERROR");
-    assert.equal(result.report.ranges[0]?.massiveRequests, 1);
-    assert.equal(tenMinHistorySummary(result.report).massiveRequests, 1);
+    assert.equal(result.report.ranges[0]?.massiveRequests, 42);
+    assert.equal(result.report.ranges[0]?.groupedDailyRequests, 41);
+    assert.equal(tenMinHistorySummary(result.report).massiveRequests, 42);
   });
 });
 
@@ -1317,6 +1350,7 @@ test("delistedCoverage MISSING is on each range report entry and the sealed mani
   await withRoot(async (root) => {
     const store = new MemoryObjectClient();
     const result = await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store,
       securities: [master("AAA")],
@@ -1364,6 +1398,7 @@ test("an old-format manifest without delistedCoverage reads as MISSING, resumes 
     let fetches = 0;
     const run = (reopen: boolean) =>
       runTenMinHistory({
+        fetchGroupedDaily: groupedOk,
         root,
         store,
         securities: [master("AAA"), master("BBB")],
@@ -1431,6 +1466,7 @@ test("an in-progress range written before the field existed resumes with 0 refet
     assert.equal(partial.sealed, false);
     const fetched: string[] = [];
     const result = await runTenMinHistory({
+      fetchGroupedDaily: groupedOk,
       root,
       store,
       securities: [master("AAA"), master("BBB")],

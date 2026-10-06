@@ -1,6 +1,11 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { SecurityMasterRecord, TenMinuteRangeReply } from "./contracts";
+import type { ProviderRawReply, SecurityMasterRecord, TenMinuteRangeReply } from "./contracts";
+import {
+  GROUPED_DAILY_MISSING,
+  type GroupedDailyStepResult,
+  storeRangeGroupedDaily,
+} from "./tenmin-grouped-daily";
 import { type DailyBarSessionIndex, monthsBetween } from "./daily-bar-sessions";
 import { FileReplyDustStore, type ReplyDustStore } from "./intraday-reply-dust";
 import { MassiveMarketProvider } from "./massive-provider";
@@ -503,6 +508,10 @@ export interface TenMinHistoryRangeReport {
   /** Known gap, not an error: master securities with no stored daily bar in the range. */
   noDailyBar?: { reason: typeof TENMIN_NO_DAILY_BAR; count: number; sampleSecurityIds: string[] };
   currentSymbolFallbackCount?: number;
+  /** Grouped-daily step for this range (absent when the range was skipped as sealed). */
+  groupedDailyRequests?: number;
+  groupedDailyStored?: number;
+  groupedDailyResumed?: number;
 }
 
 export interface TenMinHistoryRunReport {
@@ -525,7 +534,11 @@ export interface TenMinHistoryRunReport {
   error?: string;
   warnings: string[];
   zstdVersion: string;
+  /** Total Massive requests, grouped-daily included. */
   massiveRequests: number;
+  groupedDailyRequests: number;
+  groupedDailyStored: number;
+  groupedDailyResumed: number;
   completedAt: string;
 }
 
@@ -538,6 +551,14 @@ function openTenMinReplyDustStore(root: string, env: NodeJS.ProcessEnv): ReplyDu
   if (env.PEACESTOCKS_R2_BUCKET?.trim()) return R2ObjectClient.fromEnv(env);
   if (env.PEACESTOCKS_REQUIRE_OBJECT_STORE === "1") throw new Error("OBJECT_STORE_REQUIRED");
   return new FileReplyDustStore(root);
+}
+
+function groupedFields(step: GroupedDailyStepResult) {
+  return {
+    groupedDailyRequests: step.requests,
+    groupedDailyStored: step.stored,
+    groupedDailyResumed: step.resumed,
+  };
 }
 
 export async function runTenMinHistory(options: {
@@ -564,6 +585,8 @@ export async function runTenMinHistory(options: {
     from: string,
     to: string,
   ) => Promise<TenMinuteRangeReply[]>;
+  /** One session's raw grouped-daily reply. Defaults to the shared provider (same pace). */
+  fetchGroupedDaily?: (sessionDate: string) => Promise<ProviderRawReply>;
   writeReport?: boolean;
 }): Promise<TenMinHistoryRunResult> {
   const env = options.env ?? process.env;
@@ -625,6 +648,13 @@ export async function runTenMinHistory(options: {
   let outageStop: string | undefined;
   let stoppedOnError = false;
   let error: string | undefined;
+  const groupedTotals = { requests: 0, stored: 0, resumed: 0 };
+  const fetchGroupedDaily =
+    options.fetchGroupedDaily ??
+    ((sessionDate: string) => {
+      if (!provider.getGroupedDailyReply) throw new Error("GROUPED_DAILY_PROVIDER_UNSUPPORTED");
+      return provider.getGroupedDailyReply(sessionDate);
+    });
 
   for (const range of ranges) {
     const pause = await shouldYield();
@@ -655,6 +685,8 @@ export async function runTenMinHistory(options: {
         ]
       : [];
     let universe: TenMinUniversePlan | undefined;
+    let grouped: GroupedDailyStepResult | undefined;
+    let inGroupedStep = false;
     try {
       // A non-empty sealed range is skipped without reading ~200 MB of daily bars. (A manifest
       // sealed with 0 securities is not a seal; the writer replans it.)
@@ -712,6 +744,43 @@ export async function runTenMinHistory(options: {
         error = universe.refusal.message;
         break;
       }
+      // Before any 10-minute fetch: a verified grouped-daily reply stored for every trading
+      // session in the fetch span (the universe is not built from them yet).
+      if (universe) {
+        inGroupedStep = true;
+        grouped = await storeRangeGroupedDaily({
+          store,
+          provider: providerName,
+          sessions: universe.tradingSessions,
+          fetchGroupedDaily,
+          shouldYield,
+          now: stamp,
+        });
+        inGroupedStep = false;
+        groupedTotals.requests += grouped.requests;
+        groupedTotals.stored += grouped.stored;
+        groupedTotals.resumed += grouped.resumed;
+        massiveRequests += grouped.requests;
+        if (grouped.yieldedForScan || grouped.outageStop) {
+          rangeReports.push({
+            ...base,
+            status: grouped.outageStop ? "OUTAGE_STOP" : "PARTIAL",
+            ...plannedCounts,
+            securitiesWritten: 0,
+            securitiesResumed: 0,
+            gaps: [...agedOutGaps, ...grouped.gaps, ...universe.gaps],
+            symbolChangeWarnings: [],
+            fallbackFiles: 0,
+            massiveRequests: grouped.requests,
+            zstdVersion,
+            ...groupedFields(grouped),
+            ...planFields,
+          });
+          if (grouped.outageStop) outageStop = grouped.outageStop;
+          else yieldedForScan = grouped.yieldedForScan;
+          break;
+        }
+      }
       const result = await writeTenMinRangeReplyDust({
         store,
         root,
@@ -719,7 +788,10 @@ export async function runTenMinHistory(options: {
         from: range.calendarFrom,
         to: range.calendarTo,
         fetches: universe?.fetches ?? [],
-        initialGaps: [...agedOutGaps, ...(universe?.gaps ?? [])],
+        initialGaps: [...agedOutGaps, ...(grouped?.gaps ?? []), ...(universe?.gaps ?? [])],
+        ...(grouped
+          ? { initialOutageStreak: grouped.outageStreak, authoritativeGapReasons: [GROUPED_DAILY_MISSING] }
+          : {}),
         ...(reopen ? { reopen: true } : {}),
         ...(universe
           ? { securityLink: { status: universe.securityLink, source: universe.linkSource } }
@@ -755,8 +827,9 @@ export async function runTenMinHistory(options: {
         gaps: result.gaps,
         symbolChangeWarnings: symbolWarnings,
         fallbackFiles: result.fallbackFiles,
-        massiveRequests: result.massiveRequests,
+        massiveRequests: result.massiveRequests + (grouped?.requests ?? 0),
         zstdVersion: result.zstdVersion,
+        ...(grouped ? groupedFields(grouped) : {}),
         ...planFields,
       });
       if (result.outageStop) {
@@ -770,8 +843,12 @@ export async function runTenMinHistory(options: {
     } catch (err) {
       stoppedOnError = true;
       error = err instanceof Error ? err.message : String(err);
-      const made = tenMinMassiveRequestsOf(err);
-      massiveRequests += made;
+      // Requests already counted for a finished grouped step stay counted; the thrown error
+      // carries the requests of the step that failed.
+      const failedStepRequests = tenMinMassiveRequestsOf(err);
+      massiveRequests += failedStepRequests;
+      if (inGroupedStep) groupedTotals.requests += failedStepRequests;
+      const made = failedStepRequests + (grouped?.requests ?? 0);
       rangeReports.push({
         ...base,
         status: "ERROR",
@@ -785,12 +862,20 @@ export async function runTenMinHistory(options: {
         fallbackFiles: 0,
         massiveRequests: made,
         zstdVersion,
+        ...(inGroupedStep
+          ? { groupedDailyRequests: failedStepRequests, groupedDailyStored: 0, groupedDailyResumed: 0 }
+          : grouped
+            ? groupedFields(grouped)
+            : {}),
       });
       break;
     }
   }
 
   const report: TenMinHistoryRunReport = {
+    groupedDailyRequests: groupedTotals.requests,
+    groupedDailyStored: groupedTotals.stored,
+    groupedDailyResumed: groupedTotals.resumed,
     schemaVersion: TENMIN_HISTORY_RUN_SCHEMA,
     runId,
     provider: providerName,
@@ -844,11 +929,19 @@ export function tenMinHistorySummary(report: TenMinHistoryRunReport): Record<str
       delistedCoverage: range.delistedCoverage,
       securitiesPlanned: range.securitiesPlanned,
       fetchesPlanned: range.fetchesPlanned,
+      ...(range.groupedDailyRequests !== undefined
+        ? {
+            groupedDailyRequests: range.groupedDailyRequests,
+            groupedDailyStored: range.groupedDailyStored,
+            groupedDailyResumed: range.groupedDailyResumed,
+          }
+        : {}),
       ...(range.agedOut ? { agedOut: range.agedOut } : {}),
       ...(range.error ? { error: range.error } : {}),
     })),
     ...(report.skippedBeforeFirstRange ? { skippedBeforeFirstRange: report.skippedBeforeFirstRange } : {}),
     massiveRequests: report.massiveRequests,
+    groupedDailyRequests: report.groupedDailyRequests,
     yieldedForScan: report.yieldedForScan,
     outageStop: report.outageStop,
     stoppedOnError: report.stoppedOnError,
