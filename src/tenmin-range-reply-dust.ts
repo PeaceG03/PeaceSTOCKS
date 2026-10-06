@@ -156,6 +156,65 @@ export function fetchIdentityKey(fetch: {
   return `${fetch.securityId}\0${fetch.symbol}\0${fetch.fetchFrom}\0${fetch.fetchTo}`;
 }
 
+export function parseFetchIdentityKey(
+  key: string,
+): { securityId: string; symbol: string; fetchFrom: string; fetchTo: string } | undefined {
+  const parts = key.split("\0");
+  if (parts.length !== 4 || !parts[0] || !parts[1] || !parts[2] || !parts[3]) return undefined;
+  return { securityId: parts[0], symbol: parts[1], fetchFrom: parts[2], fetchTo: parts[3] };
+}
+
+/** One stored fetch identity under a security, with its page set. */
+export interface StoredTenMinRangeFetchRef {
+  key: string;
+  securityId: string;
+  symbol: string;
+  fetchFrom: string;
+  fetchTo: string;
+  pages: Set<number>;
+}
+
+/** Group listStoredTenMinRange output by securityId (one pass). */
+export function groupStoredFetchesBySecurity(
+  stored: Map<string, Set<number>>,
+): Map<string, StoredTenMinRangeFetchRef[]> {
+  const bySecurity = new Map<string, StoredTenMinRangeFetchRef[]>();
+  for (const [key, pages] of stored) {
+    const parsed = parseFetchIdentityKey(key);
+    if (!parsed) continue;
+    const list = bySecurity.get(parsed.securityId) ?? [];
+    list.push({ key, ...parsed, pages });
+    bySecurity.set(parsed.securityId, list);
+  }
+  for (const list of bySecurity.values())
+    list.sort(
+      (a, b) =>
+        (a.fetchFrom < b.fetchFrom ? -1 : a.fetchFrom > b.fetchFrom ? 1 : 0) ||
+        (a.fetchTo < b.fetchTo ? -1 : a.fetchTo > b.fetchTo ? 1 : 0) ||
+        (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0),
+    );
+  return bySecurity;
+}
+
+/**
+ * Stored fetches that can satisfy a planned fetch on resume: same security, ticker, fetchTo, and
+ * stored.fetchFrom <= planned.fetchFrom (window clamp moved forward). Earliest fetchFrom first.
+ */
+export function compatibleStoredFetches(
+  refs: readonly StoredTenMinRangeFetchRef[],
+  planned: TenMinRangePlannedFetch,
+): StoredTenMinRangeFetchRef[] {
+  return refs
+    .filter(
+      (ref) =>
+        ref.symbol === planned.symbol &&
+        ref.fetchTo === planned.fetchTo &&
+        ref.fetchFrom <= planned.fetchFrom &&
+        ref.pages.has(1),
+    )
+    .sort((a, b) => (a.fetchFrom < b.fetchFrom ? -1 : a.fetchFrom > b.fetchFrom ? 1 : 0));
+}
+
 interface ParsedFileName {
   securityId: string;
   symbol: string;
@@ -868,6 +927,7 @@ export async function writeTenMinRangeReplyDust(options: {
     ]),
   );
   const stored = await listStoredTenMinRange(store, from, to);
+  const storedBySecurity = groupStoredFetchesBySecurity(stored);
   const securitiesWritten = new Set<string>();
   const securitiesResumed = new Set<string>();
   let fetchesWritten = 0;
@@ -905,47 +965,62 @@ export async function writeTenMinRangeReplyDust(options: {
     }
 
     const idKey = fetchIdentityKey(planned);
-    const storedPages = stored.get(idKey);
-    if (storedPages) {
-      const hintEntry = hints.get(idKey);
+    const securityRefs = storedBySecurity.get(planned.securityId) ?? [];
+    const candidates = compatibleStoredFetches(securityRefs, planned);
+    let resumed = false;
+    for (const candidate of candidates) {
+      const hintEntry = hints.get(candidate.key);
       const hint =
         hintEntry?.fetch ??
         existing?.securities
           .find((s) => s.securityId === planned.securityId)
           ?.fetches.find(
             (f) =>
-              f.symbol === planned.symbol &&
-              f.fetchFrom === planned.fetchFrom &&
-              f.fetchTo === planned.fetchTo,
+              f.symbol === candidate.symbol &&
+              f.fetchFrom === candidate.fetchFrom &&
+              f.fetchTo === candidate.fetchTo,
           );
-      const verified = await verifyStoredTenMinRangeFetch(store, from, to, planned, {
-        provider,
-        storedPages,
-        backend,
-        ...(hint ? { hint } : {}),
-      });
+      const verified = await verifyStoredTenMinRangeFetch(
+        store,
+        from,
+        to,
+        {
+          securityId: planned.securityId,
+          symbol: candidate.symbol,
+          fetchFrom: candidate.fetchFrom,
+          fetchTo: candidate.fetchTo,
+        },
+        {
+          provider,
+          storedPages: candidate.pages,
+          backend,
+          ...(hint ? { hint } : {}),
+        },
+      );
       if (verified) {
-        // Match on (security, ticker, sub-span) — already exact via planned key.
-        doneFetches.set(idKey, { securityId: planned.securityId, fetch: verified });
+        // Keep the REAL stored span in the manifest (may start before today's planned fetchFrom).
+        doneFetches.set(candidate.key, { securityId: planned.securityId, fetch: verified });
         fetchesResumed += 1;
         securitiesResumed.add(planned.securityId);
         outageStreak = 0;
         clearOutageStreakGaps();
-        continue;
+        resumed = true;
+        break;
       }
     }
+    if (resumed) continue;
 
-    // Stored pages under a different symbol/sub-span for this security: warn if any leftover.
-    for (const [storedKey, pages] of stored) {
-      if (!storedKey.startsWith(`${planned.securityId}\0`)) continue;
-      if (storedKey === idKey) continue;
-      if (!pages.has(1)) continue;
-      const parts = storedKey.split("\0");
-      const oldSymbol = parts[1] ?? "";
-      if (oldSymbol && oldSymbol !== planned.symbol)
-        warnings.push(
-          `TENMIN_RANGE_SYMBOL_CHANGED:${planned.securityId}:${oldSymbol}:${planned.symbol}`,
-        );
+    // Different ticker leftovers for this security (not a compatible earlier-from span): warn once.
+    const plannedSymbols = new Set(
+      options.fetches.filter((f) => f.securityId === planned.securityId).map((f) => f.symbol),
+    );
+    for (const ref of securityRefs) {
+      if (ref.symbol === planned.symbol) continue;
+      if (plannedSymbols.has(ref.symbol)) continue;
+      if (!ref.pages.has(1)) continue;
+      warnings.push(
+        `TENMIN_RANGE_SYMBOL_CHANGED:${planned.securityId}:${ref.symbol}:${planned.symbol}`,
+      );
     }
 
     try {

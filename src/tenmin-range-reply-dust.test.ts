@@ -666,3 +666,197 @@ test("4 consecutive 5xx then a success resets the outage counter", async () => {
     assert.equal(result.gaps.length, 0);
   });
 });
+
+test("resume accepts stored fetchFrom on or before the planned date and keeps the real span", async () => {
+  await withRoot(async (root) => {
+    const store = new MemoryObjectClient();
+    const sid = id("AAA");
+    const calFrom = "2024-10-01";
+    const calTo = "2024-11-30";
+    const storedFrom = "2024-10-07";
+    const plannedLater = "2024-10-08";
+    const fetchTo = "2024-11-30";
+    let fetches = 0;
+    await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: calFrom,
+      to: calTo,
+      fetches: [{ securityId: sid, symbol: "AAA", fetchFrom: storedFrom, fetchTo }],
+      zstdVersionProbe: pinnedZstd,
+      fetchPages: async (s, f, t) => {
+        fetches += 1;
+        return fakeMassive({}, {
+          AAA: [page("AAA", 1, [bar("2024-10-07T14:30:00Z", 1)], undefined, f, t)],
+        }).getTenMinuteRangeReplies(s, f, t);
+      },
+    });
+    assert.equal(fetches, 1);
+    await store.delete(tenMinRangeManifestKey(calFrom, calTo));
+    fetches = 0;
+    const resumed = await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: calFrom,
+      to: calTo,
+      fetches: [{ securityId: sid, symbol: "AAA", fetchFrom: plannedLater, fetchTo }],
+      zstdVersionProbe: pinnedZstd,
+      fetchPages: async () => {
+        fetches += 1;
+        throw new Error("should not refetch");
+      },
+    });
+    assert.equal(fetches, 0);
+    assert.equal(resumed.sealed, true);
+    assert.equal(resumed.fetchesResumed, 1);
+    assert.equal("warnings" in resumed && resumed.warnings?.some((w) => w.includes("SYMBOL_CHANGED")), false);
+    const manifest = (await readTenMinRangeManifest(store, calFrom, calTo))!;
+    assert.equal(manifest.securities[0]?.fetches[0]?.fetchFrom, storedFrom);
+    assert.equal(manifest.securities[0]?.fetches[0]?.fetchTo, fetchTo);
+  });
+});
+
+test("resume refetches when stored fetchFrom is after the planned date", async () => {
+  await withRoot(async (root) => {
+    const store = new MemoryObjectClient();
+    const sid = id("AAA");
+    const calFrom = "2024-10-01";
+    const calTo = "2024-11-30";
+    await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: calFrom,
+      to: calTo,
+      fetches: [{ securityId: sid, symbol: "AAA", fetchFrom: "2024-10-10", fetchTo: "2024-11-30" }],
+      zstdVersionProbe: pinnedZstd,
+      fetchPages: async (s, f, t) =>
+        fakeMassive({}, {
+          AAA: [page("AAA", 1, [bar("2024-10-10T14:30:00Z", 1)], undefined, f, t)],
+        }).getTenMinuteRangeReplies(s, f, t),
+    });
+    await store.delete(tenMinRangeManifestKey(calFrom, calTo));
+    let fetches = 0;
+    const result = await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: calFrom,
+      to: calTo,
+      fetches: [{ securityId: sid, symbol: "AAA", fetchFrom: "2024-10-07", fetchTo: "2024-11-30" }],
+      zstdVersionProbe: pinnedZstd,
+      fetchPages: async (s, f, t) => {
+        fetches += 1;
+        assert.equal(f, "2024-10-07");
+        return fakeMassive({}, {
+          AAA: [page("AAA", 1, [bar("2024-10-07T14:30:00Z", 1)], undefined, f, t)],
+        }).getTenMinuteRangeReplies(s, f, t);
+      },
+    });
+    assert.equal(fetches, 1);
+    assert.equal(result.fetchesWritten, 1);
+    assert.equal((await readTenMinRangeManifest(store, calFrom, calTo))!.securities[0]?.fetches[0]?.fetchFrom, "2024-10-07");
+  });
+});
+
+test("resume refetches when stored fetchTo differs from planned", async () => {
+  await withRoot(async (root) => {
+    const store = new MemoryObjectClient();
+    const sid = id("AAA");
+    const calFrom = "2024-10-01";
+    const calTo = "2024-11-30";
+    await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: calFrom,
+      to: calTo,
+      fetches: [{ securityId: sid, symbol: "AAA", fetchFrom: "2024-10-07", fetchTo: "2024-11-15" }],
+      zstdVersionProbe: pinnedZstd,
+      fetchPages: async (s, f, t) =>
+        fakeMassive({}, {
+          AAA: [page("AAA", 1, [bar("2024-10-07T14:30:00Z", 1)], undefined, f, t)],
+        }).getTenMinuteRangeReplies(s, f, t),
+    });
+    await store.delete(tenMinRangeManifestKey(calFrom, calTo));
+    let fetches = 0;
+    await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: calFrom,
+      to: calTo,
+      fetches: [{ securityId: sid, symbol: "AAA", fetchFrom: "2024-10-07", fetchTo: "2024-11-30" }],
+      zstdVersionProbe: pinnedZstd,
+      fetchPages: async (s, f, t) => {
+        fetches += 1;
+        assert.equal(t, "2024-11-30");
+        return fakeMassive({}, {
+          AAA: [page("AAA", 1, [bar("2024-10-07T14:30:00Z", 1)], undefined, f, t)],
+        }).getTenMinuteRangeReplies(s, f, t);
+      },
+    });
+    assert.equal(fetches, 1);
+  });
+});
+
+test("resume lists the store once and groups by security (no quadratic scan)", async () => {
+  await withRoot(async (root) => {
+    const store = new MemoryObjectClient();
+    const calFrom = "2024-10-01";
+    const calTo = "2024-11-30";
+    const fetchFrom = "2024-10-07";
+    const fetchTo = "2024-11-30";
+    const symbols = Array.from({ length: 40 }, (_, i) => `S${String(i).padStart(2, "0")}`);
+    const pages: Record<string, string[]> = Object.fromEntries(
+      symbols.map((s) => [s, [page(s, 1, [bar("2024-10-07T14:30:00Z", 1)], undefined, fetchFrom, fetchTo)]]),
+    );
+    const planned = symbols.map((s) => ({
+      securityId: id(s),
+      symbol: s,
+      fetchFrom,
+      fetchTo,
+    }));
+    await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: calFrom,
+      to: calTo,
+      fetches: planned,
+      zstdVersionProbe: pinnedZstd,
+      fetchPages: (s, f, t) => fakeMassive({}, pages).getTenMinuteRangeReplies(s, f, t),
+    });
+    await store.delete(tenMinRangeManifestKey(calFrom, calTo));
+    let listCalls = 0;
+    const counting = {
+      get: (key: string) => store.get(key),
+      put: (key: string, body: Uint8Array, metadata?: ObjectMetadata) => store.put(key, body, metadata),
+      head: (key: string) => store.head(key),
+      list: async (prefix: string) => {
+        listCalls += 1;
+        return store.list(prefix);
+      },
+    };
+    let fetches = 0;
+    const result = await writeTenMinRangeReplyDust({
+      store: counting,
+      root,
+      provider: PROVIDER,
+      from: calFrom,
+      to: calTo,
+      // Plan one day later — still resumes via compatible earlier fetchFrom.
+      fetches: planned.map((f) => ({ ...f, fetchFrom: "2024-10-08" })),
+      zstdVersionProbe: pinnedZstd,
+      fetchPages: async () => {
+        fetches += 1;
+        throw new Error("should not refetch");
+      },
+    });
+    assert.equal(fetches, 0);
+    assert.equal(result.fetchesResumed, 40);
+    assert.equal(listCalls, 1);
+  });
+});
