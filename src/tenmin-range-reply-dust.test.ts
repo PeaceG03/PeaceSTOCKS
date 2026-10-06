@@ -352,7 +352,7 @@ for (const [method, error] of [["head", "R2_HEAD_500"], ["list", "R2_LIST_500"],
   });
 }
 
-test("a range over the page cap fails with the named error and leaves that security unwritten", async () => {
+test("a range over the page cap gaps that security and still seals the range", async () => {
   await withRoot(async (root) => {
     const cycle: Record<string, string[]> = {
       ...PAGES,
@@ -360,10 +360,17 @@ test("a range over the page cap fails with the named error and leaves that secur
     };
     const store = new MemoryObjectClient();
     const fetches: Record<string, number> = {};
-    await assert.rejects(write(store, root, fetches, { pages: cycle }), /^Error: MASSIVE_RANGE_PAGE_CAP:BBB:2026-01-02:2026-01-06$/u);
+    const result = await write(store, root, fetches, { pages: cycle });
+    assert.equal(result.sealed, true);
     assert.equal(fetches.BBB, 8);
+    assert.equal(fetches.AAA, 2);
+    assert.equal(fetches.CCC, 3);
     assert.equal(await store.get(tenMinRangeFileKey(FROM, TO, id("BBB"), 1)), undefined);
-    assert.equal(await store.get(tenMinRangeManifestKey(FROM, TO)), undefined);
+    const manifest = (await readTenMinRangeManifest(store, FROM, TO))!;
+    assert.equal(manifest.securityCount, 2);
+    assert.equal(manifest.gaps?.length, 1);
+    assert.equal(manifest.gaps?.[0]?.securityId, id("BBB"));
+    assert.equal(manifest.gaps?.[0]?.reason, "MASSIVE_RANGE_PAGE_CAP");
   });
 });
 

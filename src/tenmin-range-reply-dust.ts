@@ -65,6 +65,20 @@ export interface TenMinRangeDayEntry {
   securities: Array<{ securityId: string; files: string[] }>;
 }
 
+/** One security that could not be written for this range; gaps do not block sealing. */
+export interface TenMinRangeGapEntry {
+  securityId: string;
+  /** Historical symbol requested, or "" when none was known (NO_HISTORICAL_SYMBOL). */
+  symbol: string;
+  /** Stable error/gap name, e.g. MASSIVE_RANGE_PAGE_CAP, MASSIVE_HTTP_404, NO_HISTORICAL_SYMBOL. */
+  reason: string;
+  at: string;
+}
+
+/**
+ * Manifest schema stays tenmin-range-reply-dust-manifest-v1: `gaps` is an additive, optional-on-read
+ * field. New manifests always write `gaps` (possibly []) so sealed bytes stay deterministic.
+ */
 export interface TenMinRangeManifest {
   schemaVersion: typeof TENMIN_RANGE_MANIFEST_SCHEMA;
   format: typeof REPLY_DUST_FORMAT;
@@ -76,6 +90,8 @@ export interface TenMinRangeManifest {
   fallbackFileCount: number;
   securities: TenMinRangeSecurityEntry[];
   days: TenMinRangeDayEntry[];
+  /** Per-security failures / missing tickers; sorted by securityId. Absent on pre-gaps manifests. */
+  gaps?: TenMinRangeGapEntry[];
   checksum: string;
 }
 
@@ -421,17 +437,35 @@ function manifestChecksum(body: Omit<TenMinRangeManifest, "checksum">): string {
   return sha256Hex(JSON.stringify(body));
 }
 
-/** Build the manifest (deterministic: securities by id, days by date, files by page). */
+function gapEntry(fields: TenMinRangeGapEntry): TenMinRangeGapEntry {
+  return {
+    securityId: fields.securityId,
+    symbol: fields.symbol,
+    reason: fields.reason,
+    at: fields.at,
+  };
+}
+
+/** Build the manifest (deterministic: securities by id, gaps by id, days by date, files by page). */
 export function buildTenMinRangeManifest(options: {
   provider: string;
   from: string;
   to: string;
   securities: readonly TenMinRangeSecurityEntry[];
+  gaps?: readonly TenMinRangeGapEntry[];
 }): TenMinRangeManifest {
   requireRange(options.from, options.to);
   const securities = options.securities.map(securityEntry).sort((a, b) => byCodeUnit(a.securityId, b.securityId));
   if (new Set(securities.map((s) => s.securityId)).size !== securities.length)
     throw new Error("REPLY_DUST_DUPLICATE_SECURITY");
+  const gaps = (options.gaps ?? [])
+    .map(gapEntry)
+    .sort((a, b) => byCodeUnit(a.securityId, b.securityId) || byCodeUnit(a.reason, b.reason));
+  if (new Set(gaps.map((g) => g.securityId)).size !== gaps.length)
+    throw new Error("REPLY_DUST_DUPLICATE_GAP");
+  const doneIds = new Set(securities.map((s) => s.securityId));
+  for (const gap of gaps)
+    if (doneIds.has(gap.securityId)) throw new Error(`REPLY_DUST_GAP_AND_SECURITY:${gap.securityId}`);
   const byDay = new Map<string, Array<{ securityId: string; files: string[] }>>();
   for (const security of securities)
     for (const sessionDate of security.sessionDates) {
@@ -455,6 +489,7 @@ export function buildTenMinRangeManifest(options: {
     fallbackFileCount: files.filter((file) => file.version === REPLY_DUST_FALLBACK_VERSION).length,
     securities,
     days,
+    gaps,
   };
   return { ...body, checksum: manifestChecksum(body) };
 }
@@ -525,23 +560,54 @@ async function appendTenMinRangeProgress(root: string, from: string, to: string,
 }
 
 export interface TenMinRangeWriteResult {
-  manifest: TenMinRangeManifest;
-  /** True when the range was already sealed: nothing was fetched or written. */
+  manifest: TenMinRangeManifest | undefined;
+  /** True when the range was already sealed and reopen was not requested: nothing fetched or written. */
   alreadySealed: boolean;
+  /** True when the range was sealed by this call (manifest written). */
+  sealed: boolean;
   securitiesWritten: string[];
   securitiesResumed: string[];
+  gaps: TenMinRangeGapEntry[];
   filesWritten: number;
   /** Files written as the raw-zstd fallback (0x81) this run: stored, a warning, never a failure. */
   fallbackFiles: number;
   zstdVersion: string;
+  /** Massive page fetches started this run (one per security that was not resumed). */
+  massiveRequests: number;
+  /** Set when the run stopped between securities so a scan / budget can take the slot. */
+  yieldedForScan?: string;
   warnings?: string[];
+}
+
+/** Massive / auth failures that affect the whole run — abort, do not gap every security. */
+export function isTenMinRangeAbortError(message: string): boolean {
+  return (
+    message.includes("MASSIVE_CREDENTIAL_REJECTED") ||
+    message.includes("MASSIVE_API_KEY") ||
+    message.startsWith("MASSIVE_HTTP_401") ||
+    message.startsWith("MASSIVE_HTTP_403") ||
+    message.startsWith("MASSIVE_HTTP_429") ||
+    message === "OBJECT_STORE_REQUIRED" ||
+    message.startsWith("R2_") ||
+    message.startsWith("REPLY_DUST_ZSTD")
+  );
+}
+
+/** Stable gap reason from an Error message (leading CODE or CODE:rest). */
+export function tenMinRangeGapReason(message: string): string {
+  const match = /^([A-Z][A-Z0-9_]+)/u.exec(message);
+  return match?.[1] ?? "TENMIN_RANGE_FETCH_FAILED";
 }
 
 /**
  * Write one range for a set of securities and seal it with its manifest. Resume comes from the
  * store: the range prefix is listed once and each listed security's full page set verified (the
  * progress log saves the HEADs); an incomplete or bad set is fetched and written again. Store
- * errors are thrown, never treated as missing.
+ * errors are thrown, never treated as missing. A per-security Massive fetch failure becomes a gap
+ * and does not block sealing; auth/rate-limit/store failures abort the run.
+ *
+ * `reopen: true` retries only prior gap entries plus universe securities absent from a sealed
+ * manifest, then rewrites the manifest. Normal runs still skip sealed ranges.
  */
 export async function writeTenMinRangeReplyDust(options: {
   store: ReplyDustStore;
@@ -552,59 +618,203 @@ export async function writeTenMinRangeReplyDust(options: {
   to: string;
   securities: ReadonlyArray<{ securityId: string; symbol: string }>;
   fetchPages: (security: { securityId: string; symbol: string }, from: string, to: string) => Promise<TenMinuteRangeReply[]>;
+  /** Gaps known before any fetch (e.g. NO_HISTORICAL_SYMBOL); merged into the sealed manifest. */
+  initialGaps?: readonly TenMinRangeGapEntry[];
+  /** When true, retry gaps + missing securities on a sealed range and rewrite the manifest. */
+  reopen?: boolean;
+  /** Asked before each security-range unit; a reason stops between securities (nothing mid-fetch). */
+  shouldYield?: () => Promise<string | undefined>;
   backend?: ReplyDustBackend;
   zstdVersionProbe?: ZstdVersionProbe;
+  /** ISO clock for gap `at` stamps; tests inject a fixed time. */
+  now?: () => string;
 }): Promise<TenMinRangeWriteResult> {
   const { store, root, provider, from, to } = options;
   requireRange(from, to);
   const zstdVersion = assertPinnedZstdForWriting(options.zstdVersionProbe);
+  const stamp = options.now ?? (() => new Date().toISOString());
   const existing = await readTenMinRangeManifest(store, from, to);
-  if (existing)
+  const reopen = options.reopen === true;
+  if (existing && !reopen)
     return {
-      manifest: existing, alreadySealed: true, securitiesWritten: [], securitiesResumed: [], filesWritten: 0, fallbackFiles: 0, zstdVersion,
+      manifest: existing,
+      alreadySealed: true,
+      sealed: true,
+      securitiesWritten: [],
+      securitiesResumed: [],
+      gaps: [...(existing.gaps ?? [])],
+      filesWritten: 0,
+      fallbackFiles: 0,
+      zstdVersion,
+      massiveRequests: 0,
     };
+
   const backend = options.backend ?? nodeReplyDustBackend;
-  const hints = new Map((await loadTenMinRangeProgress(root, from, to)).map((entry) => [entry.securityId, entry]));
-  const stored = await listStoredTenMinRange(store, from, to);
+  const warnings: string[] = [];
+  const gaps = new Map<string, TenMinRangeGapEntry>();
+  for (const gap of options.initialGaps ?? []) gaps.set(gap.securityId, gapEntry(gap));
+
+  // Sealed reopen: keep verified securities from the prior manifest; only work gaps + newcomers.
   const done = new Map<string, TenMinRangeSecurityEntry>();
+  let work = [...options.securities];
+  if (existing && reopen) {
+    for (const entry of existing.securities) done.set(entry.securityId, securityEntry(entry));
+    for (const gap of existing.gaps ?? []) gaps.set(gap.securityId, gapEntry(gap));
+    const doneIds = new Set(done.keys());
+    const gapIds = new Set((existing.gaps ?? []).map((g) => g.securityId));
+    const byId = new Map(options.securities.map((s) => [s.securityId, s]));
+    const wanted = new Set<string>();
+    for (const id of gapIds) wanted.add(id);
+    for (const security of options.securities)
+      if (!doneIds.has(security.securityId)) wanted.add(security.securityId);
+    work = [...wanted]
+      .sort(byCodeUnit)
+      .map((id) => byId.get(id) ?? { securityId: id, symbol: gaps.get(id)?.symbol ?? "" })
+      .filter((security) => security.symbol !== "" || gaps.has(security.securityId));
+    // Drop gaps we are about to retry so a success clears them; unresolved ones are re-added.
+    for (const security of work) gaps.delete(security.securityId);
+  }
+
+  const hints = new Map((await loadTenMinRangeProgress(root, from, to)).map((entry) => [entry.securityId, entry]));
+  // Store list/verify throws on store errors before any fetch (resume path).
+  const stored = await listStoredTenMinRange(store, from, to);
   const securitiesWritten: string[] = [];
   const securitiesResumed: string[] = [];
   let filesWritten = 0;
   let fallbackFiles = 0;
-  for (const security of options.securities) {
-    if (done.has(security.securityId)) throw new Error("REPLY_DUST_DUPLICATE_SECURITY");
-    const storedPages = stored.get(security.securityId);
-    if (storedPages) {
-      const hint = hints.get(security.securityId);
-      const verified = await verifyStoredTenMinRangeSecurity(store, from, to, security.securityId, {
-        provider, storedPages, backend, ...(hint ? { hint } : {}),
-      });
-      if (verified) {
-        done.set(security.securityId, verified);
-        securitiesResumed.push(security.securityId);
-        continue;
+  let massiveRequests = 0;
+  let yieldedForScan: string | undefined;
+
+  for (const security of work) {
+    if (done.has(security.securityId) && !(existing && reopen))
+      throw new Error("REPLY_DUST_DUPLICATE_SECURITY");
+    if (options.shouldYield) {
+      const reason = await options.shouldYield();
+      if (reason) {
+        yieldedForScan = reason;
+        break;
       }
     }
-    const pages = await options.fetchPages(security, from, to);
-    const entry = await writeTenMinRangeSecurity(store, pages, { provider, from, to, backend });
-    filesWritten += entry.files.length;
-    fallbackFiles += entry.files.filter((file) => file.version === REPLY_DUST_FALLBACK_VERSION).length;
-    await appendTenMinRangeProgress(root, from, to, entry);
-    done.set(security.securityId, entry);
-    securitiesWritten.push(security.securityId);
+    // Empty symbol (NO_HISTORICAL_SYMBOL) is a gap with no fetch.
+    if (!security.symbol) {
+      gaps.set(security.securityId, {
+        securityId: security.securityId,
+        symbol: "",
+        reason: "NO_HISTORICAL_SYMBOL",
+        at: stamp(),
+      });
+      continue;
+    }
+
+    const storedPages = stored.get(security.securityId);
+    if (storedPages) {
+      const hint = hints.get(security.securityId) ?? (existing?.securities.find((s) => s.securityId === security.securityId));
+      const verified = await verifyStoredTenMinRangeSecurity(store, from, to, security.securityId, {
+        provider,
+        storedPages,
+        backend,
+        ...(hint ? { hint } : {}),
+      });
+      if (verified) {
+        if (verified.symbol !== security.symbol) {
+          warnings.push(
+            `TENMIN_RANGE_SYMBOL_CHANGED:${security.securityId}:${verified.symbol}:${security.symbol}`,
+          );
+          // Fall through to refetch and replace pages.
+        } else {
+          done.set(security.securityId, verified);
+          securitiesResumed.push(security.securityId);
+          gaps.delete(security.securityId);
+          continue;
+        }
+      }
+    }
+
+    try {
+      massiveRequests += 1;
+      const pages = await options.fetchPages(security, from, to);
+      const entry = await writeTenMinRangeSecurity(store, pages, { provider, from, to, backend });
+      filesWritten += entry.files.length;
+      fallbackFiles += entry.files.filter((file) => file.version === REPLY_DUST_FALLBACK_VERSION).length;
+      await appendTenMinRangeProgress(root, from, to, entry);
+      done.set(security.securityId, entry);
+      securitiesWritten.push(security.securityId);
+      gaps.delete(security.securityId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isTenMinRangeAbortError(message)) throw error;
+      // Store/R2 failures must not become gaps.
+      if (
+        message.startsWith("R2_") ||
+        message.startsWith("STORE_") ||
+        message === "STORE_DOWN" ||
+        message.startsWith("REPLY_DUST_") ||
+        message.startsWith("OBJECT_STORE")
+      )
+        throw error;
+      gaps.set(security.securityId, {
+        securityId: security.securityId,
+        symbol: security.symbol,
+        reason: tenMinRangeGapReason(message),
+        at: stamp(),
+      });
+    }
   }
-  const manifest = buildTenMinRangeManifest({ provider, from, to, securities: [...done.values()] });
+
+  // Incomplete run (yielded): leave progress log; do not seal.
+  if (yieldedForScan) {
+    return {
+      manifest: existing,
+      alreadySealed: false,
+      sealed: false,
+      securitiesWritten,
+      securitiesResumed,
+      gaps: [...gaps.values()].sort((a, b) => byCodeUnit(a.securityId, b.securityId)),
+      filesWritten,
+      fallbackFiles,
+      zstdVersion,
+      massiveRequests,
+      yieldedForScan,
+      ...(warnings.length || fallbackFiles > 0
+        ? {
+            warnings: [
+              ...warnings,
+              ...(fallbackFiles > 0 ? [`${REPLY_DUST_FALLBACK_WARNING}:${fallbackFiles}`] : []),
+            ],
+          }
+        : {}),
+    };
+  }
+
+  // On reopen, keep securities that were not in the work list.
+  const manifest = buildTenMinRangeManifest({
+    provider,
+    from,
+    to,
+    securities: [...done.values()],
+    gaps: [...gaps.values()],
+  });
   await writeTenMinRangeManifest(store, manifest);
   await rm(tenMinRangeProgressPath(root, from, to), { force: true });
   return {
     manifest,
     alreadySealed: false,
+    sealed: true,
     securitiesWritten,
     securitiesResumed,
+    gaps: [...(manifest.gaps ?? [])],
     filesWritten,
     fallbackFiles,
     zstdVersion,
-    ...(fallbackFiles > 0 ? { warnings: [`${REPLY_DUST_FALLBACK_WARNING}:${fallbackFiles}`] } : {}),
+    massiveRequests,
+    ...(warnings.length || fallbackFiles > 0
+      ? {
+          warnings: [
+            ...warnings,
+            ...(fallbackFiles > 0 ? [`${REPLY_DUST_FALLBACK_WARNING}:${fallbackFiles}`] : []),
+          ],
+        }
+      : {}),
   };
 }
 
