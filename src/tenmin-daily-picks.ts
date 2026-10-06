@@ -28,6 +28,9 @@ export const PICK_V1_SEED_FORMULA =
  * does not import from tenmin-union (union may still be on hold / change). Sorted for hashing.
  */
 export const PICK_V1_TYPE_FILTER_VERSION = "pick-v1-types-1" as const;
+
+/** Max tickers listed in groupedWithoutIndexEntry.sample (sorted unique). */
+export const PICK_V1_GROUPED_WITHOUT_INDEX_SAMPLE = 20;
 export const PICK_V1_ALLOWED_TYPES = ["CS", "ETF"] as const;
 export type PickV1AllowedType = (typeof PICK_V1_ALLOWED_TYPES)[number];
 
@@ -109,6 +112,12 @@ export interface PicksBaseV1 {
    * Present on production builds; omitted in pure unit fixtures that inject maps directly.
    */
   tickerIndex?: { key: string; sha256: string; asOf: string };
+  /**
+   * Informational: unique tickers in D's grouped-daily reply with no entry in the ticker
+   * reference index used for D (asOf ≤ D). Does not affect picks. Present when indexTickers
+   * was supplied to buildPicksBaseV1 (production always does).
+   */
+  groupedWithoutIndexEntry?: { count: number; sample: string[] };
   candidateCount: number;
   candidateListSha256: string;
   counts: {
@@ -226,6 +235,26 @@ function finalizePick(acc: {
  * Duplicate securityIds across tickers: keep the lexicographically smallest ticker as symbol.
  * Random N = all such candidates (top50/index/holdings are NOT removed from the pool).
  */
+
+/**
+ * Unique grouped-daily tickers absent from the point-in-time index ticker set.
+ * Sample = first PICK_V1_GROUPED_WITHOUT_INDEX_SAMPLE after sorting. Informational only.
+ */
+export function computeGroupedWithoutIndexEntry(
+  groupedTickers: readonly string[],
+  indexTickers: ReadonlySet<string>,
+): { count: number; sample: string[] } {
+  const missing = new Set<string>();
+  for (const t of groupedTickers) {
+    if (t && !indexTickers.has(t)) missing.add(t);
+  }
+  const sorted = [...missing].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return {
+    count: sorted.length,
+    sample: sorted.slice(0, PICK_V1_GROUPED_WITHOUT_INDEX_SAMPLE),
+  };
+}
+
 export function buildPicksBaseV1(input: {
   sessionDate: string;
   index: readonly PickV1NamedSecurity[];
@@ -235,6 +264,11 @@ export function buildPicksBaseV1(input: {
   tickerTypes: ReadonlyMap<string, string> | Readonly<Record<string, string>>;
   /** When set, recorded on the picks document (production buildBase always sets this). */
   tickerIndex?: { key: string; sha256: string; asOf: string };
+  /**
+   * Every ticker present in the asOf ≤ D index (any type). When set, records
+   * groupedWithoutIndexEntry on the document. Does not change pick selection.
+   */
+  indexTickers?: ReadonlySet<string>;
 }): PicksBaseV1 {
   const D = input.sessionDate;
   requireSessionDate(D, "sessionDate");
@@ -343,6 +377,18 @@ export function buildPicksBaseV1(input: {
     if (acc.reasons.has("random")) countRandom += 1;
   }
 
+  let groupedWithoutIndexEntry: { count: number; sample: string[] } | undefined;
+  if (input.indexTickers) {
+    const groupedTickers: string[] = [];
+    for (const row of input.groupedReply.results) {
+      if (typeof row.T === "string" && row.T) groupedTickers.push(row.T);
+    }
+    groupedWithoutIndexEntry = computeGroupedWithoutIndexEntry(
+      groupedTickers,
+      input.indexTickers,
+    );
+  }
+
   return {
     ruleVersion: PICK_V1_RULE_VERSION,
     sessionDate: D,
@@ -352,6 +398,7 @@ export function buildPicksBaseV1(input: {
     mappingSha256,
     tickerTypesSha256,
     ...(input.tickerIndex ? { tickerIndex: input.tickerIndex } : {}),
+    ...(groupedWithoutIndexEntry ? { groupedWithoutIndexEntry } : {}),
     candidateCount: N,
     candidateListSha256: sha256(stableJson(candidateIds)),
     counts: {

@@ -84,6 +84,11 @@ export interface TenMinDailyPicksDayResult {
   baseInput?: string;
   /** Object key that was missing or undecodable. */
   baseInputKey?: string;
+  /**
+   * Informational: unique grouped-daily tickers with no entry in D's ticker reference index.
+   * Copied from picks.json when sealed; does not affect seal/skip/pick logic.
+   */
+  groupedWithoutIndexEntry?: { count: number; sample: string[] };
 }
 
 export interface TenMinDailyPicksRunReport {
@@ -453,7 +458,14 @@ async function sealOneDay(
       observedAt,
       withinWindow: true,
     });
-    return { sessionDate, outcome: "TOP50_ADDED", requests };
+    return {
+      sessionDate,
+      outcome: "TOP50_ADDED",
+      requests,
+      ...(picksBase.groupedWithoutIndexEntry
+        ? { groupedWithoutIndexEntry: picksBase.groupedWithoutIndexEntry }
+        : {}),
+    };
   }
 
   const statuses = await options.storage.loadPredictionStatuses(sessionDate);
@@ -536,8 +548,16 @@ async function sealOneDay(
     observedAt,
     settlementNow: clock(),
   });
-  return { sessionDate, outcome: "SEALED", requests };
+  return {
+    sessionDate,
+    outcome: "SEALED",
+    requests,
+    ...(picksBase.groupedWithoutIndexEntry
+      ? { groupedWithoutIndexEntry: picksBase.groupedWithoutIndexEntry }
+      : {}),
+  };
 }
+
 
 async function collectSecurities(
   options: RunTenMinDailyPicksOptions,

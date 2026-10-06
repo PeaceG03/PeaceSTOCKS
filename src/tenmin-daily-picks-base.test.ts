@@ -571,3 +571,35 @@ test("runner: grouped present-but-corrupt → CORRUPT (not SKIPPED_BASE_INPUT); 
   assert.ok(report.sealed.includes(goodDay));
   assert.equal((await readTenMinDayPicks(dust, badDay)).status, "TENMIN_DAY_NOT_SEALED");
 });
+
+test("buildBase: groupedWithoutIndexEntry counts tickers absent from asOf≤D index", async () => {
+  const store = new MemoryObjectClient();
+  // Index includes SPY/QQQ/AAA and a non-CS/ETF WARRANT so it is "in index" but not linkable.
+  await plantIndex(store, D, [
+    { ticker: "SPY", type: "ETF" },
+    { ticker: "QQQ", type: "ETF" },
+    { ticker: "AAA", type: "CS" },
+    { ticker: "BBB", type: "CS" },
+    { ticker: "CCC", type: "CS" },
+    { ticker: "DDD", type: "CS" },
+    { ticker: "EEE", type: "CS" },
+    { ticker: "FFF", type: "CS" },
+    { ticker: "GGG", type: "CS" },
+    { ticker: "HHH", type: "CS" },
+    { ticker: "III", type: "CS" },
+    { ticker: "JJJ", type: "CS" },
+    { ticker: "WRNT", type: "WARRANT" },
+  ]);
+  // Grouped has WRNT (in index), MISS (not in index), and the CS/ETF names.
+  await plantGrouped(store, D, [
+    "SPY", "QQQ", "AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG", "HHH", "III", "JJJ",
+    "WRNT", "MISS", "MISS",
+  ]);
+  const base = await buildTenMinDailyPicksBaseFromStored({ store, sessionDate: D });
+  assert.ok(base.groupedWithoutIndexEntry);
+  assert.equal(base.groupedWithoutIndexEntry!.count, 1);
+  assert.deepEqual(base.groupedWithoutIndexEntry!.sample, ["MISS"]);
+  // WRNT is unlinkedExcluded (wrong type) but NOT in groupedWithoutIndexEntry.
+  assert.ok(base.counts.unlinkedExcluded >= 1);
+});
+

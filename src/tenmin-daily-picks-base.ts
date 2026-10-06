@@ -349,6 +349,11 @@ export async function buildTenMinDailyPicksBaseFromStored(
   const { tickerToSecurityId, tickerTypes } = mapsFromTickerReferenceEntries(indexAsOf.entries);
   const index = indexSecuritiesFromMaps(tickerToSecurityId);
   const holdings: PickV1NamedSecurity[] = [];
+  // Full index ticker set (any type) for informational groupedWithoutIndexEntry only.
+  const indexTickers = new Set<string>();
+  for (const e of indexAsOf.entries) {
+    if (typeof e.ticker === "string" && e.ticker) indexTickers.add(e.ticker);
+  }
 
   return buildPicksBaseV1({
     sessionDate: D,
@@ -367,5 +372,6 @@ export async function buildTenMinDailyPicksBaseFromStored(
       sha256: indexAsOf.sha256,
       asOf: indexAsOf.asOf,
     },
+    indexTickers,
   });
 }

@@ -10,6 +10,7 @@ import {
   PickV1InputError,
   buildPicksBaseV1,
   buildPicksTop50V1,
+  computeGroupedWithoutIndexEntry,
   mergeDailyTenMinPicksV1,
   pickV1BeliefsKey,
   pickV1MappingSha256,
@@ -478,3 +479,60 @@ test("type filter + mapping fingerprints are stable", () => {
   );
   assert.equal(pickV1RandomShaKey(D, "sec_x"), sha256(`pick-v1|${D}|sec_x`));
 });
+
+test("groupedWithoutIndexEntry: all grouped tickers indexed → count 0", () => {
+  const p = pool(5);
+  const out = buildPicksBaseV1({
+    ...baseInput(p),
+    indexTickers: new Set(p.tickers),
+  });
+  assert.deepEqual(out.groupedWithoutIndexEntry, { count: 0, sample: [] });
+  // Pick selection / counts unchanged vs without indexTickers (field omitted there).
+  const plain = buildPicksBaseV1(baseInput(p));
+  assert.equal(out.counts.random, plain.counts.random);
+  assert.equal(out.counts.unlinkedExcluded, plain.counts.unlinkedExcluded);
+  assert.equal(out.candidateCount, plain.candidateCount);
+  assert.equal(out.candidateListSha256, plain.candidateListSha256);
+  assert.equal(out.mappingSha256, plain.mappingSha256);
+  assert.deepEqual(
+    out.picks.map((x) => [x.securityId, x.symbol, x.reason]),
+    plain.picks.map((x) => [x.securityId, x.symbol, x.reason]),
+  );
+  assert.equal(plain.groupedWithoutIndexEntry, undefined);
+});
+
+test("groupedWithoutIndexEntry: some unindexed → correct count and sorted sample", () => {
+  const p = pool(3);
+  // Grouped has indexed T000-T002 plus unindexed ZZZ, MMM, AAA (and a WARRANT-like name not in index).
+  const tickers = [...p.tickers, "ZZZ", "MMM", "AAA", "ZZZ"]; // ZZZ duplicate
+  const out = buildPicksBaseV1({
+    sessionDate: D,
+    index: [SPY],
+    holdings: [],
+    groupedReply: grouped(tickers),
+    tickerToSecurityId: p.mapping,
+    tickerTypes: p.types,
+    indexTickers: new Set(p.tickers),
+  });
+  assert.equal(out.groupedWithoutIndexEntry!.count, 3);
+  assert.deepEqual(out.groupedWithoutIndexEntry!.sample, ["AAA", "MMM", "ZZZ"]);
+  // Unindexed names do not become picks; random still only from linked pool.
+  assert.ok(!out.picks.some((x) => x.symbol === "ZZZ" || x.symbol === "MMM" || x.symbol === "AAA"));
+});
+
+test("computeGroupedWithoutIndexEntry: sample capped at 20, sorted", () => {
+  const index = new Set<string>(["KEEP"]);
+  const many = Array.from({ length: 25 }, (_, i) => `U${String(i).padStart(2, "0")}`);
+  const r = computeGroupedWithoutIndexEntry(["KEEP", ...many, "KEEP"], index);
+  assert.equal(r.count, 25);
+  assert.deepEqual(r.sample, [
+    "U00","U01","U02","U03","U04","U05","U06","U07","U08","U09",
+    "U10","U11","U12","U13","U14","U15","U16","U17","U18","U19",
+  ]);
+});
+
+test("groupedWithoutIndexEntry omitted when indexTickers not supplied (fixtures unchanged)", () => {
+  const out = buildPicksBaseV1(baseInput(pool(5)));
+  assert.equal(out.groupedWithoutIndexEntry, undefined);
+});
+
