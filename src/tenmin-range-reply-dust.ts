@@ -66,9 +66,14 @@ export interface TenMinRangeTickerFetch {
   sessionDates: string[];
 }
 
+/** securityId -> ticker link quality. PROVISIONAL: taken from today's master, not point-in-time. */
+export type TenMinSecurityLink = "PROVISIONAL";
+
 export interface TenMinRangeSecurityEntry {
   securityId: string;
   dataset: "stocks-aggregates-10m";
+  /** Present when the run planned from a provisional master link. */
+  securityLink?: TenMinSecurityLink;
   fetches: TenMinRangeTickerFetch[];
   sessionDates: string[];
 }
@@ -100,6 +105,9 @@ export interface TenMinRangeManifest {
   securities: TenMinRangeSecurityEntry[];
   days: TenMinRangeDayEntry[];
   gaps: TenMinRangeGapEntry[];
+  /** Present when the run planned from a provisional master link (see rd-link). */
+  securityLink?: TenMinSecurityLink;
+  securityLinkSource?: string;
   checksum: string;
 }
 
@@ -322,6 +330,7 @@ function tickerFetch(fields: {
 function securityEntry(fields: {
   securityId: string;
   fetches: TenMinRangeTickerFetch[];
+  securityLink?: TenMinSecurityLink;
 }): TenMinRangeSecurityEntry {
   const fetches = fields.fetches
     .map((f) => tickerFetch(f))
@@ -334,6 +343,7 @@ function securityEntry(fields: {
   return {
     securityId: fields.securityId,
     dataset: "stocks-aggregates-10m",
+    ...(fields.securityLink ? { securityLink: fields.securityLink } : {}),
     fetches,
     sessionDates: [...new Set(fetches.flatMap((f) => f.sessionDates))].sort(byCodeUnit),
   };
@@ -350,7 +360,11 @@ export function tenMinRangeObjectMetadata(input: {
   observedAt: string;
   pageCount: number;
   file: Pick<TenMinRangeFileEntry, "page" | "request" | "fetchedAt" | "version" | "replySha256" | "replyByteLength">;
+  /** rd-link, e.g. provisional-master-2026-10-05. Optional: readers accept objects without it. */
+  link?: string;
 }): ObjectMetadata {
+  if (input.link !== undefined && !/^[a-z0-9][a-z0-9.-]{0,79}$/u.test(input.link))
+    throw new Error("TENMIN_RANGE_LINK_INVALID");
   return {
     "rd-schema": TENMIN_RANGE_OBJECT_SCHEMA,
     "rd-provider": input.provider,
@@ -368,6 +382,7 @@ export function tenMinRangeObjectMetadata(input: {
     "rd-fetch-to": input.fetchTo,
     "rd-page": String(input.file.page),
     "rd-page-count": String(input.pageCount),
+    ...(input.link !== undefined ? { "rd-link": input.link } : {}),
   };
 }
 
@@ -382,6 +397,7 @@ export async function writeTenMinRangeFetch(
     fetchTo: string;
     observedAt?: string;
     backend?: ReplyDustBackend;
+    link?: string;
   },
 ): Promise<{ securityId: string; fetch: TenMinRangeTickerFetch }> {
   const { calendarFrom, calendarTo, fetchFrom, fetchTo, provider } = options;
@@ -445,6 +461,7 @@ export async function writeTenMinRangeFetch(
           observedAt,
           pageCount: pages.length,
           file: entryFor(bytes),
+          ...(options.link !== undefined ? { link: options.link } : {}),
         }),
     );
     files.push(entryFor(encoded));
@@ -625,9 +642,12 @@ export function buildTenMinRangeManifest(options: {
   to: string;
   securities: readonly TenMinRangeSecurityEntry[];
   gaps?: readonly TenMinRangeGapEntry[];
+  securityLink?: { status: TenMinSecurityLink; source: string };
 }): TenMinRangeManifest {
   requireRange(options.from, options.to);
-  const securities = options.securities.map((s) => securityEntry(s)).sort((a, b) => byCodeUnit(a.securityId, b.securityId));
+  const link = options.securityLink;
+  const securities = options.securities
+    .map((s) => securityEntry({ ...s, ...(link ? { securityLink: link.status } : {}) })).sort((a, b) => byCodeUnit(a.securityId, b.securityId));
   if (new Set(securities.map((s) => s.securityId)).size !== securities.length)
     throw new Error("REPLY_DUST_DUPLICATE_SECURITY");
   const gaps = (options.gaps ?? [])
@@ -674,6 +694,7 @@ export function buildTenMinRangeManifest(options: {
     securities,
     days,
     gaps,
+    ...(link ? { securityLink: link.status, securityLinkSource: link.source } : {}),
   };
   return { ...body, checksum: manifestChecksum(body) };
 }
@@ -833,6 +854,11 @@ export async function writeTenMinRangeReplyDust(options: {
   fetches: readonly TenMinRangePlannedFetch[];
   initialGaps?: readonly TenMinRangeGapEntry[];
   reopen?: boolean;
+  /**
+   * The securityId -> ticker link is provisional (today's master): every written object gets
+   * rd-link = source, and the manifest marks every security entry securityLink: PROVISIONAL.
+   */
+  securityLink?: { status: TenMinSecurityLink; source: string };
   shouldYield?: () => Promise<string | undefined>;
   backend?: ReplyDustBackend;
   zstdVersionProbe?: ZstdVersionProbe;
@@ -1056,6 +1082,7 @@ export async function writeTenMinRangeReplyDust(options: {
         fetchFrom: planned.fetchFrom,
         fetchTo: planned.fetchTo,
         backend,
+        ...(options.securityLink ? { link: options.securityLink.source } : {}),
       });
       filesWritten += fetch.files.length;
       fallbackFiles += fetch.files.filter((file) => file.version === REPLY_DUST_FALLBACK_VERSION).length;
@@ -1142,6 +1169,7 @@ export async function writeTenMinRangeReplyDust(options: {
     to,
     securities: groupSecurities(doneFetches),
     gaps: [...gaps.values()],
+    ...(options.securityLink ? { securityLink: options.securityLink } : {}),
   });
   if (isEmptyTenMinRangeManifest(manifest))
     throw new Error(

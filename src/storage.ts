@@ -20,6 +20,7 @@ import type {
   StorageReport,
   UniverseMembershipEvidence,
 } from "./contracts";
+import { type DailyBarSessionIndex, indexDailyBarSessions, requireMonth } from "./daily-bar-sessions";
 import { stableJson } from "./identity";
 
 export const MARKET_STORAGE_PATH_ERROR = "MARKET_STORAGE_PATH_INVALID";
@@ -31,6 +32,11 @@ export interface MarketStore {
   loadMembership(): Promise<UniverseMembershipEvidence[]>;
   appendMembership(records: UniverseMembershipEvidence[]): Promise<void>;
   loadBars(sessionDate?: string): Promise<CanonicalDailyBar[]>;
+  /**
+   * securityId -> sessionDates with a stored daily bar, for one YYYY-MM file only. Streams the
+   * month's lines and keeps just those two fields (monthly files are ~100 MB).
+   */
+  loadDailyBarSessions(month: string): Promise<DailyBarSessionIndex>;
   appendBars(records: CanonicalDailyBar[]): Promise<void>;
   appendActions(records: CorporateAction[]): Promise<void>;
   writeBeliefs(records: ScannerBelief[]): Promise<void>;
@@ -195,6 +201,18 @@ export class MarketStorage implements MarketStore {
         this.path(`daily-bars/${sessionDate.slice(0, 7)}.jsonl`),
       ).then((bars) => bars.filter((bar) => bar.sessionDate === sessionDate));
     return this.readTree("daily-bars", async (file) => readJsonLines<CanonicalDailyBar>(file));
+  }
+
+  async loadDailyBarSessions(month: string): Promise<DailyBarSessionIndex> {
+    requireMonth(month);
+    const path = this.path(`daily-bars/${month}.jsonl`);
+    assertSafeStoreFile(path, MARKET_STORAGE_PATH_ERROR);
+    try {
+      return indexDailyBarSessions(await readFile(path), new Map(), month);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Map();
+      throw error;
+    }
   }
 
   async appendBars(records: CanonicalDailyBar[]): Promise<void> {

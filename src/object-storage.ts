@@ -12,6 +12,7 @@ import type {
   StorageReport,
   UniverseMembershipEvidence,
 } from "./contracts";
+import { type DailyBarSessionIndex, indexDailyBarSessions, requireMonth } from "./daily-bar-sessions";
 import { stableJson } from "./identity";
 import type { ObjectClient } from "./object-store";
 import { R2ObjectClient } from "./object-store";
@@ -100,6 +101,12 @@ export class ObjectMarketStorage implements MarketStore {
     const keys = await this.client.list("permanent/daily-bars/");
     const groups = await Promise.all(keys.map(async (key) => lines<CanonicalDailyBar>(await this.readText(key))));
     return groups.flat();
+  }
+
+  async loadDailyBarSessions(month: string): Promise<DailyBarSessionIndex> {
+    requireMonth(month);
+    const body = await this.client.get(`permanent/daily-bars/${month}.jsonl`);
+    return body ? indexDailyBarSessions(body, new Map(), month) : new Map();
   }
 
   async appendBars(records: CanonicalDailyBar[]): Promise<void> {

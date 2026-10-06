@@ -15,10 +15,16 @@ import {
   planTenMinHistoryRanges,
   runTenMinHistory,
   runTenMinHistoryFromEnv,
+  TENMIN_DAILY_COVERAGE_HOLE,
+  TENMIN_MIN_UNIVERSE_RATIO,
   TENMIN_UNIVERSE_EMPTY,
+  TENMIN_UNIVERSE_TOO_SMALL,
   tenMinHistorySummary,
+  loadDailyBarSessionsForRange,
+  tradingSessionsBetween,
   universeForTenMinRange,
 } from "./tenmin-history";
+import { type DailyBarSessionIndex, indexDailyBarSessions } from "./daily-bar-sessions";
 import {
   buildTenMinRangeManifest,
   readRangeReplies,
@@ -84,6 +90,34 @@ function master(
     barCount: 0,
     lastUniverseSeenAt: "2026-10-05",
   };
+}
+
+/** Trading sessions in [from, to] by the repo calendar. */
+function sessions(from: string, to: string): string[] {
+  return tradingSessionsBetween(from, to);
+}
+
+function barsIndex(entries: Array<[string, string[]]>): DailyBarSessionIndex {
+  return new Map(entries.map(([securityId, dates]) => [securityId, new Set(dates)]));
+}
+
+/** A loadDailyBarSessions stub serving one month at a time from an in-memory index. */
+function monthLoader(index: DailyBarSessionIndex, loaded: string[] = []) {
+  return async (month: string): Promise<DailyBarSessionIndex> => {
+    loaded.push(month);
+    const output: DailyBarSessionIndex = new Map();
+    for (const [securityId, dates] of index) {
+      const kept = [...dates].filter((date) => date.startsWith(`${month}-`));
+      if (kept.length) output.set(securityId, new Set(kept));
+    }
+    return output;
+  };
+}
+
+/** Every listed security has a stored daily bar on every trading session (2024-2026). */
+function everyDay(...symbols: string[]) {
+  const all = sessions("2024-01-01", "2026-12-31");
+  return monthLoader(barsIndex(symbols.map((symbol) => [id(symbol), all])));
 }
 
 async function withRoot<T>(run: (root: string) => Promise<T>): Promise<T> {
@@ -165,11 +199,12 @@ test("lastCompletedSessionDate is the prior eligible ET session", () => {
   assert.equal(lastCompletedSessionDate(new Date("2026-10-10T18:00:00.000Z")), "2026-10-09");
 });
 
-test("universe plans every overlapping historical ticker over its own sub-span", () => {
+test("universe plans one sub-span per held ticker when effective dates separate the stored sessions", () => {
+  // universe.ts closes a ticker with effectiveTo = the day the next one starts (exclusive end).
   const active = master("NEW", {
     listingDate: "2023-01-01",
     history: [
-      { symbol: "OLD", effectiveFrom: "2023-01-01", effectiveTo: "2024-11-25", source: PROVIDER },
+      { symbol: "OLD", effectiveFrom: "2023-01-01", effectiveTo: "2024-11-26", source: PROVIDER },
       { symbol: "NEW", effectiveFrom: "2024-11-26", source: PROVIDER },
     ],
   });
@@ -182,15 +217,22 @@ test("universe plans every overlapping historical ticker over its own sub-span",
       { symbol: "GONE", effectiveFrom: "2022-01-01", effectiveTo: "2024-11-15", source: PROVIDER },
     ],
   });
-  const plan = universeForTenMinRange([active, delisted], "2024-10-07", "2024-11-30", AT);
+  const bars = barsIndex([
+    [id("NEW"), sessions("2024-10-07", "2024-11-30")],
+    [id("GONE"), sessions("2024-10-07", "2024-11-15")],
+  ]);
+  const plan = universeForTenMinRange([active, delisted], bars, "2024-10-07", "2024-11-30", { nowIso: AT });
+  assert.equal(plan.refusal, undefined);
   const newFetches = plan.securities.find((s) => s.securityId === id("NEW"))!.fetches;
   assert.deepEqual(
     newFetches.map((f) => [f.symbol, f.fetchFrom, f.fetchTo]),
     [
       ["OLD", "2024-10-07", "2024-11-25"],
-      ["NEW", "2024-11-26", "2024-11-30"],
+      ["NEW", "2024-11-26", "2024-11-29"],
     ],
   );
+  // 2024-11-15 is outside GONE's [from, to) span, so the dates do not separate cleanly and the
+  // backfill's binding (currentSymbol) is used over first..last stored session.
   const gone = plan.securities.find((s) => s.securityId === id("GONE"))!.fetches;
   assert.deepEqual(gone, [
     { securityId: id("GONE"), symbol: "GONE", fetchFrom: "2024-10-07", fetchTo: "2024-11-15" },
@@ -215,6 +257,7 @@ test("resume on a later day reuses the same calendar folder and skips completed 
       root,
       store,
       securities,
+      loadDailyBarSessions: everyDay("AAA"),
       windowStart: "2024-10-07",
       lastCompletedSession: "2026-10-05",
       maxRanges: 1,
@@ -233,6 +276,7 @@ test("resume on a later day reuses the same calendar folder and skips completed 
       root,
       store,
       securities,
+      loadDailyBarSessions: everyDay("AAA"),
       windowStart: "2024-10-07",
       lastCompletedSession: "2026-10-19",
       maxRanges: 1,
@@ -370,6 +414,7 @@ test("history runner processes oldest calendar range first", async () => {
       root,
       store,
       securities: [master("AAA")],
+      loadDailyBarSessions: everyDay("AAA"),
       windowStart: "2024-10-07",
       lastCompletedSession: "2025-04-15",
       maxRanges: 3,
@@ -381,10 +426,11 @@ test("history runner processes oldest calendar range first", async () => {
         return pagesFor(s, from, to);
       },
     });
+    // Each fetch spans the first to last stored session in the range.
     assert.deepEqual(order, [
-      "2024-10-07_2024-11-30",
-      "2024-12-01_2025-01-31",
-      "2025-02-01_2025-03-31",
+      "2024-10-07_2024-11-29",
+      "2024-12-02_2025-01-31",
+      "2025-02-03_2025-03-31",
     ]);
   });
 });
@@ -565,6 +611,7 @@ test("history runner skips a sealed range with zero fetches", async () => {
       root,
       store,
       securities,
+      loadDailyBarSessions: everyDay("AAA"),
       windowStart: "2024-10-07",
       lastCompletedSession: "2024-12-01",
       maxRanges: 1,
@@ -579,6 +626,7 @@ test("history runner skips a sealed range with zero fetches", async () => {
       root,
       store,
       securities,
+      loadDailyBarSessions: everyDay("AAA"),
       windowStart: "2024-10-07",
       lastCompletedSession: "2024-12-01",
       maxRanges: 1,
@@ -601,6 +649,7 @@ test("history runner: store error during resume throws with zero new fetches", a
       root,
       store,
       securities,
+      loadDailyBarSessions: everyDay("AAA", "BBB"),
       windowStart: "2024-10-07",
       lastCompletedSession: "2024-12-01",
       maxRanges: 1,
@@ -625,6 +674,7 @@ test("history runner: store error during resume throws with zero new fetches", a
       root,
       store: failing,
       securities,
+      loadDailyBarSessions: everyDay("AAA", "BBB"),
       windowStart: "2024-10-07",
       lastCompletedSession: "2024-12-01",
       maxRanges: 1,
@@ -643,20 +693,27 @@ test("history runner: store error during resume throws with zero new fetches", a
   });
 });
 
-test("empty universe never seals: run stops with TENMIN_UNIVERSE_EMPTY and zero fetches", async () => {
+test("empty universe or no daily coverage never seals: run stops with the error and zero fetches", async () => {
   await withRoot(async (root) => {
     // Production-shaped master: no listing dates, first-seen dates in 2026 only.
     const firstSeenOnly = master("LATE", {
       firstSeenAt: "2026-10-02T00:00:00.000Z",
       history: [{ symbol: "LATE", effectiveFrom: "2026-10-02", source: PROVIDER }],
     });
-    for (const securities of [[], [firstSeenOnly]]) {
+    const cases = [
+      // Bars exist but no master record gives a ticker: nothing to fetch.
+      { securities: [], loader: everyDay("ORPHAN"), code: TENMIN_UNIVERSE_EMPTY, planned: 1 },
+      // The production master with no stored daily bars: fail closed on coverage first.
+      { securities: [firstSeenOnly], loader: monthLoader(new Map()), code: TENMIN_DAILY_COVERAGE_HOLE, planned: 0 },
+    ];
+    for (const { securities, loader, code, planned } of cases) {
       const store = new MemoryObjectClient();
       let fetches = 0;
       const result = await runTenMinHistory({
         root,
         store,
         securities,
+        loadDailyBarSessions: loader,
         windowStart: "2024-10-07",
         lastCompletedSession: "2026-10-05",
         maxRanges: 2,
@@ -671,12 +728,12 @@ test("empty universe never seals: run stops with TENMIN_UNIVERSE_EMPTY and zero 
       assert.equal(fetches, 0);
       assert.equal(result.report.massiveRequests, 0);
       assert.equal(result.report.stoppedOnError, true);
-      assert.match(result.report.error ?? "", new RegExp(`^${TENMIN_UNIVERSE_EMPTY}:2024-10-01_2024-11-30`));
+      assert.match(result.report.error ?? "", new RegExp(`^${code}:2024-10-07_2024-11-30`));
       // Stops at the first range; the second is never attempted.
       assert.equal(result.report.ranges.length, 1);
       assert.equal(result.report.ranges[0]?.status, "ERROR");
       assert.equal(result.report.ranges[0]?.fetchesPlanned, 0);
-      assert.match(result.report.ranges[0]?.error ?? "", /TENMIN_UNIVERSE_EMPTY/);
+      assert.match(result.report.ranges[0]?.error ?? "", new RegExp(code));
       assert.equal(result.rangeResults.length, 0);
       assert.equal(await store.get(tenMinRangeManifestKey("2024-10-01", "2024-11-30")), undefined);
       assert.equal(await readTenMinRangeManifest(store, "2024-10-01", "2024-11-30"), undefined);
@@ -688,7 +745,7 @@ test("empty universe never seals: run stops with TENMIN_UNIVERSE_EMPTY and zero 
         ranges: Array<{ status: string }>;
       };
       assert.equal(stored.stoppedOnError, true);
-      assert.match(stored.error ?? "", /TENMIN_UNIVERSE_EMPTY/);
+      assert.match(stored.error ?? "", new RegExp(code));
       assert.equal(stored.ranges[0]?.status, "ERROR");
       // Host summary line shows the per-range status and plan sizes.
       const summary = tenMinHistorySummary(result.report);
@@ -696,11 +753,11 @@ test("empty universe never seals: run stops with TENMIN_UNIVERSE_EMPTY and zero 
       assert.deepEqual((summary.ranges as unknown[])[0], {
         range: "2024-10-01_2024-11-30",
         status: "ERROR",
-        securitiesPlanned: 0,
+        securitiesPlanned: planned,
         fetchesPlanned: 0,
         error: result.report.ranges[0]?.error,
       });
-      assert.match(String(summary.error), /TENMIN_UNIVERSE_EMPTY/);
+      assert.match(String(summary.error), new RegExp(code));
     }
   });
 });
@@ -769,6 +826,7 @@ test("a range sealed earlier with 0 securities is not a seal: runs (and reopen) 
         root,
         store,
         securities: [master("AAA"), master("BBB")],
+        loadDailyBarSessions: everyDay("AAA", "BBB"),
         windowStart: "2024-10-07",
         lastCompletedSession: "2024-12-01",
         maxRanges: 1,
@@ -783,9 +841,288 @@ test("a range sealed earlier with 0 securities is not a seal: runs (and reopen) 
         },
       });
       assert.equal(result.report.ranges[0]?.status, reopen ? "REOPENED" : "SEALED");
-      assert.deepEqual(fetched.sort(), ["AAA:2024-10-07_2024-11-30", "BBB:2024-10-07_2024-11-30"]);
+      assert.deepEqual(fetched.sort(), ["AAA:2024-10-07_2024-11-29", "BBB:2024-10-07_2024-11-29"]);
       const manifest = (await readTenMinRangeManifest(store, "2024-10-01", "2024-11-30"))!;
       assert.equal(manifest.securityCount, 2);
     });
   }
+});
+
+// ---- Point-in-time universe from stored daily bars ----
+
+const OCT_NOV = { from: "2024-10-07", to: "2024-11-30" };
+
+test("daily-bar index keeps only securityId and sessionDate, line by line", () => {
+  const line = (securityId: string, sessionDate: string, revision: number) =>
+    JSON.stringify({ close: 1, flags: ["MASSIVE_GROUPED_DAILY"], revision, securityId, sessionDate, volume: 5 });
+  const body = new TextEncoder().encode(
+    [line("A", "2024-10-07", 1), "", line("A", "2024-10-07", 2), line("B", "2024-10-08", 1)].join("\n") + "\n",
+  );
+  const index = indexDailyBarSessions(body);
+  assert.deepEqual([...index.entries()].map(([k, v]) => [k, [...v]]), [
+    ["A", ["2024-10-07"]],
+    ["B", ["2024-10-08"]],
+  ]);
+  assert.throws(() => indexDailyBarSessions(new TextEncoder().encode('{"securityId":"A"}\n')), /DAILY_BARS_LINE_INVALID/);
+});
+
+test("storage month loaders index one month file (object store and local)", async () => {
+  await withRoot(async (root) => {
+    const bar = (symbol: string, sessionDate: string) => ({
+      securityId: id(symbol),
+      sessionDate,
+      open: 1,
+      high: 1,
+      low: 1,
+      close: 1,
+      volume: 1,
+      observedAt: AT,
+      ingestedAt: AT,
+      dataQuality: "GOOD" as const,
+      corporateActionIds: [],
+      flags: ["MASSIVE_GROUPED_DAILY"],
+      schemaVersion: "markets-scanner-v1" as const,
+      revision: 1,
+      provenance: { provider: PROVIDER, retrievalId: "x", providerTimestamp: AT },
+    });
+    const { ObjectMarketStorage } = await import("./object-storage");
+    const { MarketStorage } = await import("./storage");
+    const records = [bar("AAA", "2024-10-07"), bar("AAA", "2024-10-08"), bar("BBB", "2024-11-01")] as unknown as import("./contracts").CanonicalDailyBar[];
+    for (const storage of [new ObjectMarketStorage(new MemoryObjectClient()), new MarketStorage(root)]) {
+      await storage.initialize();
+      await storage.appendBars(records);
+      const october = await storage.loadDailyBarSessions("2024-10");
+      assert.deepEqual([...october.keys()], [id("AAA")]);
+      assert.deepEqual([...october.get(id("AAA"))!].sort(), ["2024-10-07", "2024-10-08"]);
+      assert.deepEqual([...(await storage.loadDailyBarSessions("2024-11")).keys()], [id("BBB")]);
+      assert.equal((await storage.loadDailyBarSessions("2024-12")).size, 0);
+    }
+  });
+});
+
+test("universe from crafted daily bars: two months, an October-only delisting, a holiday gap", async () => {
+  const all = sessions(OCT_NOV.from, OCT_NOV.to);
+  assert.ok(!all.includes("2024-11-28"), "Thanksgiving is not a session");
+  assert.ok(all.includes("2024-11-29"), "the half day is a session");
+  const loaded: string[] = [];
+  const index = barsIndex([
+    [id("AAA"), all],
+    // Delisted at the end of October: only October bars are stored.
+    [id("DLST"), all.filter((d) => d <= "2024-10-31")],
+    // Missing its own bars around Thanksgiving; the range coverage is still complete.
+    [id("HOL"), all.filter((d) => d !== "2024-11-27" && d !== "2024-11-29")],
+    // Starts mid-range: the fetch span is its first to last stored session.
+    [id("MID"), all.filter((d) => d >= "2024-10-15" && d <= "2024-11-12")],
+    // Outside the clamped window: ignored.
+    [id("EARLY"), ["2024-10-01", "2024-10-04"]],
+  ]);
+  const securities = ["AAA", "DLST", "HOL", "MID", "EARLY"].map((s) =>
+    master(s, { firstSeenAt: "2026-10-02", history: [{ symbol: s, effectiveFrom: "2026-10-02", source: PROVIDER }] }),
+  );
+  const bars = await loadDailyBarSessionsForRange(monthLoader(index, loaded), OCT_NOV.from, OCT_NOV.to);
+  assert.deepEqual(loaded, ["2024-10", "2024-11"]);
+  const plan = universeForTenMinRange(securities, bars, OCT_NOV.from, OCT_NOV.to, { nowIso: AT });
+  assert.equal(plan.refusal, undefined);
+  assert.deepEqual(plan.missingSessions, []);
+  assert.equal(plan.tradingSessions.length, all.length);
+  assert.deepEqual(
+    plan.fetches.map((f) => [f.symbol, f.fetchFrom, f.fetchTo]),
+    [
+      ["AAA", "2024-10-07", "2024-11-29"],
+      ["DLST", "2024-10-07", "2024-10-31"],
+      ["HOL", "2024-10-07", "2024-11-26"],
+      ["MID", "2024-10-15", "2024-11-12"],
+    ].sort((a, b) => (id(a[0]!) < id(b[0]!) ? -1 : 1)),
+  );
+  assert.equal(plan.noDailyBarCount, 1);
+  assert.deepEqual(plan.noDailyBarSample, [id("EARLY")]);
+  assert.equal(plan.securityLink, "PROVISIONAL");
+  assert.equal(plan.linkSource, "provisional-master-2026-10-05");
+});
+
+test("coverage hole: a trading session with zero stored bars refuses to fetch or seal", async () => {
+  await withRoot(async (root) => {
+    const all = sessions(OCT_NOV.from, OCT_NOV.to).filter((d) => d !== "2024-11-05");
+    const loader = monthLoader(barsIndex([[id("AAA"), all], [id("BBB"), all]]));
+    const plan = universeForTenMinRange(
+      [master("AAA"), master("BBB")],
+      await loadDailyBarSessionsForRange(loader, OCT_NOV.from, OCT_NOV.to),
+      OCT_NOV.from,
+      OCT_NOV.to,
+    );
+    assert.deepEqual(plan.missingSessions, ["2024-11-05"]);
+    assert.equal(plan.refusal?.code, TENMIN_DAILY_COVERAGE_HOLE);
+    assert.match(plan.refusal?.message ?? "", /missing=2024-11-05$/);
+    const store = new MemoryObjectClient();
+    let fetches = 0;
+    const result = await runTenMinHistory({
+      root,
+      store,
+      securities: [master("AAA"), master("BBB")],
+      loadDailyBarSessions: loader,
+      windowStart: "2024-10-07",
+      lastCompletedSession: "2026-10-05",
+      writeReport: false,
+      zstdVersionProbe: pinnedZstd,
+      env: {},
+      fetchPages: async (s, f, t) => {
+        fetches += 1;
+        return pagesFor(s, f, t);
+      },
+    });
+    assert.equal(fetches, 0);
+    assert.equal(result.report.stoppedOnError, true);
+    assert.match(result.report.error ?? "", /^TENMIN_DAILY_COVERAGE_HOLE:.*2024-11-05/);
+    assert.deepEqual(result.report.ranges[0]?.coverage?.missingSessions, ["2024-11-05"]);
+    assert.equal(result.report.ranges.length, 1);
+    assert.equal(await store.get(tenMinRangeManifestKey("2024-10-01", "2024-11-30")), undefined);
+  });
+});
+
+test("universe smaller than TENMIN_MIN_UNIVERSE_RATIO x median per session refuses to seal", () => {
+  assert.equal(TENMIN_MIN_UNIVERSE_RATIO, 0.8);
+  const all = sessions(OCT_NOV.from, OCT_NOV.to);
+  const symbols = Array.from({ length: 10 }, (_, i) => `S${i}`);
+  const bars = barsIndex(symbols.map((s) => [id(s), all]));
+  const median = 10;
+  // Crafted bug: only some bar securities resolve to a master ticker.
+  const needed = Math.ceil(TENMIN_MIN_UNIVERSE_RATIO * median);
+  const short = universeForTenMinRange(
+    symbols.slice(0, needed - 1).map((s) => master(s)),
+    bars,
+    OCT_NOV.from,
+    OCT_NOV.to,
+  );
+  assert.equal(short.medianSecuritiesPerSession, median);
+  assert.equal(short.securities.length, needed - 1);
+  assert.equal(short.refusal?.code, TENMIN_UNIVERSE_TOO_SMALL);
+  assert.match(short.refusal?.message ?? "", new RegExp(`planned=${needed - 1}:median=${median}:ratio=0.8`));
+  const enough = universeForTenMinRange(
+    symbols.slice(0, needed).map((s) => master(s)),
+    bars,
+    OCT_NOV.from,
+    OCT_NOV.to,
+  );
+  assert.equal(enough.refusal, undefined);
+  assert.equal(enough.gaps.filter((g) => g.reason === "NO_HISTORICAL_SYMBOL").length, median - needed);
+});
+
+test("NO_DAILY_BAR: master securities without a stored bar are a counted known gap (sample of 50)", async () => {
+  await withRoot(async (root) => {
+    const extra = Array.from({ length: 60 }, (_, i) => master(`ND${String(i).padStart(2, "0")}`));
+    const securities = [master("AAA"), ...extra];
+    const result = await runTenMinHistory({
+      root,
+      store: new MemoryObjectClient(),
+      securities,
+      loadDailyBarSessions: everyDay("AAA"),
+      windowStart: "2024-10-07",
+      lastCompletedSession: "2024-12-01",
+      maxRanges: 1,
+      writeReport: false,
+      zstdVersionProbe: pinnedZstd,
+      env: {},
+      fetchPages: (s, f, t) => Promise.resolve(pagesFor(s, f, t)),
+    });
+    const range = result.report.ranges[0]!;
+    assert.equal(range.status, "SEALED");
+    assert.equal(range.noDailyBar?.reason, "NO_DAILY_BAR");
+    assert.equal(range.noDailyBar?.count, 60);
+    assert.equal(range.noDailyBar?.sampleSecurityIds.length, 50);
+    assert.deepEqual(
+      range.noDailyBar?.sampleSecurityIds,
+      extra.map((s) => s.securityId).sort().slice(0, 50),
+    );
+    assert.equal(range.fetchesPlanned, 1);
+  });
+});
+
+test("provisional link: rd-link on written objects, securityLink in manifest and report; resume accepts objects without it", async () => {
+  await withRoot(async (root) => {
+    const store = new MemoryObjectClient();
+    // An object written earlier without rd-link (older writer).
+    await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: "2024-10-01",
+      to: "2024-11-30",
+      fetches: [{ securityId: id("OLDW"), symbol: "OLDW", fetchFrom: "2024-10-07", fetchTo: "2024-11-29" }],
+      zstdVersionProbe: pinnedZstd,
+      fetchPages: (s, f, t) => Promise.resolve(pagesFor(s, f, t)),
+    });
+    await store.delete(tenMinRangeManifestKey("2024-10-01", "2024-11-30"));
+    const fetched: string[] = [];
+    const result = await runTenMinHistory({
+      root,
+      store,
+      securities: [master("AAA"), master("OLDW")],
+      loadDailyBarSessions: everyDay("AAA", "OLDW"),
+      windowStart: "2024-10-07",
+      lastCompletedSession: "2024-12-01",
+      maxRanges: 1,
+      zstdVersionProbe: pinnedZstd,
+      env: {},
+      nowIso: () => AT,
+      fetchPages: async (s, f, t) => {
+        fetched.push(s.symbol);
+        return pagesFor(s, f, t);
+      },
+    });
+    assert.deepEqual(fetched, ["AAA"]);
+    assert.equal(result.report.ranges[0]?.securitiesResumed, 1);
+    assert.equal(result.report.securityLink, "PROVISIONAL");
+    assert.equal(result.report.ranges[0]?.securityLink, "PROVISIONAL");
+    const keys = (await store.list("permanent/tenmin-reply-dust/2024-10-01_2024-11-30/")).filter((k) =>
+      k.endsWith(".rdust"),
+    );
+    const heads = await Promise.all(keys.map(async (k) => [k, (await store.head(k))!.metadata] as const));
+    const aaa = heads.find(([k]) => k.includes(Buffer.from(id("AAA")).toString("base64url")))!;
+    assert.equal(aaa[1]["rd-link"], "provisional-master-2026-10-05");
+    const old = heads.find(([k]) => k.includes(Buffer.from(id("OLDW")).toString("base64url")))!;
+    assert.equal(old[1]["rd-link"], undefined);
+    const manifest = (await readTenMinRangeManifest(store, "2024-10-01", "2024-11-30"))!;
+    assert.equal(manifest.securityLink, "PROVISIONAL");
+    assert.equal(manifest.securityLinkSource, "provisional-master-2026-10-05");
+    assert.deepEqual(
+      manifest.securities.map((s) => s.securityLink),
+      ["PROVISIONAL", "PROVISIONAL"],
+    );
+  });
+});
+
+test("reused ticker: the fetch uses the ticker and dates the backfill stored, not the old holder", () => {
+  // In 2024 the ticker ABC belonged to OldCo (delisted 2025). Today ABC is NewCo's current symbol.
+  // The backfill bound every grouped-daily row by today's currentSymbol, so 2024 ABC rows were
+  // stored under NewCo's securityId. To stay consistent with those stored bars, the 10-minute
+  // fetch for NewCo is ticker ABC over exactly the dates NewCo has stored bars. OldCo has no stored
+  // bars (its former symbol was never bound), so it is a NO_DAILY_BAR known gap, not a fetch.
+  const newCo = master("ABC", {
+    securityId: id("NEWCO"),
+    firstSeenAt: "2026-10-02",
+    history: [{ symbol: "ABC", effectiveFrom: "2026-10-02", source: PROVIDER }],
+  });
+  const oldCo = master("ABCQ", {
+    securityId: id("OLDCO"),
+    firstSeenAt: "2026-10-03",
+    status: "INACTIVE",
+    history: [
+      { symbol: "ABC", effectiveFrom: "2015-01-01", effectiveTo: "2025-03-01", source: PROVIDER },
+      { symbol: "ABCQ", effectiveFrom: "2026-10-03", effectiveTo: "2026-10-03", source: PROVIDER },
+    ],
+  });
+  const stored = sessions("2024-10-21", "2024-11-22");
+  const others = sessions(OCT_NOV.from, OCT_NOV.to);
+  const plan = universeForTenMinRange(
+    [newCo, oldCo, master("AAA")],
+    barsIndex([[id("NEWCO"), stored], [id("AAA"), others]]),
+    OCT_NOV.from,
+    OCT_NOV.to,
+  );
+  assert.equal(plan.refusal, undefined);
+  assert.deepEqual(plan.securities.find((s) => s.securityId === id("NEWCO"))?.fetches, [
+    { securityId: id("NEWCO"), symbol: "ABC", fetchFrom: "2024-10-21", fetchTo: "2024-11-22" },
+  ]);
+  assert.ok(!plan.fetches.some((f) => f.securityId === id("OLDCO")));
+  assert.deepEqual(plan.noDailyBarSample, [id("OLDCO")]);
 });

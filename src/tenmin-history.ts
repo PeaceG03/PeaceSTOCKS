@@ -1,6 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { SecurityMasterRecord, TenMinuteRangeReply } from "./contracts";
+import { type DailyBarSessionIndex, monthsBetween } from "./daily-bar-sessions";
 import { FileReplyDustStore, type ReplyDustStore } from "./intraday-reply-dust";
 import { MassiveMarketProvider } from "./massive-provider";
 import { R2ObjectClient } from "./object-store";
@@ -13,6 +14,8 @@ import { MarketStorage } from "./storage";
 import { prepareSafeStoreFile } from "./store-path";
 import {
   TENMIN_UNIVERSE_EMPTY,
+  isEmptyTenMinRangeManifest,
+  readTenMinRangeManifest,
   type TenMinRangeGapEntry,
   type TenMinRangePlannedFetch,
   type TenMinRangeWriteResult,
@@ -224,115 +227,234 @@ export interface TenMinUniverseSecurity {
   fetches: TenMinRangePlannedFetch[];
 }
 
+/** Refuse to seal when planned securities < this × the median distinct securities per session. */
+export const TENMIN_MIN_UNIVERSE_RATIO = 0.8;
+export const TENMIN_DAILY_COVERAGE_HOLE = "TENMIN_DAILY_COVERAGE_HOLE";
+export const TENMIN_UNIVERSE_TOO_SMALL = "TENMIN_UNIVERSE_TOO_SMALL";
+/** Known gap (not an error): in the master but no stored daily bar inside the range. */
+export const TENMIN_NO_DAILY_BAR = "NO_DAILY_BAR" as const;
+export const TENMIN_NO_DAILY_BAR_SAMPLE_SIZE = 50;
+/** The securityId -> ticker link comes from today's master, not point-in-time evidence. */
+export const TENMIN_SECURITY_LINK = "PROVISIONAL" as const;
+
 export interface TenMinUniversePlan {
   securities: TenMinUniverseSecurity[];
   /** Flattened planned fetches for the writer. */
   fetches: TenMinRangePlannedFetch[];
+  /** NO_HISTORICAL_SYMBOL gaps: daily bars in range but no usable ticker in the master. */
   gaps: TenMinRangeGapEntry[];
+  /** Trading sessions in [fetchFrom, fetchTo] by the session calendar. */
+  tradingSessions: string[];
+  /** Trading sessions with zero stored daily bars (any one blocks sealing). */
+  missingSessions: string[];
+  /** Median distinct securities with a stored bar per trading session. */
+  medianSecuritiesPerSession: number;
+  noDailyBarCount: number;
+  noDailyBarSample: string[];
+  /**
+   * Securities whose master shows more than one held ticker but whose bar dates fall outside
+   * every effective span, so currentSymbol (the backfill's binding) was used.
+   */
+  currentSymbolFallbackCount: number;
+  securityLink: typeof TENMIN_SECURITY_LINK;
+  /** Object metadata rd-link value, e.g. provisional-master-2026-10-05. */
+  linkSource: string;
+  /** Set when the range must not be fetched or sealed. */
+  refusal?: { code: string; message: string };
 }
 
-function listingInterval(security: SecurityMasterRecord): { from: string; to: string } {
-  const from =
-    security.listingDate ??
-    security.historicalSymbols.map((h) => h.effectiveFrom).sort(byCodeUnit)[0] ??
-    security.firstSeenAt;
-  const to = security.delistedAt ?? security.inactiveAt ?? "9999-12-31";
-  return { from, to };
+/** Trading sessions (NORMAL or HALF_DAY) in [from, to], from the same calendar the planner uses. */
+export function tradingSessionsBetween(
+  from: string,
+  to: string,
+  calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
+): string[] {
+  requireDate(from);
+  requireDate(to);
+  const output: string[] = [];
+  for (let date = from; date <= to; date = addCalendarDays(date, 1)) {
+    const kind = calendar.getSession(date).kind;
+    if (kind === "NORMAL" || kind === "HALF_DAY") output.push(date);
+  }
+  return output;
 }
 
-function overlaps(aFrom: string, aTo: string, bFrom: string, bTo: string): boolean {
-  return aFrom <= bTo && aTo >= bFrom;
-}
-
-function maxDate(a: string, b: string): string {
-  return a > b ? a : b;
-}
-
-function minDate(a: string, b: string): string {
-  return a < b ? a : b;
+function median(values: readonly number[]): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
 /**
- * Securities whose listing overlaps [rangeFetchFrom, rangeFetchTo]. Every historicalSymbols
- * ticker whose span overlaps is planned for its own sub-span
- * [max(effectiveFrom, rangeFetchFrom, listedFrom), min(effectiveTo, rangeFetchTo, listedTo)].
+ * The ticker(s) the backfill matched for these stored sessions (sorted, inside the range).
+ *
+ * The backfill bound grouped-daily rows to securities by the master's currentSymbol at the time
+ * it ran (providerRecords -> symbolBySecurityIdFor -> groupedDailySymbolIndex, ACTIVE ids only),
+ * whatever the session date. The master records each symbol it held as current in
+ * historicalSymbols with effectiveFrom on or after firstSeenAt (former tickers added from the
+ * provider's inactive pass carry older provider dates, or effectiveFrom === effectiveTo when
+ * undated, and were never matched). So:
+ * - if every stored session falls inside exactly one held symbol's [effectiveFrom, effectiveTo),
+ *   plan one sub-span per symbol, each from its first to its last stored session;
+ * - otherwise (the usual case for history: the sessions predate every effective date) use
+ *   currentSymbol over [first, last] stored session.
+ */
+function backfillSymbolSpans(
+  security: SecurityMasterRecord,
+  sessions: readonly string[],
+): { spans: Array<{ symbol: string; from: string; to: string }>; fallback: boolean } {
+  const firstSeen = security.firstSeenAt.slice(0, 10);
+  const held = security.historicalSymbols.filter(
+    (entry) =>
+      !!entry.symbol &&
+      entry.effectiveFrom >= firstSeen &&
+      (entry.effectiveTo === undefined || entry.effectiveTo > entry.effectiveFrom),
+  );
+  const perSession: string[] = [];
+  for (const date of sessions) {
+    const matches = held.filter(
+      (entry) => entry.effectiveFrom <= date && (entry.effectiveTo === undefined || date < entry.effectiveTo),
+    );
+    if (matches.length !== 1) break;
+    perSession.push(matches[0]!.symbol);
+  }
+  if (sessions.length && perSession.length === sessions.length) {
+    const spans: Array<{ symbol: string; from: string; to: string }> = [];
+    sessions.forEach((date, index) => {
+      const symbol = perSession[index]!;
+      const last = spans.at(-1);
+      if (last && last.symbol === symbol) last.to = date;
+      else spans.push({ symbol, from: date, to: date });
+    });
+    return { spans, fallback: false };
+  }
+  const fallback = new Set(held.map((entry) => entry.symbol)).size > 1;
+  if (!security.currentSymbol || !sessions.length) return { spans: [], fallback };
+  return {
+    spans: [{ symbol: security.currentSymbol, from: sessions[0]!, to: sessions.at(-1)! }],
+    fallback,
+  };
+}
+
+/**
+ * Point-in-time universe for one range: a security is in the range if the stored daily bars have
+ * at least one bar for it with sessionDate in [rangeFetchFrom, rangeFetchTo]. The master is used
+ * only to look up the ticker(s) (see backfillSymbolSpans); each fetch spans that ticker's first to
+ * last stored session in the range. Refuses (no fetch, no seal) on a trading session with zero
+ * stored bars, an empty plan, or planned < TENMIN_MIN_UNIVERSE_RATIO × median per session.
  */
 export function universeForTenMinRange(
   securities: readonly SecurityMasterRecord[],
+  dailyBars: DailyBarSessionIndex,
   rangeFetchFrom: string,
   rangeFetchTo: string,
-  nowIso: string = new Date().toISOString(),
+  options: { nowIso?: string; calendar?: SessionCalendar; linkDate?: string } = {},
 ): TenMinUniversePlan {
   requireDate(rangeFetchFrom);
   requireDate(rangeFetchTo);
+  const nowIso = options.nowIso ?? new Date().toISOString();
+  // The master's own date (latest lastUniverseSeenAt) names the provisional link.
+  const masterDate = securities.reduce((latest, s) => {
+    const day = (s.lastUniverseSeenAt ?? "").slice(0, 10);
+    return day > latest ? day : latest;
+  }, "");
+  const linkSource = `provisional-master-${options.linkDate ?? (masterDate || nowIso.slice(0, 10))}`;
+  const tradingSessions = tradingSessionsBetween(rangeFetchFrom, rangeFetchTo, options.calendar);
+  const perSession = new Map<string, number>(tradingSessions.map((date) => [date, 0]));
+  const inRange = new Map<string, string[]>();
+  for (const [securityId, dates] of dailyBars) {
+    const kept: string[] = [];
+    for (const date of dates) {
+      if (date < rangeFetchFrom || date > rangeFetchTo) continue;
+      kept.push(date);
+      const count = perSession.get(date);
+      if (count !== undefined) perSession.set(date, count + 1);
+    }
+    if (kept.length) inRange.set(securityId, kept.sort(byCodeUnit));
+  }
+  const missingSessions = tradingSessions.filter((date) => (perSession.get(date) ?? 0) === 0);
+  const medianSecuritiesPerSession = median([...perSession.values()]);
+
+  const byId = new Map(securities.map((s) => [s.securityId, s]));
   const planned: TenMinUniverseSecurity[] = [];
   const gaps: TenMinRangeGapEntry[] = [];
-  for (const security of [...securities].sort((a, b) => byCodeUnit(a.securityId, b.securityId))) {
-    const listed = listingInterval(security);
-    if (!overlaps(listed.from, listed.to, rangeFetchFrom, rangeFetchTo)) continue;
-    const overlapping = security.historicalSymbols.filter((entry) =>
-      overlaps(entry.effectiveFrom, entry.effectiveTo ?? "9999-12-31", rangeFetchFrom, rangeFetchTo),
-    );
-    if (!overlapping.length) {
-      if (!security.historicalSymbols.length && security.currentSymbol) {
-        const fetchFrom = maxDate(rangeFetchFrom, listed.from);
-        const fetchTo = minDate(rangeFetchTo, listed.to);
-        if (fetchFrom <= fetchTo) {
-          const fetch: TenMinRangePlannedFetch = {
-            securityId: security.securityId,
-            symbol: security.currentSymbol,
-            fetchFrom,
-            fetchTo,
-          };
-          planned.push({ securityId: security.securityId, fetches: [fetch] });
-        }
-        continue;
-      }
-      gaps.push({
-        securityId: security.securityId,
-        symbol: "",
-        reason: "NO_HISTORICAL_SYMBOL",
-        at: nowIso,
-      });
+  let currentSymbolFallbackCount = 0;
+  for (const securityId of [...inRange.keys()].sort(byCodeUnit)) {
+    const sessions = inRange.get(securityId)!;
+    const security = byId.get(securityId);
+    const resolved = security
+      ? backfillSymbolSpans(security, sessions)
+      : { spans: [], fallback: false };
+    if (resolved.fallback) currentSymbolFallbackCount += 1;
+    if (!resolved.spans.length) {
+      gaps.push({ securityId, symbol: "", reason: "NO_HISTORICAL_SYMBOL", at: nowIso });
       continue;
     }
-    const fetches: TenMinRangePlannedFetch[] = [];
-    for (const entry of overlapping) {
-      const fetchFrom = maxDate(maxDate(entry.effectiveFrom, rangeFetchFrom), listed.from);
-      const fetchTo = minDate(
-        minDate(entry.effectiveTo ?? rangeFetchTo, rangeFetchTo),
-        listed.to,
-      );
-      if (fetchFrom > fetchTo) continue;
-      fetches.push({
-        securityId: security.securityId,
-        symbol: entry.symbol,
-        fetchFrom,
-        fetchTo,
-      });
-    }
-    fetches.sort(
-      (a, b) =>
-        byCodeUnit(a.fetchFrom, b.fetchFrom) ||
-        byCodeUnit(a.fetchTo, b.fetchTo) ||
-        byCodeUnit(a.symbol, b.symbol),
-    );
-    if (!fetches.length) {
-      gaps.push({
-        securityId: security.securityId,
-        symbol: "",
-        reason: "NO_HISTORICAL_SYMBOL",
-        at: nowIso,
-      });
-      continue;
-    }
-    planned.push({ securityId: security.securityId, fetches });
+    planned.push({
+      securityId,
+      fetches: resolved.spans.map((span) => ({
+        securityId,
+        symbol: span.symbol,
+        fetchFrom: span.from,
+        fetchTo: span.to,
+      })),
+    });
   }
+  const noDailyBar = securities
+    .map((s) => s.securityId)
+    .filter((securityId) => !inRange.has(securityId))
+    .sort(byCodeUnit);
+
+  const fetches = planned.flatMap((s) => s.fetches);
+  const range = `${rangeFetchFrom}_${rangeFetchTo}`;
+  let refusal: TenMinUniversePlan["refusal"];
+  if (missingSessions.length)
+    refusal = {
+      code: TENMIN_DAILY_COVERAGE_HOLE,
+      message: `${TENMIN_DAILY_COVERAGE_HOLE}:${range}:missing=${missingSessions.join(",")}`,
+    };
+  else if (!fetches.length)
+    refusal = {
+      code: TENMIN_UNIVERSE_EMPTY,
+      message: `${TENMIN_UNIVERSE_EMPTY}:${range}:securities=0:gaps=${gaps.length}`,
+    };
+  else if (planned.length < TENMIN_MIN_UNIVERSE_RATIO * medianSecuritiesPerSession)
+    refusal = {
+      code: TENMIN_UNIVERSE_TOO_SMALL,
+      message: `${TENMIN_UNIVERSE_TOO_SMALL}:${range}:planned=${planned.length}:median=${medianSecuritiesPerSession}:ratio=${TENMIN_MIN_UNIVERSE_RATIO}`,
+    };
   return {
     securities: planned,
-    fetches: planned.flatMap((s) => s.fetches),
+    fetches,
     gaps,
+    tradingSessions,
+    missingSessions,
+    medianSecuritiesPerSession,
+    noDailyBarCount: noDailyBar.length,
+    noDailyBarSample: noDailyBar.slice(0, TENMIN_NO_DAILY_BAR_SAMPLE_SIZE),
+    currentSymbolFallbackCount,
+    securityLink: TENMIN_SECURITY_LINK,
+    linkSource,
+    ...(refusal ? { refusal } : {}),
   };
+}
+
+/** Load the stored-daily-bar index for just the months [from, to] touches. */
+export async function loadDailyBarSessionsForRange(
+  load: (month: string) => Promise<DailyBarSessionIndex>,
+  from: string,
+  to: string,
+): Promise<DailyBarSessionIndex> {
+  const merged: DailyBarSessionIndex = new Map();
+  for (const month of monthsBetween(from, to)) {
+    for (const [securityId, dates] of await load(month)) {
+      const target = merged.get(securityId);
+      if (!target) merged.set(securityId, dates);
+      else for (const date of dates) target.add(date);
+    }
+  }
+  return merged;
 }
 
 export interface TenMinHistoryRangeReport {
@@ -352,6 +474,12 @@ export interface TenMinHistoryRangeReport {
   fallbackFiles: number;
   massiveRequests: number;
   zstdVersion: string;
+  /** Present when the range was planned this run (not skipped as already sealed). */
+  securityLink?: typeof TENMIN_SECURITY_LINK;
+  coverage?: { tradingSessions: number; missingSessions: string[]; medianSecuritiesPerSession: number };
+  /** Known gap, not an error: master securities with no stored daily bar in the range. */
+  noDailyBar?: { reason: typeof TENMIN_NO_DAILY_BAR; count: number; sampleSecurityIds: string[] };
+  currentSymbolFallbackCount?: number;
 }
 
 export interface TenMinHistoryRunReport {
@@ -363,6 +491,8 @@ export interface TenMinHistoryRunReport {
   lastCompletedSession: string;
   skippedBefore: Array<{ calendarFrom: string; calendarTo: string }>;
   reopen: boolean;
+  /** securityId -> ticker links come from today's master. */
+  securityLink: typeof TENMIN_SECURITY_LINK;
   ranges: TenMinHistoryRangeReport[];
   yieldedForScan?: string;
   outageStop?: string;
@@ -392,6 +522,8 @@ export async function runTenMinHistory(options: {
   provider?: MassiveMarketProvider;
   providerName?: string;
   securities?: readonly SecurityMasterRecord[];
+  /** Stored daily bars index for one YYYY-MM month. Defaults to storage.loadDailyBarSessions. */
+  loadDailyBarSessions?: (month: string) => Promise<DailyBarSessionIndex>;
   windowStart?: string;
   lastCompletedSession?: string;
   maxRanges?: number;
@@ -456,6 +588,8 @@ export async function runTenMinHistory(options: {
   });
   const ranges = plan.ranges.slice(0, options.maxRanges ?? Number.MAX_SAFE_INTEGER);
   const securities = options.securities ?? (await storage.loadSecurities());
+  const loadDailyBarSessions =
+    options.loadDailyBarSessions ?? ((month: string) => storage.loadDailyBarSessions(month));
   const reopen = options.reopen === true;
   const runId = `tenmin-history-${stamp().replaceAll(/[^0-9]/gu, "").slice(0, 17)}`;
   const rangeReports: TenMinHistoryRangeReport[] = [];
@@ -473,47 +607,82 @@ export async function runTenMinHistory(options: {
       yieldedForScan = pause;
       break;
     }
-    const universe = universeForTenMinRange(
-      securities,
-      range.fetchFrom,
-      range.fetchTo,
-      stamp(),
-    );
-    // Never seal a range with nothing planned: an empty universe means the plan is broken
-    // (e.g. a master with no listing dates), not that the market had no securities.
-    if (universe.fetches.length === 0) {
-      const message = `${TENMIN_UNIVERSE_EMPTY}:${range.calendarFrom}_${range.calendarTo}:securities=${universe.securities.length}:gaps=${universe.gaps.length}`;
-      rangeReports.push({
-        calendarFrom: range.calendarFrom,
-        calendarTo: range.calendarTo,
-        fetchFrom: range.fetchFrom,
-        fetchTo: range.fetchTo,
-        status: "ERROR",
-        error: message,
-        securitiesPlanned: universe.securities.length + universe.gaps.length,
-        fetchesPlanned: 0,
-        securitiesWritten: 0,
-        securitiesResumed: 0,
-        gaps: universe.gaps,
-        symbolChangeWarnings: [],
-        fallbackFiles: 0,
-        massiveRequests: 0,
-        zstdVersion,
-      });
-      stoppedOnError = true;
-      error = message;
-      break;
-    }
+    const base = {
+      calendarFrom: range.calendarFrom,
+      calendarTo: range.calendarTo,
+      fetchFrom: range.fetchFrom,
+      fetchTo: range.fetchTo,
+    };
+    let universe: TenMinUniversePlan | undefined;
     try {
+      // A non-empty sealed range is skipped without reading ~200 MB of daily bars. (A manifest
+      // sealed with 0 securities is not a seal; the writer replans it.)
+      const sealed = reopen
+        ? undefined
+        : await readTenMinRangeManifest(store, range.calendarFrom, range.calendarTo, { allowEmpty: true });
+      const skipPlanning = !!sealed && !isEmptyTenMinRangeManifest(sealed);
+      if (!skipPlanning) {
+        const dailyBars = await loadDailyBarSessionsForRange(loadDailyBarSessions, range.fetchFrom, range.fetchTo);
+        universe = universeForTenMinRange(securities, dailyBars, range.fetchFrom, range.fetchTo, {
+          nowIso: stamp(),
+        });
+        dailyBars.clear();
+      }
+      const planFields = universe
+        ? {
+            securityLink: universe.securityLink,
+            coverage: {
+              tradingSessions: universe.tradingSessions.length,
+              missingSessions: universe.missingSessions,
+              medianSecuritiesPerSession: universe.medianSecuritiesPerSession,
+            },
+            noDailyBar: {
+              reason: TENMIN_NO_DAILY_BAR,
+              count: universe.noDailyBarCount,
+              sampleSecurityIds: universe.noDailyBarSample,
+            },
+            currentSymbolFallbackCount: universe.currentSymbolFallbackCount,
+          }
+        : {};
+      const plannedCounts = universe
+        ? {
+            securitiesPlanned: universe.securities.length + universe.gaps.length,
+            fetchesPlanned: universe.fetches.length,
+          }
+        : { securitiesPlanned: sealed?.securityCount ?? 0, fetchesPlanned: 0 };
+      // Fail closed before any fetch: a coverage hole, an empty plan, or a too-small universe
+      // means there is no complete universe for this range, so it is neither fetched nor sealed.
+      if (universe?.refusal) {
+        rangeReports.push({
+          ...base,
+          status: "ERROR",
+          error: universe.refusal.message,
+          ...plannedCounts,
+          securitiesWritten: 0,
+          securitiesResumed: 0,
+          gaps: universe.gaps,
+          symbolChangeWarnings: [],
+          fallbackFiles: 0,
+          massiveRequests: 0,
+          zstdVersion,
+          ...planFields,
+        });
+        stoppedOnError = true;
+        error = universe.refusal.message;
+        break;
+      }
       const result = await writeTenMinRangeReplyDust({
         store,
         root,
         provider: providerName,
         from: range.calendarFrom,
         to: range.calendarTo,
-        fetches: universe.fetches,
-        initialGaps: universe.gaps,
+        fetches: universe?.fetches ?? [],
+        initialGaps: universe?.gaps ?? [],
         ...(reopen ? { reopen: true } : {}),
+        ...(universe
+          ? { securityLink: { status: universe.securityLink, source: universe.linkSource } }
+          : {}),
         shouldYield,
         fetchPages,
         ...(options.zstdVersionProbe ? { zstdVersionProbe: options.zstdVersionProbe } : {}),
@@ -525,59 +694,19 @@ export async function runTenMinHistory(options: {
         w.startsWith("TENMIN_RANGE_SYMBOL_CHANGED:"),
       );
       warnings.push(...(result.warnings ?? []));
-      if (result.outageStop) {
-        outageStop = result.outageStop;
-        rangeReports.push({
-          calendarFrom: range.calendarFrom,
-          calendarTo: range.calendarTo,
-          fetchFrom: range.fetchFrom,
-          fetchTo: range.fetchTo,
-          status: "OUTAGE_STOP",
-          securitiesPlanned: universe.securities.length + universe.gaps.length,
-          fetchesPlanned: universe.fetches.length,
-          securitiesWritten: result.securitiesWritten.length,
-          securitiesResumed: result.securitiesResumed.length,
-          gaps: result.gaps,
-          symbolChangeWarnings: symbolWarnings,
-          fallbackFiles: result.fallbackFiles,
-          massiveRequests: result.massiveRequests,
-          zstdVersion: result.zstdVersion,
-        });
-        break;
-      }
-      if (result.yieldedForScan) {
-        yieldedForScan = result.yieldedForScan;
-        rangeReports.push({
-          calendarFrom: range.calendarFrom,
-          calendarTo: range.calendarTo,
-          fetchFrom: range.fetchFrom,
-          fetchTo: range.fetchTo,
-          status: "PARTIAL",
-          securitiesPlanned: universe.securities.length + universe.gaps.length,
-          fetchesPlanned: universe.fetches.length,
-          securitiesWritten: result.securitiesWritten.length,
-          securitiesResumed: result.securitiesResumed.length,
-          gaps: result.gaps,
-          symbolChangeWarnings: symbolWarnings,
-          fallbackFiles: result.fallbackFiles,
-          massiveRequests: result.massiveRequests,
-          zstdVersion: result.zstdVersion,
-        });
-        break;
-      }
-      const status: TenMinHistoryRangeReport["status"] = result.alreadySealed
-        ? "ALREADY_SEALED"
-        : reopen
-          ? "REOPENED"
-          : "SEALED";
+      const status: TenMinHistoryRangeReport["status"] = result.outageStop
+        ? "OUTAGE_STOP"
+        : result.yieldedForScan
+          ? "PARTIAL"
+          : result.alreadySealed
+            ? "ALREADY_SEALED"
+            : reopen
+              ? "REOPENED"
+              : "SEALED";
       rangeReports.push({
-        calendarFrom: range.calendarFrom,
-        calendarTo: range.calendarTo,
-        fetchFrom: range.fetchFrom,
-        fetchTo: range.fetchTo,
+        ...base,
         status,
-        securitiesPlanned: universe.securities.length + universe.gaps.length,
-        fetchesPlanned: universe.fetches.length,
+        ...plannedCounts,
         securitiesWritten: result.securitiesWritten.length,
         securitiesResumed: result.securitiesResumed.length,
         gaps: result.gaps,
@@ -585,7 +714,16 @@ export async function runTenMinHistory(options: {
         fallbackFiles: result.fallbackFiles,
         massiveRequests: result.massiveRequests,
         zstdVersion: result.zstdVersion,
+        ...planFields,
       });
+      if (result.outageStop) {
+        outageStop = result.outageStop;
+        break;
+      }
+      if (result.yieldedForScan) {
+        yieldedForScan = result.yieldedForScan;
+        break;
+      }
     } catch (err) {
       stoppedOnError = true;
       error = err instanceof Error ? err.message : String(err);
@@ -602,6 +740,7 @@ export async function runTenMinHistory(options: {
     lastCompletedSession: lastCompleted,
     skippedBefore: plan.skippedBefore,
     reopen,
+    securityLink: TENMIN_SECURITY_LINK,
     ranges: rangeReports,
     ...(yieldedForScan ? { yieldedForScan } : {}),
     ...(outageStop ? { outageStop } : {}),
