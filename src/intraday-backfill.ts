@@ -19,6 +19,11 @@ import {
 import { intradaySessionSpec } from "./intraday";
 import { MassiveMarketProvider } from "./massive-provider";
 import { REPLY_DUST_FALLBACK_VERSION, type ReplyDustBackend } from "./reply-dust";
+import {
+  type ZstdVersionProbe,
+  assertPinnedZstdForWriting,
+  replyDustRunReport,
+} from "./reply-dust-pin";
 import { DustReader } from "./reader";
 import { MarketStorage } from "./storage";
 import { EphemeralValidationBuffer, sealValidatedDustSession } from "./validation";
@@ -52,6 +57,10 @@ export interface IntradayBackfillResult {
   replyDustFilesWritten?: number;
   /** Present only with replyDust on: files written as the raw-zstd fallback (0x81). */
   replyDustFallbackFiles?: number;
+  /** Present only with replyDust on: the pinned zstd version the run checked before writing. */
+  replyDustZstdVersion?: string;
+  /** Run warnings (not failures), e.g. REPLY_DUST_FALLBACK_FILES:<n> when fallback files > 0. */
+  warnings?: string[];
 }
 
 function parseDate(value: string): Date {
@@ -210,8 +219,14 @@ export async function backfillHistoricalIntradayEvidence(options: {
   /** Where Reply Dust files go; defaults to the local market root. */
   replyDustStore?: ReplyDustStore;
   replyDustBackend?: ReplyDustBackend;
+  /** Tests inject this; production asks the zstd program. */
+  zstdVersionProbe?: ZstdVersionProbe;
 }): Promise<IntradayBackfillResult> {
   const replyDust = options.replyDust === true;
+  // Checked once per run, before anything is fetched or written.
+  const replyDustZstdVersion = replyDust
+    ? assertPinnedZstdForWriting(options.zstdVersionProbe)
+    : undefined;
   const provider =
     options.provider ?? new MassiveMarketProvider(replyDust ? { keepRawReplies: true } : {});
   if (!provider.getIntradayBars) throw new Error("INTRADAY_PROVIDER_UNSUPPORTED");
@@ -375,6 +390,8 @@ export async function backfillHistoricalIntradayEvidence(options: {
     barsStored,
     sealedArchives,
     stoppedOnError,
-    ...(replyDust ? { replyDustFilesWritten, replyDustFallbackFiles } : {}),
+    ...(replyDustZstdVersion
+      ? replyDustRunReport(replyDustFilesWritten, replyDustFallbackFiles, replyDustZstdVersion)
+      : {}),
   };
 }

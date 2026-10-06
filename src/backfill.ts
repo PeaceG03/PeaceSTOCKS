@@ -20,6 +20,11 @@ import {
 } from "./massive-provider";
 import { openMarketStore } from "./object-storage";
 import { REPLY_DUST_FALLBACK_VERSION, type ReplyDustBackend } from "./reply-dust";
+import {
+  type ZstdVersionProbe,
+  assertPinnedZstdForWriting,
+  replyDustRunReport,
+} from "./reply-dust-pin";
 import { MarketStorage, type MarketStore } from "./storage";
 import { refreshEligibility, refreshUniverse } from "./universe";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
@@ -57,6 +62,10 @@ export interface BackfillResult {
   replyDustFilesWritten?: number;
   /** Present only with replyDust on: files written as the raw-zstd fallback (0x81). */
   replyDustFallbackFiles?: number;
+  /** Present only with replyDust on: the pinned zstd version the run checked before writing. */
+  replyDustZstdVersion?: string;
+  /** Run warnings (not failures), e.g. REPLY_DUST_FALLBACK_FILES:<n> when fallback files > 0. */
+  warnings?: string[];
 }
 
 function parseDate(value: string): Date {
@@ -213,10 +222,16 @@ export async function backfillHistoricalEvidence(options: {
   /** Where Reply Dust files go. Defaults to the local root only when storage is local. */
   replyDustStore?: ReplyDustStore;
   replyDustBackend?: ReplyDustBackend;
+  /** Tests inject this; production asks the zstd program. */
+  zstdVersionProbe?: ZstdVersionProbe;
 }): Promise<BackfillResult> {
   const env = options.env ?? process.env;
   requireObjectStore(env);
   const replyDust = options.replyDust === true;
+  // Checked once per run, before anything is fetched or written.
+  const replyDustZstdVersion = replyDust
+    ? assertPinnedZstdForWriting(options.zstdVersionProbe)
+    : undefined;
   const provider =
     options.provider ?? new MassiveMarketProvider(replyDust ? { keepRawReplies: true } : {});
   if (replyDust && !provider.takeRawReplies) throw new Error("REPLY_DUST_PROVIDER_KEEPS_NO_REPLIES");
@@ -397,7 +412,9 @@ export async function backfillHistoricalEvidence(options: {
     stoppedOnError,
     ...(yieldedForScan ? { yieldedForScan } : {}),
     eligibility,
-    ...(replyDust ? { replyDustFilesWritten, replyDustFallbackFiles } : {}),
+    ...(replyDustZstdVersion
+      ? replyDustRunReport(replyDustFilesWritten, replyDustFallbackFiles, replyDustZstdVersion)
+      : {}),
   };
 }
 

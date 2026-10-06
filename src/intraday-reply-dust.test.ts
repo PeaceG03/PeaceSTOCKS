@@ -29,6 +29,7 @@ import {
 import { MarketStorage } from "./storage";
 
 const SESSION = "2026-01-02";
+const pinnedZstd = () => "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***";
 const at = (time: string) => Date.parse(`${SESSION}T${time}:00.000Z`);
 
 function security(symbol: string): SecurityMasterRecord {
@@ -111,11 +112,13 @@ test("the same 10-minute reply gives identical canonical bars via old .dust and 
   try {
     const fetches: Record<string, number> = {};
     const result = await backfillHistoricalIntradayEvidence({
-      root, from: SESSION, to: SESSION, provider: fakeMassive(fetches), replyDust: true,
+      root, from: SESSION, to: SESSION, provider: fakeMassive(fetches), replyDust: true, zstdVersionProbe: pinnedZstd,
     });
     assert.deepEqual(result.completedSessions, [SESSION]);
     assert.equal(result.replyDustFilesWritten, 2);
     assert.equal(result.replyDustFallbackFiles, 0);
+    assert.equal(result.replyDustZstdVersion, "1.5.7");
+    assert.equal("warnings" in result, false);
     assert.deepEqual(fetches, { AAA: 1, BBB: 1 });
     const store = new FileReplyDustStore(root);
     const manifest = await readReplyDustManifest(store, SESSION);
@@ -159,7 +162,7 @@ test("a store failing mid-session never advances progress past unwritten data", 
     const fetches: Record<string, number> = {};
     const provider = fakeMassive(fetches);
     const first = await backfillHistoricalIntradayEvidence({
-      root, from: SESSION, to: SESSION, provider, replyDust: true, replyDustStore: store,
+      root, from: SESSION, to: SESSION, provider, replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: store,
     });
     assert.equal(first.stoppedOnError, true);
     assert.match(first.failedSessions[SESSION] ?? "", /STORE_DOWN/u);
@@ -178,7 +181,7 @@ test("a store failing mid-session never advances progress past unwritten data", 
 
     // Resume: only the unwritten file is fetched again; the written one is read back from the store.
     const second = await backfillHistoricalIntradayEvidence({
-      root, from: SESSION, to: SESSION, provider, replyDust: true, replyDustStore: store,
+      root, from: SESSION, to: SESSION, provider, replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: store,
     });
     assert.deepEqual(second.completedSessions, [SESSION]);
     assert.equal(second.replyDustFilesWritten, 1);
@@ -208,12 +211,16 @@ test("a reply that falls back to raw zstd is still stored, counted, and decodes 
     const store = new MemoryObjectClient();
     const result = await backfillHistoricalIntradayEvidence({
       root, from: SESSION, to: SESSION, provider: fakeMassive({}),
-      replyDust: true, replyDustStore: store, replyDustBackend: brokenTransform,
+      replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: store, replyDustBackend: brokenTransform,
     });
     assert.deepEqual(result.completedSessions, [SESSION]);
     assert.equal(result.stoppedOnError, false);
     assert.equal(result.replyDustFilesWritten, 1);
     assert.equal(result.replyDustFallbackFiles, 1);
+    // Run report: a warning, not a failure.
+    assert.deepEqual(result.warnings, ["REPLY_DUST_FALLBACK_FILES:1"]);
+    assert.equal(result.replyDustZstdVersion, "1.5.7");
+    assert.deepEqual(result.failedSessions, {});
     const id = securityId("massive-stocks", "AAA", "STOCK");
     const file = await store.get(replyDustFileKey(SESSION, id));
     assert.equal(file?.[0], REPLY_DUST_FALLBACK_VERSION);
@@ -257,4 +264,63 @@ test("a failed final decode-compare stops that file before anything is written",
     /REPLY_DUST_WRITE_VERIFY_FAILED/u,
   );
   assert.deepEqual(await store.list(""), []);
+});
+
+for (const [label, probe, error] of [
+  ["missing", () => undefined, /^Error: REPLY_DUST_ZSTD_MISSING$/u],
+  ["a different version of", () => "*** Zstandard CLI (64-bit) v1.5.6, by Yann Collet ***", /^Error: REPLY_DUST_ZSTD_VERSION:1\.5\.6$/u],
+] as const) {
+  test(`10-minute Reply Dust refuses to start with zstd ${label} and writes nothing`, async () => {
+    const root = await marketRoot(["AAA"]);
+    try {
+      const fetches: Record<string, number> = {};
+      const store = new MemoryObjectClient();
+      await assert.rejects(
+        backfillHistoricalIntradayEvidence({
+          root, from: SESSION, to: SESSION, provider: fakeMassive(fetches),
+          replyDust: true, replyDustStore: store, zstdVersionProbe: probe,
+        }),
+        (caught: unknown) => error.test(String(caught)),
+      );
+      assert.deepEqual(fetches, {});
+      assert.deepEqual(await store.list(""), []);
+      assert.equal(await exists(join(root, "intraday-backfill-state.json")), false);
+      assert.equal(await exists(join(root, "permanent", "intraday-reply-dust")), false);
+      assert.equal(await exists(join(root, "transient", "reply-dust-progress")), false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("10-minute zstd pin is checked once per run and never with the switch off", async () => {
+  const root = await marketRoot(["AAA", "BBB"]);
+  try {
+    let probes = 0;
+    const counted = () => {
+      probes += 1;
+      return pinnedZstd();
+    };
+    const store = new MemoryObjectClient();
+    const on = await backfillHistoricalIntradayEvidence({
+      root, from: SESSION, to: "2026-01-06", provider: fakeMassive({}),
+      replyDust: true, replyDustStore: store, zstdVersionProbe: counted,
+    });
+    assert.equal(on.replyDustFilesWritten, 2 * on.completedSessions.length);
+    assert.equal(probes, 1);
+    const offRoot = await marketRoot(["AAA"]);
+    try {
+      const off = await backfillHistoricalIntradayEvidence({
+        root: offRoot, from: SESSION, to: SESSION, provider: fakeMassive({}),
+        zstdVersionProbe: () => {
+          throw new Error("probe must not run with replyDust off");
+        },
+      });
+      assert.deepEqual(off.completedSessions, [SESSION]);
+    } finally {
+      await rm(offRoot, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

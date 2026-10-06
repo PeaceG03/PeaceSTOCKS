@@ -23,6 +23,7 @@ import {
 } from "./reply-dust";
 
 const DAYS = ["2026-01-20", "2026-01-21", "2026-01-22"];
+const pinnedZstd = () => "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***";
 const universe: ProviderSecurityRecord[] = [
   { provider: "massive-stocks", providerSecurityId: "AAA", symbol: "AAA", assetType: "STOCK", country: "US", exchange: "XNYS", active: true, tradable: true },
   { provider: "massive-stocks", providerSecurityId: "SPY", symbol: "SPY", assetType: "ETF", country: "US", exchange: "ARCX", active: true, tradable: true },
@@ -87,7 +88,7 @@ test("daily Reply Dust needs an explicit store when market storage is not local"
   await assert.rejects(
     backfillHistoricalEvidence({
       root: "/unused", from: DAYS[0]!, to: DAYS[0]!, provider: harness({}).provider,
-      storage: new ObjectMarketStorage(new MemoryObjectClient()), env: {}, replyDust: true,
+      storage: new ObjectMarketStorage(new MemoryObjectClient()), env: {}, replyDust: true, zstdVersionProbe: pinnedZstd,
     }),
     /REPLY_DUST_STORE_REQUIRED/u,
   );
@@ -99,11 +100,13 @@ test("the same grouped reply gives identical daily bars via the live path and th
   const fetches: Record<string, number> = {};
   const result = await backfillHistoricalEvidence({
     root: "/unused", from: DAYS[0]!, to: DAYS[2]!, provider: harness(fetches).provider,
-    storage, env: {}, replyDust: true, replyDustStore: client,
+    storage, env: {}, replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: client,
   });
   assert.deepEqual(result.completedSessions, DAYS);
   assert.equal(result.replyDustFilesWritten, 3);
   assert.equal(result.replyDustFallbackFiles, 0);
+  assert.equal(result.replyDustZstdVersion, "1.5.7");
+  assert.equal("warnings" in result, false);
   for (const day of DAYS) {
     const manifest = await readDailyReplyDustManifest(client, day);
     assert.ok(manifest);
@@ -140,7 +143,7 @@ test("a store failing mid-run does not store bars or advance progress for that d
   const fetches: Record<string, number> = {};
   const { provider } = harness(fetches);
   const run = () => backfillHistoricalEvidence({
-    root: "/unused", from: DAYS[0]!, to: DAYS[2]!, provider, storage, env: {}, replyDust: true, replyDustStore: client,
+    root: "/unused", from: DAYS[0]!, to: DAYS[2]!, provider, storage, env: {}, replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: client,
   });
   const first = await run();
   assert.equal(first.stoppedOnError, true);
@@ -178,7 +181,7 @@ test("a day already sealed in Reply Dust is rebuilt from the store, not fetched 
   const fetches: Record<string, number> = {};
   const { provider } = harness(fetches);
   const run = () => backfillHistoricalEvidence({
-    root: "/unused", from: DAYS[0]!, to: DAYS[0]!, provider, storage, env: {}, replyDust: true, replyDustStore: client,
+    root: "/unused", from: DAYS[0]!, to: DAYS[0]!, provider, storage, env: {}, replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: client,
   });
   const first = await run();
   assert.equal(first.stoppedOnError, true);
@@ -203,12 +206,16 @@ test("a grouped reply that falls back to raw zstd is still stored, counted, and 
   const storage = new ObjectMarketStorage(client);
   const result = await backfillHistoricalEvidence({
     root: "/unused", from: DAYS[0]!, to: DAYS[0]!, provider: harness({}).provider, storage, env: {},
-    replyDust: true, replyDustStore: client, replyDustBackend: brokenTransform,
+    replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: client, replyDustBackend: brokenTransform,
   });
   assert.deepEqual(result.completedSessions, [DAYS[0]]);
   assert.equal(result.stoppedOnError, false);
   assert.equal(result.replyDustFilesWritten, 1);
   assert.equal(result.replyDustFallbackFiles, 1);
+  // Run report: a warning, not a failure.
+  assert.deepEqual(result.warnings, ["REPLY_DUST_FALLBACK_FILES:1"]);
+  assert.equal(result.replyDustZstdVersion, "1.5.7");
+  assert.deepEqual(result.failedSessions, {});
   const file = await client.get(dailyReplyDustFileKey(DAYS[0]!));
   assert.equal(file?.[0], REPLY_DUST_FALLBACK_VERSION);
   assert.deepEqual(decodeReplyDust(file!), new TextEncoder().encode(grouped(DAYS[0]!)));
@@ -256,4 +263,47 @@ test("a whole-market grouped reply (10k tickers) encodes as Reply Dust v1, not t
   assert.equal(encoded[0], REPLY_DUST_VERSION);
   assert.ok(encoded.length < body.length / 2);
   assert.deepEqual(decodeReplyDust(encoded), body);
+});
+
+for (const [label, probe, error] of [
+  ["missing", () => undefined, /^Error: REPLY_DUST_ZSTD_MISSING$/u],
+  ["a different version of", () => "*** Zstandard CLI (64-bit) v1.5.8, by Yann Collet ***", /^Error: REPLY_DUST_ZSTD_VERSION:1\.5\.8$/u],
+] as const) {
+  test(`daily Reply Dust refuses to start with zstd ${label} and writes nothing`, async () => {
+    const client = new MemoryObjectClient();
+    const fetches: Record<string, number> = {};
+    await assert.rejects(
+      backfillHistoricalEvidence({
+        root: "/unused", from: DAYS[0]!, to: DAYS[0]!, provider: harness(fetches).provider,
+        storage: new ObjectMarketStorage(client), env: {}, replyDust: true, replyDustStore: client,
+        zstdVersionProbe: probe,
+      }),
+      (caught: unknown) => error.test(String(caught)),
+    );
+    assert.deepEqual(fetches, {});
+    assert.deepEqual(await client.list(""), []);
+  });
+}
+
+test("daily zstd pin is checked once per run and never with the switch off", async () => {
+  let probes = 0;
+  const client = new MemoryObjectClient();
+  const on = await backfillHistoricalEvidence({
+    root: "/unused", from: DAYS[0]!, to: DAYS[2]!, provider: harness({}).provider,
+    storage: new ObjectMarketStorage(client), env: {}, replyDust: true, replyDustStore: client,
+    zstdVersionProbe: () => {
+      probes += 1;
+      return pinnedZstd();
+    },
+  });
+  assert.equal(on.replyDustFilesWritten, 3);
+  assert.equal(probes, 1);
+  const off = await backfillHistoricalEvidence({
+    root: "/unused", from: DAYS[0]!, to: DAYS[0]!, provider: harness({}).provider,
+    storage: new ObjectMarketStorage(new MemoryObjectClient()), env: {},
+    zstdVersionProbe: () => {
+      throw new Error("probe must not run with replyDust off");
+    },
+  });
+  assert.deepEqual(off.completedSessions, [DAYS[0]]);
 });
