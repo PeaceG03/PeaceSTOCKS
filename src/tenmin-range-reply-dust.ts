@@ -32,6 +32,15 @@ export const TENMIN_RANGE_MANIFEST_SCHEMA = "tenmin-range-reply-dust-manifest-v2
 export const TENMIN_RANGE_PATH_ERROR = "TENMIN_RANGE_PATH_INVALID";
 export const TENMIN_RANGE_OUTAGE_STREAK = 5;
 export const TENMIN_RANGE_OUTAGE_STOP = "MASSIVE_OUTAGE";
+/**
+ * A range manifest sealed with 0 securities is never "complete, no data": readers refuse it, and
+ * the writer treats it as not sealed (and never seals one itself).
+ */
+export const TENMIN_UNIVERSE_EMPTY = "TENMIN_UNIVERSE_EMPTY";
+
+export function isEmptyTenMinRangeManifest(manifest: TenMinRangeManifest): boolean {
+  return manifest.securityCount === 0 || manifest.securities.length === 0;
+}
 
 export interface TenMinRangeFileEntry {
   page: number;
@@ -682,10 +691,15 @@ export async function writeTenMinRangeManifest(store: ReplyDustStore, manifest: 
     throw new Error("REPLY_DUST_MANIFEST_READBACK_MISMATCH");
 }
 
+/**
+ * Read and verify a sealed range manifest. A manifest sealed with 0 securities throws
+ * TENMIN_UNIVERSE_EMPTY unless allowEmpty is set (only the writer does that, to replace it).
+ */
 export async function readTenMinRangeManifest(
   store: ReplyDustStore,
   from: string,
   to: string,
+  options: { allowEmpty?: boolean } = {},
 ): Promise<TenMinRangeManifest | undefined> {
   const bytes = await store.get(tenMinRangeManifestKey(from, to));
   if (!bytes) return undefined;
@@ -698,6 +712,8 @@ export async function readTenMinRangeManifest(
     manifestChecksum(body) !== checksum
   )
     throw new Error("REPLY_DUST_MANIFEST_CHECKSUM_MISMATCH");
+  if (isEmptyTenMinRangeManifest(manifest) && options.allowEmpty !== true)
+    throw new Error(`${TENMIN_UNIVERSE_EMPTY}:${from}_${to}:sealed-manifest-has-0-securities`);
   return manifest;
 }
 
@@ -831,7 +847,10 @@ export async function writeTenMinRangeReplyDust(options: {
   requireRange(from, to);
   const zstdVersion = assertPinnedZstdForWriting(options.zstdVersionProbe);
   const stamp = options.now ?? (() => new Date().toISOString());
-  const existing = await readTenMinRangeManifest(store, from, to);
+  // An earlier manifest sealed with 0 securities is not a seal: plan the range from scratch and
+  // replace it.
+  const previous = await readTenMinRangeManifest(store, from, to, { allowEmpty: true });
+  const existing = previous && !isEmptyTenMinRangeManifest(previous) ? previous : undefined;
   const reopen = options.reopen === true;
   if (existing && !reopen)
     return {
@@ -1124,6 +1143,10 @@ export async function writeTenMinRangeReplyDust(options: {
     securities: groupSecurities(doneFetches),
     gaps: [...gaps.values()],
   });
+  if (isEmptyTenMinRangeManifest(manifest))
+    throw new Error(
+      `${TENMIN_UNIVERSE_EMPTY}:${from}_${to}:planned=${options.fetches.length}:gaps=${manifest.gaps.length}`,
+    );
   await writeTenMinRangeManifest(store, manifest);
   await rm(tenMinRangeProgressPath(root, from, to), { force: true });
   return {

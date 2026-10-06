@@ -17,7 +17,7 @@ import { collectionDue } from "./scheduler";
 import { MarketsScanner, type SessionCalendar } from "./scanner";
 import type { MarketStore } from "./storage";
 import { openMarketStore } from "./object-storage";
-import { runTenMinHistoryFromEnv } from "./tenmin-history";
+import { runTenMinHistoryFromEnv, tenMinHistorySummary } from "./tenmin-history";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 
 export const DEFAULT_MARKETS_ROOT = "C:\\ProgramData\\PeaceAI\\Markets";
@@ -333,15 +333,7 @@ async function main(): Promise<void> {
   const history = await runTenMinHistoryFromEnv(process.env);
   if (history) {
     process.stdout.write(
-      `${JSON.stringify({
-        mode: "tenmin-history",
-        runId: history.report.runId,
-        ranges: history.report.ranges.length,
-        massiveRequests: history.report.massiveRequests,
-        yieldedForScan: history.report.yieldedForScan,
-        stoppedOnError: history.report.stoppedOnError,
-        warnings: history.report.warnings,
-      })}\n`,
+      `${JSON.stringify(tenMinHistorySummary(history.report))}\n`,
     );
     process.exitCode = history.report.stoppedOnError ? 2 : 0;
     return;

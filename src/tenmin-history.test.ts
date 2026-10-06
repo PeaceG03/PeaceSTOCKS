@@ -15,11 +15,17 @@ import {
   planTenMinHistoryRanges,
   runTenMinHistory,
   runTenMinHistoryFromEnv,
+  TENMIN_UNIVERSE_EMPTY,
+  tenMinHistorySummary,
   universeForTenMinRange,
 } from "./tenmin-history";
 import {
+  buildTenMinRangeManifest,
+  readRangeReplies,
+  readRangeSecurityDay,
   readTenMinRangeManifest,
   tenMinRangeManifestKey,
+  writeTenMinRangeManifest,
   writeTenMinRangeReplyDust,
 } from "./tenmin-range-reply-dust";
 
@@ -635,4 +641,151 @@ test("history runner: store error during resume throws with zero new fetches", a
     assert.equal(fetches, 0);
     assert.equal(result.report.massiveRequests, 0);
   });
+});
+
+test("empty universe never seals: run stops with TENMIN_UNIVERSE_EMPTY and zero fetches", async () => {
+  await withRoot(async (root) => {
+    // Production-shaped master: no listing dates, first-seen dates in 2026 only.
+    const firstSeenOnly = master("LATE", {
+      firstSeenAt: "2026-10-02T00:00:00.000Z",
+      history: [{ symbol: "LATE", effectiveFrom: "2026-10-02", source: PROVIDER }],
+    });
+    for (const securities of [[], [firstSeenOnly]]) {
+      const store = new MemoryObjectClient();
+      let fetches = 0;
+      const result = await runTenMinHistory({
+        root,
+        store,
+        securities,
+        windowStart: "2024-10-07",
+        lastCompletedSession: "2026-10-05",
+        maxRanges: 2,
+        zstdVersionProbe: pinnedZstd,
+        env: {},
+        nowIso: () => AT,
+        fetchPages: async (s, f, t) => {
+          fetches += 1;
+          return pagesFor(s, f, t);
+        },
+      });
+      assert.equal(fetches, 0);
+      assert.equal(result.report.massiveRequests, 0);
+      assert.equal(result.report.stoppedOnError, true);
+      assert.match(result.report.error ?? "", new RegExp(`^${TENMIN_UNIVERSE_EMPTY}:2024-10-01_2024-11-30`));
+      // Stops at the first range; the second is never attempted.
+      assert.equal(result.report.ranges.length, 1);
+      assert.equal(result.report.ranges[0]?.status, "ERROR");
+      assert.equal(result.report.ranges[0]?.fetchesPlanned, 0);
+      assert.match(result.report.ranges[0]?.error ?? "", /TENMIN_UNIVERSE_EMPTY/);
+      assert.equal(result.rangeResults.length, 0);
+      assert.equal(await store.get(tenMinRangeManifestKey("2024-10-01", "2024-11-30")), undefined);
+      assert.equal(await readTenMinRangeManifest(store, "2024-10-01", "2024-11-30"), undefined);
+      // The stored run report carries the error too.
+      const reportKey = (await store.list("transient/tenmin-history-runs/"))[0]!;
+      const stored = JSON.parse(new TextDecoder().decode(await store.get(reportKey))) as {
+        stoppedOnError: boolean;
+        error?: string;
+        ranges: Array<{ status: string }>;
+      };
+      assert.equal(stored.stoppedOnError, true);
+      assert.match(stored.error ?? "", /TENMIN_UNIVERSE_EMPTY/);
+      assert.equal(stored.ranges[0]?.status, "ERROR");
+      // Host summary line shows the per-range status and plan sizes.
+      const summary = tenMinHistorySummary(result.report);
+      assert.equal(summary.mode, "tenmin-history");
+      assert.deepEqual((summary.ranges as unknown[])[0], {
+        range: "2024-10-01_2024-11-30",
+        status: "ERROR",
+        securitiesPlanned: 0,
+        fetchesPlanned: 0,
+        error: result.report.ranges[0]?.error,
+      });
+      assert.match(String(summary.error), /TENMIN_UNIVERSE_EMPTY/);
+    }
+  });
+});
+
+async function sealEmptyManifest(store: MemoryObjectClient): Promise<void> {
+  // What the bad first production run left behind: a manifest sealed with nothing in it.
+  await writeTenMinRangeManifest(
+    store,
+    buildTenMinRangeManifest({ provider: PROVIDER, from: "2024-10-01", to: "2024-11-30", securities: [] }),
+  );
+}
+
+test("reader refuses a manifest sealed with 0 securities; a normal sealed manifest still reads", async () => {
+  await withRoot(async (root) => {
+    const store = new MemoryObjectClient();
+    await sealEmptyManifest(store);
+    await assert.rejects(() => readTenMinRangeManifest(store, "2024-10-01", "2024-11-30"), /TENMIN_UNIVERSE_EMPTY/);
+    await assert.rejects(() => readRangeReplies(store, "2024-10-01", "2024-11-30", id("AAA")), /TENMIN_UNIVERSE_EMPTY/);
+    await assert.rejects(
+      () => readRangeSecurityDay(store, "2024-10-01", "2024-11-30", id("AAA"), "2024-10-28"),
+      /TENMIN_UNIVERSE_EMPTY/,
+    );
+    // The writer never seals an empty range itself.
+    const other = new MemoryObjectClient();
+    await assert.rejects(
+      () =>
+        writeTenMinRangeReplyDust({
+          store: other,
+          root,
+          provider: PROVIDER,
+          from: "2024-12-01",
+          to: "2025-01-31",
+          fetches: [],
+          zstdVersionProbe: pinnedZstd,
+          fetchPages: async () => {
+            throw new Error("unexpected fetch");
+          },
+        }),
+      /TENMIN_UNIVERSE_EMPTY/,
+    );
+    assert.equal(await other.get(tenMinRangeManifestKey("2024-12-01", "2025-01-31")), undefined);
+    // A normal sealed manifest reads fine.
+    await writeTenMinRangeReplyDust({
+      store: other,
+      root,
+      provider: PROVIDER,
+      from: "2024-12-01",
+      to: "2025-01-31",
+      fetches: [{ securityId: id("AAA"), symbol: "AAA", fetchFrom: "2024-12-02", fetchTo: "2025-01-31" }],
+      zstdVersionProbe: pinnedZstd,
+      fetchPages: (s, f, t) => Promise.resolve(pagesFor(s, f, t)),
+    });
+    const manifest = (await readTenMinRangeManifest(other, "2024-12-01", "2025-01-31"))!;
+    assert.equal(manifest.securityCount, 1);
+    assert.equal((await readRangeReplies(other, "2024-12-01", "2025-01-31", id("AAA"))).length, 1);
+  });
+});
+
+test("a range sealed earlier with 0 securities is not a seal: runs (and reopen) plan every member", async () => {
+  for (const reopen of [false, true]) {
+    await withRoot(async (root) => {
+      const store = new MemoryObjectClient();
+      await sealEmptyManifest(store);
+      const fetched: string[] = [];
+      const result = await runTenMinHistory({
+        root,
+        store,
+        securities: [master("AAA"), master("BBB")],
+        windowStart: "2024-10-07",
+        lastCompletedSession: "2024-12-01",
+        maxRanges: 1,
+        reopen,
+        writeReport: false,
+        zstdVersionProbe: pinnedZstd,
+        env: {},
+        nowIso: () => AT,
+        fetchPages: async (s, f, t) => {
+          fetched.push(`${s.symbol}:${f}_${t}`);
+          return pagesFor(s, f, t);
+        },
+      });
+      assert.equal(result.report.ranges[0]?.status, reopen ? "REOPENED" : "SEALED");
+      assert.deepEqual(fetched.sort(), ["AAA:2024-10-07_2024-11-30", "BBB:2024-10-07_2024-11-30"]);
+      const manifest = (await readTenMinRangeManifest(store, "2024-10-01", "2024-11-30"))!;
+      assert.equal(manifest.securityCount, 2);
+    });
+  }
 });

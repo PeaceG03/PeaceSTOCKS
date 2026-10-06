@@ -12,6 +12,7 @@ import type { MarketStore } from "./storage";
 import { MarketStorage } from "./storage";
 import { prepareSafeStoreFile } from "./store-path";
 import {
+  TENMIN_UNIVERSE_EMPTY,
   type TenMinRangeGapEntry,
   type TenMinRangePlannedFetch,
   type TenMinRangeWriteResult,
@@ -23,6 +24,9 @@ import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 export const DEFAULT_TENMIN_HISTORY_WINDOW_START = "2024-10-07";
 
 export const TENMIN_HISTORY_RUN_SCHEMA = "tenmin-history-run-v1" as const;
+
+/** A range whose plan has no fetches is never sealed; the run stops with this error. */
+export { TENMIN_UNIVERSE_EMPTY };
 
 const byCodeUnit = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -336,7 +340,9 @@ export interface TenMinHistoryRangeReport {
   calendarTo: string;
   fetchFrom: string;
   fetchTo: string;
-  status: "SEALED" | "ALREADY_SEALED" | "PARTIAL" | "REOPENED" | "OUTAGE_STOP";
+  status: "SEALED" | "ALREADY_SEALED" | "PARTIAL" | "REOPENED" | "OUTAGE_STOP" | "ERROR";
+  /** Set when status is ERROR (e.g. TENMIN_UNIVERSE_EMPTY); the run stopped at this range. */
+  error?: string;
   securitiesPlanned: number;
   fetchesPlanned: number;
   securitiesWritten: number;
@@ -473,6 +479,31 @@ export async function runTenMinHistory(options: {
       range.fetchTo,
       stamp(),
     );
+    // Never seal a range with nothing planned: an empty universe means the plan is broken
+    // (e.g. a master with no listing dates), not that the market had no securities.
+    if (universe.fetches.length === 0) {
+      const message = `${TENMIN_UNIVERSE_EMPTY}:${range.calendarFrom}_${range.calendarTo}:securities=${universe.securities.length}:gaps=${universe.gaps.length}`;
+      rangeReports.push({
+        calendarFrom: range.calendarFrom,
+        calendarTo: range.calendarTo,
+        fetchFrom: range.fetchFrom,
+        fetchTo: range.fetchTo,
+        status: "ERROR",
+        error: message,
+        securitiesPlanned: universe.securities.length + universe.gaps.length,
+        fetchesPlanned: 0,
+        securitiesWritten: 0,
+        securitiesResumed: 0,
+        gaps: universe.gaps,
+        symbolChangeWarnings: [],
+        fallbackFiles: 0,
+        massiveRequests: 0,
+        zstdVersion,
+      });
+      stoppedOnError = true;
+      error = message;
+      break;
+    }
     try {
       const result = await writeTenMinRangeReplyDust({
         store,
@@ -598,6 +629,30 @@ export async function runTenMinHistory(options: {
   }
 
   return { report, rangeResults };
+}
+
+/**
+ * The one-line host summary: per-range status and plan sizes so an empty or failed plan is
+ * visible in the Actions log, not only in the stored run report.
+ */
+export function tenMinHistorySummary(report: TenMinHistoryRunReport): Record<string, unknown> {
+  return {
+    mode: "tenmin-history",
+    runId: report.runId,
+    ranges: report.ranges.map((range) => ({
+      range: `${range.calendarFrom}_${range.calendarTo}`,
+      status: range.status,
+      securitiesPlanned: range.securitiesPlanned,
+      fetchesPlanned: range.fetchesPlanned,
+      ...(range.error ? { error: range.error } : {}),
+    })),
+    massiveRequests: report.massiveRequests,
+    yieldedForScan: report.yieldedForScan,
+    outageStop: report.outageStop,
+    stoppedOnError: report.stoppedOnError,
+    ...(report.error ? { error: report.error } : {}),
+    warnings: report.warnings,
+  };
 }
 
 export async function runTenMinHistoryFromEnv(
