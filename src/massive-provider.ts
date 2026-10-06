@@ -110,6 +110,92 @@ export function mergeSameIdentity(
   output.set(key, unique.length ? { ...rest, formerSymbols: unique } : rest);
 }
 
+/** The security-id -> symbol map bindUniverse builds (a later record with the same id wins). */
+export function symbolBySecurityIdFor(recordsToBind: readonly ProviderSecurityRecord[]): Map<string, string> {
+  const output = new Map<string, string>();
+  for (const record of recordsToBind)
+    output.set(securityId(record.provider, record.providerSecurityId, record.assetType), record.symbol);
+  return output;
+}
+
+/**
+ * The security-id -> symbol map getDailyBars filters with, inverted to symbol -> security id and
+ * limited to the requested ids (a later id with the same symbol wins, as before).
+ */
+export function groupedDailySymbolIndex(
+  symbolBySecurityId: ReadonlyMap<string, string>,
+  securityIds: readonly string[],
+): Map<string, string> {
+  const ids = new Set(securityIds);
+  return new Map(
+    [...symbolBySecurityId.entries()].filter(([id]) => ids.has(id)).map(([id, symbol]) => [symbol, id]),
+  );
+}
+
+/**
+ * Turns one parsed Massive grouped-daily reply (the whole market) into canonical daily bars for
+ * the symbols in bySymbol. getDailyBars and the Reply Dust reader both use this.
+ */
+export function massiveGroupedDailyBarsFromReply(input: {
+  provider: string;
+  sessionDate: string;
+  reply: Record<string, unknown>;
+  observedAt: string;
+  bySymbol: ReadonlyMap<string, string>;
+}): CanonicalDailyBar[] {
+  const { sessionDate, observedAt, bySymbol } = input;
+  const retrievalId = text(input.reply.request_id) ?? `grouped-${sessionDate}`;
+  return records(input.reply.results)
+    .flatMap((raw) => {
+      const id = bySymbol.get(text(raw.T) ?? "");
+      const open = finite(raw.o),
+        high = finite(raw.h),
+        low = finite(raw.l),
+        close = finite(raw.c),
+        volume = finite(raw.v);
+      if (
+        !id ||
+        open === undefined ||
+        high === undefined ||
+        low === undefined ||
+        close === undefined ||
+        volume === undefined
+      )
+        return [];
+      const timestamp = finite(raw.t);
+      return [
+        {
+          securityId: id,
+          sessionDate,
+          open,
+          high,
+          low,
+          close,
+          volume,
+          ...(timestamp === undefined
+            ? {}
+            : { sourceTimestamp: new Date(timestamp).toISOString() }),
+          observedAt,
+          ingestedAt: observedAt,
+          dataQuality: "GOOD" as const,
+          corporateActionIds: [],
+          flags: ["MASSIVE_GROUPED_DAILY", "UNADJUSTED"],
+          schemaVersion: MARKET_SCHEMA_VERSION,
+          revision: 1,
+          provenance: {
+            provider: input.provider,
+            dataset: "stocks-grouped-daily",
+            retrievalId,
+            providerTimestamp: observedAt,
+            ingestionVersion: "markets-scanner-v0",
+            normalizerVersion: "massive-v1",
+          },
+        },
+      ];
+    })
+    .sort((a, b) => a.securityId.localeCompare(b.securityId));
+}
+
 /**
  * Turns one parsed Massive 10-minute aggregates reply into canonical bars. Both the live fetch and
  * the Reply Dust reader use this, so a stored reply rebuilds exactly the bars the fetch produced.
@@ -394,12 +480,8 @@ export class MassiveMarketProvider implements MarketProvider {
 
   bindUniverse(recordsToBind: ProviderSecurityRecord[]): void {
     this.symbolBySecurityId.clear();
-    for (const record of recordsToBind) {
-      this.symbolBySecurityId.set(
-        securityId(record.provider, record.providerSecurityId, record.assetType),
-        record.symbol,
-      );
-    }
+    for (const [id, symbol] of symbolBySecurityIdFor(recordsToBind))
+      this.symbolBySecurityId.set(id, symbol);
   }
 
   async getDailyBars(sessionDate: string, securityIds: string[]): Promise<CanonicalDailyBar[]> {
@@ -410,63 +492,14 @@ export class MassiveMarketProvider implements MarketProvider {
       `/v2/aggs/grouped/locale/us/market/stocks/${sessionDate}`,
       { adjusted: "false", include_otc: "false" },
     );
-    const ids = new Set(securityIds);
-    const bySymbol = new Map(
-      [...this.symbolBySecurityId.entries()]
-        .filter(([id]) => ids.has(id))
-        .map(([id, symbol]) => [symbol, id]),
-    );
-    const observedAt = this.now();
-    const retrievalId = text(response.request_id) ?? `grouped-${sessionDate}`;
-    return records(response.results)
-      .flatMap((raw) => {
-        const id = bySymbol.get(text(raw.T) ?? "");
-        const open = finite(raw.o),
-          high = finite(raw.h),
-          low = finite(raw.l),
-          close = finite(raw.c),
-          volume = finite(raw.v);
-        if (
-          !id ||
-          open === undefined ||
-          high === undefined ||
-          low === undefined ||
-          close === undefined ||
-          volume === undefined
-        )
-          return [];
-        const timestamp = finite(raw.t);
-        return [
-          {
-            securityId: id,
-            sessionDate,
-            open,
-            high,
-            low,
-            close,
-            volume,
-            ...(timestamp === undefined
-              ? {}
-              : { sourceTimestamp: new Date(timestamp).toISOString() }),
-            observedAt,
-            ingestedAt: observedAt,
-            dataQuality: "GOOD" as const,
-            corporateActionIds: [],
-            flags: ["MASSIVE_GROUPED_DAILY", "UNADJUSTED"],
-            schemaVersion: MARKET_SCHEMA_VERSION,
-            revision: 1,
-            provenance: {
-              provider: this.providerName,
-              dataset: "stocks-grouped-daily",
-              retrievalId,
-              providerTimestamp: observedAt,
-              ingestionVersion: "markets-scanner-v0",
-              normalizerVersion: "massive-v1",
-            },
-          },
-        ];
-      })
-      .sort((a, b) => a.securityId.localeCompare(b.securityId));
+    const bySymbol = groupedDailySymbolIndex(this.symbolBySecurityId, securityIds);
+    return massiveGroupedDailyBarsFromReply({
+      provider: this.providerName,
+      sessionDate,
+      reply: response,
+      observedAt: this.now(),
+      bySymbol,
+    });
   }
 
   async getIntradayBars(

@@ -1,9 +1,26 @@
 import { readFile, writeFile, rename } from "node:fs/promises";
 import { assertSafeStoreFile, prepareSafeStoreFile } from "./store-path";
-import type { MarketProvider, ProviderSecurityRecord, SecurityMasterRecord } from "./contracts";
-import { MassiveMarketProvider } from "./massive-provider";
+import type {
+  CanonicalDailyBar,
+  MarketProvider,
+  ProviderSecurityRecord,
+  SecurityMasterRecord,
+} from "./contracts";
+import {
+  dailyBarsFromReply,
+  readDailyReplyDustBars,
+  readDailyReplyDustManifest,
+  writeDailyReplyDust,
+} from "./daily-reply-dust";
+import { FileReplyDustStore, type ReplyDustStore } from "./intraday-reply-dust";
+import {
+  MassiveMarketProvider,
+  groupedDailySymbolIndex,
+  symbolBySecurityIdFor,
+} from "./massive-provider";
 import { openMarketStore } from "./object-storage";
-import type { MarketStore } from "./storage";
+import { REPLY_DUST_FALLBACK_VERSION, type ReplyDustBackend } from "./reply-dust";
+import { MarketStorage, type MarketStore } from "./storage";
 import { refreshEligibility, refreshUniverse } from "./universe";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import { finalizeDailyPartition } from "./scanner";
@@ -36,6 +53,10 @@ export interface BackfillResult {
   /** Set when backfill stopped at a session boundary so a scan gets the request budget. */
   yieldedForScan?: string;
   eligibility: Record<string, number>;
+  /** Present only with replyDust on: grouped-daily Reply Dust files written by this run. */
+  replyDustFilesWritten?: number;
+  /** Present only with replyDust on: files written as the raw-zstd fallback (0x81). */
+  replyDustFallbackFiles?: number;
 }
 
 function parseDate(value: string): Date {
@@ -183,11 +204,30 @@ export async function backfillHistoricalEvidence(options: {
   env?: NodeJS.ProcessEnv;
   /** Asked before starting and before every session; a reason stops at the session boundary. */
   shouldYield?: () => Promise<string | undefined>;
+  /**
+   * Off by default. When on, each session's whole grouped-daily reply is also stored as a Reply
+   * Dust file under permanent/daily-reply-dust/ before its bars are stored. A given provider must
+   * keep raw replies (MassiveMarketProvider keepRawReplies: true).
+   */
+  replyDust?: boolean;
+  /** Where Reply Dust files go. Defaults to the local root only when storage is local. */
+  replyDustStore?: ReplyDustStore;
+  replyDustBackend?: ReplyDustBackend;
 }): Promise<BackfillResult> {
   const env = options.env ?? process.env;
   requireObjectStore(env);
-  const provider = options.provider ?? new MassiveMarketProvider();
+  const replyDust = options.replyDust === true;
+  const provider =
+    options.provider ?? new MassiveMarketProvider(replyDust ? { keepRawReplies: true } : {});
+  if (replyDust && !provider.takeRawReplies) throw new Error("REPLY_DUST_PROVIDER_KEEPS_NO_REPLIES");
   const storage = options.storage ?? openMarketStore(options.root, env);
+  const replyStore = !replyDust
+    ? undefined
+    : (options.replyDustStore ??
+      (storage instanceof MarketStorage ? new FileReplyDustStore(options.root) : undefined));
+  if (replyDust && !replyStore) throw new Error("REPLY_DUST_STORE_REQUIRED");
+  let replyDustFilesWritten = 0;
+  let replyDustFallbackFiles = 0;
   await storage.initialize();
   // On Actions the scan always wins the Massive budget; local/test runs opt in via shouldYield.
   const shouldYield =
@@ -241,6 +281,52 @@ export async function backfillHistoricalEvidence(options: {
   const activeIds = securities
     .filter((security) => security.status === "ACTIVE")
     .map((security) => security.securityId);
+
+  // Reply Dust: the grouped reply is taken right after its one fetch and stored (encode, decode,
+  // compare, put, read back) before any bar of that session is stored or progress advances. A
+  // day already sealed in Reply Dust is rebuilt from the stored reply instead of fetched again.
+  const dailyBarsWithReplyDust = async (sessionDate: string): Promise<CanonicalDailyBar[]> => {
+    const store = replyStore!;
+    const bySymbol = groupedDailySymbolIndex(
+      symbolBySecurityIdFor(providerRecords(securities, provider.providerName)),
+      activeIds,
+    );
+    if (await readDailyReplyDustManifest(store, sessionDate))
+      return readDailyReplyDustBars(store, sessionDate, bySymbol, options.replyDustBackend);
+    const takeRawReplies = provider.takeRawReplies!.bind(provider);
+    if (takeRawReplies().length) throw new Error("REPLY_DUST_UNEXPECTED_HELD_REPLIES");
+    const bars = await provider.getDailyBars(sessionDate, activeIds);
+    const replies = takeRawReplies();
+    const reply = replies[0];
+    if (
+      replies.length !== 1 ||
+      !reply ||
+      reply.dataset !== "stocks-grouped-daily" ||
+      reply.sessionDate !== sessionDate
+    )
+      throw new Error(`REPLY_DUST_REPLY_MISSING_OR_UNEXPECTED:${sessionDate}:${replies.length}`);
+    // observedAt is stamped by the provider on every bar; with no matching bar, keep fetchedAt.
+    const observedAt = bars[0]?.observedAt ?? reply.fetchedAt;
+    const rebuilt = dailyBarsFromReply({
+      provider: provider.providerName,
+      sessionDate,
+      observedAt,
+      reply: reply.body,
+      bySymbol,
+    });
+    if (JSON.stringify(rebuilt) !== JSON.stringify(bars))
+      throw new Error(`REPLY_DUST_DAILY_REBUILD_MISMATCH:${sessionDate}`);
+    const manifest = await writeDailyReplyDust(
+      store,
+      reply,
+      { provider: provider.providerName, observedAt },
+      options.replyDustBackend,
+    );
+    replyDustFilesWritten += 1;
+    if (manifest.version === REPLY_DUST_FALLBACK_VERSION) replyDustFallbackFiles += 1;
+    return bars;
+  };
+
   for (const sessionDate of sessions) {
     if (state.completedSessions.includes(sessionDate)) {
       skippedExistingSessions.push(sessionDate);
@@ -257,7 +343,9 @@ export async function backfillHistoricalEvidence(options: {
     if (yieldedForScan) break;
     attemptedSessions.push(sessionDate);
     try {
-      const bars = await provider.getDailyBars(sessionDate, activeIds);
+      const bars = replyDust
+        ? await dailyBarsWithReplyDust(sessionDate)
+        : await provider.getDailyBars(sessionDate, activeIds);
       await storage.appendBars(bars);
       barsStored += bars.length;
       try {
@@ -309,6 +397,7 @@ export async function backfillHistoricalEvidence(options: {
     stoppedOnError,
     ...(yieldedForScan ? { yieldedForScan } : {}),
     eligibility,
+    ...(replyDust ? { replyDustFilesWritten, replyDustFallbackFiles } : {}),
   };
 }
 

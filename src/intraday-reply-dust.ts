@@ -61,10 +61,10 @@ export interface ReplyDustSessionManifest {
   checksum: string;
 }
 
-const sha256Hex = (bytes: Uint8Array | string): string =>
+export const sha256Hex = (bytes: Uint8Array | string): string =>
   createHash("sha256").update(bytes).digest("hex");
 
-function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+export function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
   return true;
@@ -115,6 +115,32 @@ export class FileReplyDustStore implements ReplyDustStore {
 }
 
 /**
+ * Encode a reply, decode it back, byte-compare to the reply, put it, read it back and compare.
+ * Throws before the put if the decoded bytes differ. Returns the stored bytes.
+ */
+export async function storeVerifiedReplyDust(
+  store: ReplyDustStore,
+  key: string,
+  body: Uint8Array,
+  label: string,
+  backend: ReplyDustBackend = nodeReplyDustBackend,
+): Promise<Uint8Array> {
+  const encoded = encodeReplyDust(body, backend);
+  let decoded: Uint8Array;
+  try {
+    decoded = decodeReplyDust(encoded, backend);
+  } catch (error) {
+    throw new Error(`REPLY_DUST_WRITE_VERIFY_FAILED:${label}:${String(error)}`);
+  }
+  if (!sameBytes(decoded, body)) throw new Error(`REPLY_DUST_WRITE_VERIFY_FAILED:${label}`);
+  await store.put(key, encoded);
+  const stored = await store.get(key);
+  if (!stored || !sameBytes(stored, encoded))
+    throw new Error(`REPLY_DUST_STORE_READBACK_MISMATCH:${label}`);
+  return encoded;
+}
+
+/**
  * Store one 10-minute reply as a Reply Dust file. Order: encode, decode back, byte-compare to the
  * reply, write, read back and compare. Throws (and the caller must not advance progress) if any
  * step fails. A raw-zstd fallback file is exact too: it is written like any other file.
@@ -129,22 +155,10 @@ export async function writeReplyDustFile(
     throw new Error("REPLY_DUST_NOT_A_10M_REPLY");
   if (await store.get(replyDustManifestKey(reply.sessionDate)))
     throw new Error(`REPLY_DUST_SESSION_ALREADY_SEALED:${reply.sessionDate}`);
-  const encoded = encodeReplyDust(reply.body, backend);
-  let decoded: Uint8Array;
-  try {
-    decoded = decodeReplyDust(encoded, backend);
-  } catch (error) {
-    throw new Error(`REPLY_DUST_WRITE_VERIFY_FAILED:${reply.securityId}:${String(error)}`);
-  }
-  if (!sameBytes(decoded, reply.body))
-    throw new Error(`REPLY_DUST_WRITE_VERIFY_FAILED:${reply.securityId}`);
   const key = replyDustFileKey(reply.sessionDate, reply.securityId);
   // A file already here is not yet listed in any progress marker or manifest (those are checked
   // above and by the caller), so it is a leftover from a crashed attempt and is replaced.
-  await store.put(key, encoded);
-  const stored = await store.get(key);
-  if (!stored || !sameBytes(stored, encoded))
-    throw new Error(`REPLY_DUST_STORE_READBACK_MISMATCH:${reply.securityId}`);
+  const encoded = await storeVerifiedReplyDust(store, key, reply.body, reply.securityId, backend);
   return {
     securityId: reply.securityId,
     symbol: reply.symbol,

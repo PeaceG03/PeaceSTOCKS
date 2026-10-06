@@ -20,6 +20,7 @@ export * from "./dust";
 export * from "./packed-dust";
 export * from "./reply-dust";
 export * from "./intraday-reply-dust";
+export * from "./daily-reply-dust";
 export * from "./packed-fixture";
 export * from "./archive-sync";
 export * from "./read-api";
@@ -46,4 +47,6 @@ export const MARKET_STORAGE_LAYOUT = {
   intradayManifests: "permanent/intraday-dust/YYYY-MM-DD/manifest.json",
   intradayReplyDust: "permanent/intraday-reply-dust/YYYY-MM-DD/<base64url security-id>.rdust",
   intradayReplyDustManifests: "permanent/intraday-reply-dust/YYYY-MM-DD/manifest.json",
+  dailyReplyDust: "permanent/daily-reply-dust/YYYY-MM-DD/grouped-daily.rdust",
+  dailyReplyDustManifests: "permanent/daily-reply-dust/YYYY-MM-DD/manifest.json",
 } as const;
