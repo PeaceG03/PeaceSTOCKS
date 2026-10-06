@@ -7,6 +7,7 @@ import type {
   MassiveAggregateBar,
   ProviderRawReply,
   ProviderSecurityRecord,
+  TenMinuteRangeReply,
 } from "./contracts";
 import { MARKET_SCHEMA_VERSION } from "./contracts";
 import { securityId } from "./identity";
@@ -539,6 +540,53 @@ export class MassiveMarketProvider implements MarketProvider {
       (a, b) => a.securityId.localeCompare(b.securityId) || a.intervalIndex - b.intervalIndex,
     );
   }
+
+  /**
+   * Fetch every page of a multi-day 10-minute aggregates range for one security, keeping each
+   * page's exact response bytes. The caller supplies the historical symbol valid for the range;
+   * this method does not look it up from the bound universe. Pages are returned directly (not
+   * buffered in takeRawReplies). Pagination reuses getWithBody (shared pace, 429/network backoff,
+   * and MASSIVE_UNTRUSTED_NEXT_URL origin check); apiKey is never stored in recorded requests.
+   */
+  async getTenMinuteRangeReplies(
+    security: { securityId: string; symbol: string },
+    from: string,
+    to: string,
+  ): Promise<TenMinuteRangeReply[]> {
+    requireDate(from);
+    requireDate(to);
+    const path = `/v2/aggs/ticker/${encodeURIComponent(security.symbol)}/range/10/minute/${from}/${to}`;
+    const params = { adjusted: "false", sort: "asc", limit: "50000" };
+    const pages: TenMinuteRangeReply[] = [];
+    let next: string | undefined = path;
+    let first = true;
+    let page = 0;
+    while (next) {
+      page += 1;
+      const pathOrUrl: string = next;
+      const pageParams = first ? params : undefined;
+      const { record, body } = await this.getWithBody(pathOrUrl, pageParams);
+      const request = new URL(pathOrUrl, this.baseUrl);
+      if (pageParams)
+        for (const [key, value] of Object.entries(pageParams)) request.searchParams.set(key, value);
+      request.searchParams.delete("apiKey");
+      pages.push({
+        page,
+        request: `${request.pathname}${request.search}`,
+        fetchedAt: this.now(),
+        body,
+        rangeFrom: from,
+        rangeTo: to,
+        securityId: security.securityId,
+        symbol: security.symbol,
+      });
+      const candidate = text(record.next_url);
+      next = candidate && candidate !== pathOrUrl ? candidate : undefined;
+      first = false;
+    }
+    return pages;
+  }
+
   private async actions(
     path: string,
     dateParam: string,

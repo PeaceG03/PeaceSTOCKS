@@ -390,6 +390,27 @@ export interface ProviderRawReply {
   request: string;
   fetchedAt: string;
   body: Uint8Array;
+  /** Present when this reply is one page of a multi-day aggregates range fetch. */
+  rangeFrom?: string;
+  rangeTo?: string;
+  /** 1-based page number within a multi-day range fetch. */
+  page?: number;
+}
+
+/**
+ * One page of a multi-day 10-minute aggregates range fetch: exact wire bytes, request without
+ * apiKey, and the range/page metadata needed to store or resume later. Returned directly by
+ * getTenMinuteRangeReplies so callers are not forced through the global rawReplies buffer.
+ */
+export interface TenMinuteRangeReply {
+  page: number;
+  request: string;
+  fetchedAt: string;
+  body: Uint8Array;
+  rangeFrom: string;
+  rangeTo: string;
+  securityId: string;
+  symbol: string;
 }
 
 export interface MarketProvider {

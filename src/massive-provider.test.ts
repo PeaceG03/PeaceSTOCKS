@@ -373,3 +373,138 @@ test("raw replies are not kept unless asked for", async () => {
   await provider.getDailyBars("2026-01-02", [securityIdForTest()]);
   assert.deepEqual(provider.takeRawReplies(), []);
 });
+
+
+test("ten-minute range fetch returns exact page bytes and request without apiKey", async () => {
+  // Odd spacing proves stored bytes are the wire bytes, not re-serialized JSON.
+  const pageBody =
+    '{"ticker":"SPY","resultsCount":1,"results":[{"v":10,"o":100,"c":101,"h":102,"l":99,"t":1767387600000}],  "status":"OK","request_id":"req-range-1"}';
+  const urls: string[] = [];
+  const provider = new MassiveMarketProvider({
+    apiKey: "secret-key",
+    minRequestIntervalMs: 0,
+    now: () => "2026-03-01T22:00:00.000Z",
+    fetchImpl: async (input) => {
+      urls.push(String(input));
+      return new Response(pageBody, { status: 200 });
+    },
+  });
+  const id = securityIdForTest();
+  const pages = await provider.getTenMinuteRangeReplies(
+    { securityId: id, symbol: "SPY" },
+    "2026-01-02",
+    "2026-02-28",
+  );
+  assert.equal(pages.length, 1);
+  assert.equal(pages[0]?.page, 1);
+  assert.equal(
+    pages[0]?.request,
+    "/v2/aggs/ticker/SPY/range/10/minute/2026-01-02/2026-02-28?adjusted=false&sort=asc&limit=50000",
+  );
+  assert.ok(!pages[0]?.request.includes("secret-key"));
+  assert.ok(!pages[0]?.request.includes("apiKey"));
+  assert.deepEqual(pages[0]?.body, new TextEncoder().encode(pageBody));
+  assert.equal(pages[0]?.rangeFrom, "2026-01-02");
+  assert.equal(pages[0]?.rangeTo, "2026-02-28");
+  assert.equal(pages[0]?.securityId, id);
+  assert.equal(pages[0]?.symbol, "SPY");
+  assert.equal(pages[0]?.fetchedAt, "2026-03-01T22:00:00.000Z");
+  assert.match(urls[0]!, /apiKey=secret-key/);
+  assert.match(urls[0]!, /\/v2\/aggs\/ticker\/SPY\/range\/10\/minute\/2026-01-02\/2026-02-28/);
+  // Range replies are returned directly; the global buffer stays empty.
+  assert.deepEqual(provider.takeRawReplies(), []);
+});
+
+test("ten-minute range fetch follows next_url and keeps every page's exact bytes", async () => {
+  const page1 =
+    '{"results":[{"v":1,"o":1,"c":1,"h":1,"l":1,"t":1}],"next_url":"https://api.massive.com/v2/aggs/ticker/SPY/range/10/minute/2026-01-02/2026-02-28?cursor=p2","status":"OK"}';
+  const page2 =
+    '{"results":[{"v":2,"o":2,"c":2,"h":2,"l":2,"t":2}],  "status":"OK","request_id":"p2"}\n';
+  const urls: string[] = [];
+  const provider = new MassiveMarketProvider({
+    apiKey: "secret-key",
+    minRequestIntervalMs: 0,
+    now: () => "2026-03-01T22:00:00.000Z",
+    fetchImpl: async (input) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes("cursor=p2")) return new Response(page2, { status: 200 });
+      return new Response(page1, { status: 200 });
+    },
+  });
+  const id = securityIdForTest();
+  const pages = await provider.getTenMinuteRangeReplies(
+    { securityId: id, symbol: "SPY" },
+    "2026-01-02",
+    "2026-02-28",
+  );
+  assert.equal(pages.length, 2);
+  assert.equal(pages[0]?.page, 1);
+  assert.equal(pages[1]?.page, 2);
+  assert.deepEqual(pages[0]?.body, new TextEncoder().encode(page1));
+  assert.deepEqual(pages[1]?.body, new TextEncoder().encode(page2));
+  assert.equal(
+    pages[0]?.request,
+    "/v2/aggs/ticker/SPY/range/10/minute/2026-01-02/2026-02-28?adjusted=false&sort=asc&limit=50000",
+  );
+  assert.equal(
+    pages[1]?.request,
+    "/v2/aggs/ticker/SPY/range/10/minute/2026-01-02/2026-02-28?cursor=p2",
+  );
+  assert.ok(pages.every((p) => !p.request.includes("secret-key") && !p.request.includes("apiKey")));
+  assert.equal(urls.length, 2);
+  assert.ok(urls.every((u) => u.includes("apiKey=secret-key")));
+  assert.ok(urls[1]!.includes("cursor=p2"));
+});
+
+test("ten-minute range fetch refuses a next_url on a different origin", async () => {
+  const provider = new MassiveMarketProvider({
+    apiKey: "test-key",
+    minRequestIntervalMs: 0,
+    fetchImpl: async () =>
+      new Response(
+        JSON.stringify({
+          results: [],
+          next_url: "https://evil.example/v2/aggs/ticker/SPY/range/10/minute/2026-01-02/2026-02-28?cursor=x",
+        }),
+        { status: 200 },
+      ),
+  });
+  await assert.rejects(
+    provider.getTenMinuteRangeReplies(
+      { securityId: securityIdForTest(), symbol: "SPY" },
+      "2026-01-02",
+      "2026-02-28",
+    ),
+    /MASSIVE_UNTRUSTED_NEXT_URL/,
+  );
+});
+
+test("ten-minute range pages share the provider pace", async () => {
+  const stamps: number[] = [];
+  const provider = new MassiveMarketProvider({
+    apiKey: "test-key",
+    minRequestIntervalMs: 40,
+    retryBackoffMs: 0,
+    fetchImpl: async (input) => {
+      stamps.push(Date.now());
+      const url = String(input);
+      if (url.includes("cursor=p2"))
+        return new Response(JSON.stringify({ results: [] }), { status: 200 });
+      return new Response(
+        JSON.stringify({
+          results: [],
+          next_url: "https://api.massive.com/v2/aggs/ticker/SPY/range/10/minute/2026-01-02/2026-02-28?cursor=p2",
+        }),
+        { status: 200 },
+      );
+    },
+  });
+  await provider.getTenMinuteRangeReplies(
+    { securityId: securityIdForTest(), symbol: "SPY" },
+    "2026-01-02",
+    "2026-02-28",
+  );
+  assert.equal(stamps.length, 2);
+  assert.equal(stamps[1]! - stamps[0]! >= 40, true);
+});
