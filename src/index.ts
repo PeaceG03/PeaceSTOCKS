@@ -18,6 +18,7 @@ export * from "./intraday-backfill";
 export * from "./intraday";
 export * from "./dust";
 export * from "./packed-dust";
+export * from "./reply-dust";
 export * from "./packed-fixture";
 export * from "./archive-sync";
 export * from "./read-api";

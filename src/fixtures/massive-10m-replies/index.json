@@ -1,0 +1,235 @@
+{
+  "source": "Frozen Massive 10-minute replies, sample 2026-10-01 (read-only mirror, Auditor-verified)",
+  "population": {
+    "large": 1000,
+    "mid": 2000,
+    "small": 1729,
+    "etf": 5393
+  },
+  "replies": [
+    {
+      "symbol": "PCTY",
+      "stratum": "large",
+      "file": "PCTY.json",
+      "bytes": 5266,
+      "sha256": "4dbe3e1cda99d8dd7b81ef58568ded8d75d3dee6a44f870bc2e2c96d1eaccf69"
+    },
+    {
+      "symbol": "QLYS",
+      "stratum": "large",
+      "file": "QLYS.json",
+      "bytes": 4706,
+      "sha256": "c26f97480056f7b74a21fa5ec9be8035365563a8f6fa49d9af978a7f1d217d85"
+    },
+    {
+      "symbol": "STX",
+      "stratum": "large",
+      "file": "STX.json",
+      "bytes": 8242,
+      "sha256": "fbda07490d2767cdd9ec6be759f3b95faedb19affcd53e651dbeb18d13ebcee4"
+    },
+    {
+      "symbol": "UNF",
+      "stratum": "large",
+      "file": "UNF.json",
+      "bytes": 4162,
+      "sha256": "88330f8173c5248e232433524c61c7bb2b4cd87be4ea61dae864bee32f230b92"
+    },
+    {
+      "symbol": "QSR",
+      "stratum": "large",
+      "file": "QSR.json",
+      "bytes": 4193,
+      "sha256": "bd0469422ad61de048dff24d3ea1181670cbfbb2bb4e42c2f559ad3eed4de272"
+    },
+    {
+      "symbol": "SMTC",
+      "stratum": "large",
+      "file": "SMTC.json",
+      "bytes": 6076,
+      "sha256": "72f905fc1fee4773938f21b00ae2f06e5eee8263114443e745397b9d0efffd84"
+    },
+    {
+      "symbol": "BURL",
+      "stratum": "large",
+      "file": "BURL.json",
+      "bytes": 4523,
+      "sha256": "76dcbe2d359edd2aac16e493d4d7dec948d13aa25b942809ccc52d513b4dbd31"
+    },
+    {
+      "symbol": "GNRC",
+      "stratum": "large",
+      "file": "GNRC.json",
+      "bytes": 4740,
+      "sha256": "68340689550c8ca66159001590c4496b0991daba2c5c4c7fd9da8cfed857fe6b"
+    },
+    {
+      "symbol": "AGYS",
+      "stratum": "mid",
+      "file": "AGYS.json",
+      "bytes": 4155,
+      "sha256": "3c566b87cf43e8455872b7415c9ea0b31153171d9e29c80bcd3b44bff419a7bd"
+    },
+    {
+      "symbol": "LFUS",
+      "stratum": "mid",
+      "file": "LFUS.json",
+      "bytes": 4557,
+      "sha256": "e80ce394a390c509f0849c234b95664c3a82d679edeb91f11685912edd221af2"
+    },
+    {
+      "symbol": "WNC",
+      "stratum": "mid",
+      "file": "WNC.json",
+      "bytes": 3873,
+      "sha256": "e1cd0980181debcd8bb258c43091694e8a6c7934842eed581fc8b752df485a5d"
+    },
+    {
+      "symbol": "LBRX",
+      "stratum": "mid",
+      "file": "LBRX.json",
+      "bytes": 3682,
+      "sha256": "a704ba725161dc692a78d860c283a7d1b80d26716a49c3fbe34b95e07672be07"
+    },
+    {
+      "symbol": "TCBK",
+      "stratum": "mid",
+      "file": "TCBK.json",
+      "bytes": 3895,
+      "sha256": "844f08f9fb76b529567adb9ce0daf6c5619b8c14239858d7ec24fc7863600f56"
+    },
+    {
+      "symbol": "LOVE",
+      "stratum": "mid",
+      "file": "LOVE.json",
+      "bytes": 3663,
+      "sha256": "d901835e32855d56f11960795a9d60d87ec0a6f2c3ff4fc0e8cdd646f834fa08"
+    },
+    {
+      "symbol": "GLAD",
+      "stratum": "mid",
+      "file": "GLAD.json",
+      "bytes": 4047,
+      "sha256": "86f10e601f5c3520b2fe4418f75815ae01c5846b61f179d6fde6228eb8b4b363"
+    },
+    {
+      "symbol": "ABSI",
+      "stratum": "mid",
+      "file": "ABSI.json",
+      "bytes": 6892,
+      "sha256": "7dbc40ff482d42edfddba13bbd56ef15c91e20c1e4aaa3006a39e3d51623499c"
+    },
+    {
+      "symbol": "CVV",
+      "stratum": "small",
+      "file": "CVV.json",
+      "bytes": 2506,
+      "sha256": "cb0c5dfccac7fa40b190a5d0a8ebdfc4e27b1a959ee53dc79016c8c3bcf00d5a"
+    },
+    {
+      "symbol": "IGC",
+      "stratum": "small",
+      "file": "IGC.json",
+      "bytes": 5156,
+      "sha256": "8381c3220e5076f5a197298e32a43dc585393376592531f6d418957647bb44ac"
+    },
+    {
+      "symbol": "POAS",
+      "stratum": "small",
+      "file": "POAS.json",
+      "bytes": 4424,
+      "sha256": "0822db4d9c9461f783db613b8a0ac8a16fc4a96953b4b2920c05e64373dfef11"
+    },
+    {
+      "symbol": "OGI",
+      "stratum": "small",
+      "file": "OGI.json",
+      "bytes": 4291,
+      "sha256": "9a0b5ddbfc2e560011363cb2047925d0ee2024bb2ccc8037f9248bcd7a2e9236"
+    },
+    {
+      "symbol": "MOBX",
+      "stratum": "small",
+      "file": "MOBX.json",
+      "bytes": 5158,
+      "sha256": "be004e1b809b920c331be7649c1c4ec33cfc19122635af18ee8f4034df8495e6"
+    },
+    {
+      "symbol": "TROO",
+      "stratum": "small",
+      "file": "TROO.json",
+      "bytes": 3545,
+      "sha256": "9794dc5de2d7681f0000e5207b8d5264fcaa20633b953216b80a362d2efdcad8"
+    },
+    {
+      "symbol": "MYO",
+      "stratum": "small",
+      "file": "MYO.json",
+      "bytes": 3719,
+      "sha256": "a9e3755a4c9ea0f9bbaa9544880943c63bdcdf53dd2e6bc74f8e62789aaec881"
+    },
+    {
+      "symbol": "ANVS",
+      "stratum": "small",
+      "file": "ANVS.json",
+      "bytes": 4314,
+      "sha256": "51665847f90e0fff94c8030261083c2f8ef4b2681791678f3afbf58656988129"
+    },
+    {
+      "symbol": "XSEP",
+      "stratum": "etf",
+      "file": "XSEP.json",
+      "bytes": 518,
+      "sha256": "fcdc2a1d8fd72834aa9a6fffd493bbd165d9d76b8536fdfdf793f4c5a21a22ee"
+    },
+    {
+      "symbol": "DECO",
+      "stratum": "etf",
+      "file": "DECO.json",
+      "bytes": 241,
+      "sha256": "981190cabe58c9878e1bf020b2fabb6a76a68d44b39125c7a9d4132a9e2edd54"
+    },
+    {
+      "symbol": "DECU",
+      "stratum": "etf",
+      "file": "DECU.json",
+      "bytes": 328,
+      "sha256": "3eb48c9ba15c2ed0230bad0cd8d9cffc955456e254ca3c2d90623447b6eb7f1b"
+    },
+    {
+      "symbol": "ROBN",
+      "stratum": "etf",
+      "file": "ROBN.json",
+      "bytes": 6889,
+      "sha256": "8b40a823c297f8decf76d678918bbbd43c494509ab58fe26759ea839fc50659a"
+    },
+    {
+      "symbol": "BSJY",
+      "stratum": "etf",
+      "file": "BSJY.json",
+      "bytes": 239,
+      "sha256": "a80ac9ea7afabc9ef567326b3e447428f0dd7160c6caa49591455287d76a0cb9"
+    },
+    {
+      "symbol": "QBUF",
+      "stratum": "etf",
+      "file": "QBUF.json",
+      "bytes": 3090,
+      "sha256": "06e49d892830bce00d064dd904d968f8883a768130f8a37611eb55952bdfa2da"
+    },
+    {
+      "symbol": "QQI",
+      "stratum": "etf",
+      "file": "QQI.json",
+      "bytes": 1207,
+      "sha256": "f07ef11044c7b19ec16adc3b55ec9960ed73bce3e5a38e5d6520ab269fadfeb3"
+    },
+    {
+      "symbol": "BREM",
+      "stratum": "etf",
+      "file": "BREM.json",
+      "bytes": 128,
+      "sha256": "b3c7859fd7f6ece749f0ba568e24f8df7b03f71adf1bac8f26430c48f8eba4ed"
+    }
+  ]
+}
