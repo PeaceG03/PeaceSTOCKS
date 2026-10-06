@@ -423,6 +423,34 @@ test("a corrupted or metadata-less stored object is refetched on resume", async 
   }
 });
 
+test("an R2 error during resume fails the session instead of refetching from Massive", async () => {
+  const root = await marketRoot(["AAA", "BBB"]);
+  try {
+    const store = new FailingStore();
+    const fetches: Record<string, number> = {};
+    store.failNextRdust = 2; // AAA is stored, BBB's write fails
+    await backfillHistoricalIntradayEvidence({
+      root, from: SESSION, to: SESSION, provider: fakeMassive(fetches),
+      replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: store,
+    });
+    assert.deepEqual(fetches, { AAA: 1, BBB: 1 });
+    // Fresh runner (no local log) whose store HEAD returns a 500: nothing may be fetched again.
+    await rm(join(root, "transient", "reply-dust-progress"), { recursive: true, force: true });
+    store.head = async () => {
+      throw new Error("R2_HEAD_500");
+    };
+    const resumed = await backfillHistoricalIntradayEvidence({
+      root, from: SESSION, to: SESSION, provider: fakeMassive(fetches),
+      replyDust: true, zstdVersionProbe: pinnedZstd, replyDustStore: store,
+    });
+    assert.deepEqual(resumed.completedSessions, []);
+    assert.match(resumed.failedSessions[SESSION] ?? "", /R2_HEAD_500/);
+    assert.deepEqual(fetches, { AAA: 1, BBB: 1 });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("the session manifest is read once per session, not once per file", async () => {
   const root = await marketRoot(["AAA", "BBB"]);
   try {

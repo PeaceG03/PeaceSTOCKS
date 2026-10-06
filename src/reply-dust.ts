@@ -480,7 +480,9 @@ function dictionaryFile(dictionary: Uint8Array): string {
 }
 function runZstd(args: string[], input: Uint8Array): Uint8Array {
   const result = spawnSync("zstd", args, { input, maxBuffer: ZSTD_MAX_OUTPUT_BYTES });
-  if (result.error || result.status !== 0) throw new Error("REPLY_DUST_ZSTD_FAILED");
+  // A missing or unrunnable zstd is an environment fault, not a bad file, so it gets its own name.
+  if (result.error) throw new Error("REPLY_DUST_ZSTD_UNAVAILABLE");
+  if (result.status !== 0) throw new Error("REPLY_DUST_ZSTD_FAILED");
   return new Uint8Array(result.stdout);
 }
 

@@ -301,45 +301,61 @@ export async function verifyStoredReplyDust(
   options: { provider: string; hint?: ReplyDustFileEntry; backend?: ReplyDustBackend },
 ): Promise<{ entry: ReplyDustFileEntry; reply: Uint8Array } | undefined> {
   const backend = options.backend ?? nodeReplyDustBackend;
-  try {
-    let expected = options.hint;
-    if (!expected) {
-      const head = await store.head(replyDustFileKey(sessionDate, securityId));
-      if (!head) return undefined;
-      const m = head.metadata;
-      if (
-        m["rd-schema"] !== INTRADAY_REPLY_DUST_OBJECT_SCHEMA ||
-        m["rd-provider"] !== options.provider ||
-        m["rd-session-date"] !== sessionDate ||
-        m["rd-security-id"] !== securityId
-      )
-        return undefined;
-      const bytes = await store.get(replyDustFileKey(sessionDate, securityId));
-      if (!bytes) return undefined;
-      const replyByteLength = Number(m["rd-reply-length"]);
-      const version = Number(m["rd-version"]);
-      if (!m["rd-symbol"] || !m["rd-request"] || !m["rd-fetched-at"] || !m["rd-observed-at"]) return undefined;
-      if (!Number.isSafeInteger(replyByteLength) || !Number.isSafeInteger(version)) return undefined;
-      expected = fileEntry({
-        securityId,
-        symbol: m["rd-symbol"],
-        request: m["rd-request"],
-        fetchedAt: m["rd-fetched-at"],
-        observedAt: m["rd-observed-at"],
-        byteLength: bytes.length,
-        version,
-        replySha256: m["rd-reply-sha256"] ?? "",
-        replyByteLength,
-        fileSha256: sha256Hex(bytes),
-      });
-      return { entry: expected, reply: verifyBytes(bytes, expected, backend) };
-    }
-    if (expected.securityId !== securityId) return undefined;
+  // Store errors (R2 5xx, timeouts, network) are thrown, never treated as "missing": a flaky store
+  // must fail the session for a later resume, not spend Massive requests refetching good files.
+  // Only a missing object, missing or wrong metadata, or a failed checksum/decode returns undefined.
+  let expected = options.hint;
+  if (!expected) {
+    const head = await store.head(replyDustFileKey(sessionDate, securityId));
+    if (!head) return undefined;
+    const m = head.metadata;
+    if (
+      m["rd-schema"] !== INTRADAY_REPLY_DUST_OBJECT_SCHEMA ||
+      m["rd-provider"] !== options.provider ||
+      m["rd-session-date"] !== sessionDate ||
+      m["rd-security-id"] !== securityId
+    )
+      return undefined;
+    if (!m["rd-symbol"] || !m["rd-request"] || !m["rd-fetched-at"] || !m["rd-observed-at"]) return undefined;
+    const replyByteLength = Number(m["rd-reply-length"]);
+    const version = Number(m["rd-version"]);
+    if (!Number.isSafeInteger(replyByteLength) || !Number.isSafeInteger(version)) return undefined;
     const bytes = await store.get(replyDustFileKey(sessionDate, securityId));
     if (!bytes) return undefined;
-    return { entry: expected, reply: verifyBytes(bytes, expected, backend) };
-  } catch {
-    return undefined;
+    expected = fileEntry({
+      securityId,
+      symbol: m["rd-symbol"],
+      request: m["rd-request"],
+      fetchedAt: m["rd-fetched-at"],
+      observedAt: m["rd-observed-at"],
+      byteLength: bytes.length,
+      version,
+      replySha256: m["rd-reply-sha256"] ?? "",
+      replyByteLength,
+      fileSha256: sha256Hex(bytes),
+    });
+    const reply = verifiedOrUndefined(bytes, expected, backend);
+    return reply ? { entry: expected, reply } : undefined;
+  }
+  if (expected.securityId !== securityId) return undefined;
+  const bytes = await store.get(replyDustFileKey(sessionDate, securityId));
+  if (!bytes) return undefined;
+  const reply = verifiedOrUndefined(bytes, expected, backend);
+  return reply ? { entry: expected, reply } : undefined;
+}
+
+/** A file that fails its checksum or decode is "not done" (refetch); anything else is rethrown. */
+function verifiedOrUndefined(
+  bytes: Uint8Array,
+  entry: ReplyDustFileEntry,
+  backend: ReplyDustBackend,
+): Uint8Array | undefined {
+  try {
+    return verifyBytes(bytes, entry, backend);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (message.startsWith("REPLY_DUST_") && message !== "REPLY_DUST_ZSTD_UNAVAILABLE") return undefined;
+    throw error;
   }
 }
 
