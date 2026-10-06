@@ -807,6 +807,17 @@ export interface TenMinRangeWriteResult {
   warnings?: string[];
 }
 
+/** Error property carrying the Massive requests a range made before it threw. */
+export function withTenMinMassiveRequests(error: unknown, massiveRequests: number): unknown {
+  if (error instanceof Error) return Object.assign(error, { tenMinMassiveRequests: massiveRequests });
+  return error;
+}
+
+export function tenMinMassiveRequestsOf(error: unknown): number {
+  const value = (error as { tenMinMassiveRequests?: unknown } | undefined)?.tenMinMassiveRequests;
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
 export function isTenMinRangeAbortError(message: string): boolean {
   return (
     message.includes("MASSIVE_CREDENTIAL_REJECTED") ||
@@ -1004,148 +1015,154 @@ export async function writeTenMinRangeReplyDust(options: {
     outageKeys.length = 0;
   };
 
-  for (const planned of work) {
-    if (options.shouldYield) {
-      const reason = await options.shouldYield();
-      if (reason) {
-        yieldedForScan = reason;
-        break;
-      }
-    }
-    if (!planned.symbol) {
-      const gap = {
-        securityId: planned.securityId,
-        symbol: "",
-        reason: "NO_HISTORICAL_SYMBOL",
-        at: stamp(),
-      };
-      gaps.set(gapKey(gap), gap);
-      continue;
-    }
-
-    const idKey = fetchIdentityKey(planned);
-    const securityRefs = storedBySecurity.get(planned.securityId) ?? [];
-    const candidates = compatibleStoredFetches(securityRefs, planned);
-    let resumed = false;
-    for (const candidate of candidates) {
-      const hintEntry = hints.get(candidate.key);
-      const hint =
-        hintEntry?.fetch ??
-        existing?.securities
-          .find((s) => s.securityId === planned.securityId)
-          ?.fetches.find(
-            (f) =>
-              f.symbol === candidate.symbol &&
-              f.fetchFrom === candidate.fetchFrom &&
-              f.fetchTo === candidate.fetchTo,
-          );
-      const verified = await verifyStoredTenMinRangeFetch(
-        store,
-        from,
-        to,
-        {
-          securityId: planned.securityId,
-          symbol: candidate.symbol,
-          fetchFrom: candidate.fetchFrom,
-          fetchTo: candidate.fetchTo,
-        },
-        {
-          provider,
-          storedPages: candidate.pages,
-          backend,
-          ...(hint ? { hint } : {}),
-        },
-      );
-      if (verified) {
-        // Keep the REAL stored span in the manifest (may start before today's planned fetchFrom).
-        doneFetches.set(candidate.key, { securityId: planned.securityId, fetch: verified });
-        fetchesResumed += 1;
-        securitiesResumed.add(planned.securityId);
-        outageStreak = 0;
-        clearOutageStreakGaps();
-        resumed = true;
-        break;
-      }
-    }
-    if (resumed) continue;
-
-    // Different ticker leftovers for this security (not a compatible earlier-from span): warn once.
-    const plannedSymbols = new Set(
-      options.fetches.filter((f) => f.securityId === planned.securityId).map((f) => f.symbol),
-    );
-    for (const ref of securityRefs) {
-      if (ref.symbol === planned.symbol) continue;
-      if (plannedSymbols.has(ref.symbol)) continue;
-      if (!ref.pages.has(1)) continue;
-      warnings.push(
-        `TENMIN_RANGE_SYMBOL_CHANGED:${planned.securityId}:${ref.symbol}:${planned.symbol}`,
-      );
-    }
-
-    try {
-      massiveRequests += 1;
-      const pages = await options.fetchPages(
-        { securityId: planned.securityId, symbol: planned.symbol },
-        planned.fetchFrom,
-        planned.fetchTo,
-      );
-      const { fetch } = await writeTenMinRangeFetch(store, pages, {
-        provider,
-        calendarFrom: from,
-        calendarTo: to,
-        fetchFrom: planned.fetchFrom,
-        fetchTo: planned.fetchTo,
-        backend,
-        ...(options.securityLink ? { link: options.securityLink.source } : {}),
-      });
-      filesWritten += fetch.files.length;
-      fallbackFiles += fetch.files.filter((file) => file.version === REPLY_DUST_FALLBACK_VERSION).length;
-      await appendTenMinRangeProgress(root, from, to, { securityId: planned.securityId, fetch });
-      doneFetches.set(idKey, { securityId: planned.securityId, fetch });
-      fetchesWritten += 1;
-      securitiesWritten.add(planned.securityId);
-      outageStreak = 0;
-      clearOutageStreakGaps();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (isTenMinRangeAbortError(message)) throw error;
-      if (
-        message.startsWith("R2_") ||
-        message.startsWith("STORE_") ||
-        message === "STORE_DOWN" ||
-        message.startsWith("REPLY_DUST_") ||
-        message.startsWith("OBJECT_STORE")
-      )
-        throw error;
-
-      if (isTenMinRangeOutageError(message)) {
-        outageStreak += 1;
-        if (outageStreak >= TENMIN_RANGE_OUTAGE_STREAK) {
-          clearOutageStreakGaps();
-          outageStop = `${TENMIN_RANGE_OUTAGE_STOP}:${message}`;
+  try {
+    for (const planned of work) {
+      if (options.shouldYield) {
+        const reason = await options.shouldYield();
+        if (reason) {
+          yieldedForScan = reason;
           break;
         }
-        // Do not record as a durable gap yet; streak failures are retried next run.
+      }
+      if (!planned.symbol) {
+        const gap = {
+          securityId: planned.securityId,
+          symbol: "",
+          reason: "NO_HISTORICAL_SYMBOL",
+          at: stamp(),
+        };
+        gaps.set(gapKey(gap), gap);
         continue;
       }
 
-      outageStreak = 0;
-      clearOutageStreakGaps();
-      const siblings = options.fetches.filter((f) => f.securityId === planned.securityId);
-      const reason =
-        siblings.length > 1
-          ? `SYMBOL_PARTIAL:${tenMinRangeGapReason(message)}`
-          : tenMinRangeGapReason(message);
-      const gap: TenMinRangeGapEntry = {
-        securityId: planned.securityId,
-        symbol: planned.symbol,
-        reason,
-        at: stamp(),
-        fetchFrom: planned.fetchFrom,
-        fetchTo: planned.fetchTo,
-      };
-      gaps.set(gapKey(gap), gap);
+      const idKey = fetchIdentityKey(planned);
+      const securityRefs = storedBySecurity.get(planned.securityId) ?? [];
+      const candidates = compatibleStoredFetches(securityRefs, planned);
+      let resumed = false;
+      for (const candidate of candidates) {
+        const hintEntry = hints.get(candidate.key);
+        const hint =
+          hintEntry?.fetch ??
+          existing?.securities
+            .find((s) => s.securityId === planned.securityId)
+            ?.fetches.find(
+              (f) =>
+                f.symbol === candidate.symbol &&
+                f.fetchFrom === candidate.fetchFrom &&
+                f.fetchTo === candidate.fetchTo,
+            );
+        const verified = await verifyStoredTenMinRangeFetch(
+          store,
+          from,
+          to,
+          {
+            securityId: planned.securityId,
+            symbol: candidate.symbol,
+            fetchFrom: candidate.fetchFrom,
+            fetchTo: candidate.fetchTo,
+          },
+          {
+            provider,
+            storedPages: candidate.pages,
+            backend,
+            ...(hint ? { hint } : {}),
+          },
+        );
+        if (verified) {
+          // Keep the REAL stored span in the manifest (may start before today's planned fetchFrom).
+          doneFetches.set(candidate.key, { securityId: planned.securityId, fetch: verified });
+          fetchesResumed += 1;
+          securitiesResumed.add(planned.securityId);
+          outageStreak = 0;
+          clearOutageStreakGaps();
+          resumed = true;
+          break;
+        }
+      }
+      if (resumed) continue;
+
+      // Different ticker leftovers for this security (not a compatible earlier-from span): warn once.
+      const plannedSymbols = new Set(
+        options.fetches.filter((f) => f.securityId === planned.securityId).map((f) => f.symbol),
+      );
+      for (const ref of securityRefs) {
+        if (ref.symbol === planned.symbol) continue;
+        if (plannedSymbols.has(ref.symbol)) continue;
+        if (!ref.pages.has(1)) continue;
+        warnings.push(
+          `TENMIN_RANGE_SYMBOL_CHANGED:${planned.securityId}:${ref.symbol}:${planned.symbol}`,
+        );
+      }
+
+      try {
+        massiveRequests += 1;
+        const pages = await options.fetchPages(
+          { securityId: planned.securityId, symbol: planned.symbol },
+          planned.fetchFrom,
+          planned.fetchTo,
+        );
+        const { fetch } = await writeTenMinRangeFetch(store, pages, {
+          provider,
+          calendarFrom: from,
+          calendarTo: to,
+          fetchFrom: planned.fetchFrom,
+          fetchTo: planned.fetchTo,
+          backend,
+          ...(options.securityLink ? { link: options.securityLink.source } : {}),
+        });
+        filesWritten += fetch.files.length;
+        fallbackFiles += fetch.files.filter((file) => file.version === REPLY_DUST_FALLBACK_VERSION).length;
+        await appendTenMinRangeProgress(root, from, to, { securityId: planned.securityId, fetch });
+        doneFetches.set(idKey, { securityId: planned.securityId, fetch });
+        fetchesWritten += 1;
+        securitiesWritten.add(planned.securityId);
+        outageStreak = 0;
+        clearOutageStreakGaps();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isTenMinRangeAbortError(message)) throw error;
+        if (
+          message.startsWith("R2_") ||
+          message.startsWith("STORE_") ||
+          message === "STORE_DOWN" ||
+          message.startsWith("REPLY_DUST_") ||
+          message.startsWith("OBJECT_STORE")
+        )
+          throw error;
+
+        if (isTenMinRangeOutageError(message)) {
+          outageStreak += 1;
+          if (outageStreak >= TENMIN_RANGE_OUTAGE_STREAK) {
+            clearOutageStreakGaps();
+            outageStop = `${TENMIN_RANGE_OUTAGE_STOP}:${message}`;
+            break;
+          }
+          // Do not record as a durable gap yet; streak failures are retried next run.
+          continue;
+        }
+
+        outageStreak = 0;
+        clearOutageStreakGaps();
+        const siblings = options.fetches.filter((f) => f.securityId === planned.securityId);
+        const reason =
+          siblings.length > 1
+            ? `SYMBOL_PARTIAL:${tenMinRangeGapReason(message)}`
+            : tenMinRangeGapReason(message);
+        const gap: TenMinRangeGapEntry = {
+          securityId: planned.securityId,
+          symbol: planned.symbol,
+          reason,
+          at: stamp(),
+          fetchFrom: planned.fetchFrom,
+          fetchTo: planned.fetchTo,
+        };
+        gaps.set(gapKey(gap), gap);
+      }
     }
+
+  } catch (error) {
+    // Requests already made still count in the range and run reports.
+    throw withTenMinMassiveRequests(error, massiveRequests);
   }
 
   if (yieldedForScan || outageStop) {

@@ -37,6 +37,64 @@ export function assertObjectMetadata(metadata: ObjectMetadata): void {
   if (bytes > OBJECT_METADATA_MAX_BYTES) throw new Error(`OBJECT_METADATA_TOO_LARGE:${bytes}`);
 }
 
+const ENCODED_WORD = /=\?([^?\s]+)\?([QqBb])\?([^?\s]*)\?=/gu;
+
+function decodeEncodedWord(charset: string, encoding: string, text: string): string | undefined {
+  const name = charset.toLowerCase().split("*")[0];
+  if (name !== "utf-8" && name !== "utf8" && name !== "us-ascii") return undefined;
+  let bytes: Uint8Array;
+  if (encoding === "B" || encoding === "b") {
+    if (!/^[A-Za-z0-9+/]*={0,2}$/u.test(text)) return undefined;
+    bytes = Buffer.from(text, "base64");
+  } else {
+    const out: number[] = [];
+    for (let i = 0; i < text.length; i += 1) {
+      const char = text[i]!;
+      if (char === "_") out.push(0x20);
+      else if (char === "=") {
+        const hex = text.slice(i + 1, i + 3);
+        if (!/^[0-9A-Fa-f]{2}$/u.test(hex)) return undefined;
+        out.push(Number.parseInt(hex, 16));
+        i += 2;
+      } else out.push(char.charCodeAt(0));
+    }
+    bytes = Uint8Array.from(out);
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Decode RFC 2047 encoded words (=?charset?Q?...?= / =?charset?B?...?=, utf-8 or us-ascii) in a
+ * metadata value as R2 returns it on HEAD/GET for values with characters like / ? = &. Whitespace
+ * between two adjacent encoded words is dropped; plain text around them is kept. Values with no
+ * encoded word (or an undecodable one) are returned unchanged.
+ */
+export function decodeRfc2047Value(value: string): string {
+  if (!value.includes("=?")) return value;
+  let output = "";
+  let last = 0;
+  let previousWasWord = false;
+  for (const match of value.matchAll(ENCODED_WORD)) {
+    const start = match.index;
+    const between = value.slice(last, start);
+    const decoded = decodeEncodedWord(match[1]!, match[2]!, match[3]!);
+    if (decoded === undefined) {
+      output += between + match[0];
+      previousWasWord = false;
+    } else {
+      if (!(previousWasWord && /^\s*$/u.test(between))) output += between;
+      output += decoded;
+      previousWasWord = true;
+    }
+    last = start + match[0].length;
+  }
+  return output + value.slice(last);
+}
+
 export class MemoryObjectClient implements ObjectClient {
   private readonly objects = new Map<string, Uint8Array>();
   private readonly metadata = new Map<string, ObjectMetadata>();
@@ -223,7 +281,9 @@ export class R2ObjectClient implements ObjectClient {
     const metadata: ObjectMetadata = {};
     response.headers.forEach((value, name) => {
       const lower = name.toLowerCase();
-      if (lower.startsWith(METADATA_PREFIX)) metadata[lower.slice(METADATA_PREFIX.length)] = value;
+      // R2 returns values containing / ? = & as RFC 2047 encoded words; we store them raw.
+      if (lower.startsWith(METADATA_PREFIX))
+        metadata[lower.slice(METADATA_PREFIX.length)] = decodeRfc2047Value(value);
     });
     return { size: Number(response.headers.get("content-length") ?? "0"), metadata };
   }

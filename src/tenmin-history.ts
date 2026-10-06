@@ -13,6 +13,7 @@ import type { MarketStore } from "./storage";
 import { MarketStorage } from "./storage";
 import { prepareSafeStoreFile } from "./store-path";
 import {
+  tenMinMassiveRequestsOf,
   TENMIN_AGED_OUT,
   TENMIN_UNIVERSE_EMPTY,
   isEmptyTenMinRangeManifest,
@@ -759,6 +760,22 @@ export async function runTenMinHistory(options: {
     } catch (err) {
       stoppedOnError = true;
       error = err instanceof Error ? err.message : String(err);
+      const made = tenMinMassiveRequestsOf(err);
+      massiveRequests += made;
+      rangeReports.push({
+        ...base,
+        status: "ERROR",
+        error,
+        securitiesPlanned: universe ? universe.securities.length + universe.gaps.length : 0,
+        fetchesPlanned: universe?.fetches.length ?? 0,
+        securitiesWritten: 0,
+        securitiesResumed: 0,
+        gaps: universe?.gaps ?? [],
+        symbolChangeWarnings: [],
+        fallbackFiles: 0,
+        massiveRequests: made,
+        zstdVersion,
+      });
       break;
     }
   }

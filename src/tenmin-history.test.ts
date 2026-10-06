@@ -1269,3 +1269,41 @@ test("AGED_OUT: window start inside an unsealed range clamps the fetch, records 
     );
   });
 });
+
+test("requests made before an abort are counted in the range and run reports", async () => {
+  await withRoot(async (root) => {
+    const inner = new MemoryObjectClient();
+    const store = {
+      get: (key: string) => inner.get(key),
+      head: (key: string) => inner.head(key),
+      list: (prefix: string) => inner.list(prefix),
+      put: async (key: string, body: Uint8Array, metadata?: import("./object-store").ObjectMetadata) => {
+        if (key.endsWith(".rdust")) throw new Error("REPLY_DUST_METADATA_READBACK_MISMATCH:test");
+        return inner.put(key, body, metadata);
+      },
+    };
+    let fetches = 0;
+    const result = await runTenMinHistory({
+      root,
+      store,
+      securities: [master("AAA"), master("BBB")],
+      loadDailyBarSessions: everyDay("AAA", "BBB"),
+      lastCompletedSession: "2026-10-05",
+      maxRanges: 1,
+      writeReport: false,
+      zstdVersionProbe: pinnedZstd,
+      env: {},
+      fetchPages: async (s, f, t) => {
+        fetches += 1;
+        return pagesFor(s, f, t);
+      },
+    });
+    assert.equal(fetches, 1);
+    assert.equal(result.report.stoppedOnError, true);
+    assert.match(result.report.error ?? "", /REPLY_DUST_METADATA_READBACK_MISMATCH/);
+    assert.equal(result.report.massiveRequests, 1);
+    assert.equal(result.report.ranges[0]?.status, "ERROR");
+    assert.equal(result.report.ranges[0]?.massiveRequests, 1);
+    assert.equal(tenMinHistorySummary(result.report).massiveRequests, 1);
+  });
+});

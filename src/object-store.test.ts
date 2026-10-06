@@ -9,6 +9,7 @@ import {
   OBJECT_METADATA_MAX_BYTES,
   R2ObjectClient,
   assertObjectMetadata,
+  decodeRfc2047Value,
 } from "./object-store";
 
 const config = {
@@ -135,4 +136,43 @@ test("the local file store keeps metadata in a hidden sidecar and lists only obj
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// ---- RFC 2047 metadata values (R2 encodes values containing / ? = & on HEAD) ----
+
+const PRODUCTION_ENCODED =
+  "=?utf-8?Q?=2Fv2=2Faggs?= =?utf-8?Q?=2Fticker=2F?= =?utf-8?Q?IBTP=2Fran?= =?utf-8?Q?ge=2F10=2Fmi?= =?utf-8?Q?nute=2F202?= =?utf-8?Q?4-11-01=2F?= =?utf-8?Q?2024-12-?= =?utf-8?Q?31=3Fadjus?=ted=false&sort=asc&limit=50000";
+
+test("decodeRfc2047Value decodes R2's encoded words and leaves plain values alone", () => {
+  assert.equal(
+    decodeRfc2047Value(PRODUCTION_ENCODED),
+    "/v2/aggs/ticker/IBTP/range/10/minute/2024-11-01/2024-12-31?adjusted=false&sort=asc&limit=50000",
+  );
+  // B encoding, case-insensitive charset and encoding letter.
+  assert.equal(decodeRfc2047Value(`=?UTF-8?b?${Buffer.from("/a?b=c&d").toString("base64")}?=`), "/a?b=c&d");
+  // Mixed plain and encoded: plain text before/after is kept; whitespace only between words dropped.
+  assert.equal(decodeRfc2047Value("pre =?utf-8?Q?=2Fx?=  =?us-ascii?q?=3Fy?= post"), "pre /x?y post");
+  // Underscore is a space in Q encoding; UTF-8 bytes decode.
+  assert.equal(decodeRfc2047Value("=?utf-8?Q?a_b=C3=A9?="), "a bé");
+  // Not encoded (has = but no encoded word): unchanged. ISO timestamps unchanged.
+  for (const plain of ["adjusted=false&sort=asc", "2026-10-06T08:00:00.000Z", "a=?b", "=?bad", ""])
+    assert.equal(decodeRfc2047Value(plain), plain);
+  // Unknown charset or broken word is left as is.
+  assert.equal(decodeRfc2047Value("=?iso-2022-jp?Q?abc?="), "=?iso-2022-jp?Q?abc?=");
+  assert.equal(decodeRfc2047Value("=?utf-8?Q?=ZZ?="), "=?utf-8?Q?=ZZ?=");
+});
+
+test("R2 head decodes an RFC 2047 encoded x-amz-meta value", async () => {
+  const client = new R2ObjectClient({
+    ...config,
+    fetchImpl: async () =>
+      new Response(null, {
+        status: 200,
+        headers: { "content-length": "5", "x-amz-meta-rd-request": PRODUCTION_ENCODED, "x-amz-meta-rd-fetched-at": "2026-10-06T08:00:00.000Z" },
+      }),
+  });
+  assert.deepEqual((await client.head("k"))!.metadata, {
+    "rd-request": "/v2/aggs/ticker/IBTP/range/10/minute/2024-11-01/2024-12-31?adjusted=false&sort=asc&limit=50000",
+    "rd-fetched-at": "2026-10-06T08:00:00.000Z",
+  });
 });

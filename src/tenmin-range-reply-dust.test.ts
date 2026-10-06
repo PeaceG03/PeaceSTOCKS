@@ -6,7 +6,7 @@ import test from "node:test";
 import { securityId } from "./identity";
 import { readReplyDustSecurityDay, writeReplyDustFile, writeReplyDustManifest } from "./intraday-reply-dust";
 import { MassiveMarketProvider } from "./massive-provider";
-import { MemoryObjectClient, type ObjectMetadata, OBJECT_METADATA_MAX_BYTES } from "./object-store";
+import { MemoryObjectClient, type ObjectMetadata, OBJECT_METADATA_MAX_BYTES, R2ObjectClient } from "./object-store";
 import { REPLY_DUST_FALLBACK_VERSION, REPLY_DUST_VERSION, type ReplyDustBackend, decodeReplyDust, nodeReplyDustBackend } from "./reply-dust";
 import {
   TENMIN_RANGE_MANIFEST_SCHEMA,
@@ -858,5 +858,125 @@ test("resume lists the store once and groups by security (no quadratic scan)", a
     assert.equal(fetches, 0);
     assert.equal(result.fetchesResumed, 40);
     assert.equal(listCalls, 1);
+  });
+});
+
+// ---- R2 returns some metadata values RFC 2047 encoded on HEAD ----
+
+/** Q-encode like R2 does for values with / ? = &: short words up to the last "?", rest plain. */
+function encodeLikeR2(value: string): string {
+  if (!/[/?=&]/u.test(value)) return value;
+  const cut = value.lastIndexOf("?") >= 0 ? value.lastIndexOf("?") + 6 : value.length;
+  const head = value.slice(0, Math.min(cut, value.length));
+  const words: string[] = [];
+  for (let i = 0; i < head.length; i += 9) {
+    const chunk = head.slice(i, i + 9);
+    words.push(
+      `=?utf-8?Q?${[...Buffer.from(chunk, "utf8")].map((b) => (/[A-Za-z0-9.-]/u.test(String.fromCharCode(b)) ? String.fromCharCode(b) : `=${b.toString(16).toUpperCase().padStart(2, "0")}`)).join("")}?=`,
+    );
+  }
+  return words.join(" ") + value.slice(head.length);
+}
+
+function rangePages(s: { securityId: string; symbol: string }, from: string, to: string) {
+  return [
+    {
+      page: 1,
+      request: `/v2/aggs/ticker/${s.symbol}/range/10/minute/${from}/${to}?adjusted=false&sort=asc&limit=50000`,
+      fetchedAt: FETCHED_AT,
+      body: new TextEncoder().encode(page(s.symbol, 1, [bar("2024-11-04T15:00:00Z", 10)], undefined, from, to)),
+      rangeFrom: from,
+      rangeTo: to,
+      securityId: s.securityId,
+      symbol: s.symbol,
+    },
+  ];
+}
+
+/** A fake R2 endpoint (PUT/GET/HEAD/DELETE/list) that encodes metadata on HEAD like real R2. */
+function fakeR2() {
+  const objects = new Map<string, { body: Uint8Array; meta: Record<string, string> }>();
+  const keyOf = (url: URL) => decodeURIComponent(url.pathname.split("/").slice(2).join("/"));
+  const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const url = new URL(String(input));
+    const method = init?.method ?? "GET";
+    const key = keyOf(url);
+    if (method === "GET" && url.searchParams.get("list-type") === "2") {
+      const prefix = url.searchParams.get("prefix") ?? "";
+      const keys = [...objects.keys()].filter((k) => k.startsWith(prefix)).sort();
+      return new Response(`<ListBucketResult>${keys.map((k) => `<Key>${k}</Key>`).join("")}<IsTruncated>false</IsTruncated></ListBucketResult>`);
+    }
+    if (method === "PUT") {
+      const headers = new Headers(init?.headers);
+      const meta: Record<string, string> = {};
+      headers.forEach((value, name) => {
+        if (name.startsWith("x-amz-meta-")) meta[name.slice(11)] = value;
+      });
+      objects.set(key, { body: new Uint8Array(init?.body as Uint8Array), meta });
+      return new Response(null, { status: 200 });
+    }
+    const found = objects.get(key);
+    if (method === "DELETE") {
+      objects.delete(key);
+      return new Response(null, { status: 204 });
+    }
+    if (!found) return new Response(null, { status: 404 });
+    if (method === "HEAD") {
+      const headers: Record<string, string> = { "content-length": String(found.body.length) };
+      for (const [name, value] of Object.entries(found.meta)) headers[`x-amz-meta-${name}`] = encodeLikeR2(value);
+      return new Response(null, { status: 200, headers });
+    }
+    return new Response(found.body, { status: 200 });
+  };
+  return { objects, client: new R2ObjectClient({ accountId: "a", bucket: "b", accessKeyId: "k", secretAccessKey: "s", fetchImpl }) };
+}
+
+test("range writer readback passes and resume accepts objects when R2 HEAD returns RFC 2047 values", async () => {
+  await withRoot(async (root) => {
+    const { objects, client } = fakeR2();
+    const fetches = [
+      { securityId: id("IBTP"), symbol: "IBTP", fetchFrom: "2024-11-01", fetchTo: "2024-12-31" },
+    ];
+    let requests = 0;
+    const fetchPages = async (s: { securityId: string; symbol: string }, f: string, t: string) => {
+      requests += 1;
+      return rangePages(s, f, t);
+    };
+    const first = await writeTenMinRangeReplyDust({
+      store: client,
+      root,
+      provider: PROVIDER,
+      from: "2024-11-01",
+      to: "2024-12-31",
+      fetches,
+      zstdVersionProbe: pinnedZstd,
+      fetchPages,
+    });
+    assert.equal(first.sealed, true);
+    const objectKey = [...objects.keys()].find((k) => k.endsWith(".rdust"))!;
+    // Stored raw; HEAD returns it encoded (like production), and the client decodes it.
+    assert.match(objects.get(objectKey)!.meta["rd-request"]!, /^\/v2\/aggs\/ticker\/IBTP\/range\//u);
+    const raw = await (client as unknown as { request: (m: string, u: URL) => Promise<Response> }).request(
+      "HEAD",
+      new URL(`https://a.r2.cloudflarestorage.com/b/${objectKey}`),
+    );
+    assert.match(raw.headers.get("x-amz-meta-rd-request") ?? "", /^=\?utf-8\?Q\?/u);
+    // Resume from stored objects (manifest and local progress gone): 0 refetches.
+    await client.delete(tenMinRangeManifestKey("2024-11-01", "2024-12-31"));
+    await rm(join(root, "transient"), { recursive: true, force: true });
+    requests = 0;
+    const resumed = await writeTenMinRangeReplyDust({
+      store: client,
+      root,
+      provider: PROVIDER,
+      from: "2024-11-01",
+      to: "2024-12-31",
+      fetches,
+      zstdVersionProbe: pinnedZstd,
+      fetchPages,
+    });
+    assert.equal(requests, 0);
+    assert.equal(resumed.fetchesResumed, 1);
+    assert.equal(resumed.sealed, true);
   });
 });
