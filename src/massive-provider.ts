@@ -75,6 +75,38 @@ function safeProviderErrorBody(body: string): string {
 }
 
 /** Read-only adapter for Massive Stocks REST reference, EOD, split, and dividend APIs. */
+// The active pass runs before the inactive pass and both share one map keyed by identity. An
+// inactive record must never replace an active one with the same FIGI (that dropped live tickers
+// from the universe); among records with the same status the later one wins as before. The
+// losing ticker is kept on the winner as a former symbol so the security master records it.
+export function mergeSameIdentity(
+  output: Map<string, ProviderSecurityRecord>,
+  incoming: ProviderSecurityRecord,
+): void {
+  const key = `${incoming.providerSecurityId}|${incoming.assetType}`;
+  const current = output.get(key);
+  if (!current) {
+    output.set(key, incoming);
+    return;
+  }
+  const incomingWins = incoming.active || !current.active;
+  const winner = incomingWins ? incoming : current;
+  const loser = incomingWins ? current : incoming;
+  const former = [...(current.formerSymbols ?? []), ...(incoming.formerSymbols ?? [])];
+  if (loser.symbol !== winner.symbol)
+    former.push({
+      symbol: loser.symbol,
+      ...(loser.listingDate ? { listingDate: loser.listingDate } : {}),
+      ...(loser.delistedDate ? { delistedDate: loser.delistedDate } : {}),
+    });
+  const unique = former.filter(
+    (item, index) =>
+      item.symbol !== winner.symbol && former.findIndex((other) => other.symbol === item.symbol) === index,
+  );
+  const { formerSymbols: _drop, ...rest } = winner;
+  output.set(key, unique.length ? { ...rest, formerSymbols: unique } : rest);
+}
+
 export class MassiveMarketProvider implements MarketProvider {
   readonly providerName = "massive-stocks";
   private readonly apiKey: string;
@@ -195,6 +227,7 @@ export class MassiveMarketProvider implements MarketProvider {
     const locale = text(record.locale)?.toLowerCase();
     const listingDate = text(record.list_date);
     const providerUpdatedAt = text(record.last_updated);
+    const delistedDate = text(record.delisted_utc)?.slice(0, 10);
     if (!symbol || !providerSecurityId || (type !== "CS" && type !== "ETF")) return undefined;
     if (market && market !== "stocks") return undefined;
     if (locale && locale !== "us") return undefined;
@@ -210,6 +243,7 @@ export class MassiveMarketProvider implements MarketProvider {
       ...(typeof record.fractionable === "boolean" ? { fractional: record.fractionable } : {}),
       ...(listingDate ? { listingDate } : {}),
       ...(providerUpdatedAt ? { providerUpdatedAt } : {}),
+      ...(record.active === false && delistedDate ? { delistedDate } : {}),
     };
   }
 
@@ -243,8 +277,7 @@ export class MassiveMarketProvider implements MarketProvider {
         first = false;
         for (const record of records(response.results)) {
           const normalized = this.normalize(record);
-          if (normalized)
-            output.set(`${normalized.providerSecurityId}|${normalized.assetType}`, normalized);
+          if (normalized) mergeSameIdentity(output, normalized);
         }
         const candidate = text(response.next_url);
         next = candidate && candidate !== next ? candidate : undefined;

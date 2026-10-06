@@ -135,6 +135,46 @@ test("security identity is stable across ticker changes and scope excludes non-U
   }
 });
 
+test("former tickers from the provider are recorded in the security's symbol history", async () => {
+  const root = await fixtureRoot();
+  try {
+    const storage = new MarketStorage(root);
+    const result = await refreshUniverse(
+      new FixtureProvider(
+        [
+          {
+            ...providerRecord("issuer-9", "NEWN"),
+            formerSymbols: [
+              { symbol: "OLDN", listingDate: "2019-03-01", delistedDate: "2024-05-20" },
+              { symbol: "UNDATED" },
+            ],
+          },
+        ],
+        [],
+      ),
+      storage,
+      "2026-01-05",
+    );
+    const history = result.securities.find((item) => item.currentSymbol === "NEWN")?.historicalSymbols;
+    assert.deepEqual(history, [
+      { symbol: "OLDN", effectiveFrom: "2019-03-01", effectiveTo: "2024-05-20", source: "fixture-provider" },
+      { symbol: "UNDATED", effectiveFrom: "2026-01-05", effectiveTo: "2026-01-05", source: "fixture-provider" },
+      { symbol: "NEWN", effectiveFrom: "2026-01-05", source: "fixture-provider" },
+    ]);
+    const again = await refreshUniverse(
+      new FixtureProvider([{ ...providerRecord("issuer-9", "NEWN"), formerSymbols: [{ symbol: "OLDN" }] }], []),
+      storage,
+      "2026-01-06",
+    );
+    assert.deepEqual(
+      again.securities.find((item) => item.currentSymbol === "NEWN")?.historicalSymbols.map((item) => item.symbol),
+      ["OLDN", "UNDATED", "NEWN"],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("universe refresh is idempotent and preserves inactive history", async () => {
   const root = await fixtureRoot();
   try {

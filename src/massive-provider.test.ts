@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { securityId } from "./identity";
-import { MassiveMarketProvider } from "./massive-provider";
+import { MassiveMarketProvider, mergeSameIdentity } from "./massive-provider";
+import type { ProviderSecurityRecord } from "./contracts";
 import { ScanYieldError } from "./scan-yield";
 
 function securityIdForTest(): string {
@@ -214,4 +215,75 @@ test("Massive ticker listing checks shouldStop at each later page boundary and r
   // Not asked before the first page; asked before pages 2, 3 and 4; stopped before page 4.
   assert.equal(asked, 3);
   assert.equal(urls.length, 3);
+});
+
+test("an inactive ticker never replaces an active ticker with the same FIGI", async () => {
+  const provider = new MassiveMarketProvider({
+    apiKey: "test-key",
+    minRequestIntervalMs: 0,
+    fetchImpl: async (input) => {
+      const active = new URL(String(input)).searchParams.get("active");
+      const ticker = (symbol: string, isActive: boolean, figi: string, extra: object = {}) => ({
+        ticker: symbol,
+        type: "CS",
+        market: "stocks",
+        locale: "us",
+        active: isActive,
+        share_class_figi: figi,
+        ...extra,
+      });
+      const results =
+        active === "false"
+          ? [
+              ticker("OLDN", false, "FIGI-SAME", { list_date: "2019-03-01", delisted_utc: "2024-05-20T00:00:00Z" }),
+              ticker("GONE", false, "FIGI-GONE", { delisted_utc: "2023-01-03T00:00:00Z" }),
+            ]
+          : [ticker("NEWN", true, "FIGI-SAME", { list_date: "2024-05-21" }), ticker("LIVE", true, "FIGI-LIVE")];
+      return new Response(JSON.stringify({ request_id: `universe-${active}`, results }), { status: 200 });
+    },
+  });
+  const universe = await provider.listApprovedSecurities();
+  assert.deepEqual(
+    universe.map((item) => [item.symbol, item.active]),
+    [
+      ["GONE", false],
+      ["LIVE", true],
+      ["NEWN", true],
+    ],
+  );
+  const renamed = universe.find((item) => item.symbol === "NEWN");
+  assert.deepEqual(renamed?.formerSymbols, [{ symbol: "OLDN", listingDate: "2019-03-01", delistedDate: "2024-05-20" }]);
+  assert.equal(universe.find((item) => item.symbol === "GONE")?.delistedDate, "2023-01-03");
+  assert.equal(universe.find((item) => item.symbol === "LIVE")?.formerSymbols, undefined);
+});
+
+test("same-identity merge: active wins in either order, same status keeps the later record", () => {
+  const record = (symbol: string, active: boolean): ProviderSecurityRecord => ({
+    provider: "massive-stocks",
+    providerSecurityId: "FIGI-X",
+    symbol,
+    assetType: "STOCK",
+    country: "US",
+    exchange: "XNAS",
+    active,
+    tradable: active,
+  });
+  for (const order of [
+    [record("A", true), record("B", false)],
+    [record("B", false), record("A", true)],
+  ]) {
+    const output = new Map<string, ProviderSecurityRecord>();
+    for (const item of order) mergeSameIdentity(output, item);
+    assert.equal(output.size, 1);
+    assert.equal(output.get("FIGI-X|STOCK")?.symbol, "A");
+    assert.deepEqual(output.get("FIGI-X|STOCK")?.formerSymbols, [{ symbol: "B" }]);
+  }
+  const inactive = new Map<string, ProviderSecurityRecord>();
+  for (const item of [record("C", false), record("D", false), record("C", false)]) mergeSameIdentity(inactive, item);
+  assert.equal(inactive.get("FIGI-X|STOCK")?.symbol, "C");
+  assert.deepEqual(inactive.get("FIGI-X|STOCK")?.formerSymbols, [{ symbol: "D" }]);
+  const same = new Map<string, ProviderSecurityRecord>();
+  for (const item of [record("E", true), record("E", false)]) mergeSameIdentity(same, item);
+  assert.equal(same.get("FIGI-X|STOCK")?.active, true);
+  assert.equal(same.get("FIGI-X|STOCK")?.formerSymbols, undefined);
 });

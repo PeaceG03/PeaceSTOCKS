@@ -70,6 +70,18 @@ export async function refreshUniverse(
       );
     const previous = byId.get(id);
     const history = previous?.historicalSymbols ?? [];
+    // Former tickers of the same identity (from the provider's inactive pass) go in front of the
+    // history if they are not already recorded. Without a provider date the refresh date is used.
+    const missingFormer = (providerRecord.formerSymbols ?? [])
+      .filter((item) => !history.some((entry) => entry.symbol === item.symbol))
+      .map((item) => ({
+        symbol: item.symbol,
+        effectiveFrom: item.listingDate ?? asOf,
+        effectiveTo: item.delistedDate ?? asOf,
+        source: providerRecord.provider,
+      }))
+      .sort((a, b) => a.effectiveTo.localeCompare(b.effectiveTo) || a.symbol.localeCompare(b.symbol));
+    if (missingFormer.length) history.unshift(...missingFormer);
     if (!history.length || history[history.length - 1]?.symbol !== providerRecord.symbol) {
       const last = history[history.length - 1];
       if (last) history[history.length - 1] = { ...last, effectiveTo: asOf };

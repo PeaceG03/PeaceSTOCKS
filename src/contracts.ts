@@ -145,6 +145,16 @@ export interface ProviderSecurityRecord {
   fractional?: boolean;
   listingDate?: string;
   providerUpdatedAt?: string;
+  /** Provider's delisting date for an inactive record (YYYY-MM-DD), when it gives one. */
+  delistedDate?: string;
+  /** Other tickers the provider listed under the same identity that lost the merge. */
+  formerSymbols?: ProviderFormerSymbol[];
+}
+
+export interface ProviderFormerSymbol {
+  symbol: string;
+  listingDate?: string;
+  delistedDate?: string;
 }
 
 export interface UniverseMembershipEvidence {
