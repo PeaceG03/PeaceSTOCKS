@@ -38,11 +38,17 @@ import {
   resolveTenMinRangeEntryKey,
   sortTenMinRangeEntries,
   assertNoDuplicateTenMinRangeEntryPages,
+  assertNoOverlappingTenMinRangeStoredFetches,
+  buildTenMinRangeEntryRecordsFromState,
+  collapseExactDuplicateGapRecords,
+  hydrateTenMinRangeManifestFromCompact,
+  TENMIN_RANGE_OVERLAPPING_FETCHES,
   validateTenMinRangeEntriesPages,
   statusCodeOf,
   statusReasonOf,
   tenMinRangeEntriesObjectKey,
   tenMinRangeHashedCopyFileKey,
+  type TenMinRangeCompactManifest,
   type TenMinRangeEntryRecord,
 } from "./tenmin-range-entries";
 
@@ -550,6 +556,207 @@ test("compact load verifies entries; missing/corrupt entries => listing fallback
   assert.deepEqual(ok.warnings, []);
   assert.equal(ok.records.length, 1);
   assert.equal(puts, 0);
+});
+
+
+test("two gaps different reasons same key: encode/decode; exact duplicate gaps collapse", () => {
+  const gapA: TenMinRangeEntryRecord = {
+    securityId: "sec_gap",
+    symbol: "GAP",
+    fetchFrom: FROM,
+    fetchTo: TO,
+    pageNumber: 1,
+    pageCount: 1,
+    replySha256: "0".repeat(64),
+    byteLength: 0,
+    status: TENMIN_NO_DAILY_BAR_STATUS,
+  };
+  const gapB: TenMinRangeEntryRecord = {
+    ...gapA,
+    status: TENMIN_AGED_OUT,
+  };
+  const exactDup = { ...gapA };
+  // Different reasons on same key must not trip dupPage
+  assert.deepEqual(validateTenMinRangeEntriesPages([gapA, gapB]), []);
+  assert.doesNotThrow(() => assertNoDuplicateTenMinRangeEntryPages([gapA, gapB]));
+  const body = encodeTenMinRangeEntriesBody([gapA, gapB, exactDup]);
+  const decoded = decodeTenMinRangeEntriesBody(body);
+  assert.equal(decoded.records.length, 2, "exact duplicate gap collapsed");
+  const statuses = decoded.records.map((r) => r.status).sort();
+  assert.deepEqual(statuses, [TENMIN_AGED_OUT, TENMIN_NO_DAILY_BAR_STATUS].sort());
+  // collapse helper alone
+  assert.equal(collapseExactDuplicateGapRecords([gapA, exactDup, gapB]).length, 2);
+});
+
+
+test("buildTenMinRangeEntryRecordsFromState: two gap reasons same key + STORED seals via encode", () => {
+  const done = new Map();
+  const gaps = [
+    {
+      securityId: "sec_seal",
+      symbol: "SL",
+      reason: TENMIN_NO_DAILY_BAR_STATUS,
+      at: AT,
+      fetchFrom: FROM,
+      fetchTo: TO,
+    },
+    {
+      securityId: "sec_seal",
+      symbol: "SL",
+      reason: TENMIN_AGED_OUT,
+      at: AT,
+      fetchFrom: FROM,
+      fetchTo: TO,
+    },
+    {
+      securityId: "sec_other",
+      symbol: "OT",
+      reason: TENMIN_NO_HISTORICAL_SYMBOL,
+      at: AT,
+      fetchFrom: FROM,
+      fetchTo: TO,
+    },
+  ];
+  // duplicate exact gap should collapse
+  gaps.push({ ...gaps[0]! });
+  const records = buildTenMinRangeEntryRecordsFromState({ from: FROM, to: TO, doneFetches: done, gaps });
+  assert.equal(records.filter((r) => r.securityId === "sec_seal").length, 2);
+  const body = encodeTenMinRangeEntriesBody(records);
+  assert.equal(decodeTenMinRangeEntriesBody(body).records.length, records.length);
+});
+
+test("gap plus STORED on same key encodes (dupPage only applies to STORED)", () => {
+  const stored = rec({ securityId: "sec_mix", symbol: "MIX" });
+  const gap: TenMinRangeEntryRecord = {
+    securityId: "sec_mix",
+    symbol: "MIX",
+    fetchFrom: FROM,
+    fetchTo: TO,
+    pageNumber: 1,
+    pageCount: 1,
+    replySha256: "0".repeat(64),
+    byteLength: 0,
+    status: TENMIN_NO_HISTORICAL_SYMBOL,
+  };
+  assert.deepEqual(validateTenMinRangeEntriesPages([stored, gap]), []);
+  const body = encodeTenMinRangeEntriesBody([stored, gap]);
+  const decoded = decodeTenMinRangeEntriesBody(body);
+  assert.equal(decoded.records.length, 2);
+  assert.ok(decoded.records.some((r) => r.status === TENMIN_RANGE_STATUS_STORED));
+  assert.ok(decoded.records.some((r) => r.status === TENMIN_NO_HISTORICAL_SYMBOL));
+});
+
+test("duplicate STORED page different sha still refused", () => {
+  const dup: TenMinRangeEntryRecord[] = [
+    rec({ securityId: "sec_dup2", symbol: "D2", pageNumber: 1, pageCount: 1, replySha256: sha256Hex("a") }),
+    rec({ securityId: "sec_dup2", symbol: "D2", pageNumber: 1, pageCount: 1, replySha256: sha256Hex("b") }),
+  ];
+  assert.ok(validateTenMinRangeEntriesPages(dup).some((h) => h.includes(":dupPage=1")));
+  assert.throws(() => encodeTenMinRangeEntriesBody(dup), /TENMIN_RANGE_ENTRIES_DUPLICATE_PAGE/);
+});
+
+test("overlap: two base STORED spans on same security throw TENMIN_RANGE_OVERLAPPING_FETCHES", () => {
+  const a = rec({
+    securityId: "sec_ov",
+    symbol: "OV",
+    fetchFrom: "2024-11-01",
+    fetchTo: "2024-11-30",
+    replySha256: sha256Hex("ov-a"),
+  });
+  const b = rec({
+    securityId: "sec_ov",
+    symbol: "OV",
+    fetchFrom: "2024-11-15",
+    fetchTo: "2024-12-15",
+    replySha256: sha256Hex("ov-b"),
+  });
+  assert.throws(
+    () => assertNoOverlappingTenMinRangeStoredFetches([a, b]),
+    (err: unknown) =>
+      err instanceof Error && err.message.startsWith(`${TENMIN_RANGE_OVERLAPPING_FETCHES}:sec_ov:`),
+  );
+  assert.throws(() => encodeTenMinRangeEntriesBody([a, b]), /TENMIN_RANGE_OVERLAPPING_FETCHES:sec_ov:/);
+  const compact: TenMinRangeCompactManifest = {
+    schemaVersion: TENMIN_RANGE_MANIFEST_COMPACT_SCHEMA,
+    format: "REPLY_DUST_V1_ZSTD19_DICT4K",
+    provider: "massive-stocks",
+    rangeFrom: FROM,
+    rangeTo: TO,
+    keyRule: TENMIN_RANGE_KEY_RULE,
+    securityCount: 1,
+    fileCount: 2,
+    fallbackFileCount: 0,
+    entriesKey: "entries-dummy.bin.zst",
+    entriesSha256: "0".repeat(64),
+    entriesByteLength: 0,
+    gaps: [],
+    checksum: "0".repeat(64),
+  };
+  assert.throws(
+    () => hydrateTenMinRangeManifestFromCompact(compact, [a, b]),
+    /TENMIN_RANGE_OVERLAPPING_FETCHES:sec_ov:/,
+  );
+});
+
+test("adjacent base spans do not overlap", () => {
+  const a = rec({
+    securityId: "sec_adj",
+    symbol: "ADJ",
+    fetchFrom: "2024-11-01",
+    fetchTo: "2024-11-30",
+    replySha256: sha256Hex("adj-a"),
+  });
+  const b = rec({
+    securityId: "sec_adj",
+    symbol: "ADJ",
+    fetchFrom: "2024-12-01",
+    fetchTo: "2024-12-31",
+    replySha256: sha256Hex("adj-b"),
+  });
+  assert.doesNotThrow(() => assertNoOverlappingTenMinRangeStoredFetches([a, b]));
+  assert.doesNotThrow(() => encodeTenMinRangeEntriesBody([a, b]));
+});
+
+test("copy over its own base span: encode, hydrate, resume/read path does not throw", () => {
+  const base = rec({
+    securityId: "sec_copy",
+    symbol: "CPY",
+    fetchFrom: FROM,
+    fetchTo: TO,
+    replySha256: sha256Hex("base"),
+  });
+  const copySha = sha256Hex("copy-body");
+  const copy = rec({
+    securityId: "sec_copy",
+    symbol: "CPY",
+    fetchFrom: FROM,
+    fetchTo: TO,
+    copySha256: copySha,
+    replySha256: sha256Hex("copy"),
+  });
+  assert.doesNotThrow(() => assertNoOverlappingTenMinRangeStoredFetches([base, copy]));
+  const body = encodeTenMinRangeEntriesBody([base, copy]);
+  const decoded = decodeTenMinRangeEntriesBody(body);
+  assert.equal(decoded.records.length, 2);
+  const compact: TenMinRangeCompactManifest = {
+    schemaVersion: TENMIN_RANGE_MANIFEST_COMPACT_SCHEMA,
+    format: "REPLY_DUST_V1_ZSTD19_DICT4K",
+    provider: "massive-stocks",
+    rangeFrom: FROM,
+    rangeTo: TO,
+    keyRule: TENMIN_RANGE_KEY_RULE,
+    securityCount: 1,
+    fileCount: 2,
+    fallbackFileCount: 0,
+    entriesKey: "entries-dummy.bin.zst",
+    entriesSha256: "0".repeat(64),
+    entriesByteLength: 0,
+    gaps: [],
+    checksum: "0".repeat(64),
+  };
+  const view = hydrateTenMinRangeManifestFromCompact(compact, decoded.records);
+  assert.equal(view.securities.length, 1);
+  assert.equal(view.securities[0]!.fetches.length, 2); // base + copy as two fetches in hydrated view
 });
 
 test("size: 7363 synthetic records — report raw and zstd bytes", () => {

@@ -276,7 +276,10 @@ export function tenMinRangeEntriesObjectKey(calendarFrom: string, calendarTo: st
   return `${tenMinRangePrefix(calendarFrom, calendarTo)}/entries-${bodySha256}.bin.zst`;
 }
 
-/** Deterministic order: securityId, symbol, fetchFrom, fetchTo, copySha256, pageNumber. */
+/**
+ * Deterministic order: securityId, symbol, fetchFrom, fetchTo, copySha256, pageNumber,
+ * then status (reason) as tiebreaker so gap records with different reasons sort stably.
+ */
 function compareRecords(a: TenMinRangeEntryRecord, b: TenMinRangeEntryRecord): number {
   if (a.securityId < b.securityId) return -1;
   if (a.securityId > b.securityId) return 1;
@@ -290,20 +293,57 @@ function compareRecords(a: TenMinRangeEntryRecord, b: TenMinRangeEntryRecord): n
   const bc = b.copySha256 ?? "";
   if (ac < bc) return -1;
   if (ac > bc) return 1;
-  return a.pageNumber - b.pageNumber;
+  if (a.pageNumber !== b.pageNumber) return a.pageNumber - b.pageNumber;
+  // Gap identity includes status/reason so two gaps on the same key sort deterministically.
+  if (a.status < b.status) return -1;
+  if (a.status > b.status) return 1;
+  return 0;
 }
 
+/** Group key for STORED page completeness / dupPage checks (fetch + copy). Gaps are excluded upstream. */
 function fetchGroupKey(r: TenMinRangeEntryRecord): string {
   return `${r.securityId}\0${r.symbol}\0${r.fetchFrom}\0${r.fetchTo}\0${r.copySha256 ?? ""}`;
 }
 
 /**
- * Every fetch group must have pages 1..pageCount exactly once with a consistent pageCount.
+ * Exact-equality key for collapsing duplicate gap records (preferred over refusing: no information lost).
+ * Identity includes status/reason so two gaps with different reasons on the same fetch key are distinct.
+ */
+function gapRecordIdentityKey(r: TenMinRangeEntryRecord): string {
+  return `${r.securityId}\0${r.symbol}\0${r.fetchFrom}\0${r.fetchTo}\0${r.status}\0${r.pageNumber}\0${r.pageCount}\0${r.replySha256}\0${r.byteLength}\0${r.copySha256 ?? ""}`;
+}
+
+/**
+ * Collapse exact-duplicate gap records (same key + status/reason + payload). STORED records are kept as-is.
+ * Documented policy: collapsing exact duplicates is preferred because it cannot lose information.
+ */
+export function collapseExactDuplicateGapRecords(
+  records: readonly TenMinRangeEntryRecord[],
+): TenMinRangeEntryRecord[] {
+  const out: TenMinRangeEntryRecord[] = [];
+  const seenGaps = new Set<string>();
+  for (const r of records) {
+    if (r.status === TENMIN_RANGE_STATUS_STORED) {
+      out.push(r);
+      continue;
+    }
+    const key = gapRecordIdentityKey(r);
+    if (seenGaps.has(key)) continue;
+    seenGaps.add(key);
+    out.push(r);
+  }
+  return out;
+}
+
+/**
+ * Every STORED fetch group must have pages 1..pageCount exactly once with a consistent pageCount.
+ * Gap records are ignored here (their identity includes status/reason; see collapseExactDuplicateGapRecords).
  * Returns TENMIN_MANIFEST_V2_PAGE_MISSING:… strings for each hole (never silent).
  */
 export function validateTenMinRangeEntriesPages(records: readonly TenMinRangeEntryRecord[]): string[] {
   const groups = new Map<string, TenMinRangeEntryRecord[]>();
   for (const r of records) {
+    if (r.status !== TENMIN_RANGE_STATUS_STORED) continue; // dupPage / page holes apply only to STORED
     const list = groups.get(fetchGroupKey(r)) ?? [];
     list.push(r);
     groups.set(fetchGroupKey(r), list);
@@ -340,12 +380,61 @@ export function validateTenMinRangeEntriesPages(records: readonly TenMinRangeEnt
   return missing;
 }
 
-/** Encoder refuses duplicate pageNumber within the same fetch+copy group. */
+/** Encoder refuses duplicate pageNumber within the same STORED fetch+copy group. */
 export const TENMIN_RANGE_ENTRIES_DUPLICATE_PAGE = "TENMIN_RANGE_ENTRIES_DUPLICATE_PAGE" as const;
 
 export function assertNoDuplicateTenMinRangeEntryPages(records: readonly TenMinRangeEntryRecord[]): void {
+  // validateTenMinRangeEntriesPages already skips non-STORED; dupPage only applies to STORED.
   const dup = validateTenMinRangeEntriesPages(records).find((h) => h.includes(":dupPage="));
   if (dup) throw new Error(`${TENMIN_RANGE_ENTRIES_DUPLICATE_PAGE}:${dup}`);
+}
+
+export const TENMIN_RANGE_OVERLAPPING_FETCHES = "TENMIN_RANGE_OVERLAPPING_FETCHES" as const;
+
+/** Inclusive date-span overlap on YYYY-MM-DD strings (lexicographic works for ISO dates). */
+function spansOverlap(aFrom: string, aTo: string, bFrom: string, bTo: string): boolean {
+  return aFrom <= bTo && bFrom <= aTo;
+}
+
+/**
+ * Overlap check matches v1 intent for the hydrated view: ONLY base STORED records
+ * (status === STORED and no copySha256), grouped by securityId. Copy records are left out
+ * entirely — a re-fetch copy has the same span as its base by definition and is not an overlap.
+ * Adjacent spans (aTo < bFrom) do not overlap.
+ */
+export function assertNoOverlappingTenMinRangeStoredFetches(
+  records: readonly TenMinRangeEntryRecord[],
+): void {
+  const bySecurity = new Map<string, TenMinRangeEntryRecord[]>();
+  for (const r of records) {
+    if (r.status !== TENMIN_RANGE_STATUS_STORED) continue;
+    if (r.copySha256) continue; // copies out entirely
+    const list = bySecurity.get(r.securityId) ?? [];
+    list.push(r);
+    bySecurity.set(r.securityId, list);
+  }
+  for (const [securityId, pages] of bySecurity) {
+    // Collapse multi-page records to one span per base fetch (same from/to).
+    const spans = new Map<string, { fetchFrom: string; fetchTo: string }>();
+    for (const p of pages) {
+      const key = `${p.fetchFrom}\0${p.fetchTo}`;
+      spans.set(key, { fetchFrom: p.fetchFrom, fetchTo: p.fetchTo });
+    }
+    const list = [...spans.values()].sort((a, b) =>
+      a.fetchFrom < b.fetchFrom ? -1 : a.fetchFrom > b.fetchFrom ? 1 : a.fetchTo < b.fetchTo ? -1 : a.fetchTo > b.fetchTo ? 1 : 0,
+    );
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        const a = list[i]!;
+        const b = list[j]!;
+        if (spansOverlap(a.fetchFrom, a.fetchTo, b.fetchFrom, b.fetchTo)) {
+          throw new Error(
+            `${TENMIN_RANGE_OVERLAPPING_FETCHES}:${securityId}:${a.fetchFrom}_${a.fetchTo}|${b.fetchFrom}_${b.fetchTo}`,
+          );
+        }
+      }
+    }
+  }
 }
 
 /** Sort records into the deterministic encode order (mutates a copy). */
@@ -388,8 +477,10 @@ function bytesToHex(bytes: Uint8Array): string {
  * Header: magic(4) | schemaVersion u16 | recordCount u32 | fieldOrder u16 | byteOrder u8.
  */
 export function encodeTenMinRangeEntriesBody(records: readonly TenMinRangeEntryRecord[]): Uint8Array {
-  assertNoDuplicateTenMinRangeEntryPages(records);
-  const sorted = sortTenMinRangeEntries(records);
+  const collapsed = collapseExactDuplicateGapRecords(records);
+  assertNoDuplicateTenMinRangeEntryPages(collapsed);
+  assertNoOverlappingTenMinRangeStoredFetches(collapsed);
+  const sorted = sortTenMinRangeEntries(collapsed);
   const parts: Uint8Array[] = [];
   for (const r of sorted) {
     if (typeof r.status !== "string") throw new Error("TENMIN_RANGE_STATUS_NOT_STRING");
@@ -797,7 +888,9 @@ export function buildTenMinRangeEntryRecordsFromState(input: {
       status: gap.reason,
     });
   }
-  return sortTenMinRangeEntries(records);
+  const collapsed = collapseExactDuplicateGapRecords(records);
+  assertNoOverlappingTenMinRangeStoredFetches(collapsed);
+  return sortTenMinRangeEntries(collapsed);
 }
 
 /**
@@ -808,6 +901,7 @@ export function hydrateTenMinRangeManifestFromCompact(
   compact: TenMinRangeCompactManifest,
   records: readonly TenMinRangeEntryRecord[],
 ): TenMinRangeManifest {
+  assertNoOverlappingTenMinRangeStoredFetches(records);
   const byFetch = new Map<string, TenMinRangeEntryRecord[]>();
   for (const r of records) {
     if (r.status !== TENMIN_RANGE_STATUS_STORED) continue;
