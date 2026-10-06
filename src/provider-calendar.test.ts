@@ -141,6 +141,10 @@ test("NYSE calendar recognizes holidays and common early closes", () => {
   assert.equal(US_EQUITY_MARKET_CALENDAR.getSession("2026-11-27").kind, "HALF_DAY");
   assert.equal(US_EQUITY_MARKET_CALENDAR.getSession("2026-11-25").kind, "NORMAL");
   assert.equal(US_EQUITY_MARKET_CALENDAR.getSession("2026-11-28").kind, "CLOSED");
+  // One-off closure: national day of mourning for President Carter.
+  assert.equal(US_EQUITY_MARKET_CALENDAR.getSession("2025-01-09").kind, "CLOSED");
+  assert.equal(US_EQUITY_MARKET_CALENDAR.getSession("2025-01-08").kind, "NORMAL");
+  assert.equal(US_EQUITY_MARKET_CALENDAR.getSession("2025-01-10").kind, "NORMAL");
 });
 
 test("scheduler waits through close plus provider publication delay", () => {

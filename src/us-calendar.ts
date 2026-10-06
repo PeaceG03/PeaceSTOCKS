@@ -39,6 +39,14 @@ function easterSunday(year: number): Date {
     day = ((h + l - 7 * m + 114) % 31) + 1;
   return new Date(Date.UTC(year, month - 1, day));
 }
+/**
+ * One-off full-day NYSE closures not produced by the regular holiday rules, with the reason.
+ * Add new ones here (e.g. national days of mourning).
+ */
+export const NYSE_SPECIAL_CLOSURES: Readonly<Record<string, string>> = {
+  "2025-01-09": "National Day of Mourning for President Jimmy Carter",
+};
+
 function nyseClosedDates(year: number): Set<string> {
   const goodFriday = easterSunday(year);
   goodFriday.setUTCDate(goodFriday.getUTCDate() - 2);
@@ -53,6 +61,7 @@ function nyseClosedDates(year: number): Set<string> {
     nthWeekday(year, 9, 1, 1),
     nthWeekday(year, 11, 4, 4),
     observedFixed(year, 12, 25),
+    ...Object.keys(NYSE_SPECIAL_CLOSURES).filter((date) => date.startsWith(`${year}-`)),
   ]);
 }
 function nyseHalfDayDates(year: number): Set<string> {
