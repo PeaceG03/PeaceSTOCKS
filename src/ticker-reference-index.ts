@@ -186,6 +186,15 @@ export interface TickerReferenceObjectRef {
   bodySha256: string;
 }
 
+/** Optional provenance for point-in-time dated-list builds (absent on live security-master captures). */
+export interface TickerReferenceIndexFingerprints {
+  source: "dated-list";
+  requestedDate: string;
+  pages: Array<{ key: string; sha256: string }>;
+  /** Names listing mid-month appear only in the next month's dated index. */
+  knownGap: "mid-month-listings-appear-in-next-month-index";
+}
+
 export interface TickerReferenceIndexManifest {
   schemaVersion: typeof TICKER_REFERENCE_INDEX_SCHEMA;
   provider: string;
@@ -205,6 +214,8 @@ export interface TickerReferenceIndexManifest {
    */
   previousManifest?: TickerReferenceManifestLink | null;
   previousManifestReason?: string;
+  /** Present when this commit was built from a dated Massive ticker list. */
+  fingerprints?: TickerReferenceIndexFingerprints;
   checksum: string;
 }
 
@@ -529,7 +540,7 @@ async function putVerified(
 export async function writeTickerReferenceIndex(
   store: IndexStore,
   capture: TickerReferenceCapture,
-  options: { provider: string; asOf: string },
+  options: { provider: string; asOf: string; fingerprints?: TickerReferenceIndexFingerprints },
   backend: ReplyDustBackend = nodeReplyDustBackend,
 ): Promise<TickerReferenceIndexManifest & { wrote: "BASE" | "DELTA"; baseReason?: string }> {
   if (!/^\d{4}-\d{2}-\d{2}$/u.test(options.asOf)) throw new Error("TICKER_REFERENCE_INDEX_ASOF_INVALID");
@@ -613,6 +624,7 @@ export async function writeTickerReferenceIndex(
     base,
     deltas,
     ...history,
+    ...(options.fingerprints ? { fingerprints: options.fingerprints } : {}),
   };
   // 3. The live manifest, last.
   const manifest: TickerReferenceIndexManifest = { ...manifestBody, checksum: checksumOf(manifestBody) };

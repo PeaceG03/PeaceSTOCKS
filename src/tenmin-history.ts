@@ -18,6 +18,11 @@ import {
   runTenMinDailyPicks,
   tenMinDailyPicksEnabled,
 } from "./tenmin-daily-runner";
+import {
+  type DatedTickerRunReport,
+  runDatedTickerIndexBuild,
+  tickerIndexDatedEnabled,
+} from "./ticker-reference-dated";
 import type { SessionCalendar } from "./scanner";
 import type { MarketStore } from "./storage";
 import { MarketStorage } from "./storage";
@@ -746,6 +751,8 @@ export interface TenMinHistoryRunReport {
 
 export interface TenMinHistoryRunResult {
   report: TenMinHistoryRunReport;
+  /** Present when TICKER_INDEX_DATED === "true"; runs before daily picks / ranges. */
+  datedTickerIndex?: DatedTickerRunReport;
   /** Present when TENMIN_DAILY_PICKS === "true"; runs before range history. */
   dailyPicks?: TenMinDailyPicksRunReport;
   rangeResults: TenMinRangeWriteResult[];
@@ -841,7 +848,50 @@ export async function runTenMinHistory(options: {
         });
 
   const lastCompleted = options.lastCompletedSession ?? lastCompletedSessionDate(now);
-  // First phase: daily 10-minute picks when TENMIN_DAILY_PICKS === "true".
+  // Optional phase: dated ticker reference indexes (off unless TICKER_INDEX_DATED === "true").
+  // Runs before daily picks so loadTickerReferenceIndexAsOf can see asOf ≤ D. Probe by default.
+  let datedTickerIndex: DatedTickerRunReport | undefined;
+  if (tickerIndexDatedEnabled(env)) {
+    datedTickerIndex = await runDatedTickerIndexBuild({
+      store,
+      provider,
+      env,
+      now,
+      clock: options.clock ?? (() => new Date()),
+      shouldYield,
+    });
+    if (datedTickerIndex.yieldedForScan) {
+      // Still emit a minimal history report shell so the host can stop cleanly.
+      const report: TenMinHistoryRunReport = {
+        groupedDailyRequests: 0,
+        groupedDailyStored: 0,
+        groupedDailyResumed: 0,
+        schemaVersion: TENMIN_HISTORY_RUN_SCHEMA,
+        runId: `tenmin-history-${(options.nowIso ?? (() => new Date().toISOString()))().replaceAll(/[^0-9]/gu, "").slice(0, 17)}`,
+        provider: providerName,
+        configuredWindowStart: options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START,
+        windowStart: options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START,
+        lastCompletedSession: lastCompleted,
+        skippedBefore: [],
+        reopen: options.reopen === true,
+        securityLink: TENMIN_SECURITY_LINK,
+        ranges: [],
+        rangesPlanned: 0,
+        yieldedForScan: datedTickerIndex.yieldedForScan,
+        stoppedOnError: false,
+        warnings: [],
+        zstdVersion,
+        massiveRequests: datedTickerIndex.requests,
+        completedAt: (options.nowIso ?? (() => new Date().toISOString()))(),
+      };
+      return {
+        report,
+        rangeResults: [],
+        datedTickerIndex,
+      };
+    }
+  }
+  // Daily 10-minute picks when TENMIN_DAILY_PICKS === "true".
   let dailyPicks: TenMinDailyPicksRunReport | undefined;
   if (tenMinDailyPicksEnabled(env)) {
     dailyPicks = await runTenMinDailyPicks({
@@ -1192,7 +1242,12 @@ export async function runTenMinHistory(options: {
     }
   }
 
-  return { report, rangeResults, ...(dailyPicks ? { dailyPicks } : {}) };
+  return {
+    report,
+    rangeResults,
+    ...(datedTickerIndex ? { datedTickerIndex } : {}),
+    ...(dailyPicks ? { dailyPicks } : {}),
+  };
 }
 
 /**

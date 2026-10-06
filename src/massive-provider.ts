@@ -39,6 +39,8 @@ const DEFAULT_MIN_REQUEST_INTERVAL_MS = 12_500;
 const PAGE_LIMIT = 1_000;
 /** Most pages one 10-minute range request may take; more is an error, never a silent truncation. */
 export const TENMIN_RANGE_PAGE_CAP = 8;
+/** Max results per /v3/reference/tickers page (Massive/Polygon). */
+export const MASSIVE_TICKER_PAGE_LIMIT = PAGE_LIMIT;
 type JsonRecord = Record<string, unknown>;
 
 export interface MassiveProviderOptions {
@@ -664,6 +666,57 @@ export class MassiveMarketProvider implements MarketProvider {
     return output.sort(
       (a, b) => a.securityId.localeCompare(b.securityId) || a.intervalIndex - b.intervalIndex,
     );
+  }
+
+  /**
+   * One page of point-in-time /v3/reference/tickers for `date` (active=true: names trading that
+   * day, including later-delisted). First page uses the same params as listApprovedSecurities
+   * plus date=; later pages follow next_url. Request strings never include apiKey.
+   */
+  async getDatedTickerReferencePage(options: {
+    date: string;
+    /** Prior page's next_url (path+query, no apiKey) to continue pagination. */
+    nextUrl?: string;
+  }): Promise<{
+    status: number;
+    body: Uint8Array;
+    request: string;
+    nextUrl?: string;
+    fetchedAt: string;
+  }> {
+    requireDate(options.date);
+    const firstParams = {
+      market: "stocks",
+      locale: "us",
+      active: "true",
+      order: "asc",
+      sort: "ticker",
+      limit: String(PAGE_LIMIT),
+      date: options.date,
+    };
+    const pathOrUrl = options.nextUrl ?? "/v3/reference/tickers";
+    const pageParams = options.nextUrl ? undefined : firstParams;
+    const { record, body } = await this.getWithBody(pathOrUrl, pageParams);
+    const request = new URL(pathOrUrl, this.baseUrl);
+    if (pageParams)
+      for (const [key, value] of Object.entries(pageParams)) request.searchParams.set(key, value);
+    request.searchParams.delete("apiKey");
+    const candidate = text(record.next_url);
+    let nextUrl: string | undefined;
+    if (candidate && candidate !== pathOrUrl) {
+      const next = new URL(candidate, this.baseUrl);
+      if (next.origin !== this.baseUrl.origin || next.protocol !== "https:")
+        throw new Error("MASSIVE_UNTRUSTED_NEXT_URL");
+      next.searchParams.delete("apiKey");
+      nextUrl = `${next.pathname}${next.search}`;
+    }
+    return {
+      status: 200,
+      body,
+      request: `${request.pathname}${request.search}`,
+      ...(nextUrl ? { nextUrl } : {}),
+      fetchedAt: this.now(),
+    };
   }
 
   /**

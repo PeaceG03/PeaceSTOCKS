@@ -469,6 +469,8 @@ async function main(): Promise<void> {
   // run as the first phase when TENMIN_DAILY_PICKS === "true".
   const history = await runTenMinHistoryFromEnv(process.env);
   if (history) {
+    if (history.datedTickerIndex)
+      process.stdout.write(`${JSON.stringify({ datedTickerIndex: history.datedTickerIndex })}\n`);
     if (history.dailyPicks)
       process.stdout.write(`${JSON.stringify({ dailyPicks: history.dailyPicks })}\n`);
     process.stdout.write(

@@ -222,6 +222,9 @@ jobs:
       PEACESTOCKS_TENMIN_HISTORY: "1"
       # Daily picks first phase: must be exactly "true" (repo var). Default off when unset.
       TENMIN_DAILY_PICKS: ${{ vars.TENMIN_DAILY_PICKS }}
+      # Dated ticker reference index phase (off unless exactly "true"). Probe unless FULL=true.
+      TICKER_INDEX_DATED: ${{ vars.TICKER_INDEX_DATED }}
+      TICKER_INDEX_DATED_FULL: ${{ vars.TICKER_INDEX_DATED_FULL }}
       # Repo variable (YYYY-MM-DD): ranges ending after it are not planned; at the cap the chain
       # stops with STOP_RANGE_END_CAP. Empty = no cap. Invalid = the run fails before any request.
       # Raising it later is a variable change only (the fallback restarts the chain).
