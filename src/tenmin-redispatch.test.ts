@@ -76,7 +76,8 @@ function input(extra: Partial<TenMinRedispatchInput> = {}): TenMinRedispatchInpu
     trigger: "chain",
     outcome: continueOutcome,
     jobResult: "success",
-    nowUtc: at("10:00:00"),
+    // Outside both guard windows (05:15–06:15 and 09:15–10:15 UTC).
+    nowUtc: at("12:00:00"),
     queue: { otherActiveRuns: 0 },
     killSwitch: "true",
     chain: 0,
@@ -131,18 +132,27 @@ test("decision: the clean partial dispatches the next run with the chain number 
 
 test("decision: guard windows and the lead before them, at the edges", () => {
   const cases: Array<[string, boolean, string]> = [
-    ["21:04:59", true, "CONTINUE_TIME_BUDGET"],
-    ["21:05:00", false, "WAIT_NEAR_GUARD_WINDOW"],
-    ["21:14:59", false, "WAIT_NEAR_GUARD_WINDOW"],
-    ["21:15:00", false, "WAIT_GUARD_WINDOW"],
-    ["21:30:00", false, "WAIT_GUARD_WINDOW"],
-    ["22:14:59", false, "WAIT_GUARD_WINDOW"],
-    ["22:15:00", true, "CONTINUE_TIME_BUDGET"],
-    ["01:04:59", true, "CONTINUE_TIME_BUDGET"],
-    ["01:05:00", false, "WAIT_NEAR_GUARD_WINDOW"],
-    ["01:15:00", false, "WAIT_GUARD_WINDOW"],
-    ["02:14:59", false, "WAIT_GUARD_WINDOW"],
-    ["02:15:00", true, "CONTINUE_TIME_BUDGET"],
+    // 05:15–06:15 (lead from 05:05)
+    ["05:04:59", true, "CONTINUE_TIME_BUDGET"],
+    ["05:05:00", false, "WAIT_NEAR_GUARD_WINDOW"],
+    ["05:14:59", false, "WAIT_NEAR_GUARD_WINDOW"],
+    ["05:15:00", false, "WAIT_GUARD_WINDOW"],
+    ["05:17:00", false, "WAIT_GUARD_WINDOW"], // fallback :17 tick inside window
+    ["05:30:00", false, "WAIT_GUARD_WINDOW"],
+    ["06:14:59", false, "WAIT_GUARD_WINDOW"],
+    ["06:15:00", true, "CONTINUE_TIME_BUDGET"],
+    // 09:15–10:15 (lead from 09:05)
+    ["09:04:59", true, "CONTINUE_TIME_BUDGET"],
+    ["09:05:00", false, "WAIT_NEAR_GUARD_WINDOW"],
+    ["09:14:59", false, "WAIT_NEAR_GUARD_WINDOW"],
+    ["09:15:00", false, "WAIT_GUARD_WINDOW"],
+    ["09:17:00", false, "WAIT_GUARD_WINDOW"], // fallback :17 tick inside window
+    ["09:30:00", false, "WAIT_GUARD_WINDOW"],
+    ["10:14:59", false, "WAIT_GUARD_WINDOW"],
+    ["10:15:00", true, "CONTINUE_TIME_BUDGET"],
+    // Former windows / scan times are now allowed
+    ["21:30:00", true, "CONTINUE_TIME_BUDGET"],
+    ["01:30:00", true, "CONTINUE_TIME_BUDGET"],
     ["00:17:00", true, "CONTINUE_TIME_BUDGET"],
   ];
   for (const [time, dispatch, reason] of cases) {
@@ -150,8 +160,9 @@ test("decision: guard windows and the lead before them, at the edges", () => {
     assert.deepEqual([decision.dispatch, decision.reason], [dispatch, reason], time);
     if (!dispatch) assert.equal(decision.nextAction, "wait", time);
   }
-  assert.deepEqual(guardWindowState(at("21:15:00")), { inside: true, minutesUntilNext: 0 });
-  assert.equal(guardWindowState(at("23:00:00")).minutesUntilNext, 135);
+  assert.deepEqual(guardWindowState(at("05:15:00")), { inside: true, minutesUntilNext: 0 });
+  // 23:00 → next window 05:15 = 6h15m = 375
+  assert.equal(guardWindowState(at("23:00:00")).minutesUntilNext, 375);
 });
 
 test("decision: a queued scan (or any other active scanner.yml run) waits; a failed queue check waits", () => {
@@ -184,7 +195,7 @@ test("decision: kill switch off, job failure, missing outcome, ranges done, a ne
   assert.deepEqual([maxChainOf("500"), maxChainOf("x"), maxChainOf(undefined), maxChainOf("0")], [100, 24, 24, 0]);
   // A stop always wins over a guard window or a queue.
   assert.equal(
-    decideTenMinRedispatch(input({ killSwitch: "false", nowUtc: at("21:30:00"), queue: { otherActiveRuns: 2 } })).nextAction,
+    decideTenMinRedispatch(input({ killSwitch: "false", nowUtc: at("05:30:00"), queue: { otherActiveRuns: 2 } })).nextAction,
     "stop",
   );
 });
@@ -230,7 +241,7 @@ test("range-end cap: raising or clearing the variable restarts the chain from th
   assert.equal(decideTenMinRedispatch(input({ trigger: "fallback", outcome: atCap, currentMaxRangeEnd: "2024-10-31" })).nextAction, "stop");
   assert.equal(decideTenMinRedispatch(input({ trigger: "fallback", outcome: atCap, killSwitch: "" })).reason, "KILL_SWITCH_OFF");
   assert.equal(
-    decideTenMinRedispatch(input({ trigger: "fallback", outcome: atCap, currentMaxRangeEnd: "2025-12-31", nowUtc: at("21:30:00") })).reason,
+    decideTenMinRedispatch(input({ trigger: "fallback", outcome: atCap, currentMaxRangeEnd: "2025-12-31", nowUtc: at("05:30:00") })).reason,
     "WAIT_GUARD_WINDOW",
   );
   assert.equal(

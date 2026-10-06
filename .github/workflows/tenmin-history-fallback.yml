@@ -7,9 +7,10 @@ name: Ten-minute history fallback
 # file so scanner.yml's schedule-triggered scan job never fires on these crons.
 on:
   schedule:
-    # Every 2 hours at :17 (00:17, 02:17, ..., 22:17 UTC): off the :00/:30 marks, never inside the
-    # 21:15-22:15 / 01:15-02:15 UTC guard windows, never at 21:30 / 01:30 when the scans fire.
-    # A late cron is still checked against the windows by decideTenMinRedispatch.
+    # Every 2 hours at :17 (00:17, 02:17, ..., 22:17 UTC): off the :00/:30 marks. The 05:17 and
+    # 09:17 ticks fall inside the 05:15–06:15 / 09:15–10:15 UTC guard windows (scans at 05:30 /
+    # 09:30); decideTenMinRedispatch skips those with WAIT_GUARD_WINDOW. A late cron is still
+    # checked against the windows.
     - cron: "17 */2 * * *"
 
 permissions:

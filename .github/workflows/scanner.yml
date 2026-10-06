@@ -44,10 +44,11 @@ on:
         required: false
         default: "0"
   schedule:
-    # 21:30 UTC is 4:30 PM ET in winter and 5:30 PM ET in summer, after the close plus the 30 minute delay.
-    - cron: "30 21 * * 1-5"
-    # Next-morning UTC retry for a session the provider had not published yet. Saturday covers Friday.
-    - cron: "30 1 * * 2-6"
+    # 05:30 UTC Tue–Sat: just after midnight ET (00:30 EST / 01:30 EDT) so collectionDue targets the
+    # previous ET trading day (S2: due only when ET date strictly after D). Saturday covers Friday.
+    - cron: "30 5 * * 2-6"
+    # Later UTC morning retry if Massive was not ready yet (04:30 EST / 05:30 EDT). Saturday covers Friday.
+    - cron: "30 9 * * 2-6"
 
 # One writer at a time: scans and backfills both write R2 (month files, cursor), so they queue
 # instead of overlapping. A run already in progress is never canceled.

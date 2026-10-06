@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
 import { inScanGuardWindow, scanYieldReason } from "./scan-yield";
 
@@ -17,17 +19,24 @@ const runs = (workflow_runs: { id: number; status: string; event: string }[]): t
   }) as typeof fetch;
 
 test("guard windows open 15 minutes before each scheduled scan and last an hour", () => {
-  assert.equal(inScanGuardWindow(new Date("2026-10-05T21:14:59Z")), false);
-  assert.equal(inScanGuardWindow(new Date("2026-10-05T21:15:00Z")), true);
-  assert.equal(inScanGuardWindow(new Date("2026-10-05T22:14:00Z")), true);
-  assert.equal(inScanGuardWindow(new Date("2026-10-05T22:15:00Z")), false);
-  assert.equal(inScanGuardWindow(new Date("2026-10-06T01:15:00Z")), true);
-  assert.equal(inScanGuardWindow(new Date("2026-10-06T02:15:00Z")), false);
+  // 05:15–06:15 UTC
+  assert.equal(inScanGuardWindow(new Date("2026-10-06T05:14:59Z")), false);
+  assert.equal(inScanGuardWindow(new Date("2026-10-06T05:15:00Z")), true);
+  assert.equal(inScanGuardWindow(new Date("2026-10-06T06:14:59Z")), true);
+  assert.equal(inScanGuardWindow(new Date("2026-10-06T06:15:00Z")), false);
+  // 09:15–10:15 UTC
+  assert.equal(inScanGuardWindow(new Date("2026-10-06T09:14:59Z")), false);
+  assert.equal(inScanGuardWindow(new Date("2026-10-06T09:15:00Z")), true);
+  assert.equal(inScanGuardWindow(new Date("2026-10-06T10:14:59Z")), true);
+  assert.equal(inScanGuardWindow(new Date("2026-10-06T10:15:00Z")), false);
+  // Former windows (21:15–22:15 / 01:15–02:15) are no longer guarded.
+  assert.equal(inScanGuardWindow(new Date("2026-10-05T21:30:00Z")), false);
+  assert.equal(inScanGuardWindow(new Date("2026-10-06T01:30:00Z")), false);
 });
 
 test("backfill yields inside a guard window even without API access", async () => {
   assert.match(
-    (await scanYieldReason({ now: () => new Date("2026-10-05T21:20:00Z"), env: {} })) ?? "",
+    (await scanYieldReason({ now: () => new Date("2026-10-06T05:20:00Z"), env: {} })) ?? "",
     /^SCAN_GUARD_WINDOW:/,
   );
   assert.equal(await scanYieldReason({ now: midday, env: {} }), undefined);
@@ -49,4 +58,12 @@ test("a failed run check yields rather than risk the scan's budget", async () =>
   assert.equal(await scanYieldReason({ now: midday, env: actionsEnv, fetchImpl: failing }), "SCAN_CHECK_FAILED:http-503");
   const throwing = (async () => { throw new Error("offline"); }) as typeof fetch;
   assert.match((await scanYieldReason({ now: midday, env: actionsEnv, fetchImpl: throwing })) ?? "", /^SCAN_CHECK_FAILED:Error: offline/);
+});
+
+test("scanner.yml schedule crons are 05:30 and 09:30 UTC Tue–Sat", () => {
+  const yml = readFileSync(join(process.cwd(), ".github/workflows/scanner.yml"), "utf8");
+  const crons = [...yml.matchAll(/^[ \t]*- cron: "([^"]+)"/gm)].map((m) => m[1]);
+  assert.deepEqual(crons, ["30 5 * * 2-6", "30 9 * * 2-6"]);
+  assert.equal(yml.includes("30 21 * * 1-5"), false);
+  assert.equal(yml.includes("30 1 * * 2-6"), false);
 });

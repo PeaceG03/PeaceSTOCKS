@@ -4,10 +4,10 @@
  * waiting, so a scan never competes with it for requests.
  */
 
-/** UTC minute-of-day windows that start 15 minutes before each scheduled scan (21:30 and 01:30 UTC). */
+/** UTC minute-of-day windows that start 15 minutes before each scheduled scan (05:30 and 09:30 UTC). */
 export const SCAN_GUARD_WINDOWS_UTC: ReadonlyArray<readonly [number, number]> = [
-  [21 * 60 + 15, 22 * 60 + 15],
-  [1 * 60 + 15, 2 * 60 + 15],
+  [5 * 60 + 15, 6 * 60 + 15],
+  [9 * 60 + 15, 10 * 60 + 15],
 ];
 
 export interface ScanYieldOptions {

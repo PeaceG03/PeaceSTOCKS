@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -109,6 +109,13 @@ async function seedCursor(root: string, lastObservedSessionDate: string, nowIso:
       2,
     )}\n`,
   );
+}
+
+async function readCursor(root: string): Promise<string> {
+  const state = JSON.parse(await readFile(join(root, "scheduler-host-state.json"), "utf8")) as {
+    lastObservedSessionDate: string;
+  };
+  return state.lastObservedSessionDate;
 }
 
 function modesOf(result: Awaited<ReturnType<typeof runScannerHost>>): Array<{
@@ -260,6 +267,9 @@ test("S2 host: 05:30Z day after Labor Day 2026-09-07 → due CLOSED; no double; 
     assert.deepEqual(result.sessions, []);
     assert.deepEqual(provider.barSessions, []);
     assert.equal(result.status, "NOT_DUE");
+    // Park on the CLOSED due day — never jump to today (09-08), which still needs collection later.
+    assert.equal(await readCursor(root), "2026-09-07");
+    assert.notEqual(await readCursor(root), "2026-09-08");
   } finally {
     if (previous === undefined) delete process.env.MASSIVE_API_KEY;
     else process.env.MASSIVE_API_KEY = previous;
@@ -340,6 +350,133 @@ test("S2 host: exactly 13:30Z Wed 10-07 (09:30 EDT open) lastObserved 10-05 → 
     const storage = new MarketStorage(root);
     assert.equal((await storage.loadPredictions("2026-10-06")).length, 0);
     assert.equal((await storage.loadBeliefs("2026-10-06")).length, 0);
+  } finally {
+    if (previous === undefined) delete process.env.MASSIVE_API_KEY;
+    else process.env.MASSIVE_API_KEY = previous;
+    if (previousBucket === undefined) delete process.env.PEACESTOCKS_R2_BUCKET;
+    else process.env.PEACESTOCKS_R2_BUCKET = previousBucket;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("S3 host: after Labor Day CLOSED park, skipped Wed slots still catch 09-08 then FORWARD 09-09 on Thu", async () => {
+  const root = await mkdtemp(join(tmpdir(), "host-s3-labor-"));
+  const previous = process.env.MASSIVE_API_KEY;
+  const previousBucket = process.env.PEACESTOCKS_R2_BUCKET;
+  process.env.MASSIVE_API_KEY = "test-key";
+  delete process.env.PEACESTOCKS_R2_BUCKET;
+  try {
+    const tue = new Date("2026-09-08T05:30:00.000Z");
+    await seedCursor(root, "2026-09-04", tue.toISOString());
+    const provider = new RecordingProvider([
+      "2026-09-04",
+      "2026-09-08",
+      "2026-09-09",
+      "2026-09-10",
+    ]);
+    const tueResult = await runScannerHost({ now: tue, storageRoot: root, provider });
+    assert.deepEqual(tueResult.sessions, []);
+    assert.equal(await readCursor(root), "2026-09-07");
+    // Both Wednesday 09-09 slots dropped — no run. Thursday morning recovers.
+    const thu = new Date("2026-09-10T05:30:00.000Z");
+    assert.equal(collectionDue({ now: thu }).session.sessionDate, "2026-09-09");
+    const thuResult = await runScannerHost({ now: thu, storageRoot: root, provider });
+    assert.deepEqual(modesOf(thuResult), [
+      { session: "2026-09-08", mode: "EVIDENCE_ONLY" },
+      { session: "2026-09-09", mode: "FORWARD" },
+    ]);
+    assert.deepEqual(provider.barSessions, ["2026-09-08", "2026-09-09"]);
+    assert.equal(await readCursor(root), "2026-09-09");
+  } finally {
+    if (previous === undefined) delete process.env.MASSIVE_API_KEY;
+    else process.env.MASSIVE_API_KEY = previous;
+    if (previousBucket === undefined) delete process.env.PEACESTOCKS_R2_BUCKET;
+    else process.env.PEACESTOCKS_R2_BUCKET = previousBucket;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("S3 host: PROVIDER_NOT_READY on due session parks cursor before that session (not on today)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "host-s3-notready-"));
+  const previous = process.env.MASSIVE_API_KEY;
+  const previousBucket = process.env.PEACESTOCKS_R2_BUCKET;
+  process.env.MASSIVE_API_KEY = "test-key";
+  delete process.env.PEACESTOCKS_R2_BUCKET;
+  try {
+    // 05:30Z Wed 10-07 → due 10-06; provider refuses.
+    const now = new Date("2026-10-07T05:30:00.000Z");
+    await seedCursor(root, "2026-10-05", now.toISOString());
+    const { MassiveMarketProvider } = await import("./massive-provider");
+    const provider = new MassiveMarketProvider({
+      apiKey: "test-key",
+      minRequestIntervalMs: 0,
+      retryBackoffMs: 0,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({ message: "Attempted to request today's data before end of day" }),
+          { status: 403 },
+        ),
+    });
+    const result = await runScannerHost({ now, storageRoot: root, provider });
+    assert.equal(result.status, "NOT_READY");
+    assert.equal(result.reason, "PROVIDER_NOT_READY");
+    assert.equal(await readCursor(root), "2026-10-05");
+  } finally {
+    if (previous === undefined) delete process.env.MASSIVE_API_KEY;
+    else process.env.MASSIVE_API_KEY = previous;
+    if (previousBucket === undefined) delete process.env.PEACESTOCKS_R2_BUCKET;
+    else process.env.PEACESTOCKS_R2_BUCKET = previousBucket;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("S3 host: successful FORWARD advances lastObserved to the due session only", async () => {
+  const root = await mkdtemp(join(tmpdir(), "host-s3-fwd-cursor-"));
+  const previous = process.env.MASSIVE_API_KEY;
+  const previousBucket = process.env.PEACESTOCKS_R2_BUCKET;
+  process.env.MASSIVE_API_KEY = "test-key";
+  delete process.env.PEACESTOCKS_R2_BUCKET;
+  try {
+    const now = new Date("2026-10-07T05:30:00.000Z");
+    await seedCursor(root, "2026-10-05", now.toISOString());
+    const provider = new RecordingProvider(["2026-10-05", "2026-10-06", "2026-10-07"]);
+    const result = await runScannerHost({ now, storageRoot: root, provider });
+    assert.deepEqual(modesOf(result), [{ session: "2026-10-06", mode: "FORWARD" }]);
+    assert.equal(await readCursor(root), "2026-10-06");
+  } finally {
+    if (previous === undefined) delete process.env.MASSIVE_API_KEY;
+    else process.env.MASSIVE_API_KEY = previous;
+    if (previousBucket === undefined) delete process.env.PEACESTOCKS_R2_BUCKET;
+    else process.env.PEACESTOCKS_R2_BUCKET = previousBucket;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("S3 host: catch-up NOT_READY before due parks before the missed session; due is not marked observed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "host-s3-miss-break-"));
+  const previous = process.env.MASSIVE_API_KEY;
+  const previousBucket = process.env.PEACESTOCKS_R2_BUCKET;
+  process.env.MASSIVE_API_KEY = "test-key";
+  delete process.env.PEACESTOCKS_R2_BUCKET;
+  try {
+    // due 10-06; catch-up should try 10-05 first and fail NOT_READY — must not advance to 10-06.
+    const now = new Date("2026-10-07T05:30:00.000Z");
+    await seedCursor(root, "2026-10-02", now.toISOString());
+    const { MassiveMarketProvider } = await import("./massive-provider");
+    const provider = new MassiveMarketProvider({
+      apiKey: "test-key",
+      minRequestIntervalMs: 0,
+      retryBackoffMs: 0,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({ message: "Attempted to request today's data before end of day" }),
+          { status: 403 },
+        ),
+    });
+    const result = await runScannerHost({ now, storageRoot: root, provider });
+    assert.equal(result.status, "NOT_READY");
+    assert.deepEqual([...result.sessions], ["2026-10-05"]);
+    assert.equal(await readCursor(root), "2026-10-04");
   } finally {
     if (previous === undefined) delete process.env.MASSIVE_API_KEY;
     else process.env.MASSIVE_API_KEY = previous;

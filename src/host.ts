@@ -342,11 +342,13 @@ export async function runScannerHost(
     )
     .map((report) => report.session.sessionDate)
     .sort();
+  // Never advance past an uncollected eligible session. On failure, park before the first
+  // unresolved session. Otherwise park on due.session: when READY that session was collected
+  // or already complete; when CLOSED the closed day needs no collection and must not jump to
+  // `today` (D+1 would skip today's still-uncollected trading day, e.g. Tue after Labor Day).
   const nextObserved = unresolved[0]
     ? addDays(unresolved[0], -1)
-    : due.due
-      ? due.session.sessionDate
-      : today;
+    : due.session.sessionDate;
   const nextState = {
     ...state,
     lastObservedSessionDate: nextObserved,
