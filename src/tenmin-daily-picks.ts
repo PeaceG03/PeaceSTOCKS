@@ -104,6 +104,11 @@ export interface PicksBaseV1 {
   mappingSha256: string;
   /** sha256 of the canonical sorted ticker→type map used for filtering. */
   tickerTypesSha256: string;
+  /**
+   * Point-in-time ticker reference index used for types/links (asOf ≤ sessionDate).
+   * Present on production builds; omitted in pure unit fixtures that inject maps directly.
+   */
+  tickerIndex?: { key: string; sha256: string; asOf: string };
   candidateCount: number;
   candidateListSha256: string;
   counts: {
@@ -228,6 +233,8 @@ export function buildPicksBaseV1(input: {
   groupedReply: PickV1GroupedReplyInput;
   tickerToSecurityId: ReadonlyMap<string, string> | Readonly<Record<string, string>>;
   tickerTypes: ReadonlyMap<string, string> | Readonly<Record<string, string>>;
+  /** When set, recorded on the picks document (production buildBase always sets this). */
+  tickerIndex?: { key: string; sha256: string; asOf: string };
 }): PicksBaseV1 {
   const D = input.sessionDate;
   requireSessionDate(D, "sessionDate");
@@ -344,6 +351,7 @@ export function buildPicksBaseV1(input: {
     typeFilter: { version: PICK_V1_TYPE_FILTER_VERSION, sha256: typeFilterSha256 },
     mappingSha256,
     tickerTypesSha256,
+    ...(input.tickerIndex ? { tickerIndex: input.tickerIndex } : {}),
     candidateCount: N,
     candidateListSha256: sha256(stableJson(candidateIds)),
     counts: {

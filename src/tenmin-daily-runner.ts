@@ -44,6 +44,16 @@ import {
 } from "./tenmin-daily-picks";
 import { resolveSessionPredictionStatus } from "./prediction-status";
 import type { MassiveMarketProvider } from "./massive-provider";
+import {
+  TENMIN_DAILY_BASE_INPUT_FAILED,
+  TENMIN_DAILY_BASE_INPUT_MISSING,
+  TenMinDailyBaseCorruptError,
+  TenMinDailyBaseFailedError,
+  TenMinDailyBaseInputError,
+  buildTenMinDailyPicksBaseFromStored,
+} from "./tenmin-daily-picks-base";
+
+const TENMIN_DAILY_BASE_INPUT_MISSING_PREFIX = `${TENMIN_DAILY_BASE_INPUT_MISSING}:`;
 
 export const TENMIN_DAILY_PICKS_RUN_SCHEMA = "tenmin-daily-picks-run-v1" as const;
 export const TENMIN_DAILY_PICKS_KILL_SWITCH = "TENMIN_DAILY_PICKS" as const;
@@ -61,6 +71,7 @@ export type TenMinDailyDayOutcome =
   | "SKIPPED_GUARD"
   | "SKIPPED_OUT_OF_WINDOW"
   | "SKIPPED_NOT_SETTLED"
+  | "SKIPPED_BASE_INPUT"
   | "FAILED";
 
 export interface TenMinDailyPicksDayResult {
@@ -69,6 +80,10 @@ export interface TenMinDailyPicksDayResult {
   requests: number;
   corruptKey?: string;
   error?: string;
+  /** When outcome is SKIPPED_BASE_INPUT: which input (grouped_reply | ticker_index). */
+  baseInput?: string;
+  /** Object key that was missing or undecodable. */
+  baseInputKey?: string;
 }
 
 export interface TenMinDailyPicksRunReport {
@@ -83,6 +98,7 @@ export interface TenMinDailyPicksRunReport {
   corrupt: TenMinDailyCorruptEntry[];
   skippedOutOfWindow: string[];
   skippedNotSettled: string[];
+  skippedBaseInput: Array<{ sessionDate: string; input: string; key: string }>;
   totalRequests: number;
   yieldedForScan?: string;
 }
@@ -193,6 +209,7 @@ export async function runTenMinDailyPicks(
     corrupt: [],
     skippedOutOfWindow: [],
     skippedNotSettled: [],
+    skippedBaseInput: [],
     totalRequests: 0,
   });
   if (!enabled) return empty();
@@ -228,6 +245,7 @@ export async function runTenMinDailyPicks(
   const corrupt: TenMinDailyCorruptEntry[] = [];
   const skippedOutOfWindow: string[] = [];
   const skippedNotSettled: string[] = [];
+  const skippedBaseInput: Array<{ sessionDate: string; input: string; key: string }> = [];
   const skippedThisRun = new Set<string>();
   let totalRequests = 0;
   let yieldedForScan: string | undefined;
@@ -276,6 +294,13 @@ export async function runTenMinDailyPicks(
         skippedThisRun.add(entry.sessionDate);
       } else if (result.outcome === "SKIPPED_NOT_SETTLED") {
         skippedNotSettled.push(entry.sessionDate);
+      } else if (result.outcome === "SKIPPED_BASE_INPUT") {
+        skippedThisRun.add(entry.sessionDate);
+        skippedBaseInput.push({
+          sessionDate: entry.sessionDate,
+          input: result.baseInput ?? "unknown",
+          key: result.baseInputKey ?? result.error ?? "",
+        });
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -302,6 +327,43 @@ export async function runTenMinDailyPicks(
         });
         continue;
       }
+      if (
+        error instanceof TenMinDailyBaseInputError ||
+        message.startsWith(TENMIN_DAILY_BASE_INPUT_MISSING_PREFIX)
+      ) {
+        const baseErr = error instanceof TenMinDailyBaseInputError ? error : null;
+        const input = baseErr?.input ?? message.split(":")[1] ?? "unknown";
+        const key = baseErr?.key ?? message.split(":").slice(2).join(":");
+        skippedThisRun.add(entry.sessionDate);
+        skippedBaseInput.push({ sessionDate: entry.sessionDate, input, key });
+        dayResults.push({
+          sessionDate: entry.sessionDate,
+          outcome: "SKIPPED_BASE_INPUT",
+          requests: 0,
+          error: message,
+          baseInput: input,
+          baseInputKey: key,
+        });
+        continue;
+      }
+      if (
+        error instanceof TenMinDailyBaseFailedError ||
+        message.startsWith(`${TENMIN_DAILY_BASE_INPUT_FAILED}:`)
+      ) {
+        const key =
+          error instanceof TenMinDailyBaseFailedError
+            ? error.key
+            : message.split(":")[1] ?? message;
+        skippedThisRun.add(entry.sessionDate);
+        dayResults.push({
+          sessionDate: entry.sessionDate,
+          outcome: "FAILED",
+          requests: 0,
+          error: message,
+          baseInputKey: key,
+        });
+        continue;
+      }
       skippedThisRun.add(entry.sessionDate);
       dayResults.push({
         sessionDate: entry.sessionDate,
@@ -324,6 +386,7 @@ export async function runTenMinDailyPicks(
     corrupt,
     skippedOutOfWindow,
     skippedNotSettled,
+    skippedBaseInput,
     totalRequests,
     ...(yieldedForScan ? { yieldedForScan } : {}),
   };
@@ -404,8 +467,42 @@ async function sealOneDay(
   if (existingPicksBytes) {
     picksBase = parsePicksBaseBytes(existingPicksBytes);
   } else {
-    if (!options.buildBase) throw new Error(`TENMIN_DAILY_BUILD_BASE_REQUIRED:${sessionDate}`);
-    picksBase = await options.buildBase(sessionDate);
+    try {
+      const builder =
+        options.buildBase ??
+        ((d: string) => buildTenMinDailyPicksBaseFromStored({ store: options.store, sessionDate: d }));
+      picksBase = await builder(sessionDate);
+    } catch (error) {
+      if (error instanceof TenMinDailyBaseInputError) {
+        return {
+          sessionDate,
+          outcome: "SKIPPED_BASE_INPUT",
+          requests: 0,
+          error: error.message,
+          baseInput: error.input,
+          baseInputKey: error.key,
+        };
+      }
+      if (error instanceof TenMinDailyBaseCorruptError) {
+        return {
+          sessionDate,
+          outcome: "CORRUPT",
+          requests: 0,
+          corruptKey: error.key,
+          error: error.message,
+        };
+      }
+      if (error instanceof TenMinDailyBaseFailedError) {
+        return {
+          sessionDate,
+          outcome: "FAILED",
+          requests: 0,
+          error: error.message,
+          baseInputKey: error.key,
+        };
+      }
+      throw error;
+    }
   }
 
   const picksTop50 =

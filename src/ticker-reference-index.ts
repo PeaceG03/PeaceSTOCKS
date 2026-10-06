@@ -462,6 +462,23 @@ async function rebuildCommitted(
   return { state, body };
 }
 
+/**
+ * Rebuild one committed manifest (live or archived) to entries + body.
+ * Callers that need point-in-time (asOf ≤ D) pick the manifest first via history.
+ */
+export async function loadTickerReferenceIndexFromManifest(
+  store: Pick<IndexStore, "get">,
+  manifest: TickerReferenceIndexManifest,
+  backend: ReplyDustBackend = nodeReplyDustBackend,
+): Promise<{ manifest: TickerReferenceIndexManifest; entries: TickerReferenceEntry[]; body: Uint8Array }> {
+  const { body } = await rebuildCommitted(store, manifest, backend);
+  const entries = parseTickerReferenceBody(body);
+  const count = (pass: TickerReferencePass) => entries.filter((e) => e.pass === pass).length;
+  if (count("active") !== manifest.records.active || count("inactive") !== manifest.records.inactive)
+    throw new Error("TICKER_REFERENCE_INDEX_COUNT_MISMATCH");
+  return { manifest, entries, body };
+}
+
 /** Immutable plain object: identical bytes reused, different bytes throw, else put + read back. */
 async function putImmutable(store: IndexStore, key: string, bytes: Uint8Array): Promise<void> {
   const existing = await store.get(key);
