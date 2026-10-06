@@ -9,7 +9,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SCAN_GUARD_WINDOWS_UTC } from "./scan-yield";
-import type { TenMinHistoryRunReport } from "./tenmin-history";
+import { type TenMinHistoryRunReport, parseTenMinMaxRangeEnd } from "./tenmin-history";
 
 export const TENMIN_OUTCOME_SCHEMA = "tenmin-history-outcome-v1" as const;
 /** Don't start a run this close before a guard window: a pending run could start inside it. */
@@ -17,6 +17,11 @@ export const TENMIN_REDISPATCH_LEAD_MINUTES = 10;
 /** Default and hard ceiling for runs in one chain without a human (repo variable may lower it). */
 export const TENMIN_REDISPATCH_DEFAULT_MAX_CHAIN = 24;
 export const TENMIN_REDISPATCH_HARD_MAX_CHAIN = 100;
+/** Outcome/decision reason prefix: every range up to TENMIN_HISTORY_MAX_RANGE_END is done. */
+export const TENMIN_STOP_RANGE_END_CAP = "STOP_RANGE_END_CAP" as const;
+/** Post-dispatch: a scheduled scanner.yml run created this recently and cancelled fails the step. */
+export const TENMIN_SCAN_CANCELLED_WINDOW_MINUTES = 10;
+export const TENMIN_REDISPATCH_SCAN_CANCELLED = "TENMIN_REDISPATCH_SCAN_CANCELLED" as const;
 
 /** Error codes that are refusals: the plan is wrong, a human must look. */
 export const TENMIN_REFUSAL_CODES = [
@@ -72,6 +77,8 @@ export function tenMinRunOutcome(report: TenMinHistoryRunReport): TenMinRunOutco
   if (report.outageStop) return out("stop", `STOP_OUTAGE:${report.outageStop.slice(0, 160)}`);
   if (report.reopen) return out("stop", "STOP_BOUNDED_MANUAL_RUN:reopen");
   if (report.maxRanges !== undefined) return out("stop", `STOP_BOUNDED_MANUAL_RUN:maxRanges=${report.maxRanges}`);
+  if (rangesRemaining === 0 && report.rangeEndCap && report.rangeEndCap.rangesBeyondCap > 0)
+    return out("stop", `${TENMIN_STOP_RANGE_END_CAP}:${report.rangeEndCap.maxRangeEnd}`);
   if (rangesRemaining === 0) return out("stop", "STOP_DONE:no-range-left");
   const yielded = report.yieldedForScan;
   if (yielded?.startsWith("TIME_BUDGET")) {
@@ -111,6 +118,11 @@ export interface TenMinRedispatchInput {
   maxChain: string | number | undefined;
   /** fallback: a scanner.yml dispatch newer than the outcome ended failure/timed_out. */
   newerFailedRun?: string;
+  /**
+   * fallback: today's TENMIN_HISTORY_MAX_RANGE_END (parsed; undefined = no cap). A run that stopped
+   * at an older, lower cap restarts the chain when the variable is raised or cleared.
+   */
+  currentMaxRangeEnd?: string;
 }
 
 export interface TenMinRedispatchDecision {
@@ -134,18 +146,70 @@ export function decideTenMinRedispatch(input: TenMinRedispatchInput): TenMinRedi
   const wait = (reason: string): TenMinRedispatchDecision => ({ dispatch: false, nextAction: "wait", reason, nextChain });
   if (input.killSwitch !== "true") return stop("KILL_SWITCH_OFF");
   if (!input.outcome) return stop("STOP_NO_OUTCOME");
-  if (input.outcome.nextAction !== "continue") return stop(input.outcome.reason);
+  const capRaised = rangeEndCapRaised(input);
+  if (input.outcome.nextAction !== "continue" && !capRaised) return stop(input.outcome.reason);
   if (input.jobResult !== "success") return stop(`STOP_JOB_${input.jobResult.toUpperCase() || "UNKNOWN"}`);
   if (input.newerFailedRun) return stop(`STOP_NEWER_RUN_FAILED:${input.newerFailedRun}`);
-  if (input.outcome.rangesRemaining <= 0) return stop("STOP_DONE:no-range-left");
+  if (input.outcome.rangesRemaining <= 0 && !capRaised) return stop("STOP_DONE:no-range-left");
   const maxChain = maxChainOf(input.maxChain);
-  if (nextChain > maxChain) return stop(`STOP_CHAIN_CAP:${maxChain}`);
-  if (input.queue.checkFailed) return wait(`WAIT_QUEUE_CHECK_FAILED:${input.queue.checkFailed}`);
-  if (input.queue.otherActiveRuns > 0) return wait(`WAIT_RUN_ACTIVE:${input.queue.otherActiveRuns}`);
-  const guard = guardWindowState(input.nowUtc);
-  if (guard.inside) return wait("WAIT_GUARD_WINDOW");
-  if (guard.minutesUntilNext <= TENMIN_REDISPATCH_LEAD_MINUTES) return wait("WAIT_NEAR_GUARD_WINDOW");
+  // Raising the cap is a human action: the restarted chain counts from 1 again.
+  const chainNext = capRaised ? 1 : nextChain;
+  if (chainNext > maxChain) return stop(`STOP_CHAIN_CAP:${maxChain}`);
+  if (capRaised) {
+    const reason = `CONTINUE_RANGE_END_CAP_RAISED:${capRaised.from}->${capRaised.to}`;
+    const gate = queueAndGuard(input);
+    return gate
+      ? { dispatch: false, nextAction: "wait", reason: gate, nextChain: chainNext }
+      : { dispatch: true, nextAction: "continue", reason, nextChain: chainNext };
+  }
+  const gate = queueAndGuard(input);
+  if (gate) return wait(gate);
   return { dispatch: true, nextAction: "continue", reason: input.outcome.reason, nextChain };
+}
+
+function queueAndGuard(input: TenMinRedispatchInput): string | undefined {
+  if (input.queue.checkFailed) return `WAIT_QUEUE_CHECK_FAILED:${input.queue.checkFailed}`;
+  if (input.queue.otherActiveRuns > 0) return `WAIT_RUN_ACTIVE:${input.queue.otherActiveRuns}`;
+  const guard = guardWindowState(input.nowUtc);
+  if (guard.inside) return "WAIT_GUARD_WINDOW";
+  if (guard.minutesUntilNext <= TENMIN_REDISPATCH_LEAD_MINUTES) return "WAIT_NEAR_GUARD_WINDOW";
+  return undefined;
+}
+
+/** fallback only: the outcome stopped at a range-end cap lower than today's (or today has none). */
+function rangeEndCapRaised(input: TenMinRedispatchInput): { from: string; to: string } | undefined {
+  if (input.trigger !== "fallback" || !input.outcome) return undefined;
+  const prefix = `${TENMIN_STOP_RANGE_END_CAP}:`;
+  if (!input.outcome.reason.startsWith(prefix)) return undefined;
+  const from = input.outcome.reason.slice(prefix.length);
+  const to = input.currentMaxRangeEnd;
+  if (to !== undefined && to <= from) return undefined;
+  return { from, to: to ?? "none" };
+}
+
+export interface ScannerRunSummary {
+  id: number;
+  event: string;
+  status: string;
+  conclusion: string | null;
+  created_at: string;
+}
+
+/**
+ * Pure post-dispatch check: a scanner.yml run with event "schedule", created within the last
+ * TENMIN_SCAN_CANCELLED_WINDOW_MINUTES of nowUtc, that ended "cancelled" (e.g. a pending scan the
+ * dispatched run displaced in the concurrency group). Returns the first such run, else undefined.
+ */
+export function cancelledScheduledScan(
+  runs: readonly ScannerRunSummary[],
+  nowUtc: Date,
+  windowMinutes: number = TENMIN_SCAN_CANCELLED_WINDOW_MINUTES,
+): ScannerRunSummary | undefined {
+  const since = nowUtc.getTime() - windowMinutes * 60_000;
+  return runs.find((run) => {
+    const created = Date.parse(run.created_at);
+    return run.event === "schedule" && run.conclusion === "cancelled" && Number.isFinite(created) && created >= since;
+  });
 }
 
 // ---- CLI (thin I/O around the pure functions) ----
@@ -188,6 +252,18 @@ async function scannerRuns(): Promise<{ runs: Run[]; checkFailed?: string }> {
 
 function output(name: string, value: string): void {
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value.replaceAll("\n", " ")}\n`);
+}
+
+/** After the dispatch call: list scanner.yml runs and fail loudly if a recent scheduled scan was cancelled. */
+async function checkNoScheduledScanCancelled(): Promise<void> {
+  const delayMs = Number(process.env.TENMIN_POST_DISPATCH_CHECK_DELAY_MS ?? "15000");
+  if (Number.isFinite(delayMs) && delayMs > 0) await new Promise((done) => setTimeout(done, delayMs));
+  const { runs, checkFailed } = await scannerRuns();
+  if (checkFailed) throw new Error(`${TENMIN_REDISPATCH_SCAN_CANCELLED}:check-failed:${checkFailed}`);
+  const cancelled = cancelledScheduledScan(runs, new Date());
+  if (cancelled)
+    throw new Error(`${TENMIN_REDISPATCH_SCAN_CANCELLED}:run=${cancelled.id}:created=${cancelled.created_at}`);
+  process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", postDispatchCheck: "OK", runsListed: runs.length })}\n`);
 }
 
 async function dispatch(chain: number): Promise<void> {
@@ -255,10 +331,15 @@ async function main(mode: string | undefined): Promise<void> {
     output("next_action", decision.nextAction);
     output("reason", decision.reason);
     process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", trigger: "chain", ...decision })}\n`);
-    if (decision.dispatch) await dispatch(decision.nextChain);
+    if (decision.dispatch) {
+      await dispatch(decision.nextChain);
+      await checkNoScheduledScanCancelled();
+    }
     return;
   }
   if (mode === "fallback") {
+    // Invalid cap fails the fallback loudly (same rule as the history run).
+    const currentMaxRangeEnd = parseTenMinMaxRangeEnd(env.TENMIN_HISTORY_MAX_RANGE_END);
     const record = readJson<TenMinRunRecord>(env.TENMIN_RECORD_FILE);
     const { runs, checkFailed } = await scannerRuns();
     const recordRun = runs.find((r) => String(r.id) === record?.githubRunId);
@@ -282,11 +363,15 @@ async function main(mode: string | undefined): Promise<void> {
       chain: record?.chain ?? 0,
       maxChain: env.TENMIN_AUTO_REDISPATCH_MAX_CHAIN,
       ...(newerFailed ? { newerFailedRun: `${newerFailed.id}:${newerFailed.conclusion}` } : {}),
+      ...(currentMaxRangeEnd ? { currentMaxRangeEnd } : {}),
     });
     output("next_action", decision.nextAction);
     output("reason", decision.reason);
     process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", trigger: "fallback", lastRun: record?.githubRunId, ...decision })}\n`);
-    if (decision.dispatch) await dispatch(decision.nextChain);
+    if (decision.dispatch) {
+      await dispatch(decision.nextChain);
+      await checkNoScheduledScanCancelled();
+    }
     return;
   }
   throw new Error("TENMIN_REDISPATCH_MODE:chain|fallback");

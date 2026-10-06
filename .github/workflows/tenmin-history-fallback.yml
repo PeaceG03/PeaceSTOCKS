@@ -52,6 +52,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           TENMIN_AUTO_REDISPATCH: ${{ vars.TENMIN_AUTO_REDISPATCH }}
           TENMIN_AUTO_REDISPATCH_MAX_CHAIN: ${{ vars.TENMIN_AUTO_REDISPATCH_MAX_CHAIN }}
+          # Same cap as the history job: a raised or cleared value restarts a chain stopped at the
+          # old cap; an invalid value fails this step loudly.
+          TENMIN_HISTORY_MAX_RANGE_END: ${{ vars.TENMIN_HISTORY_MAX_RANGE_END }}
           TENMIN_RECORD_FILE: ${{ runner.temp }}/record/tenmin-history-record.json
           TENMIN_DISPATCH_REF: ${{ github.event.repository.default_branch }}
+        # After a dispatch: fails with TENMIN_REDISPATCH_SCAN_CANCELLED if a scheduled scanner.yml
+        # run created in the last 10 min was cancelled.
         run: pnpm exec tsx src/tenmin-redispatch.ts fallback

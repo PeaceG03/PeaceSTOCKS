@@ -25,6 +25,7 @@ import {
   loadDailyBarSessionsForRange,
   tradingSessionsBetween,
   universeForTenMinRange,
+  parseTenMinMaxRangeEnd,
 } from "./tenmin-history";
 import { type DailyBarSessionIndex, indexDailyBarSessions } from "./daily-bar-sessions";
 import {
@@ -230,6 +231,67 @@ test("planTenMinHistoryRanges: fixed first range (Nov 2024), two-month pairs, cl
   assert.deepEqual(later.skippedBefore, [{ calendarFrom: "2024-11-01", calendarTo: "2024-12-31" }]);
   assert.equal(later.ranges[0]?.calendarFrom, "2025-01-01");
   assert.equal(later.ranges[0]?.fetchFrom, "2025-02-17");
+});
+
+test("TENMIN_HISTORY_MAX_RANGE_END: ranges ending after the cap are not planned and are counted", () => {
+  const capped = planTenMinHistoryRanges({
+    windowStart: "2024-10-07",
+    lastCompletedSession: "2026-10-05",
+    maxRangeEnd: "2024-12-31",
+  });
+  assert.deepEqual(capped.ranges.map((r) => `${r.calendarFrom}_${r.calendarTo}`), ["2024-11-01_2024-12-31"]);
+  assert.deepEqual(capped.rangeEndCap, { maxRangeEnd: "2024-12-31", rangesBeyondCap: 10, reason: "RANGE_END_CAP" });
+  // A cap inside a range holds that range back too (calendarTo after the cap).
+  const mid = planTenMinHistoryRanges({ windowStart: "2024-10-07", lastCompletedSession: "2026-10-05", maxRangeEnd: "2025-02-27" });
+  assert.deepEqual(mid.ranges.map((r) => r.calendarTo), ["2024-12-31"]);
+  // Raising the cap is just a new value: more ranges are planned.
+  const raised = planTenMinHistoryRanges({ windowStart: "2024-10-07", lastCompletedSession: "2026-10-05", maxRangeEnd: "2025-04-30" });
+  assert.deepEqual(raised.ranges.map((r) => r.calendarTo), ["2024-12-31", "2025-02-28", "2025-04-30"]);
+  assert.equal(raised.rangeEndCap?.rangesBeyondCap, 8);
+  // Unset or empty: no cap, the plan is unchanged.
+  const uncapped = planTenMinHistoryRanges({ windowStart: "2024-10-07", lastCompletedSession: "2026-10-05" });
+  for (const value of [undefined, "", "   "]) {
+    const plan = planTenMinHistoryRanges({ windowStart: "2024-10-07", lastCompletedSession: "2026-10-05", maxRangeEnd: value });
+    assert.deepEqual(plan, uncapped);
+    assert.equal(plan.rangeEndCap, undefined);
+  }
+});
+
+test("TENMIN_HISTORY_MAX_RANGE_END: invalid values fail loudly before any store or Massive request", async () => {
+  assert.equal(parseTenMinMaxRangeEnd("2024-12-31"), "2024-12-31");
+  assert.equal(parseTenMinMaxRangeEnd(" 2024-12-31 "), "2024-12-31");
+  assert.equal(parseTenMinMaxRangeEnd(undefined), undefined);
+  assert.equal(parseTenMinMaxRangeEnd(""), undefined);
+  for (const bad of ["2024-12-32", "2024-02-30", "2024/12/31", "20241231", "2024-12", "Dec 31 2024", "2024-12-31T00:00:00Z", "true"]) {
+    assert.throws(() => parseTenMinMaxRangeEnd(bad), /TENMIN_HISTORY_MAX_RANGE_END_INVALID/, bad);
+    assert.throws(
+      () => planTenMinHistoryRanges({ lastCompletedSession: "2026-10-05", maxRangeEnd: bad }),
+      /TENMIN_HISTORY_MAX_RANGE_END_INVALID/,
+    );
+  }
+  let requests = 0;
+  const count = async () => {
+    requests += 1;
+    throw new Error("NO_REQUESTS_EXPECTED");
+  };
+  await assert.rejects(
+    runTenMinHistoryFromEnv(
+      { PEACESTOCKS_TENMIN_HISTORY: "1", TENMIN_HISTORY_MAX_RANGE_END: "2024-13-01" },
+      { root: "/nonexistent-tenmin-root", fetchPages: count, fetchGroupedDaily: count, writeReport: false },
+    ),
+    /TENMIN_HISTORY_MAX_RANGE_END_INVALID/,
+  );
+  await assert.rejects(
+    runTenMinHistory({
+      root: "/nonexistent-tenmin-root",
+      env: { TENMIN_HISTORY_MAX_RANGE_END: "2024-12-31x" },
+      fetchPages: count,
+      fetchGroupedDaily: count,
+      writeReport: false,
+    }),
+    /TENMIN_HISTORY_MAX_RANGE_END_INVALID/,
+  );
+  assert.equal(requests, 0);
 });
 
 test("lastCompletedSessionDate is the prior eligible ET session", () => {

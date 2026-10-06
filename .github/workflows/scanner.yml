@@ -215,6 +215,10 @@ jobs:
       PEACESTOCKS_SOURCE_COMMIT: ${{ github.sha }}
       PEACESTOCKS_REQUIRE_OBJECT_STORE: "1"
       PEACESTOCKS_TENMIN_HISTORY: "1"
+      # Repo variable (YYYY-MM-DD): ranges ending after it are not planned; at the cap the chain
+      # stops with STOP_RANGE_END_CAP. Empty = no cap. Invalid = the run fails before any request.
+      # Raising it later is a variable change only (the fallback restarts the chain).
+      TENMIN_HISTORY_MAX_RANGE_END: ${{ vars.TENMIN_HISTORY_MAX_RANGE_END }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -272,6 +276,8 @@ jobs:
       # Decision logic is decideTenMinRedispatch (src/tenmin-redispatch.ts, unit-tested); it stops
       # on any refusal, error, outage, failure, bounded manual run, chain cap, or kill switch off,
       # and waits (no dispatch) in or just before a guard window or while another run is queued.
+      # Right after a dispatch it lists scanner.yml runs and fails loudly with
+      # TENMIN_REDISPATCH_SCAN_CANCELLED if a scheduled run created in the last 10 min was cancelled.
       - name: Auto re-dispatch (chain)
         id: redispatch
         if: ${{ always() }}

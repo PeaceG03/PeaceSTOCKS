@@ -91,6 +91,25 @@ export function effectiveHistoryWindowStart(
  * before it are reported as SKIPPED_BEFORE_FIRST_RANGE (a choice, not an error). Change it here.
  */
 export const TENMIN_HISTORY_FIRST_RANGE_START = "2024-11-01";
+
+/** Reason recorded when the plan stops at TENMIN_HISTORY_MAX_RANGE_END. */
+export const TENMIN_RANGE_END_CAP = "RANGE_END_CAP" as const;
+
+/**
+ * Repo variable TENMIN_HISTORY_MAX_RANGE_END (YYYY-MM-DD): the last calendarTo the planner may plan.
+ * Unset, empty or whitespace = no cap. Anything else that is not a real calendar date throws
+ * TENMIN_HISTORY_MAX_RANGE_END_INVALID (the run fails before any Massive request).
+ */
+export function parseTenMinMaxRangeEnd(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const valid =
+    /^\d{4}-\d{2}-\d{2}$/u.test(trimmed) &&
+    !Number.isNaN(Date.parse(`${trimmed}T00:00:00Z`)) &&
+    new Date(`${trimmed}T00:00:00Z`).toISOString().slice(0, 10) === trimmed;
+  if (!valid) throw new Error(`TENMIN_HISTORY_MAX_RANGE_END_INVALID:${JSON.stringify(trimmed.slice(0, 40))}`);
+  return trimmed;
+}
 export const TENMIN_SKIPPED_BEFORE_FIRST_RANGE = "SKIPPED_BEFORE_FIRST_RANGE" as const;
 /** Range-level gap for days of an unsealed range that fell out of the window before it sealed. */
 export { TENMIN_AGED_OUT };
@@ -189,6 +208,8 @@ export interface TenMinHistoryPlan {
   skippedBefore: Array<{ calendarFrom: string; calendarTo: string }>;
   /** Window days before the first range start, skipped on purpose. */
   skippedBeforeFirstRange?: TenMinSkippedBeforeFirstRange;
+  /** Set when maxRangeEnd was given: the cap and how many otherwise-plannable ranges it held back. */
+  rangeEndCap?: { maxRangeEnd: string; rangesBeyondCap: number; reason: typeof TENMIN_RANGE_END_CAP };
 }
 
 /**
@@ -200,7 +221,10 @@ export function planTenMinHistoryRanges(options: {
   windowStart?: string;
   lastCompletedSession: string;
   firstRangeStart?: string;
+  /** TENMIN_HISTORY_MAX_RANGE_END: ranges whose calendarTo is after it are not planned. */
+  maxRangeEnd?: string | undefined;
 }): TenMinHistoryPlan {
+  const maxRangeEnd = parseTenMinMaxRangeEnd(options.maxRangeEnd);
   const configured = options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START;
   const firstRangeStart = options.firstRangeStart ?? TENMIN_HISTORY_FIRST_RANGE_START;
   requireDate(options.lastCompletedSession);
@@ -215,11 +239,13 @@ export function planTenMinHistoryRanges(options: {
           reason: TENMIN_SKIPPED_BEFORE_FIRST_RANGE,
         }
       : undefined;
+  let rangesBeyondCap = 0;
   const result = (ranges: TenMinHistoryRange[], skippedBefore: TenMinHistoryPlan["skippedBefore"]) => ({
     windowStart,
     ranges,
     skippedBefore,
     ...(skippedBeforeFirstRange ? { skippedBeforeFirstRange } : {}),
+    ...(maxRangeEnd ? { rangeEndCap: { maxRangeEnd, rangesBeyondCap, reason: TENMIN_RANGE_END_CAP } } : {}),
   });
   if (windowStart >= options.lastCompletedSession) return result([], []);
 
@@ -229,6 +255,7 @@ export function planTenMinHistoryRanges(options: {
   for (let i = 0; i < 240 && cursor.calendarTo < options.lastCompletedSession; i += 1) {
     const { calendarFrom, calendarTo } = cursor;
     if (calendarTo < windowStart) skippedBefore.push({ calendarFrom, calendarTo });
+    else if (maxRangeEnd && calendarTo > maxRangeEnd) rangesBeyondCap += 1;
     else {
       const fetchFrom = windowStart > calendarFrom ? windowStart : calendarFrom;
       ranges.push({
@@ -532,6 +559,8 @@ export interface TenMinHistoryRunReport {
   rangesPlanned: number;
   /** Was maxRanges set for this run (a deliberately bounded run). */
   maxRanges?: number;
+  /** TENMIN_HISTORY_MAX_RANGE_END for this run, and the ranges it held back. */
+  rangeEndCap?: TenMinHistoryPlan["rangeEndCap"];
   yieldedForScan?: string;
   outageStop?: string;
   stoppedOnError: boolean;
@@ -577,6 +606,8 @@ export async function runTenMinHistory(options: {
   windowStart?: string;
   lastCompletedSession?: string;
   maxRanges?: number;
+  /** TENMIN_HISTORY_MAX_RANGE_END; defaults to env.TENMIN_HISTORY_MAX_RANGE_END. */
+  maxRangeEnd?: string;
   reopen?: boolean;
   deadlineMs?: number;
   shouldYield?: () => Promise<string | undefined>;
@@ -594,6 +625,8 @@ export async function runTenMinHistory(options: {
   writeReport?: boolean;
 }): Promise<TenMinHistoryRunResult> {
   const env = options.env ?? process.env;
+  // Validate the range-end cap first: an invalid value fails before any store or Massive call.
+  const maxRangeEnd = parseTenMinMaxRangeEnd(options.maxRangeEnd ?? env.TENMIN_HISTORY_MAX_RANGE_END);
   const now = options.now ?? new Date();
   const stamp = options.nowIso ?? (() => new Date().toISOString());
   const zstdVersion = assertPinnedZstdForWriting(options.zstdVersionProbe);
@@ -637,6 +670,7 @@ export async function runTenMinHistory(options: {
   const plan = planTenMinHistoryRanges({
     windowStart: configuredWindowStart,
     lastCompletedSession: lastCompleted,
+    ...(maxRangeEnd ? { maxRangeEnd } : {}),
   });
   const ranges = plan.ranges.slice(0, options.maxRanges ?? Number.MAX_SAFE_INTEGER);
   const securities = options.securities ?? (await storage.loadSecurities());
@@ -893,6 +927,7 @@ export async function runTenMinHistory(options: {
     ranges: rangeReports,
     rangesPlanned: plan.ranges.length,
     ...(options.maxRanges !== undefined ? { maxRanges: options.maxRanges } : {}),
+    ...(plan.rangeEndCap ? { rangeEndCap: plan.rangeEndCap } : {}),
     ...(yieldedForScan ? { yieldedForScan } : {}),
     ...(outageStop ? { outageStop } : {}),
     stoppedOnError,
@@ -946,6 +981,7 @@ export function tenMinHistorySummary(report: TenMinHistoryRunReport): Record<str
       ...(range.error ? { error: range.error } : {}),
     })),
     ...(report.skippedBeforeFirstRange ? { skippedBeforeFirstRange: report.skippedBeforeFirstRange } : {}),
+    ...(report.rangeEndCap ? { rangeEndCap: report.rangeEndCap } : {}),
     massiveRequests: report.massiveRequests,
     groupedDailyRequests: report.groupedDailyRequests,
     yieldedForScan: report.yieldedForScan,
@@ -961,6 +997,7 @@ export async function runTenMinHistoryFromEnv(
   overrides: Partial<Parameters<typeof runTenMinHistory>[0]> = {},
 ): Promise<TenMinHistoryRunResult | undefined> {
   if (env.PEACESTOCKS_TENMIN_HISTORY !== "1") return undefined;
+  const maxRangeEnd = parseTenMinMaxRangeEnd(env.TENMIN_HISTORY_MAX_RANGE_END);
   const root =
     overrides.root ??
     env.PEACEAI_MARKETS_ROOT ??
@@ -978,6 +1015,7 @@ export async function runTenMinHistoryFromEnv(
     root,
     env,
     reopen: env.PEACESTOCKS_TENMIN_HISTORY_REOPEN === "1",
+    ...(maxRangeEnd ? { maxRangeEnd } : {}),
     ...(maxRanges !== undefined && Number.isFinite(maxRanges) ? { maxRanges } : {}),
     ...(deadlineMs !== undefined ? { deadlineMs } : {}),
     ...overrides,
