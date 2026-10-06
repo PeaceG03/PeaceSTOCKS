@@ -163,13 +163,13 @@ export class MarketsScanner {
       .map((security) => security.securityId);
     let bars: CanonicalDailyBar[] = [];
     let actions: CorporateAction[] = [];
-    let hadDailyBarsFetch = false;
+    // Start both as before (Promise.all). If corporate-actions rejects first, still await the
+    // bars promise so keepRawReplies can finish and the dust step can store those bytes without
+    // changing append/report behavior when either side fails.
+    const barsPromise = this.provider.getDailyBars(sessionDate, ids);
+    const actionsPromise = this.provider.getCorporateActions(sessionDate, ids);
     try {
-      [bars, actions] = await Promise.all([
-        this.provider.getDailyBars(sessionDate, ids),
-        this.provider.getCorporateActions(sessionDate, ids),
-      ]);
-      hadDailyBarsFetch = true;
+      [bars, actions] = await Promise.all([barsPromise, actionsPromise]);
       await this.storage.appendBars(bars);
       await this.storage.appendActions(actions);
     } catch (error) {
@@ -179,7 +179,13 @@ export class MarketsScanner {
           ? `PROVIDER_NOT_READY:${message}`
           : `EVIDENCE_PROVIDER_ERROR:${message}`,
       );
+      await barsPromise.then(
+        () => undefined,
+        () => undefined,
+      );
     }
+    // Store grouped-daily Reply Dust from any reply the provider still holds (even when
+    // corporate-actions failed after getDailyBars kept raw bytes).
     let groupedReplyDust: ScanGroupedReplyDustReport | undefined;
     if (this.groupedReplyDust) {
       groupedReplyDust = await maybeStoreScanGroupedReplyDust({
@@ -187,7 +193,6 @@ export class MarketsScanner {
         ...(this.groupedReplyDust.store ? { store: this.groupedReplyDust.store } : {}),
         provider: this.provider,
         sessionDate,
-        hadDailyBarsFetch,
         ...(this.groupedReplyDust.backend ? { backend: this.groupedReplyDust.backend } : {}),
         ...(this.groupedReplyDust.zstdVersionProbe
           ? { zstdVersionProbe: this.groupedReplyDust.zstdVersionProbe }

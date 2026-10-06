@@ -175,13 +175,21 @@ async function writeHashedCopy(
   };
 }
 
-function listCopies(
+/**
+ * List every copy for the day. Every non-first copy always gets resultsMatchFirst (and
+ * resultsDiffSummary when false) by decoding its stored bytes against the canonical reply.
+ * Decode failures become warnings and do not fail the scan.
+ */
+async function listCopies(
+  store: ReplyDustStore,
   sessionDate: string,
   manifest: DailyReplyDustManifest,
   highlight: ScanGroupedReplyDustCopyReport | undefined,
   firstReply: Uint8Array | undefined,
-  replyByKey: Map<string, Uint8Array>,
-): ScanGroupedReplyDustCopyReport[] {
+  backend: ReplyDustBackend,
+  warnings: string[],
+  knownReplies: Map<string, Uint8Array>,
+): Promise<ScanGroupedReplyDustCopyReport[]> {
   const copies: ScanGroupedReplyDustCopyReport[] = [];
   const canonicalKey = dailyReplyDustFileKey(sessionDate);
   copies.push(
@@ -192,7 +200,17 @@ function listCopies(
   for (const entry of manifest.copies ?? []) {
     const key = copyKey(sessionDate, entry.relativePath);
     if (highlight?.key === key) {
-      copies.push(highlight);
+      // Highlight already carries resultsMatchFirst from the store path; still ensure it is set.
+      const h = { ...highlight };
+      if (h.resultsMatchFirst === undefined && firstReply) {
+        const other = knownReplies.get(key);
+        if (other) {
+          const cmp = compareGroupedResultsIgnoringRequestId(firstReply, other);
+          h.resultsMatchFirst = cmp.match;
+          if (!cmp.match && cmp.summary) h.resultsDiffSummary = cmp.summary;
+        }
+      }
+      copies.push(h);
       continue;
     }
     const report: ScanGroupedReplyDustCopyReport = {
@@ -200,15 +218,42 @@ function listCopies(
       sha256: entry.replySha256,
       status: "reused",
     };
-    const other = replyByKey.get(key);
-    if (firstReply && other) {
+    let other = knownReplies.get(key);
+    if (!other) {
+      try {
+        const encoded = await store.get(key);
+        if (!encoded) throw new Error("FILE_MISSING");
+        other = decodeReplyDust(encoded, backend);
+        knownReplies.set(key, other);
+      } catch (error) {
+        const warning = `${SCAN_GROUPED_REPLY_DUST_DECODE_FAILED}:${key}:${String(error).slice(0, 80)}`;
+        warnings.push(warning);
+        report.resultsMatchFirst = false;
+        report.resultsDiffSummary = `decode-failed`;
+        report.warning = warning;
+        report.status = "warning";
+        copies.push(report);
+        continue;
+      }
+    }
+    if (firstReply) {
       const cmp = compareGroupedResultsIgnoringRequestId(firstReply, other);
       report.resultsMatchFirst = cmp.match;
       if (!cmp.match && cmp.summary) report.resultsDiffSummary = cmp.summary;
+    } else {
+      report.resultsMatchFirst = false;
+      report.resultsDiffSummary = "first-reply-unavailable";
     }
     copies.push(report);
   }
-  if (highlight && !copies.some((c) => c.key === highlight.key)) copies.push(highlight);
+  if (highlight && !copies.some((c) => c.key === highlight.key)) {
+    const h = { ...highlight };
+    if (h.resultsMatchFirst === undefined) {
+      h.resultsMatchFirst = false;
+      h.resultsDiffSummary = h.resultsDiffSummary ?? "first-reply-unavailable";
+    }
+    copies.push(h);
+  }
   return copies;
 }
 
@@ -262,7 +307,9 @@ export async function storeScanGroupedReplyDust(options: {
   try {
     firstReply = await readDailyReplyDustReply(options.store, manifest, backend);
   } catch (error) {
-    warnings.push(`${SCAN_GROUPED_REPLY_DUST_DECODE_FAILED}:${String(error).slice(0, 120)}`);
+    warnings.push(
+      `${SCAN_GROUPED_REPLY_DUST_DECODE_FAILED}:${canonicalKey}:${String(error).slice(0, 120)}`,
+    );
   }
 
   if (manifest.replySha256 === replySha256 || (firstReply !== undefined && sameBytes(firstReply, reply.body))) {
@@ -270,7 +317,16 @@ export async function storeScanGroupedReplyDust(options: {
       enabled: true,
       sessionDate: reply.sessionDate,
       extraMassiveRequests: 0,
-      copies: listCopies(reply.sessionDate, manifest, undefined, firstReply, new Map()),
+      copies: await listCopies(
+        options.store,
+        reply.sessionDate,
+        manifest,
+        undefined,
+        firstReply,
+        backend,
+        warnings,
+        new Map(firstReply ? [[canonicalKey, firstReply]] : []),
+      ),
       warnings,
     };
   }
@@ -294,14 +350,23 @@ export async function storeScanGroupedReplyDust(options: {
       try {
         decoded = decodeReplyDust(existingEncoded, backend);
       } catch (error) {
-        const warning = `${SCAN_GROUPED_REPLY_DUST_DECODE_FAILED}:${String(error).slice(0, 80)}`;
+        const warning = `${SCAN_GROUPED_REPLY_DUST_DECODE_FAILED}:${hashedKey}:${String(error).slice(0, 80)}`;
         warnings.push(warning);
         highlight = { key: hashedKey, sha256: replySha256, status: "warning", ...matchFields, warning };
         return {
           enabled: true,
           sessionDate: reply.sessionDate,
           extraMassiveRequests: 0,
-          copies: listCopies(reply.sessionDate, manifest, highlight, firstReply, replyByKey),
+          copies: await listCopies(
+            options.store,
+            reply.sessionDate,
+            manifest,
+            highlight,
+            firstReply,
+            backend,
+            warnings,
+            replyByKey,
+          ),
           warnings,
         };
       }
@@ -356,7 +421,16 @@ export async function storeScanGroupedReplyDust(options: {
     enabled: true,
     sessionDate: reply.sessionDate,
     extraMassiveRequests: 0,
-    copies: listCopies(reply.sessionDate, manifest, highlight, firstReply, replyByKey),
+    copies: await listCopies(
+      options.store,
+      reply.sessionDate,
+      manifest,
+      highlight,
+      firstReply,
+      backend,
+      warnings,
+      replyByKey,
+    ),
     warnings,
   };
 }
@@ -370,8 +444,6 @@ export async function maybeStoreScanGroupedReplyDust(options: {
   store?: ReplyDustStore;
   provider: { providerName: string; takeRawReplies?: () => ProviderRawReply[] };
   sessionDate: string;
-  /** True when getDailyBars succeeded for this session. */
-  hadDailyBarsFetch: boolean;
   backend?: ReplyDustBackend;
   zstdVersionProbe?: ZstdVersionProbe;
 }): Promise<ScanGroupedReplyDustReport> {
@@ -386,16 +458,8 @@ export async function maybeStoreScanGroupedReplyDust(options: {
       warnings: [`${SCAN_GROUPED_REPLY_DUST_WRITE_FAILED}:STORE_UNAVAILABLE`],
     };
   }
-  if (!options.hadDailyBarsFetch) {
-    return {
-      enabled: true,
-      reason: "NO_GROUPED_REPLY_FETCH",
-      sessionDate: options.sessionDate,
-      extraMassiveRequests: 0,
-      copies: [],
-      warnings: [],
-    };
-  }
+  // Independent of corporate-actions (or other Promise.all siblings): store whenever the provider
+  // still holds a verified grouped-daily reply for this session.
   if (!options.provider.takeRawReplies) {
     return {
       enabled: true,

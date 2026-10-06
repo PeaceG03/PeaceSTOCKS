@@ -335,25 +335,23 @@ test("fake R2: first write and hashed second copy land under permanent/daily-rep
   assert.equal(manifest!.replySha256, sha256Hex(first.body));
 });
 
-test("maybeStore: kill switch off / no fetch / holiday path via disabled report", async () => {
+test("maybeStore: kill switch off / no held reply", async () => {
   const off = await maybeStoreScanGroupedReplyDust({
     enabled: false,
     provider: { providerName: PROVIDER },
     sessionDate: DAY,
-    hadDailyBarsFetch: true,
   });
   assert.equal(off.enabled, false);
   assert.equal(off.reason, "SCAN_GROUPED_REPLY_DUST_OFF");
 
-  const noFetch = await maybeStoreScanGroupedReplyDust({
+  const noHeld = await maybeStoreScanGroupedReplyDust({
     enabled: true,
     store: new MemoryObjectClient(),
     provider: { providerName: PROVIDER, takeRawReplies: () => [] },
     sessionDate: DAY,
-    hadDailyBarsFetch: false,
   });
-  assert.equal(noFetch.reason, "NO_GROUPED_REPLY_FETCH");
-  assert.equal(noFetch.copies.length, 0);
+  assert.equal(noHeld.reason, "NO_GROUPED_REPLY_HELD");
+  assert.equal(noHeld.copies.length, 0);
 });
 
 test("hash conflict warning when existing hashed object has different bytes", async () => {
@@ -395,4 +393,97 @@ test("hash conflict warning when existing hashed object has different bytes", as
   );
   const highlighted = again.copies.find((c) => c.key === key);
   assert.equal(highlighted?.status, "warning");
+});
+
+
+test("corporate-actions failure: grouped reply still stored; core report matches feature-off failure", async () => {
+  const body = groupedBody("ca-fail");
+  let actionsCalls = 0;
+  function makeProvider(): MarketProvider & {
+    bindUniverse(records: ProviderSecurityRecord[]): void;
+    takeRawReplies(): ReturnType<MassiveMarketProvider["takeRawReplies"]>;
+  } {
+    const massive = new MassiveMarketProvider({
+      apiKey: "test-key",
+      minRequestIntervalMs: 0,
+      retryBackoffMs: 0,
+      keepRawReplies: true,
+      now: () => AT,
+      fetchImpl: async (input) => {
+        if (String(input).includes("/v2/aggs/grouped/")) {
+          return new Response(body, { status: 200 });
+        }
+        return new Response("{}", { status: 404 });
+      },
+    });
+    return {
+      providerName: massive.providerName,
+      listApprovedSecurities: async () => universe,
+      getDailyBars: (day, ids) => massive.getDailyBars(day, ids),
+      getCorporateActions: async () => {
+        actionsCalls += 1;
+        throw new Error("MASSIVE_HTTP_500:corporate");
+      },
+      takeRawReplies: () => massive.takeRawReplies(),
+      bindUniverse: (records) => massive.bindUniverse(records),
+    };
+  }
+
+  const offProvider = makeProvider();
+  const offStorage = new ObjectMarketStorage(new MemoryObjectClient());
+  const off = await new MarketsScanner(offProvider, offStorage, US_EQUITY_CALENDAR).run(DAY);
+
+  actionsCalls = 0;
+  const onProvider = makeProvider();
+  const dustStore = new MemoryObjectClient();
+  const onStorage = new ObjectMarketStorage(new MemoryObjectClient());
+  const on = await new MarketsScanner(onProvider, onStorage, US_EQUITY_CALENDAR, {
+    enabled: true,
+    store: dustStore,
+    zstdVersionProbe: pinnedZstd,
+  }).run(DAY);
+
+  assert.deepEqual(coreReport(on), coreReport(off));
+  assert.equal(on.groupedReplyDust?.copies[0]?.status, "stored");
+  assert.equal(on.groupedReplyDust?.extraMassiveRequests, 0);
+  assert.ok(await readDailyReplyDustManifest(dustStore, DAY));
+  assert.ok(actionsCalls >= 1);
+});
+
+test("A,B,C,B,A: every non-first copy always has resultsMatchFirst; C stays false with ticker summary", async () => {
+  const store = new MemoryObjectClient();
+  const A = reply(groupedBody("A"));
+  const B = reply(groupedBody("B")); // same results, different request_id
+  const C = reply(groupedBody("C", `,{"T":"ZZZ","v":9,"o":9,"c":9,"h":9,"l":9,"t":1,"n":1}`));
+  const sequence = [A, B, C, B, A];
+  const shaB = sha256Hex(B.body);
+  const shaC = sha256Hex(C.body);
+
+  for (let i = 0; i < sequence.length; i += 1) {
+    const report = await storeScanGroupedReplyDust({
+      store,
+      reply: sequence[i]!,
+      provider: PROVIDER,
+      zstdVersionProbe: pinnedZstd,
+    });
+    const nonFirst = report.copies.slice(1);
+    for (const copy of nonFirst) {
+      assert.equal(typeof copy.resultsMatchFirst, "boolean", `run ${i} ${copy.key}`);
+      if (copy.resultsMatchFirst === false) {
+        assert.ok(copy.resultsDiffSummary, `run ${i} ${copy.key} needs summary`);
+      }
+    }
+    const cCopy = report.copies.find((c) => c.sha256 === shaC);
+    if (cCopy) {
+      assert.equal(cCopy.resultsMatchFirst, false, `run ${i} C must not match first`);
+      assert.match(cCopy.resultsDiffSummary ?? "", /1 tickers changed|counts differ/u);
+    }
+    const bCopy = report.copies.find((c) => c.sha256 === shaB);
+    if (bCopy) {
+      assert.equal(bCopy.resultsMatchFirst, true, `run ${i} B matches first ignoring request_id`);
+    }
+  }
+  const finalManifest = await readDailyReplyDustManifest(store, DAY);
+  assert.equal(finalManifest!.replySha256, sha256Hex(A.body));
+  assert.equal(finalManifest!.copies?.length, 2); // B and C
 });
