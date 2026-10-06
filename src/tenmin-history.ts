@@ -13,12 +13,13 @@ import { MarketStorage } from "./storage";
 import { prepareSafeStoreFile } from "./store-path";
 import {
   type TenMinRangeGapEntry,
+  type TenMinRangePlannedFetch,
   type TenMinRangeWriteResult,
   writeTenMinRangeReplyDust,
 } from "./tenmin-range-reply-dust";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 
-/** Default Massive Basic ~2y window start for 10-minute history ranges. */
+/** Default Massive Basic ~2y floor for the history window. */
 export const DEFAULT_TENMIN_HISTORY_WINDOW_START = "2024-10-07";
 
 export const TENMIN_HISTORY_RUN_SCHEMA = "tenmin-history-run-v1" as const;
@@ -29,8 +30,45 @@ function requireDate(value: string): void {
   if (!/^\d{4}-\d{2}-\d{2}$/u.test(value)) throw new Error("INVALID_SESSION_DATE");
 }
 
+/** Add `days` (may be negative) to a YYYY-MM-DD using UTC calendar arithmetic. */
+export function addCalendarDays(date: string, days: number): string {
+  requireDate(date);
+  const cursor = new Date(`${date}T00:00:00Z`);
+  cursor.setUTCDate(cursor.getUTCDate() + days);
+  return cursor.toISOString().slice(0, 10);
+}
+
+/**
+ * Subtract/add whole calendar years. Feb 29 → Feb 28 in a non-leap destination year
+ * (UTC Date.setUTCFullYear clamps).
+ */
+export function addCalendarYears(date: string, years: number): string {
+  requireDate(date);
+  const year = Number(date.slice(0, 4));
+  const month = Number(date.slice(5, 7));
+  const day = Number(date.slice(8, 10));
+  const targetYear = year + years;
+  // Clamp Feb 29 → last day of Feb in target year.
+  const lastDay = new Date(Date.UTC(targetYear, month, 0)).getUTCDate();
+  const clampedDay = Math.min(day, lastDay);
+  return `${targetYear}-${String(month).padStart(2, "0")}-${String(clampedDay).padStart(2, "0")}`;
+}
+
+/**
+ * Effective history window start: max(configured floor, lastCompletedSession − 2y + 2d).
+ * On 2026-10-06 (last completed 2026-10-05) → max(2024-10-07, 2024-10-07) = 2024-10-07.
+ */
+export function effectiveHistoryWindowStart(
+  lastCompletedSession: string,
+  configuredWindowStart: string = DEFAULT_TENMIN_HISTORY_WINDOW_START,
+): string {
+  requireDate(lastCompletedSession);
+  requireDate(configuredWindowStart);
+  const retention = addCalendarDays(addCalendarYears(lastCompletedSession, -2), 2);
+  return configuredWindowStart > retention ? configuredWindowStart : retention;
+}
+
 function lastDayOfMonth(year: number, month: number): string {
-  // month is 1-based; day 0 of next month is last day of this month.
   const day = new Date(Date.UTC(year, month, 0)).getUTCDate();
   return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
@@ -39,7 +77,6 @@ function firstDayOfMonth(year: number, month: number): string {
   return `${year}-${String(month).padStart(2, "0")}-01`;
 }
 
-/** Two-month pair start months: Oct, Dec, Feb, Apr, Jun, Aug (aligned so Oct-Nov is one range). */
 function pairStartMonth(month: number): number {
   if (month === 11) return 10;
   if (month === 1) return 12;
@@ -51,7 +88,7 @@ function pairEndMonth(startMonth: number): number {
   return startMonth === 12 ? 1 : startMonth + 1;
 }
 
-function pairRangeForDate(date: string): { from: string; to: string } {
+export function pairRangeForDate(date: string): { calendarFrom: string; calendarTo: string } {
   requireDate(date);
   const year = Number(date.slice(0, 4));
   const month = Number(date.slice(5, 7));
@@ -60,25 +97,19 @@ function pairRangeForDate(date: string): { from: string; to: string } {
   const endMonth = pairEndMonth(startMonth);
   const endYear = startMonth === 12 ? startYear + 1 : startYear;
   return {
-    from: firstDayOfMonth(startYear, startMonth),
-    to: lastDayOfMonth(endYear, endMonth),
+    calendarFrom: firstDayOfMonth(startYear, startMonth),
+    calendarTo: lastDayOfMonth(endYear, endMonth),
   };
 }
 
-function nextPairRange(to: string): { from: string; to: string } {
-  requireDate(to);
-  const year = Number(to.slice(0, 4));
-  const month = Number(to.slice(5, 7));
-  // to is the last day of a pair-end month; next starts on the following month.
+function nextPairRange(calendarTo: string): { calendarFrom: string; calendarTo: string } {
+  requireDate(calendarTo);
+  const year = Number(calendarTo.slice(0, 4));
+  const month = Number(calendarTo.slice(5, 7));
   const nextStart = month === 12 ? { year: year + 1, month: 1 } : { year, month: month + 1 };
-  const start = firstDayOfMonth(nextStart.year, nextStart.month);
-  return pairRangeForDate(start);
+  return pairRangeForDate(firstDayOfMonth(nextStart.year, nextStart.month));
 }
 
-/**
- * Most recent eligible (NORMAL/HALF_DAY) session strictly before today's America/New_York date.
- * History ranges must end before this date.
- */
 export function lastCompletedSessionDate(
   now: Date = new Date(),
   calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
@@ -101,52 +132,98 @@ export function lastCompletedSessionDate(
   throw new Error("NO_COMPLETED_SESSION");
 }
 
+/**
+ * One two-month history range. Folder keys use calendarFrom/calendarTo (stable). fetchFrom is
+ * clamped to the effective window start on the first overlapping range.
+ */
 export interface TenMinHistoryRange {
-  from: string;
-  to: string;
+  /** Stable folder identity start (e.g. 2024-10-01). */
+  calendarFrom: string;
+  /** Stable folder identity end (e.g. 2024-11-30). */
+  calendarTo: string;
+  /** Actual earliest date this run fetches inside the range (>= calendarFrom). */
+  fetchFrom: string;
+  fetchTo: string;
+}
+
+export interface TenMinHistoryPlan {
+  windowStart: string;
+  ranges: TenMinHistoryRange[];
+  /** Calendar ranges entirely before the effective window (skipped). */
+  skippedBefore: Array<{ calendarFrom: string; calendarTo: string }>;
 }
 
 /**
- * Two-calendar-month history ranges, oldest first. The first range is clamped so it starts at
- * `windowStart` (default 2024-10-07 → 2024-10-07..2024-11-30). Ranges whose end is not strictly
- * before `lastCompletedSession` are excluded (current/incomplete range is never included).
+ * Two-calendar-month ranges oldest first. Folder identity is always the full calendar pair.
+ * Effective window = max(configured, lastCompleted − 2y + 2d). Ranges entirely before the window
+ * are skipped; the first overlapping range clamps fetchFrom to the window start.
  */
 export function planTenMinHistoryRanges(options: {
   windowStart?: string;
   lastCompletedSession: string;
-}): TenMinHistoryRange[] {
-  const windowStart = options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START;
-  requireDate(windowStart);
+}): TenMinHistoryPlan {
+  const configured = options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START;
   requireDate(options.lastCompletedSession);
-  if (windowStart >= options.lastCompletedSession) return [];
+  const windowStart = effectiveHistoryWindowStart(options.lastCompletedSession, configured);
+  if (windowStart >= options.lastCompletedSession)
+    return { windowStart, ranges: [], skippedBefore: [] };
+
   const first = pairRangeForDate(windowStart);
-  let from = windowStart > first.from ? windowStart : first.from;
-  let to = first.to;
-  const output: TenMinHistoryRange[] = [];
-  for (;;) {
-    if (to < options.lastCompletedSession && from <= to) output.push({ from, to });
-    const next = nextPairRange(to);
-    if (next.from >= options.lastCompletedSession) break;
-    // Stop if we cannot make progress (safety).
-    if (next.to <= to) break;
-    from = next.from;
-    to = next.to;
-    // Cap runaway plans (Massive Basic ~2y is far smaller).
-    if (output.length > 48) break;
+  // Walk from a range that could contain the configured floor, recording skips.
+  let cursor = pairRangeForDate(
+    configured < windowStart ? configured : windowStart,
+  );
+  // If configured is much earlier, start from a range near windowStart's pair.
+  if (cursor.calendarTo < windowStart) cursor = first;
+
+  // Also walk any earlier calendar pairs from configured for skippedBefore reporting.
+  const skippedBefore: Array<{ calendarFrom: string; calendarTo: string }> = [];
+  let skipCursor = pairRangeForDate(configured);
+  while (skipCursor.calendarTo < windowStart) {
+    skippedBefore.push({
+      calendarFrom: skipCursor.calendarFrom,
+      calendarTo: skipCursor.calendarTo,
+    });
+    const next = nextPairRange(skipCursor.calendarTo);
+    if (next.calendarTo <= skipCursor.calendarTo) break;
+    skipCursor = next;
+    if (skippedBefore.length > 48) break;
   }
-  return output;
+
+  const ranges: TenMinHistoryRange[] = [];
+  let { calendarFrom, calendarTo } = first;
+  for (;;) {
+    if (calendarTo < options.lastCompletedSession && calendarTo >= windowStart) {
+      const fetchFrom = windowStart > calendarFrom ? windowStart : calendarFrom;
+      if (fetchFrom <= calendarTo)
+        ranges.push({
+          calendarFrom,
+          calendarTo,
+          fetchFrom,
+          fetchTo: calendarTo,
+        });
+    } else if (calendarTo < windowStart) {
+      // already in skippedBefore
+    }
+    const next = nextPairRange(calendarTo);
+    if (next.calendarFrom >= options.lastCompletedSession) break;
+    if (next.calendarTo <= calendarTo) break;
+    calendarFrom = next.calendarFrom;
+    calendarTo = next.calendarTo;
+    if (ranges.length > 48) break;
+  }
+  return { windowStart, ranges, skippedBefore };
 }
 
 export interface TenMinUniverseSecurity {
   securityId: string;
-  /** Historical ticker valid for the range (deterministic choice when several overlap). */
-  symbol: string;
-  /** How the ticker was chosen when more than one historicalSymbols entry overlapped. */
-  symbolChoice?: "SOLE_OVERLAP" | "MAX_COVERAGE" | "CURRENT_FALLBACK";
+  fetches: TenMinRangePlannedFetch[];
 }
 
 export interface TenMinUniversePlan {
   securities: TenMinUniverseSecurity[];
+  /** Flattened planned fetches for the writer. */
+  fetches: TenMinRangePlannedFetch[];
   gaps: TenMinRangeGapEntry[];
 }
 
@@ -163,42 +240,48 @@ function overlaps(aFrom: string, aTo: string, bFrom: string, bTo: string): boole
   return aFrom <= bTo && aTo >= bFrom;
 }
 
-function coverageDays(overlapFrom: string, overlapTo: string): number {
-  if (overlapFrom > overlapTo) return 0;
-  const start = Date.parse(`${overlapFrom}T00:00:00Z`);
-  const end = Date.parse(`${overlapTo}T00:00:00Z`);
-  return Math.floor((end - start) / 86_400_000) + 1;
+function maxDate(a: string, b: string): string {
+  return a > b ? a : b;
+}
+
+function minDate(a: string, b: string): string {
+  return a < b ? a : b;
 }
 
 /**
- * Securities whose listing interval overlaps [from, to], each with the historical ticker that
- * covers the most of the range (ties: earlier effectiveFrom, then symbol code-unit order). Delisted
- * names are included. No known ticker → gap NO_HISTORICAL_SYMBOL.
+ * Securities whose listing overlaps [rangeFetchFrom, rangeFetchTo]. Every historicalSymbols
+ * ticker whose span overlaps is planned for its own sub-span
+ * [max(effectiveFrom, rangeFetchFrom, listedFrom), min(effectiveTo, rangeFetchTo, listedTo)].
  */
 export function universeForTenMinRange(
   securities: readonly SecurityMasterRecord[],
-  from: string,
-  to: string,
+  rangeFetchFrom: string,
+  rangeFetchTo: string,
   nowIso: string = new Date().toISOString(),
 ): TenMinUniversePlan {
-  requireDate(from);
-  requireDate(to);
+  requireDate(rangeFetchFrom);
+  requireDate(rangeFetchTo);
   const planned: TenMinUniverseSecurity[] = [];
   const gaps: TenMinRangeGapEntry[] = [];
   for (const security of [...securities].sort((a, b) => byCodeUnit(a.securityId, b.securityId))) {
     const listed = listingInterval(security);
-    if (!overlaps(listed.from, listed.to, from, to)) continue;
+    if (!overlaps(listed.from, listed.to, rangeFetchFrom, rangeFetchTo)) continue;
     const overlapping = security.historicalSymbols.filter((entry) =>
-      overlaps(entry.effectiveFrom, entry.effectiveTo ?? "9999-12-31", from, to),
+      overlaps(entry.effectiveFrom, entry.effectiveTo ?? "9999-12-31", rangeFetchFrom, rangeFetchTo),
     );
     if (!overlapping.length) {
-      // No historical span: only fall back to currentSymbol when history is empty entirely.
       if (!security.historicalSymbols.length && security.currentSymbol) {
-        planned.push({
-          securityId: security.securityId,
-          symbol: security.currentSymbol,
-          symbolChoice: "CURRENT_FALLBACK",
-        });
+        const fetchFrom = maxDate(rangeFetchFrom, listed.from);
+        const fetchTo = minDate(rangeFetchTo, listed.to);
+        if (fetchFrom <= fetchTo) {
+          const fetch: TenMinRangePlannedFetch = {
+            securityId: security.securityId,
+            symbol: security.currentSymbol,
+            fetchFrom,
+            fetchTo,
+          };
+          planned.push({ securityId: security.securityId, fetches: [fetch] });
+        }
         continue;
       }
       gaps.push({
@@ -209,34 +292,53 @@ export function universeForTenMinRange(
       });
       continue;
     }
-    const scored = overlapping
-      .map((entry) => {
-        const overlapFrom = entry.effectiveFrom > from ? entry.effectiveFrom : from;
-        const end = entry.effectiveTo ?? to;
-        const overlapTo = end < to ? end : to;
-        return { entry, days: coverageDays(overlapFrom, overlapTo) };
-      })
-      .sort(
-        (a, b) =>
-          b.days - a.days ||
-          byCodeUnit(a.entry.effectiveFrom, b.entry.effectiveFrom) ||
-          byCodeUnit(a.entry.symbol, b.entry.symbol),
+    const fetches: TenMinRangePlannedFetch[] = [];
+    for (const entry of overlapping) {
+      const fetchFrom = maxDate(maxDate(entry.effectiveFrom, rangeFetchFrom), listed.from);
+      const fetchTo = minDate(
+        minDate(entry.effectiveTo ?? rangeFetchTo, rangeFetchTo),
+        listed.to,
       );
-    const best = scored[0]!;
-    planned.push({
-      securityId: security.securityId,
-      symbol: best.entry.symbol,
-      symbolChoice: overlapping.length === 1 ? "SOLE_OVERLAP" : "MAX_COVERAGE",
-    });
+      if (fetchFrom > fetchTo) continue;
+      fetches.push({
+        securityId: security.securityId,
+        symbol: entry.symbol,
+        fetchFrom,
+        fetchTo,
+      });
+    }
+    fetches.sort(
+      (a, b) =>
+        byCodeUnit(a.fetchFrom, b.fetchFrom) ||
+        byCodeUnit(a.fetchTo, b.fetchTo) ||
+        byCodeUnit(a.symbol, b.symbol),
+    );
+    if (!fetches.length) {
+      gaps.push({
+        securityId: security.securityId,
+        symbol: "",
+        reason: "NO_HISTORICAL_SYMBOL",
+        at: nowIso,
+      });
+      continue;
+    }
+    planned.push({ securityId: security.securityId, fetches });
   }
-  return { securities: planned, gaps };
+  return {
+    securities: planned,
+    fetches: planned.flatMap((s) => s.fetches),
+    gaps,
+  };
 }
 
 export interface TenMinHistoryRangeReport {
-  from: string;
-  to: string;
-  status: "SEALED" | "ALREADY_SEALED" | "PARTIAL" | "REOPENED";
+  calendarFrom: string;
+  calendarTo: string;
+  fetchFrom: string;
+  fetchTo: string;
+  status: "SEALED" | "ALREADY_SEALED" | "PARTIAL" | "REOPENED" | "OUTAGE_STOP";
   securitiesPlanned: number;
+  fetchesPlanned: number;
   securitiesWritten: number;
   securitiesResumed: number;
   gaps: TenMinRangeGapEntry[];
@@ -244,18 +346,20 @@ export interface TenMinHistoryRangeReport {
   fallbackFiles: number;
   massiveRequests: number;
   zstdVersion: string;
-  symbolChoices?: Array<{ securityId: string; symbol: string; choice: string }>;
 }
 
 export interface TenMinHistoryRunReport {
   schemaVersion: typeof TENMIN_HISTORY_RUN_SCHEMA;
   runId: string;
   provider: string;
+  configuredWindowStart: string;
   windowStart: string;
   lastCompletedSession: string;
+  skippedBefore: Array<{ calendarFrom: string; calendarTo: string }>;
   reopen: boolean;
   ranges: TenMinHistoryRangeReport[];
   yieldedForScan?: string;
+  outageStop?: string;
   stoppedOnError: boolean;
   error?: string;
   warnings: string[];
@@ -275,11 +379,6 @@ function openTenMinReplyDustStore(root: string, env: NodeJS.ProcessEnv): ReplyDu
   return new FileReplyDustStore(root);
 }
 
-/**
- * Process whole two-month ranges oldest-first. Within a range every overlapping security is
- * requested once (plus next_url pages). Yields between securities for the daily scan / guard
- * windows / time budget; per-security Massive failures become gaps and the range still seals.
- */
 export async function runTenMinHistory(options: {
   root: string;
   store?: ReplyDustStore;
@@ -291,7 +390,6 @@ export async function runTenMinHistory(options: {
   lastCompletedSession?: string;
   maxRanges?: number;
   reopen?: boolean;
-  /** Wall-clock deadline; checked between securities / ranges. */
   deadlineMs?: number;
   shouldYield?: () => Promise<string | undefined>;
   env?: NodeJS.ProcessEnv;
@@ -303,7 +401,6 @@ export async function runTenMinHistory(options: {
     from: string,
     to: string,
   ) => Promise<TenMinuteRangeReply[]>;
-  /** When false, do not persist the run report via MarketStore.writeRunReport. Default true. */
   writeReport?: boolean;
 }): Promise<TenMinHistoryRunResult> {
   const env = options.env ?? process.env;
@@ -322,9 +419,7 @@ export async function runTenMinHistory(options: {
   )
     throw new Error("OBJECT_STORE_REQUIRED");
 
-  const provider =
-    options.provider ??
-    new MassiveMarketProvider({ keepRawReplies: true });
+  const provider = options.provider ?? new MassiveMarketProvider({ keepRawReplies: true });
   const providerName = options.providerName ?? provider.providerName;
   const fetchPages =
     options.fetchPages ??
@@ -347,14 +442,13 @@ export async function runTenMinHistory(options: {
           return undefined;
         });
 
-  const lastCompleted =
-    options.lastCompletedSession ?? lastCompletedSessionDate(now);
-  const windowStart = options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START;
-  const ranges = planTenMinHistoryRanges({
-    windowStart,
+  const lastCompleted = options.lastCompletedSession ?? lastCompletedSessionDate(now);
+  const configuredWindowStart = options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START;
+  const plan = planTenMinHistoryRanges({
+    windowStart: configuredWindowStart,
     lastCompletedSession: lastCompleted,
-  }).slice(0, options.maxRanges ?? Number.MAX_SAFE_INTEGER);
-
+  });
+  const ranges = plan.ranges.slice(0, options.maxRanges ?? Number.MAX_SAFE_INTEGER);
   const securities = options.securities ?? (await storage.loadSecurities());
   const reopen = options.reopen === true;
   const runId = `tenmin-history-${stamp().replaceAll(/[^0-9]/gu, "").slice(0, 17)}`;
@@ -363,6 +457,7 @@ export async function runTenMinHistory(options: {
   const warnings: string[] = [];
   let massiveRequests = 0;
   let yieldedForScan: string | undefined;
+  let outageStop: string | undefined;
   let stoppedOnError = false;
   let error: string | undefined;
 
@@ -372,18 +467,20 @@ export async function runTenMinHistory(options: {
       yieldedForScan = pause;
       break;
     }
-    const universe = universeForTenMinRange(securities, range.from, range.to, stamp());
+    const universe = universeForTenMinRange(
+      securities,
+      range.fetchFrom,
+      range.fetchTo,
+      stamp(),
+    );
     try {
       const result = await writeTenMinRangeReplyDust({
         store,
         root,
         provider: providerName,
-        from: range.from,
-        to: range.to,
-        securities: universe.securities.map((s) => ({
-          securityId: s.securityId,
-          symbol: s.symbol,
-        })),
+        from: range.calendarFrom,
+        to: range.calendarTo,
+        fetches: universe.fetches,
         initialGaps: universe.gaps,
         ...(reopen ? { reopen: true } : {}),
         shouldYield,
@@ -397,13 +494,16 @@ export async function runTenMinHistory(options: {
         w.startsWith("TENMIN_RANGE_SYMBOL_CHANGED:"),
       );
       warnings.push(...(result.warnings ?? []));
-      if (result.yieldedForScan) {
-        yieldedForScan = result.yieldedForScan;
+      if (result.outageStop) {
+        outageStop = result.outageStop;
         rangeReports.push({
-          from: range.from,
-          to: range.to,
-          status: "PARTIAL",
+          calendarFrom: range.calendarFrom,
+          calendarTo: range.calendarTo,
+          fetchFrom: range.fetchFrom,
+          fetchTo: range.fetchTo,
+          status: "OUTAGE_STOP",
           securitiesPlanned: universe.securities.length + universe.gaps.length,
+          fetchesPlanned: universe.fetches.length,
           securitiesWritten: result.securitiesWritten.length,
           securitiesResumed: result.securitiesResumed.length,
           gaps: result.gaps,
@@ -411,13 +511,26 @@ export async function runTenMinHistory(options: {
           fallbackFiles: result.fallbackFiles,
           massiveRequests: result.massiveRequests,
           zstdVersion: result.zstdVersion,
-          symbolChoices: universe.securities
-            .filter((s) => s.symbolChoice)
-            .map((s) => ({
-              securityId: s.securityId,
-              symbol: s.symbol,
-              choice: s.symbolChoice!,
-            })),
+        });
+        break;
+      }
+      if (result.yieldedForScan) {
+        yieldedForScan = result.yieldedForScan;
+        rangeReports.push({
+          calendarFrom: range.calendarFrom,
+          calendarTo: range.calendarTo,
+          fetchFrom: range.fetchFrom,
+          fetchTo: range.fetchTo,
+          status: "PARTIAL",
+          securitiesPlanned: universe.securities.length + universe.gaps.length,
+          fetchesPlanned: universe.fetches.length,
+          securitiesWritten: result.securitiesWritten.length,
+          securitiesResumed: result.securitiesResumed.length,
+          gaps: result.gaps,
+          symbolChangeWarnings: symbolWarnings,
+          fallbackFiles: result.fallbackFiles,
+          massiveRequests: result.massiveRequests,
+          zstdVersion: result.zstdVersion,
         });
         break;
       }
@@ -427,10 +540,13 @@ export async function runTenMinHistory(options: {
           ? "REOPENED"
           : "SEALED";
       rangeReports.push({
-        from: range.from,
-        to: range.to,
+        calendarFrom: range.calendarFrom,
+        calendarTo: range.calendarTo,
+        fetchFrom: range.fetchFrom,
+        fetchTo: range.fetchTo,
         status,
         securitiesPlanned: universe.securities.length + universe.gaps.length,
+        fetchesPlanned: universe.fetches.length,
         securitiesWritten: result.securitiesWritten.length,
         securitiesResumed: result.securitiesResumed.length,
         gaps: result.gaps,
@@ -438,13 +554,6 @@ export async function runTenMinHistory(options: {
         fallbackFiles: result.fallbackFiles,
         massiveRequests: result.massiveRequests,
         zstdVersion: result.zstdVersion,
-        symbolChoices: universe.securities
-          .filter((s) => s.symbolChoice)
-          .map((s) => ({
-            securityId: s.securityId,
-            symbol: s.symbol,
-            choice: s.symbolChoice!,
-          })),
       });
     } catch (err) {
       stoppedOnError = true;
@@ -457,11 +566,14 @@ export async function runTenMinHistory(options: {
     schemaVersion: TENMIN_HISTORY_RUN_SCHEMA,
     runId,
     provider: providerName,
-    windowStart,
+    configuredWindowStart,
+    windowStart: plan.windowStart,
     lastCompletedSession: lastCompleted,
+    skippedBefore: plan.skippedBefore,
     reopen,
     ranges: rangeReports,
     ...(yieldedForScan ? { yieldedForScan } : {}),
+    ...(outageStop ? { outageStop } : {}),
     stoppedOnError,
     ...(error ? { error } : {}),
     warnings: [...new Set(warnings)],
@@ -471,7 +583,6 @@ export async function runTenMinHistory(options: {
   };
 
   if (options.writeReport !== false) {
-    // Dedicated prefix: never write into runs/ (scanner loadRunReports would treat these as sessions).
     const key = `transient/tenmin-history-runs/${runId}.json`;
     const bytes = new TextEncoder().encode(`${JSON.stringify(report, null, 2)}\n`);
     try {
@@ -481,7 +592,7 @@ export async function runTenMinHistory(options: {
         const target = prepareSafeStoreFile(join(root, key), "TENMIN_HISTORY_PATH_INVALID");
         await writeFile(target, bytes);
       } catch {
-        // Report persistence must not hide the run outcome; caller still gets `report`.
+        // ignore
       }
     }
   }
@@ -489,7 +600,6 @@ export async function runTenMinHistory(options: {
   return { report, rangeResults };
 }
 
-/** Host entry: run only when PEACESTOCKS_TENMIN_HISTORY=1. Returns undefined when the mode is off. */
 export async function runTenMinHistoryFromEnv(
   env: NodeJS.ProcessEnv = process.env,
   overrides: Partial<Parameters<typeof runTenMinHistory>[0]> = {},
@@ -517,4 +627,3 @@ export async function runTenMinHistoryFromEnv(
     ...overrides,
   });
 }
-

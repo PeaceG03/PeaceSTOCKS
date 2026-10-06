@@ -52,7 +52,7 @@ export const MARKET_STORAGE_LAYOUT = {
   intradayReplyDustManifests: "permanent/intraday-reply-dust/YYYY-MM-DD/manifest.json",
   dailyReplyDust: "permanent/daily-reply-dust/YYYY-MM-DD/grouped-daily.rdust",
   dailyReplyDustManifests: "permanent/daily-reply-dust/YYYY-MM-DD/manifest.json",
-  tenminReplyDust: "permanent/tenmin-reply-dust/<from>_<to>/<base64url security-id>[.pN].rdust",
-  tenminReplyDustManifests: "permanent/tenmin-reply-dust/<from>_<to>/manifest.json",
+  tenminReplyDust: "permanent/tenmin-reply-dust/<calFrom>_<calTo>/<b64url(securityId)>.<b64url(symbol)>.<fetchFrom>_<fetchTo>[.pN].rdust",
+  tenminReplyDustManifests: "permanent/tenmin-reply-dust/<calFrom>_<calTo>/manifest.json",
   tenminHistoryRuns: "transient/tenmin-history-runs/<runId>.json",
 } as const;

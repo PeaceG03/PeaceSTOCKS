@@ -18,45 +18,49 @@ import {
 import { REPLY_DUST_FALLBACK_WARNING, type ZstdVersionProbe, assertPinnedZstdForWriting } from "./reply-dust-pin";
 import { prepareSafeStoreFile } from "./store-path";
 
-// Two-month 10-minute range replies as Reply Dust, one exact Massive page per file:
-//   permanent/tenmin-reply-dust/<from>_<to>/<base64url security id>.rdust        (page 1)
-//   permanent/tenmin-reply-dust/<from>_<to>/<base64url security id>.p<N>.rdust   (page N >= 2)
-//   permanent/tenmin-reply-dust/<from>_<to>/manifest.json
-// A security counts as done only when every one of its pages is stored, read back, and its
-// metadata HEAD-checked. The manifest is written after all files. The local progress log under
-// transient/tenmin-range-progress/ only saves metadata reads; the store is the record.
+// Two-month 10-minute range replies as Reply Dust. Folder identity is the fixed calendar pair
+// (e.g. 2024-10-01_2024-11-30) so a later window clamp still resumes the same folder. Each
+// (security, ticker, fetch-span) has its own file set:
+//   permanent/tenmin-reply-dust/<calFrom>_<calTo>/
+//     <b64url(securityId)>.<b64url(symbol)>.<fetchFrom>_<fetchTo>.rdust
+//     <b64url(securityId)>.<b64url(symbol)>.<fetchFrom>_<fetchTo>.p<N>.rdust
+//     manifest.json
 
 export const TENMIN_RANGE_REPLY_DUST_PREFIX = "permanent/tenmin-reply-dust";
-export const TENMIN_RANGE_OBJECT_SCHEMA = "tenmin-range-reply-dust-object-v1";
-export const TENMIN_RANGE_MANIFEST_SCHEMA = "tenmin-range-reply-dust-manifest-v1" as const;
+export const TENMIN_RANGE_OBJECT_SCHEMA = "tenmin-range-reply-dust-object-v2";
+export const TENMIN_RANGE_MANIFEST_SCHEMA = "tenmin-range-reply-dust-manifest-v2" as const;
 export const TENMIN_RANGE_PATH_ERROR = "TENMIN_RANGE_PATH_INVALID";
+export const TENMIN_RANGE_OUTAGE_STREAK = 5;
+export const TENMIN_RANGE_OUTAGE_STOP = "MASSIVE_OUTAGE";
 
 export interface TenMinRangeFileEntry {
   page: number;
-  /** File name under the range prefix. */
   relativePath: string;
-  /** Request path and query for this page (no API key). */
   request: string;
   fetchedAt: string;
   byteLength: number;
-  /** Byte 0 of the file: REPLY_DUST_VERSION, or REPLY_DUST_FALLBACK_VERSION for raw-zstd. */
   version: number;
   replySha256: string;
   replyByteLength: number;
   fileSha256: string;
-  /** America/New_York dates of the bars in this page, sorted. */
+  sessionDates: string[];
+}
+
+/** One Massive range request for one ticker over its own sub-span. */
+export interface TenMinRangeTickerFetch {
+  symbol: string;
+  fetchFrom: string;
+  fetchTo: string;
+  observedAt: string;
+  pageCount: number;
+  files: TenMinRangeFileEntry[];
   sessionDates: string[];
 }
 
 export interface TenMinRangeSecurityEntry {
   securityId: string;
-  /** Historical symbol the range was requested with. */
-  symbol: string;
   dataset: "stocks-aggregates-10m";
-  observedAt: string;
-  pageCount: number;
-  files: TenMinRangeFileEntry[];
-  /** Union of the pages' session dates, sorted. */
+  fetches: TenMinRangeTickerFetch[];
   sessionDates: string[];
 }
 
@@ -65,24 +69,20 @@ export interface TenMinRangeDayEntry {
   securities: Array<{ securityId: string; files: string[] }>;
 }
 
-/** One security that could not be written for this range; gaps do not block sealing. */
 export interface TenMinRangeGapEntry {
   securityId: string;
-  /** Historical symbol requested, or "" when none was known (NO_HISTORICAL_SYMBOL). */
   symbol: string;
-  /** Stable error/gap name, e.g. MASSIVE_RANGE_PAGE_CAP, MASSIVE_HTTP_404, NO_HISTORICAL_SYMBOL. */
   reason: string;
   at: string;
+  fetchFrom?: string;
+  fetchTo?: string;
 }
 
-/**
- * Manifest schema stays tenmin-range-reply-dust-manifest-v1: `gaps` is an additive, optional-on-read
- * field. New manifests always write `gaps` (possibly []) so sealed bytes stay deterministic.
- */
 export interface TenMinRangeManifest {
   schemaVersion: typeof TENMIN_RANGE_MANIFEST_SCHEMA;
   format: typeof REPLY_DUST_FORMAT;
   provider: string;
+  /** Calendar folder identity (stable across window clamps). */
   rangeFrom: string;
   rangeTo: string;
   securityCount: number;
@@ -90,9 +90,16 @@ export interface TenMinRangeManifest {
   fallbackFileCount: number;
   securities: TenMinRangeSecurityEntry[];
   days: TenMinRangeDayEntry[];
-  /** Per-security failures / missing tickers; sorted by securityId. Absent on pre-gaps manifests. */
-  gaps?: TenMinRangeGapEntry[];
+  gaps: TenMinRangeGapEntry[];
   checksum: string;
+}
+
+/** Planned Massive fetch unit: one ticker over one sub-span. */
+export interface TenMinRangePlannedFetch {
+  securityId: string;
+  symbol: string;
+  fetchFrom: string;
+  fetchTo: string;
 }
 
 const byCodeUnit = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
@@ -102,33 +109,76 @@ function requireRange(from: string, to: string): void {
     throw new Error("INVALID_RANGE");
 }
 
-export function tenMinRangePrefix(from: string, to: string): string {
-  requireRange(from, to);
-  return `${TENMIN_RANGE_REPLY_DUST_PREFIX}/${from}_${to}`;
+export function tenMinRangePrefix(calendarFrom: string, calendarTo: string): string {
+  requireRange(calendarFrom, calendarTo);
+  return `${TENMIN_RANGE_REPLY_DUST_PREFIX}/${calendarFrom}_${calendarTo}`;
 }
 
-/** Same base64url security-id encoding as the one-day writer. */
-export function tenMinRangeFileName(securityId: string, page: number): string {
+const b64 = (value: string): string => Buffer.from(value, "utf8").toString("base64url");
+const unb64 = (value: string): string => Buffer.from(value, "base64url").toString("utf8");
+
+/** Filesystem/URL-safe name for one page of a (security, ticker, sub-span) fetch. */
+export function tenMinRangeFileName(
+  securityId: string,
+  symbol: string,
+  fetchFrom: string,
+  fetchTo: string,
+  page: number,
+): string {
   if (!Number.isSafeInteger(page) || page < 1) throw new Error("INVALID_RANGE_PAGE");
-  const id = Buffer.from(securityId, "utf8").toString("base64url");
-  return page === 1 ? `${id}.rdust` : `${id}.p${page}.rdust`;
+  requireRange(fetchFrom, fetchTo);
+  const base = `${b64(securityId)}.${b64(symbol)}.${fetchFrom}_${fetchTo}`;
+  return page === 1 ? `${base}.rdust` : `${base}.p${page}.rdust`;
 }
 
-export function tenMinRangeFileKey(from: string, to: string, securityId: string, page: number): string {
-  return `${tenMinRangePrefix(from, to)}/${tenMinRangeFileName(securityId, page)}`;
+export function tenMinRangeFileKey(
+  calendarFrom: string,
+  calendarTo: string,
+  securityId: string,
+  symbol: string,
+  fetchFrom: string,
+  fetchTo: string,
+  page: number,
+): string {
+  return `${tenMinRangePrefix(calendarFrom, calendarTo)}/${tenMinRangeFileName(securityId, symbol, fetchFrom, fetchTo, page)}`;
 }
 
-export function tenMinRangeManifestKey(from: string, to: string): string {
-  return `${tenMinRangePrefix(from, to)}/manifest.json`;
+export function tenMinRangeManifestKey(calendarFrom: string, calendarTo: string): string {
+  return `${tenMinRangePrefix(calendarFrom, calendarTo)}/manifest.json`;
 }
 
-/** Parse a file name under the range prefix back to its security id and page. */
-function parseFileName(name: string): { securityId: string; page: number } | undefined {
-  const match = /^([A-Za-z0-9_-]+)(?:\.p([1-9]\d*))?\.rdust$/u.exec(name);
+export function fetchIdentityKey(fetch: {
+  securityId: string;
+  symbol: string;
+  fetchFrom: string;
+  fetchTo: string;
+}): string {
+  return `${fetch.securityId}\0${fetch.symbol}\0${fetch.fetchFrom}\0${fetch.fetchTo}`;
+}
+
+interface ParsedFileName {
+  securityId: string;
+  symbol: string;
+  fetchFrom: string;
+  fetchTo: string;
+  page: number;
+}
+
+function parseFileName(name: string): ParsedFileName | undefined {
+  const match =
+    /^([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})(?:\.p([1-9]\d*))?\.rdust$/u.exec(
+      name,
+    );
   if (!match) return undefined;
-  const page = match[2] === undefined ? 1 : Number(match[2]);
-  if (page === 1 && match[2] !== undefined) return undefined; // ".p1" is never written
-  return { securityId: Buffer.from(match[1]!, "base64url").toString("utf8"), page };
+  const page = match[5] === undefined ? 1 : Number(match[5]);
+  if (page === 1 && match[5] !== undefined) return undefined;
+  return {
+    securityId: unb64(match[1]!),
+    symbol: unb64(match[2]!),
+    fetchFrom: match[3]!,
+    fetchTo: match[4]!,
+    page,
+  };
 }
 
 const easternDate = new Intl.DateTimeFormat("en-CA", {
@@ -138,7 +188,6 @@ const easternDate = new Intl.DateTimeFormat("en-CA", {
   day: "2-digit",
 });
 
-/** America/New_York calendar date of a bar timestamp (ms), e.g. 00:50Z on the 6th -> the 5th. */
 export function easternSessionDate(timestamp: number): string {
   return easternDate.format(new Date(timestamp));
 }
@@ -155,7 +204,6 @@ function resultRecords(reply: Record<string, unknown>): Array<Record<string, unk
     : [];
 }
 
-/** Sorted ET dates of every bar with a finite timestamp in one reply. */
 export function replySessionDates(reply: Uint8Array): string[] {
   const dates = new Set<string>();
   for (const raw of resultRecords(parseReply(reply)))
@@ -163,10 +211,16 @@ export function replySessionDates(reply: Uint8Array): string[] {
   return [...dates].sort(byCodeUnit);
 }
 
-function fileEntry(fields: Omit<TenMinRangeFileEntry, "relativePath">, securityId: string): TenMinRangeFileEntry {
+function fileEntry(
+  fields: Omit<TenMinRangeFileEntry, "relativePath">,
+  securityId: string,
+  symbol: string,
+  fetchFrom: string,
+  fetchTo: string,
+): TenMinRangeFileEntry {
   return {
     page: fields.page,
-    relativePath: tenMinRangeFileName(securityId, fields.page),
+    relativePath: tenMinRangeFileName(securityId, symbol, fetchFrom, fetchTo, fields.page),
     request: fields.request,
     fetchedAt: fields.fetchedAt,
     byteLength: fields.byteLength,
@@ -178,17 +232,18 @@ function fileEntry(fields: Omit<TenMinRangeFileEntry, "relativePath">, securityI
   };
 }
 
-function securityEntry(fields: {
-  securityId: string;
+function tickerFetch(fields: {
   symbol: string;
+  fetchFrom: string;
+  fetchTo: string;
   observedAt: string;
   files: TenMinRangeFileEntry[];
-}): TenMinRangeSecurityEntry {
+}): TenMinRangeTickerFetch {
   const files = [...fields.files].sort((a, b) => a.page - b.page);
   return {
-    securityId: fields.securityId,
     symbol: fields.symbol,
-    dataset: "stocks-aggregates-10m",
+    fetchFrom: fields.fetchFrom,
+    fetchTo: fields.fetchTo,
     observedAt: fields.observedAt,
     pageCount: files.length,
     files,
@@ -196,13 +251,34 @@ function securityEntry(fields: {
   };
 }
 
-/** R2 custom metadata on each range object; enough to rebuild its entry from the store. Must fit 2 KB. */
+function securityEntry(fields: {
+  securityId: string;
+  fetches: TenMinRangeTickerFetch[];
+}): TenMinRangeSecurityEntry {
+  const fetches = fields.fetches
+    .map((f) => tickerFetch(f))
+    .sort(
+      (a, b) =>
+        byCodeUnit(a.fetchFrom, b.fetchFrom) ||
+        byCodeUnit(a.fetchTo, b.fetchTo) ||
+        byCodeUnit(a.symbol, b.symbol),
+    );
+  return {
+    securityId: fields.securityId,
+    dataset: "stocks-aggregates-10m",
+    fetches,
+    sessionDates: [...new Set(fetches.flatMap((f) => f.sessionDates))].sort(byCodeUnit),
+  };
+}
+
 export function tenMinRangeObjectMetadata(input: {
   provider: string;
-  from: string;
-  to: string;
+  calendarFrom: string;
+  calendarTo: string;
   securityId: string;
   symbol: string;
+  fetchFrom: string;
+  fetchTo: string;
   observedAt: string;
   pageCount: number;
   file: Pick<TenMinRangeFileEntry, "page" | "request" | "fetchedAt" | "version" | "replySha256" | "replyByteLength">;
@@ -218,29 +294,35 @@ export function tenMinRangeObjectMetadata(input: {
     "rd-version": String(input.file.version),
     "rd-reply-length": String(input.file.replyByteLength),
     "rd-reply-sha256": input.file.replySha256,
-    "rd-range-from": input.from,
-    "rd-range-to": input.to,
+    "rd-range-from": input.calendarFrom,
+    "rd-range-to": input.calendarTo,
+    "rd-fetch-from": input.fetchFrom,
+    "rd-fetch-to": input.fetchTo,
     "rd-page": String(input.file.page),
     "rd-page-count": String(input.pageCount),
   };
 }
 
-/**
- * Store every page of one security's range reply. Per page: encode, decode back and byte-compare,
- * check metadata fits, put, read back, HEAD and compare metadata (storeVerifiedReplyDust). Throws
- * on any failure; the security is done only when this returns.
- */
-export async function writeTenMinRangeSecurity(
+export async function writeTenMinRangeFetch(
   store: ReplyDustStore,
   pages: readonly TenMinuteRangeReply[],
-  options: { provider: string; from: string; to: string; observedAt?: string; backend?: ReplyDustBackend },
-): Promise<TenMinRangeSecurityEntry> {
-  const { from, to, provider } = options;
-  requireRange(from, to);
+  options: {
+    provider: string;
+    calendarFrom: string;
+    calendarTo: string;
+    fetchFrom: string;
+    fetchTo: string;
+    observedAt?: string;
+    backend?: ReplyDustBackend;
+  },
+): Promise<{ securityId: string; fetch: TenMinRangeTickerFetch }> {
+  const { calendarFrom, calendarTo, fetchFrom, fetchTo, provider } = options;
+  requireRange(calendarFrom, calendarTo);
+  requireRange(fetchFrom, fetchTo);
   const first = pages[0];
   if (!first) throw new Error("TENMIN_RANGE_NO_PAGES");
   if (pages.length > TENMIN_RANGE_PAGE_CAP)
-    throw new Error(`MASSIVE_RANGE_PAGE_CAP:${first.symbol}:${from}:${to}`);
+    throw new Error(`MASSIVE_RANGE_PAGE_CAP:${first.symbol}:${fetchFrom}:${fetchTo}`);
   const { securityId, symbol } = first;
   if (!securityId || !symbol) throw new Error("TENMIN_RANGE_SECURITY_REQUIRED");
   pages.forEach((page, index) => {
@@ -248,10 +330,10 @@ export async function writeTenMinRangeSecurity(
       page.page !== index + 1 ||
       page.securityId !== securityId ||
       page.symbol !== symbol ||
-      page.rangeFrom !== from ||
-      page.rangeTo !== to
+      page.rangeFrom !== fetchFrom ||
+      page.rangeTo !== fetchTo
     )
-      throw new Error(`TENMIN_RANGE_PAGES_INCONSISTENT:${securityId}:${index + 1}`);
+      throw new Error(`TENMIN_RANGE_PAGES_INCONSISTENT:${securityId}:${symbol}:${index + 1}`);
     if (/[?&]apikey=/iu.test(page.request)) throw new Error("TENMIN_RANGE_REQUEST_HAS_API_KEY");
   });
   const observedAt = options.observedAt ?? first.fetchedAt;
@@ -273,24 +355,35 @@ export async function writeTenMinRangeSecurity(
           sessionDates,
         },
         securityId,
+        symbol,
+        fetchFrom,
+        fetchTo,
       );
     const encoded = await storeVerifiedReplyDust(
       store,
-      tenMinRangeFileKey(from, to, securityId, page.page),
+      tenMinRangeFileKey(calendarFrom, calendarTo, securityId, symbol, fetchFrom, fetchTo, page.page),
       page.body,
-      `${securityId}:p${page.page}`,
+      `${securityId}:${symbol}:p${page.page}`,
       backend,
       (bytes) =>
         tenMinRangeObjectMetadata({
-          provider, from, to, securityId, symbol, observedAt, pageCount: pages.length, file: entryFor(bytes),
+          provider,
+          calendarFrom,
+          calendarTo,
+          securityId,
+          symbol,
+          fetchFrom,
+          fetchTo,
+          observedAt,
+          pageCount: pages.length,
+          file: entryFor(bytes),
         }),
     );
     files.push(entryFor(encoded));
   }
-  return securityEntry({ securityId, symbol, observedAt, files });
+  return { securityId, fetch: tickerFetch({ symbol, fetchFrom, fetchTo, observedAt, files }) };
 }
 
-/** Checksum or decode failure is "not done" (redo); anything else (store, zstd missing) is thrown. */
 function verifiedReply(bytes: Uint8Array, file: TenMinRangeFileEntry, backend: ReplyDustBackend): Uint8Array | undefined {
   try {
     return verifyRangeBytes(bytes, file, backend, "");
@@ -305,57 +398,61 @@ function verifyRangeBytes(
   bytes: Uint8Array,
   file: TenMinRangeFileEntry,
   backend: ReplyDustBackend,
-  securityId: string,
+  label: string,
 ): Uint8Array {
   if (bytes.length !== file.byteLength || bytes[0] !== file.version || sha256Hex(bytes) !== file.fileSha256)
-    throw new Error(`REPLY_DUST_FILE_CHECKSUM_MISMATCH:${securityId}:p${file.page}`);
+    throw new Error(`REPLY_DUST_FILE_CHECKSUM_MISMATCH:${label}:p${file.page}`);
   const reply = decodeReplyDust(bytes, backend);
   if (reply.length !== file.replyByteLength || sha256Hex(reply) !== file.replySha256)
-    throw new Error(`REPLY_DUST_REPLY_CHECKSUM_MISMATCH:${securityId}:p${file.page}`);
+    throw new Error(`REPLY_DUST_REPLY_CHECKSUM_MISMATCH:${label}:p${file.page}`);
   return reply;
 }
 
-/**
- * Verify one security's full stored page set and return its entry, or undefined when the set is
- * incomplete or bad (a page missing from `storedPages`, missing or inconsistent metadata, wrong
- * page count, failed checksum or decode). Store errors are thrown, never treated as missing. A
- * hint (progress log) saves the HEADs; the bytes of every page are always verified.
- */
-export async function verifyStoredTenMinRangeSecurity(
+export async function verifyStoredTenMinRangeFetch(
   store: ReplyDustStore,
-  from: string,
-  to: string,
-  securityId: string,
+  calendarFrom: string,
+  calendarTo: string,
+  planned: TenMinRangePlannedFetch,
   options: {
     provider: string;
-    /** Pages listed under the range prefix for this security (from one list call). */
     storedPages: ReadonlySet<number>;
-    hint?: TenMinRangeSecurityEntry;
+    hint?: TenMinRangeTickerFetch;
     backend?: ReplyDustBackend;
   },
-): Promise<TenMinRangeSecurityEntry | undefined> {
+): Promise<TenMinRangeTickerFetch | undefined> {
   const backend = options.backend ?? nodeReplyDustBackend;
+  const { securityId, symbol, fetchFrom, fetchTo } = planned;
   const complete = (count: number) =>
-    count >= 1 && count <= TENMIN_RANGE_PAGE_CAP && Array.from({ length: count }, (_, i) => i + 1).every((p) => options.storedPages.has(p));
+    count >= 1 &&
+    count <= TENMIN_RANGE_PAGE_CAP &&
+    Array.from({ length: count }, (_, i) => i + 1).every((p) => options.storedPages.has(p));
   const hint = options.hint;
-  if (hint && hint.securityId === securityId && hint.files.length === hint.pageCount && complete(hint.pageCount)) {
+  if (
+    hint &&
+    hint.symbol === symbol &&
+    hint.fetchFrom === fetchFrom &&
+    hint.fetchTo === fetchTo &&
+    hint.files.length === hint.pageCount &&
+    complete(hint.pageCount)
+  ) {
     let ok = true;
     for (const file of hint.files) {
-      const bytes = await store.get(tenMinRangeFileKey(from, to, securityId, file.page));
+      const bytes = await store.get(
+        tenMinRangeFileKey(calendarFrom, calendarTo, securityId, symbol, fetchFrom, fetchTo, file.page),
+      );
       if (!bytes || !verifiedReply(bytes, file, backend)) {
         ok = false;
         break;
       }
     }
-    if (ok) return securityEntry(hint);
+    if (ok) return tickerFetch(hint);
   }
   if (!options.storedPages.has(1)) return undefined;
-  let symbol: string | undefined;
   let observedAt: string | undefined;
   let pageCount = 0;
   const files: TenMinRangeFileEntry[] = [];
   for (let page = 1; page <= Math.max(pageCount, 1); page += 1) {
-    const key = tenMinRangeFileKey(from, to, securityId, page);
+    const key = tenMinRangeFileKey(calendarFrom, calendarTo, securityId, symbol, fetchFrom, fetchTo, page);
     const head = await store.head(key);
     if (!head) return undefined;
     const m = head.metadata;
@@ -366,10 +463,12 @@ export async function verifyStoredTenMinRangeSecurity(
       m["rd-schema"] !== TENMIN_RANGE_OBJECT_SCHEMA ||
       m["rd-provider"] !== options.provider ||
       m["rd-security-id"] !== securityId ||
-      m["rd-range-from"] !== from ||
-      m["rd-range-to"] !== to ||
+      m["rd-symbol"] !== symbol ||
+      m["rd-range-from"] !== calendarFrom ||
+      m["rd-range-to"] !== calendarTo ||
+      m["rd-fetch-from"] !== fetchFrom ||
+      m["rd-fetch-to"] !== fetchTo ||
       m["rd-page"] !== String(page) ||
-      !m["rd-symbol"] ||
       !m["rd-request"] ||
       !m["rd-fetched-at"] ||
       !m["rd-observed-at"] ||
@@ -382,9 +481,8 @@ export async function verifyStoredTenMinRangeSecurity(
     if (page === 1) {
       if (!complete(count)) return undefined;
       pageCount = count;
-      symbol = m["rd-symbol"];
       observedAt = m["rd-observed-at"];
-    } else if (count !== pageCount || m["rd-symbol"] !== symbol || m["rd-observed-at"] !== observedAt) {
+    } else if (count !== pageCount || m["rd-observed-at"] !== observedAt) {
       return undefined;
     }
     const bytes = await store.get(key);
@@ -400,7 +498,7 @@ export async function verifyStoredTenMinRangeSecurity(
       fileSha256: sha256Hex(bytes),
       sessionDates: [] as string[],
     };
-    const reply = verifiedReply(bytes, fileEntry(partial, securityId), backend);
+    const reply = verifiedReply(bytes, fileEntry(partial, securityId, symbol, fetchFrom, fetchTo), backend);
     if (!reply) return undefined;
     let sessionDates: string[];
     try {
@@ -408,27 +506,28 @@ export async function verifyStoredTenMinRangeSecurity(
     } catch {
       return undefined;
     }
-    files.push(fileEntry({ ...partial, sessionDates }, securityId));
+    files.push(fileEntry({ ...partial, sessionDates }, securityId, symbol, fetchFrom, fetchTo));
   }
-  return securityEntry({ securityId, symbol: symbol!, observedAt: observedAt!, files });
+  return tickerFetch({ symbol, fetchFrom, fetchTo, observedAt: observedAt!, files });
 }
 
-/** Security id -> stored page numbers under the range prefix (one list call). */
+/** fetchIdentityKey -> stored page numbers under the calendar range prefix. */
 export async function listStoredTenMinRange(
   store: ReplyDustStore,
-  from: string,
-  to: string,
+  calendarFrom: string,
+  calendarTo: string,
 ): Promise<Map<string, Set<number>>> {
-  const prefix = `${tenMinRangePrefix(from, to)}/`;
+  const prefix = `${tenMinRangePrefix(calendarFrom, calendarTo)}/`;
   const output = new Map<string, Set<number>>();
   for (const key of await store.list(prefix)) {
     const name = key.slice(prefix.length);
     if (name.includes("/")) continue;
     const parsed = parseFileName(name);
     if (!parsed) continue;
-    const pages = output.get(parsed.securityId) ?? new Set<number>();
+    const id = fetchIdentityKey(parsed);
+    const pages = output.get(id) ?? new Set<number>();
     pages.add(parsed.page);
-    output.set(parsed.securityId, pages);
+    output.set(id, pages);
   }
   return output;
 }
@@ -443,10 +542,15 @@ function gapEntry(fields: TenMinRangeGapEntry): TenMinRangeGapEntry {
     symbol: fields.symbol,
     reason: fields.reason,
     at: fields.at,
+    ...(fields.fetchFrom ? { fetchFrom: fields.fetchFrom } : {}),
+    ...(fields.fetchTo ? { fetchTo: fields.fetchTo } : {}),
   };
 }
 
-/** Build the manifest (deterministic: securities by id, gaps by id, days by date, files by page). */
+function gapKey(gap: TenMinRangeGapEntry): string {
+  return `${gap.securityId}\0${gap.symbol}\0${gap.fetchFrom ?? ""}\0${gap.fetchTo ?? ""}\0${gap.reason}`;
+}
+
 export function buildTenMinRangeManifest(options: {
   provider: string;
   from: string;
@@ -455,29 +559,41 @@ export function buildTenMinRangeManifest(options: {
   gaps?: readonly TenMinRangeGapEntry[];
 }): TenMinRangeManifest {
   requireRange(options.from, options.to);
-  const securities = options.securities.map(securityEntry).sort((a, b) => byCodeUnit(a.securityId, b.securityId));
+  const securities = options.securities.map((s) => securityEntry(s)).sort((a, b) => byCodeUnit(a.securityId, b.securityId));
   if (new Set(securities.map((s) => s.securityId)).size !== securities.length)
     throw new Error("REPLY_DUST_DUPLICATE_SECURITY");
   const gaps = (options.gaps ?? [])
     .map(gapEntry)
-    .sort((a, b) => byCodeUnit(a.securityId, b.securityId) || byCodeUnit(a.reason, b.reason));
-  if (new Set(gaps.map((g) => g.securityId)).size !== gaps.length)
-    throw new Error("REPLY_DUST_DUPLICATE_GAP");
-  const doneIds = new Set(securities.map((s) => s.securityId));
-  for (const gap of gaps)
-    if (doneIds.has(gap.securityId)) throw new Error(`REPLY_DUST_GAP_AND_SECURITY:${gap.securityId}`);
+    .sort(
+      (a, b) =>
+        byCodeUnit(a.securityId, b.securityId) ||
+        byCodeUnit(a.symbol, b.symbol) ||
+        byCodeUnit(a.fetchFrom ?? "", b.fetchFrom ?? "") ||
+        byCodeUnit(a.reason, b.reason),
+    );
+  if (new Set(gaps.map(gapKey)).size !== gaps.length) throw new Error("REPLY_DUST_DUPLICATE_GAP");
   const byDay = new Map<string, Array<{ securityId: string; files: string[] }>>();
   for (const security of securities)
-    for (const sessionDate of security.sessionDates) {
-      const list = byDay.get(sessionDate) ?? [];
-      list.push({
-        securityId: security.securityId,
-        files: security.files.filter((file) => file.sessionDates.includes(sessionDate)).map((file) => file.relativePath),
-      });
-      byDay.set(sessionDate, list);
-    }
-  const days = [...byDay.keys()].sort(byCodeUnit).map((sessionDate) => ({ sessionDate, securities: byDay.get(sessionDate)! }));
-  const files = securities.flatMap((security) => security.files);
+    for (const fetch of security.fetches)
+      for (const sessionDate of fetch.sessionDates) {
+        const list = byDay.get(sessionDate) ?? [];
+        const existing = list.find((item) => item.securityId === security.securityId);
+        const paths = fetch.files
+          .filter((file) => file.sessionDates.includes(sessionDate))
+          .map((file) => file.relativePath);
+        if (existing) existing.files.push(...paths);
+        else list.push({ securityId: security.securityId, files: paths });
+        byDay.set(sessionDate, list);
+      }
+  for (const list of byDay.values()) {
+    list.sort((a, b) => byCodeUnit(a.securityId, b.securityId));
+    for (const item of list) item.files.sort(byCodeUnit);
+  }
+  const days = [...byDay.keys()].sort(byCodeUnit).map((sessionDate) => ({
+    sessionDate,
+    securities: byDay.get(sessionDate)!,
+  }));
+  const files = securities.flatMap((s) => s.fetches.flatMap((f) => f.files));
   const body: Omit<TenMinRangeManifest, "checksum"> = {
     schemaVersion: TENMIN_RANGE_MANIFEST_SCHEMA,
     format: REPLY_DUST_FORMAT,
@@ -498,7 +614,6 @@ export function tenMinRangeManifestBytes(manifest: TenMinRangeManifest): Uint8Ar
   return new TextEncoder().encode(`${JSON.stringify(manifest, null, 2)}\n`);
 }
 
-/** Write the range manifest after its files; verified by HEAD size and checksum metadata. */
 export async function writeTenMinRangeManifest(store: ReplyDustStore, manifest: TenMinRangeManifest): Promise<void> {
   const key = tenMinRangeManifestKey(manifest.rangeFrom, manifest.rangeTo);
   const bytes = tenMinRangeManifestBytes(manifest);
@@ -527,13 +642,21 @@ export async function readTenMinRangeManifest(
   return manifest;
 }
 
-// Local progress log: one JSON line per security, appended only after all its pages are verified.
+export interface TenMinRangeProgressEntry {
+  securityId: string;
+  fetch: TenMinRangeTickerFetch;
+}
+
 export function tenMinRangeProgressPath(root: string, from: string, to: string): string {
   requireRange(from, to);
   return join(root, "transient", "tenmin-range-progress", `${from}_${to}.jsonl`);
 }
 
-export async function loadTenMinRangeProgress(root: string, from: string, to: string): Promise<TenMinRangeSecurityEntry[]> {
+export async function loadTenMinRangeProgress(
+  root: string,
+  from: string,
+  to: string,
+): Promise<TenMinRangeProgressEntry[]> {
   const target = prepareSafeStoreFile(tenMinRangeProgressPath(root, from, to), TENMIN_RANGE_PATH_ERROR);
   let text: string;
   try {
@@ -542,44 +665,46 @@ export async function loadTenMinRangeProgress(root: string, from: string, to: st
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
   }
-  const entries: TenMinRangeSecurityEntry[] = [];
+  const entries: TenMinRangeProgressEntry[] = [];
   for (const line of text.split("\n")) {
     if (!line) continue;
     try {
-      entries.push(JSON.parse(line) as TenMinRangeSecurityEntry);
+      entries.push(JSON.parse(line) as TenMinRangeProgressEntry);
     } catch {
-      // torn final line from a crash mid-append
+      // torn final line
     }
   }
   return entries;
 }
 
-async function appendTenMinRangeProgress(root: string, from: string, to: string, entry: TenMinRangeSecurityEntry): Promise<void> {
+async function appendTenMinRangeProgress(
+  root: string,
+  from: string,
+  to: string,
+  entry: TenMinRangeProgressEntry,
+): Promise<void> {
   const target = prepareSafeStoreFile(tenMinRangeProgressPath(root, from, to), TENMIN_RANGE_PATH_ERROR);
   await appendFile(target, `\n${JSON.stringify(entry)}\n`, "utf8");
 }
 
 export interface TenMinRangeWriteResult {
   manifest: TenMinRangeManifest | undefined;
-  /** True when the range was already sealed and reopen was not requested: nothing fetched or written. */
   alreadySealed: boolean;
-  /** True when the range was sealed by this call (manifest written). */
   sealed: boolean;
   securitiesWritten: string[];
   securitiesResumed: string[];
+  fetchesWritten: number;
+  fetchesResumed: number;
   gaps: TenMinRangeGapEntry[];
   filesWritten: number;
-  /** Files written as the raw-zstd fallback (0x81) this run: stored, a warning, never a failure. */
   fallbackFiles: number;
   zstdVersion: string;
-  /** Massive page fetches started this run (one per security that was not resumed). */
   massiveRequests: number;
-  /** Set when the run stopped between securities so a scan / budget can take the slot. */
   yieldedForScan?: string;
+  outageStop?: string;
   warnings?: string[];
 }
 
-/** Massive / auth failures that affect the whole run — abort, do not gap every security. */
 export function isTenMinRangeAbortError(message: string): boolean {
   return (
     message.includes("MASSIVE_CREDENTIAL_REJECTED") ||
@@ -593,41 +718,55 @@ export function isTenMinRangeAbortError(message: string): boolean {
   );
 }
 
-/** Stable gap reason from an Error message (leading CODE or CODE:rest). */
+/** Transient Massive failures that count toward the outage streak (after provider retries). */
+export function isTenMinRangeOutageError(message: string): boolean {
+  return (
+    message.startsWith("MASSIVE_NETWORK") ||
+    /^MASSIVE_HTTP_5\d\d\b/u.test(message)
+  );
+}
+
 export function tenMinRangeGapReason(message: string): string {
   const match = /^([A-Z][A-Z0-9_]+)/u.exec(message);
   return match?.[1] ?? "TENMIN_RANGE_FETCH_FAILED";
 }
 
+function groupSecurities(
+  doneFetches: Map<string, { securityId: string; fetch: TenMinRangeTickerFetch }>,
+): TenMinRangeSecurityEntry[] {
+  const bySecurity = new Map<string, TenMinRangeTickerFetch[]>();
+  for (const { securityId, fetch } of doneFetches.values()) {
+    const list = bySecurity.get(securityId) ?? [];
+    list.push(fetch);
+    bySecurity.set(securityId, list);
+  }
+  return [...bySecurity.entries()].map(([securityId, fetches]) => securityEntry({ securityId, fetches }));
+}
+
 /**
- * Write one range for a set of securities and seal it with its manifest. Resume comes from the
- * store: the range prefix is listed once and each listed security's full page set verified (the
- * progress log saves the HEADs); an incomplete or bad set is fetched and written again. Store
- * errors are thrown, never treated as missing. A per-security Massive fetch failure becomes a gap
- * and does not block sealing; auth/rate-limit/store failures abort the run.
- *
- * `reopen: true` retries only prior gap entries plus universe securities absent from a sealed
- * manifest, then rewrites the manifest. Normal runs still skip sealed ranges.
+ * Write one calendar range. Work units are planned (security, ticker, sub-span) fetches.
+ * Folder keys use calendar from/to; each file's metadata carries the actual fetch span.
  */
 export async function writeTenMinRangeReplyDust(options: {
   store: ReplyDustStore;
-  /** Local market root for the transient progress log. */
   root: string;
   provider: string;
+  /** Calendar folder identity (stable). */
   from: string;
   to: string;
-  securities: ReadonlyArray<{ securityId: string; symbol: string }>;
-  fetchPages: (security: { securityId: string; symbol: string }, from: string, to: string) => Promise<TenMinuteRangeReply[]>;
-  /** Gaps known before any fetch (e.g. NO_HISTORICAL_SYMBOL); merged into the sealed manifest. */
+  /** Planned ticker fetches (may be multiple per security). */
+  fetches: readonly TenMinRangePlannedFetch[];
   initialGaps?: readonly TenMinRangeGapEntry[];
-  /** When true, retry gaps + missing securities on a sealed range and rewrite the manifest. */
   reopen?: boolean;
-  /** Asked before each security-range unit; a reason stops between securities (nothing mid-fetch). */
   shouldYield?: () => Promise<string | undefined>;
   backend?: ReplyDustBackend;
   zstdVersionProbe?: ZstdVersionProbe;
-  /** ISO clock for gap `at` stamps; tests inject a fixed time. */
   now?: () => string;
+  fetchPages: (
+    security: { securityId: string; symbol: string },
+    fetchFrom: string,
+    fetchTo: string,
+  ) => Promise<TenMinuteRangeReply[]>;
 }): Promise<TenMinRangeWriteResult> {
   const { store, root, provider, from, to } = options;
   requireRange(from, to);
@@ -642,6 +781,8 @@ export async function writeTenMinRangeReplyDust(options: {
       sealed: true,
       securitiesWritten: [],
       securitiesResumed: [],
+      fetchesWritten: 0,
+      fetchesResumed: 0,
       gaps: [...(existing.gaps ?? [])],
       filesWritten: 0,
       fallbackFiles: 0,
@@ -652,42 +793,99 @@ export async function writeTenMinRangeReplyDust(options: {
   const backend = options.backend ?? nodeReplyDustBackend;
   const warnings: string[] = [];
   const gaps = new Map<string, TenMinRangeGapEntry>();
-  for (const gap of options.initialGaps ?? []) gaps.set(gap.securityId, gapEntry(gap));
+  for (const gap of options.initialGaps ?? []) gaps.set(gapKey(gap), gapEntry(gap));
 
-  // Sealed reopen: keep verified securities from the prior manifest; only work gaps + newcomers.
-  const done = new Map<string, TenMinRangeSecurityEntry>();
-  let work = [...options.securities];
+  const doneFetches = new Map<string, { securityId: string; fetch: TenMinRangeTickerFetch }>();
+  let work = [...options.fetches];
+
   if (existing && reopen) {
-    for (const entry of existing.securities) done.set(entry.securityId, securityEntry(entry));
-    for (const gap of existing.gaps ?? []) gaps.set(gap.securityId, gapEntry(gap));
-    const doneIds = new Set(done.keys());
-    const gapIds = new Set((existing.gaps ?? []).map((g) => g.securityId));
-    const byId = new Map(options.securities.map((s) => [s.securityId, s]));
+    for (const security of existing.securities)
+      for (const fetch of security.fetches)
+        doneFetches.set(fetchIdentityKey({ securityId: security.securityId, ...fetch }), {
+          securityId: security.securityId,
+          fetch: tickerFetch(fetch),
+        });
+    for (const gap of existing.gaps ?? []) gaps.set(gapKey(gap), gapEntry(gap));
+    const plannedKeys = new Set(options.fetches.map(fetchIdentityKey));
     const wanted = new Set<string>();
-    for (const id of gapIds) wanted.add(id);
-    for (const security of options.securities)
-      if (!doneIds.has(security.securityId)) wanted.add(security.securityId);
+    for (const gap of existing.gaps ?? []) {
+      if (gap.fetchFrom && gap.fetchTo && gap.symbol) {
+        const key = fetchIdentityKey({
+          securityId: gap.securityId,
+          symbol: gap.symbol,
+          fetchFrom: gap.fetchFrom,
+          fetchTo: gap.fetchTo,
+        });
+        wanted.add(key);
+      } else if (!gap.symbol) {
+        // NO_HISTORICAL_SYMBOL — keep unless a planned fetch now exists for this security.
+        if (![...plannedKeys].some((k) => k.startsWith(`${gap.securityId}\0`)))
+          gaps.set(gapKey(gap), gapEntry(gap));
+      }
+    }
+    for (const fetch of options.fetches) {
+      const key = fetchIdentityKey(fetch);
+      if (!doneFetches.has(key)) wanted.add(key);
+    }
+    const byKey = new Map(options.fetches.map((f) => [fetchIdentityKey(f), f]));
+    for (const gap of existing.gaps ?? []) {
+      if (!gap.fetchFrom || !gap.fetchTo || !gap.symbol) continue;
+      const key = fetchIdentityKey({
+        securityId: gap.securityId,
+        symbol: gap.symbol,
+        fetchFrom: gap.fetchFrom,
+        fetchTo: gap.fetchTo,
+      });
+      if (!byKey.has(key))
+        byKey.set(key, {
+          securityId: gap.securityId,
+          symbol: gap.symbol,
+          fetchFrom: gap.fetchFrom,
+          fetchTo: gap.fetchTo,
+        });
+    }
     work = [...wanted]
       .sort(byCodeUnit)
-      .map((id) => byId.get(id) ?? { securityId: id, symbol: gaps.get(id)?.symbol ?? "" })
-      .filter((security) => security.symbol !== "" || gaps.has(security.securityId));
-    // Drop gaps we are about to retry so a success clears them; unresolved ones are re-added.
-    for (const security of work) gaps.delete(security.securityId);
+      .map((key) => byKey.get(key))
+      .filter((f): f is TenMinRangePlannedFetch => !!f);
+    for (const fetch of work) {
+      for (const [key, gap] of [...gaps.entries()]) {
+        if (
+          gap.securityId === fetch.securityId &&
+          gap.symbol === fetch.symbol &&
+          gap.fetchFrom === fetch.fetchFrom &&
+          gap.fetchTo === fetch.fetchTo
+        )
+          gaps.delete(key);
+      }
+    }
   }
 
-  const hints = new Map((await loadTenMinRangeProgress(root, from, to)).map((entry) => [entry.securityId, entry]));
-  // Store list/verify throws on store errors before any fetch (resume path).
+  const hints = new Map(
+    (await loadTenMinRangeProgress(root, from, to)).map((entry) => [
+      fetchIdentityKey({ securityId: entry.securityId, ...entry.fetch }),
+      entry,
+    ]),
+  );
   const stored = await listStoredTenMinRange(store, from, to);
-  const securitiesWritten: string[] = [];
-  const securitiesResumed: string[] = [];
+  const securitiesWritten = new Set<string>();
+  const securitiesResumed = new Set<string>();
+  let fetchesWritten = 0;
+  let fetchesResumed = 0;
   let filesWritten = 0;
   let fallbackFiles = 0;
   let massiveRequests = 0;
   let yieldedForScan: string | undefined;
+  let outageStop: string | undefined;
+  let outageStreak = 0;
+  const outageKeys: string[] = [];
 
-  for (const security of work) {
-    if (done.has(security.securityId) && !(existing && reopen))
-      throw new Error("REPLY_DUST_DUPLICATE_SECURITY");
+  const clearOutageStreakGaps = (): void => {
+    for (const key of outageKeys) gaps.delete(key);
+    outageKeys.length = 0;
+  };
+
+  for (const planned of work) {
     if (options.shouldYield) {
       const reason = await options.shouldYield();
       if (reason) {
@@ -695,55 +893,87 @@ export async function writeTenMinRangeReplyDust(options: {
         break;
       }
     }
-    // Empty symbol (NO_HISTORICAL_SYMBOL) is a gap with no fetch.
-    if (!security.symbol) {
-      gaps.set(security.securityId, {
-        securityId: security.securityId,
+    if (!planned.symbol) {
+      const gap = {
+        securityId: planned.securityId,
         symbol: "",
         reason: "NO_HISTORICAL_SYMBOL",
         at: stamp(),
-      });
+      };
+      gaps.set(gapKey(gap), gap);
       continue;
     }
 
-    const storedPages = stored.get(security.securityId);
+    const idKey = fetchIdentityKey(planned);
+    const storedPages = stored.get(idKey);
     if (storedPages) {
-      const hint = hints.get(security.securityId) ?? (existing?.securities.find((s) => s.securityId === security.securityId));
-      const verified = await verifyStoredTenMinRangeSecurity(store, from, to, security.securityId, {
+      const hintEntry = hints.get(idKey);
+      const hint =
+        hintEntry?.fetch ??
+        existing?.securities
+          .find((s) => s.securityId === planned.securityId)
+          ?.fetches.find(
+            (f) =>
+              f.symbol === planned.symbol &&
+              f.fetchFrom === planned.fetchFrom &&
+              f.fetchTo === planned.fetchTo,
+          );
+      const verified = await verifyStoredTenMinRangeFetch(store, from, to, planned, {
         provider,
         storedPages,
         backend,
         ...(hint ? { hint } : {}),
       });
       if (verified) {
-        if (verified.symbol !== security.symbol) {
-          warnings.push(
-            `TENMIN_RANGE_SYMBOL_CHANGED:${security.securityId}:${verified.symbol}:${security.symbol}`,
-          );
-          // Fall through to refetch and replace pages.
-        } else {
-          done.set(security.securityId, verified);
-          securitiesResumed.push(security.securityId);
-          gaps.delete(security.securityId);
-          continue;
-        }
+        // Match on (security, ticker, sub-span) — already exact via planned key.
+        doneFetches.set(idKey, { securityId: planned.securityId, fetch: verified });
+        fetchesResumed += 1;
+        securitiesResumed.add(planned.securityId);
+        outageStreak = 0;
+        clearOutageStreakGaps();
+        continue;
       }
+    }
+
+    // Stored pages under a different symbol/sub-span for this security: warn if any leftover.
+    for (const [storedKey, pages] of stored) {
+      if (!storedKey.startsWith(`${planned.securityId}\0`)) continue;
+      if (storedKey === idKey) continue;
+      if (!pages.has(1)) continue;
+      const parts = storedKey.split("\0");
+      const oldSymbol = parts[1] ?? "";
+      if (oldSymbol && oldSymbol !== planned.symbol)
+        warnings.push(
+          `TENMIN_RANGE_SYMBOL_CHANGED:${planned.securityId}:${oldSymbol}:${planned.symbol}`,
+        );
     }
 
     try {
       massiveRequests += 1;
-      const pages = await options.fetchPages(security, from, to);
-      const entry = await writeTenMinRangeSecurity(store, pages, { provider, from, to, backend });
-      filesWritten += entry.files.length;
-      fallbackFiles += entry.files.filter((file) => file.version === REPLY_DUST_FALLBACK_VERSION).length;
-      await appendTenMinRangeProgress(root, from, to, entry);
-      done.set(security.securityId, entry);
-      securitiesWritten.push(security.securityId);
-      gaps.delete(security.securityId);
+      const pages = await options.fetchPages(
+        { securityId: planned.securityId, symbol: planned.symbol },
+        planned.fetchFrom,
+        planned.fetchTo,
+      );
+      const { fetch } = await writeTenMinRangeFetch(store, pages, {
+        provider,
+        calendarFrom: from,
+        calendarTo: to,
+        fetchFrom: planned.fetchFrom,
+        fetchTo: planned.fetchTo,
+        backend,
+      });
+      filesWritten += fetch.files.length;
+      fallbackFiles += fetch.files.filter((file) => file.version === REPLY_DUST_FALLBACK_VERSION).length;
+      await appendTenMinRangeProgress(root, from, to, { securityId: planned.securityId, fetch });
+      doneFetches.set(idKey, { securityId: planned.securityId, fetch });
+      fetchesWritten += 1;
+      securitiesWritten.add(planned.securityId);
+      outageStreak = 0;
+      clearOutageStreakGaps();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (isTenMinRangeAbortError(message)) throw error;
-      // Store/R2 failures must not become gaps.
       if (
         message.startsWith("R2_") ||
         message.startsWith("STORE_") ||
@@ -752,29 +982,55 @@ export async function writeTenMinRangeReplyDust(options: {
         message.startsWith("OBJECT_STORE")
       )
         throw error;
-      gaps.set(security.securityId, {
-        securityId: security.securityId,
-        symbol: security.symbol,
-        reason: tenMinRangeGapReason(message),
+
+      if (isTenMinRangeOutageError(message)) {
+        outageStreak += 1;
+        if (outageStreak >= TENMIN_RANGE_OUTAGE_STREAK) {
+          clearOutageStreakGaps();
+          outageStop = `${TENMIN_RANGE_OUTAGE_STOP}:${message}`;
+          break;
+        }
+        // Do not record as a durable gap yet; streak failures are retried next run.
+        continue;
+      }
+
+      outageStreak = 0;
+      clearOutageStreakGaps();
+      const siblings = options.fetches.filter((f) => f.securityId === planned.securityId);
+      const reason =
+        siblings.length > 1
+          ? `SYMBOL_PARTIAL:${tenMinRangeGapReason(message)}`
+          : tenMinRangeGapReason(message);
+      const gap: TenMinRangeGapEntry = {
+        securityId: planned.securityId,
+        symbol: planned.symbol,
+        reason,
         at: stamp(),
-      });
+        fetchFrom: planned.fetchFrom,
+        fetchTo: planned.fetchTo,
+      };
+      gaps.set(gapKey(gap), gap);
     }
   }
 
-  // Incomplete run (yielded): leave progress log; do not seal.
-  if (yieldedForScan) {
+  if (yieldedForScan || outageStop) {
     return {
       manifest: existing,
       alreadySealed: false,
       sealed: false,
-      securitiesWritten,
-      securitiesResumed,
-      gaps: [...gaps.values()].sort((a, b) => byCodeUnit(a.securityId, b.securityId)),
+      securitiesWritten: [...securitiesWritten],
+      securitiesResumed: [...securitiesResumed],
+      fetchesWritten,
+      fetchesResumed,
+      gaps: [...gaps.values()].sort(
+        (a, b) => byCodeUnit(a.securityId, b.securityId) || byCodeUnit(a.symbol, b.symbol),
+      ),
       filesWritten,
       fallbackFiles,
       zstdVersion,
       massiveRequests,
-      yieldedForScan,
+      ...(yieldedForScan ? { yieldedForScan } : {}),
+      ...(outageStop ? { outageStop } : {}),
       ...(warnings.length || fallbackFiles > 0
         ? {
             warnings: [
@@ -786,12 +1042,11 @@ export async function writeTenMinRangeReplyDust(options: {
     };
   }
 
-  // On reopen, keep securities that were not in the work list.
   const manifest = buildTenMinRangeManifest({
     provider,
     from,
     to,
-    securities: [...done.values()],
+    securities: groupSecurities(doneFetches),
     gaps: [...gaps.values()],
   });
   await writeTenMinRangeManifest(store, manifest);
@@ -800,9 +1055,11 @@ export async function writeTenMinRangeReplyDust(options: {
     manifest,
     alreadySealed: false,
     sealed: true,
-    securitiesWritten,
-    securitiesResumed,
-    gaps: [...(manifest.gaps ?? [])],
+    securitiesWritten: [...securitiesWritten],
+    securitiesResumed: [...securitiesResumed],
+    fetchesWritten,
+    fetchesResumed,
+    gaps: [...manifest.gaps],
     filesWritten,
     fallbackFiles,
     zstdVersion,
@@ -822,6 +1079,7 @@ export interface TenMinRangeVerifiedPage {
   page: number;
   file: TenMinRangeFileEntry;
   reply: Uint8Array;
+  fetch: TenMinRangeTickerFetch;
 }
 
 function requireManifest(manifest: TenMinRangeManifest | undefined): TenMinRangeManifest {
@@ -829,22 +1087,29 @@ function requireManifest(manifest: TenMinRangeManifest | undefined): TenMinRange
   return manifest;
 }
 
-async function readSecurityPages(
+async function readFetchPages(
   store: ReplyDustStore,
   manifest: TenMinRangeManifest,
-  security: TenMinRangeSecurityEntry,
+  securityId: string,
+  fetch: TenMinRangeTickerFetch,
   backend: ReplyDustBackend,
 ): Promise<TenMinRangeVerifiedPage[]> {
   const output: TenMinRangeVerifiedPage[] = [];
-  for (const file of security.files) {
-    const bytes = await store.get(`${tenMinRangePrefix(manifest.rangeFrom, manifest.rangeTo)}/${file.relativePath}`);
-    if (!bytes) throw new Error(`REPLY_DUST_FILE_MISSING:${security.securityId}:p${file.page}`);
-    output.push({ page: file.page, file, reply: verifyRangeBytes(bytes, file, backend, security.securityId) });
+  for (const file of fetch.files) {
+    const bytes = await store.get(
+      `${tenMinRangePrefix(manifest.rangeFrom, manifest.rangeTo)}/${file.relativePath}`,
+    );
+    if (!bytes) throw new Error(`REPLY_DUST_FILE_MISSING:${securityId}:${fetch.symbol}:p${file.page}`);
+    output.push({
+      page: file.page,
+      file,
+      reply: verifyRangeBytes(bytes, file, backend, `${securityId}:${fetch.symbol}`),
+      fetch,
+    });
   }
   return output;
 }
 
-/** Every page of one security's range reply, verified against the manifest; [] if not listed. */
 export async function readRangeReplies(
   store: ReplyDustStore,
   from: string,
@@ -854,15 +1119,16 @@ export async function readRangeReplies(
 ): Promise<TenMinRangeVerifiedPage[]> {
   const manifest = requireManifest(await readTenMinRangeManifest(store, from, to));
   const security = manifest.securities.find((entry) => entry.securityId === securityId);
-  return security ? readSecurityPages(store, manifest, security, backend) : [];
+  if (!security) return [];
+  const output: TenMinRangeVerifiedPage[] = [];
+  for (const fetch of security.fetches)
+    output.push(...(await readFetchPages(store, manifest, securityId, fetch, backend)));
+  return output;
 }
 
 /**
- * Canonical 10-minute bars for one security's session from its range reply: the bars of that ET
- * date (across all pages, in page order) go through the same normalizer the one-day path uses.
- * retrievalId comes from the request_id of the first page with bars on the day (else page 1).
- * [] if the security is not listed; a listed security with no bars that day gets the normalizer's
- * explicit missing intervals, exactly as an empty one-day reply would.
+ * Canonical 10-minute bars for one security's session: merge bars across that security's ticker
+ * fetches for the day. Sub-spans do not overlap, so at most one fetch contributes bars per day.
  */
 export async function readRangeSecurityDay(
   store: ReplyDustStore,
@@ -877,7 +1143,26 @@ export async function readRangeSecurityDay(
   const manifest = requireManifest(await readTenMinRangeManifest(store, from, to));
   const security = manifest.securities.find((entry) => entry.securityId === securityId);
   if (!security) return [];
-  const pages = await readSecurityPages(store, manifest, security, backend);
+  const contributors = security.fetches.filter((f) => f.sessionDates.includes(sessionDate));
+  if (contributors.length > 1)
+    throw new Error(`TENMIN_RANGE_OVERLAPPING_FETCHES:${securityId}:${sessionDate}`);
+  const fetch = contributors[0] ?? security.fetches.find(
+    (f) => sessionDate >= f.fetchFrom && sessionDate <= f.fetchTo,
+  );
+  if (!fetch) {
+    // Listed security with no fetch covering the day: empty-day bars via first fetch's symbol if any.
+    const any = security.fetches[0];
+    if (!any) return [];
+    return massiveTenMinuteBarsFromReply({
+      provider: manifest.provider,
+      sessionDate,
+      securityId,
+      symbol: any.symbol,
+      reply: { results: [] },
+      observedAt: any.observedAt,
+    });
+  }
+  const pages = await readFetchPages(store, manifest, securityId, fetch, backend);
   const results: Array<Record<string, unknown>> = [];
   let requestId: unknown;
   for (const { reply } of pages) {
@@ -893,8 +1178,8 @@ export async function readRangeSecurityDay(
     provider: manifest.provider,
     sessionDate,
     securityId,
-    symbol: security.symbol,
+    symbol: fetch.symbol,
     reply: { results, ...(requestId === undefined ? {} : { request_id: requestId }) },
-    observedAt: security.observedAt,
+    observedAt: fetch.observedAt,
   });
 }
