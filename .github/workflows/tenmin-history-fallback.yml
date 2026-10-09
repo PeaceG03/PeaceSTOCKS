@@ -19,6 +19,8 @@ on:
 permissions:
   contents: read
   actions: write
+  # issues: write lets the stop-alert step open/close the scanner-alert issue.
+  issues: write
 
 concurrency:
   group: tenmin-history-fallback
@@ -79,3 +81,18 @@ jobs:
           path: ${{ runner.temp }}/record/tenmin-history-record.json
           retention-days: 14
           if-no-files-found: warn
+      # Same stop alert as scanner.yml (src/tenmin-alert.ts): alert when the fallback finds a stopped
+      # chain it will not restart or its own check fails; close the open alert when it restarts the
+      # chain. Planned waits, a manual pause, or another scanner run being active never alert.
+      # Already-reported stops (same run + reason) are not repeated every 2 hours.
+      - name: Stop alert (issue)
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TENMIN_AUTO_REDISPATCH: ${{ vars.TENMIN_AUTO_REDISPATCH }}
+          TENMIN_REDISPATCH_STEP: ${{ steps.redispatch.outcome }}
+          TENMIN_NEXT_ACTION: ${{ steps.redispatch.outputs.next_action }}
+          TENMIN_REASON: ${{ steps.redispatch.outputs.reason }}
+          TENMIN_RECORD_FILE: ${{ runner.temp }}/record/tenmin-history-record.json
+        run: pnpm exec tsx src/tenmin-alert.ts fallback

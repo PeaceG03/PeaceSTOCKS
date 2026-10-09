@@ -210,6 +210,8 @@ jobs:
     permissions:
       contents: read
       actions: write
+      # issues: write lets the last step open/close the scanner-alert issue.
+      issues: write
     timeout-minutes: 120
     env:
       MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
@@ -314,6 +316,31 @@ jobs:
           path: ${{ runner.temp }}/tenmin-history-record.json
           retention-days: 14
           if-no-files-found: warn
+      # Stop alert: one GitHub issue (label scanner-alert, assigned to the repo owner) when the chain
+      # really stops or fails; comments on an open one instead of opening another; closes it with
+      # "Chain running again" when a later run chains. No alert for a manual pause or a planned wait.
+      # Logic: planTenMinAlert (src/tenmin-alert.ts, unit-tested). Never fails the job.
+      - name: Stop alert (issue)
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          TENMIN_AUTO_REDISPATCH: ${{ vars.TENMIN_AUTO_REDISPATCH }}
+          TENMIN_HISTORY_STEP: ${{ steps.history.outcome }}
+          TENMIN_REDISPATCH_STEP: ${{ steps.redispatch.outcome }}
+          TENMIN_NEXT_ACTION: ${{ steps.redispatch.outputs.next_action }}
+          TENMIN_REASON: ${{ steps.redispatch.outputs.reason }}
+          TENMIN_RECORD_FILE: ${{ runner.temp }}/tenmin-history-record.json
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if ! pnpm exec tsx src/tenmin-alert.ts chain; then
+            # Last resort when the alert script itself cannot run: one generic alert.
+            body="The scanner alert check could not run. History step: ${TENMIN_HISTORY_STEP:-unknown}, chain step: ${TENMIN_REDISPATCH_STEP:-unknown}. Run: $RUN_URL"
+            n="$(gh issue list --repo "$GITHUB_REPOSITORY" --label scanner-alert --state open --json number --jq '.[0].number // empty')"
+            if [ -n "$n" ]; then gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$body"
+            else gh issue create --repo "$GITHUB_REPOSITORY" --title "Scanner stopped: alert check failed" --label scanner-alert --assignee PeaceG03 --body "$body"; fi
+          fi
 
   # Standalone daily 10-minute picks. Shares peacestocks-r2-writer. Kill switch TENMIN_DAILY_PICKS
   # must be exactly "true" (repo var); workflow does not force it on.

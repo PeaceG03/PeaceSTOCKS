@@ -1,0 +1,55 @@
+name: Scanner alert test
+
+# Manual only. Proves the built-in token can open and close a stop-alert issue and that the owner
+# gets notified, without touching the scanner: separate workflow (scanner.yml's queue checks never
+# see it), no secrets, no R2, no Massive, and its own label (scanner-alert-test) so a real
+# scanner-alert issue is never closed by a test.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "open (forced test alert) or close (the 'Chain running again' path)"
+        required: true
+        default: open
+        type: choice
+        options:
+          - open
+          - close
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+jobs:
+  alert-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Open a test alert
+        if: ${{ github.event.inputs.action == 'open' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SCANNER_ALERT_LABEL: scanner-alert-test
+          SCANNER_ALERT_FORCE_REASON: "TEST_ALERT:safe to close"
+        run: pnpm exec tsx src/tenmin-alert.ts chain
+      - name: Close the test alert
+        if: ${{ github.event.inputs.action == 'close' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SCANNER_ALERT_LABEL: scanner-alert-test
+          TENMIN_AUTO_REDISPATCH: "true"
+          TENMIN_HISTORY_STEP: success
+          TENMIN_REDISPATCH_STEP: success
+          TENMIN_NEXT_ACTION: continue
+          TENMIN_REASON: CONTINUE_TEST
+        run: pnpm exec tsx src/tenmin-alert.ts chain
