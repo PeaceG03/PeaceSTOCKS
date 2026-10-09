@@ -9,6 +9,11 @@
  * - picksBacklog + runner step past CORRUPT/FAILED until the seal cap fills.
  * - Base seals only when D is settled (FROZEN or no_forward_scan after next
  *   session 09:30 ET open); not_yet_frozen days are skipped this run.
+ * - Short-circuit: the first day that reports baseInput ticker_index missing (no index
+ *   asOf ≤ D) triggers ONE probe of the newest backlog day; if that day has no index
+ *   either, no remaining day can (asOf ≤ D is monotone in D) and the rest of the picks
+ *   loop is skipped for this run. grouped_reply misses (e.g. October) never trip it;
+ *   a day that has an index is never skipped by it.
  * - Resume: reuse picks.json byte-for-byte; adopt existing .rdust; fetch order
  *   holding → index → top50 → random; each fetch persists immediately.
  */
@@ -51,6 +56,7 @@ import {
   TenMinDailyBaseFailedError,
   TenMinDailyBaseInputError,
   buildTenMinDailyPicksBaseFromStored,
+  loadTickerReferenceIndexAsOf,
 } from "./tenmin-daily-picks-base";
 
 const TENMIN_DAILY_BASE_INPUT_MISSING_PREFIX = `${TENMIN_DAILY_BASE_INPUT_MISSING}:`;
@@ -106,6 +112,16 @@ export interface TenMinDailyPicksRunReport {
   skippedBaseInput: Array<{ sessionDate: string; input: string; key: string }>;
   totalRequests: number;
   yieldedForScan?: string;
+  /**
+   * True when this run skipped the picks day loop (or the remainder) because no
+   * usable ticker reference index exists yet. Oct grouped_reply misses alone never set this.
+   */
+  shortCircuited?: boolean;
+  shortCircuitReason?: "no_ticker_index";
+  /** Backlog days left unprocessed after the short-circuit. */
+  daysSkippedAfter?: number;
+  /** Session whose ticker_index miss tripped the short-circuit. */
+  shortCircuitAt?: string;
 }
 
 /** Concise picks section for history summary / R2 run report / Actions logs. */
@@ -129,6 +145,10 @@ export interface TenMinDailyPicksSummary {
     groupedWithoutIndexEntry?: { count: number; sample: string[] };
   }>;
   yieldedForScan?: string;
+  shortCircuited?: boolean;
+  shortCircuitReason?: "no_ticker_index";
+  daysSkippedAfter?: number;
+  shortCircuitAt?: string;
 }
 
 export function tenMinDailyPicksSummary(
@@ -161,6 +181,14 @@ export function tenMinDailyPicksSummary(
         : {}),
     })),
     ...(report.yieldedForScan ? { yieldedForScan: report.yieldedForScan } : {}),
+    ...(report.shortCircuited
+      ? {
+          shortCircuited: true,
+          shortCircuitReason: report.shortCircuitReason ?? "no_ticker_index",
+          daysSkippedAfter: report.daysSkippedAfter ?? 0,
+          ...(report.shortCircuitAt ? { shortCircuitAt: report.shortCircuitAt } : {}),
+        }
+      : {}),
   };
 }
 
@@ -211,6 +239,11 @@ export interface RunTenMinDailyPicksOptions {
     sessionDate: string,
   ) => Promise<Uint8Array>;
   buildBase?: (sessionDate: string) => Promise<PicksBaseV1> | PicksBaseV1;
+  /**
+   * Short-circuit probe: newest ticker reference index with asOf ≤ D, or undefined.
+   * Defaults to loadTickerReferenceIndexAsOf(store, D).
+   */
+  loadIndexAsOf?: (sessionDate: string) => Promise<unknown>;
   buildTop50?: (sessionDate: string) => Promise<PicksTop50V1 | undefined> | PicksTop50V1 | undefined;
   withinWindow?: (sessionDate: string) => boolean;
   shouldYield?: () => Promise<string | undefined>;
@@ -311,8 +344,41 @@ export async function runTenMinDailyPicks(
   let totalRequests = 0;
   let yieldedForScan: string | undefined;
   let sealedCount = 0;
+  let shortCircuited = false;
+  let shortCircuitReason: "no_ticker_index" | undefined;
+  let daysSkippedAfter = 0;
 
-  for (const entry of backlog) {
+  let shortCircuitAt: string | undefined;
+  let newestProbed = false;
+  const newestBacklogDay = backlog.length ? backlog[backlog.length - 1]!.sessionDate : undefined;
+  const loadIndexAsOf =
+    options.loadIndexAsOf ?? ((d: string) => loadTickerReferenceIndexAsOf(options.store, d));
+  /**
+   * Called after day D reported baseInput ticker_index missing (no index asOf ≤ D).
+   * Probes the newest backlog day once per run: when it has no index either, no later
+   * day can, so the rest of the loop is skipped. A probe error never trips.
+   */
+  const tripOnTickerIndexMiss = async (sessionDate: string, position: number): Promise<boolean> => {
+    if (newestProbed || !newestBacklogDay) return false;
+    newestProbed = true;
+    let newestHasIndex = true;
+    if (newestBacklogDay === sessionDate) newestHasIndex = false;
+    else {
+      try {
+        newestHasIndex = (await loadIndexAsOf(newestBacklogDay)) !== undefined;
+      } catch {
+        newestHasIndex = true;
+      }
+    }
+    if (newestHasIndex) return false;
+    shortCircuited = true;
+    shortCircuitReason = "no_ticker_index";
+    shortCircuitAt = sessionDate;
+    daysSkippedAfter = backlog.length - position - 1;
+    return true;
+  };
+
+  for (const [position, entry] of backlog.entries()) {
     if (sealedCount >= limit) break;
     if (skippedThisRun.has(entry.sessionDate)) continue;
 
@@ -362,6 +428,8 @@ export async function runTenMinDailyPicks(
           input: result.baseInput ?? "unknown",
           key: result.baseInputKey ?? result.error ?? "",
         });
+        if (result.baseInput === "ticker_index" && (await tripOnTickerIndexMiss(entry.sessionDate, position)))
+          break;
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -405,6 +473,7 @@ export async function runTenMinDailyPicks(
           baseInput: input,
           baseInputKey: key,
         });
+        if (input === "ticker_index" && (await tripOnTickerIndexMiss(entry.sessionDate, position))) break;
         continue;
       }
       if (
@@ -450,6 +519,14 @@ export async function runTenMinDailyPicks(
     skippedBaseInput,
     totalRequests,
     ...(yieldedForScan ? { yieldedForScan } : {}),
+    ...(shortCircuited
+      ? {
+          shortCircuited: true,
+          shortCircuitReason: shortCircuitReason ?? "no_ticker_index",
+          daysSkippedAfter,
+          ...(shortCircuitAt ? { shortCircuitAt } : {}),
+        }
+      : {}),
   };
 }
 

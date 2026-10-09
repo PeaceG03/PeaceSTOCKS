@@ -1598,24 +1598,25 @@ test("history: TENMIN_DAILY_PICKS writes concise dailyPicks onto R2 report and s
     assert.equal(tenMinCalls, 0);
     assert.ok(result.dailyPicks);
     assert.equal(result.dailyPicks!.totalRequests, 0);
+    assert.equal(result.dailyPicks!.shortCircuited, true);
+    assert.equal(result.dailyPicks!.shortCircuitReason, "no_ticker_index");
     assert.ok(result.report.dailyPicks, "concise section on history run report");
     assert.equal(result.report.dailyPicks!.totalRequests, 0);
-    assert.ok(result.report.dailyPicks!.skippedBaseInput >= 1);
-    assert.ok(
-      result.report.dailyPicks!.days.every(
-        (d) => d.outcome === "SKIPPED_BASE_INPUT" || d.outcome === "SKIPPED_NOT_SETTLED",
-      ),
-    );
+    assert.equal(result.report.dailyPicks!.shortCircuited, true);
+    assert.equal(result.report.dailyPicks!.shortCircuitReason, "no_ticker_index");
+    assert.ok((result.report.dailyPicks!.daysSkippedAfter ?? 0) >= 1);
     const summary = tenMinHistorySummary(result.report);
     assert.ok(summary.dailyPicks);
     assert.equal((summary.dailyPicks as { totalRequests: number }).totalRequests, 0);
+    assert.equal((summary.dailyPicks as { shortCircuited?: boolean }).shortCircuited, true);
     // Stored R2/transient report carries the concise section.
     const reportKey = (await store.list("transient/tenmin-history-runs/"))[0]!;
     const stored = JSON.parse(new TextDecoder().decode((await store.get(reportKey))!)) as {
-      dailyPicks?: { totalRequests: number; skippedBaseInput: number };
+      dailyPicks?: { totalRequests: number; shortCircuited?: boolean };
     };
     assert.ok(stored.dailyPicks);
     assert.equal(stored.dailyPicks!.totalRequests, 0);
+    assert.equal(stored.dailyPicks!.shortCircuited, true);
   });
 });
 

@@ -27,7 +27,7 @@ import {
   immutableReplyDustStore,
   readTenMinDayPicks,
 } from "./tenmin-day-picks";
-import { runTenMinDailyPicks } from "./tenmin-daily-runner";
+import { runTenMinDailyPicks, tenMinDailyPicksSummary as tenMinDailyPicksSummaryOf } from "./tenmin-daily-runner";
 import {
   TICKER_REFERENCE_INDEX_MANIFEST_KEY,
   type TickerReferenceCapture,
@@ -606,19 +606,42 @@ test("buildBase: groupedWithoutIndexEntry counts tickers absent from asOf≤D in
   assert.ok(base.counts.unlinkedExcluded >= 1);
 });
 
-test("runner: no ticker index at all → every settled day SKIPPED_BASE_INPUT, zero Massive requests", async () => {
+test("runner: no ticker index → first ticker_index miss trips; remaining days not loaded; zero Massive", async () => {
   const inner = new MemoryObjectClient();
   const dust = immutableReplyDustStore(inner);
   const days = ["2024-11-04", "2024-11-05", "2024-11-06"];
+  // Grouped keys of the days AFTER the one that trips: none may be read.
+  const laterGroupedKeys = new Set<string>();
   for (const d of days) {
     await plantGrouped(inner, d, UNIVERSE.map((u) => u.ticker));
+    if (d !== days[0]) {
+      laterGroupedKeys.add(dailyReplyDustFileKey(d));
+      laterGroupedKeys.add(dailyReplyDustManifestKey(d));
+    }
   }
   // Intentionally no plantIndex — production state before dated indexes seal.
+
+  let groupedGets = 0;
+  const counting = {
+    async get(key: string) {
+      if (laterGroupedKeys.has(key)) groupedGets += 1;
+      return dust.get(key);
+    },
+    async put(key: string, body: Uint8Array, metadata?: object) {
+      return dust.put(key, body, metadata as never);
+    },
+    async head(key: string) {
+      return dust.head?.(key);
+    },
+    async list(prefix: string) {
+      return dust.list(prefix);
+    },
+  };
 
   let providerCalls = 0;
   let fetchCalls = 0;
   const report = await runTenMinDailyPicks({
-    store: dust,
+    store: counting as never,
     storage: memoryStorage(),
     days,
     env: { TENMIN_DAILY_PICKS: "true" },
@@ -650,17 +673,27 @@ test("runner: no ticker index at all → every settled day SKIPPED_BASE_INPUT, z
   assert.equal(fetchCalls, 0);
   assert.equal(report.totalRequests, 0);
   assert.equal(report.sealed.length, 0);
-  assert.equal(report.days.length, days.length);
+  assert.equal(report.shortCircuited, true);
+  assert.equal(report.shortCircuitReason, "no_ticker_index");
+  assert.equal(report.shortCircuitAt, days[0]);
+  assert.equal(report.daysSkippedAfter, days.length - 1);
+  // Only the tripping day was processed (ticker_index miss); the rest never ran.
+  assert.deepEqual(
+    report.days.map((d) => [d.sessionDate, d.outcome, d.baseInput]),
+    [[days[0], "SKIPPED_BASE_INPUT", "ticker_index"]],
+  );
+  assert.deepEqual(report.skippedBaseInput.map((s) => [s.sessionDate, s.input]), [[days[0], "ticker_index"]]);
+  assert.equal(groupedGets, 0, "remaining days' grouped-daily never loaded");
   for (const d of days) {
-    assert.ok(
-      report.skippedBaseInput.some((s) => s.sessionDate === d && s.input === "ticker_index"),
-      `expected ticker_index skip for ${d}: ${JSON.stringify(report.skippedBaseInput)}`,
-    );
-    const day = report.days.find((x) => x.sessionDate === d);
-    assert.equal(day?.outcome, "SKIPPED_BASE_INPUT");
-    assert.equal(day?.requests, 0);
     assert.equal((await readTenMinDayPicks(dust, d)).status, "TENMIN_DAY_NOT_SEALED");
   }
+
+  const { tenMinDailyPicksSummary } = await import("./tenmin-daily-runner");
+  const summary = tenMinDailyPicksSummary(report);
+  assert.equal(summary.shortCircuited, true);
+  assert.equal(summary.shortCircuitReason, "no_ticker_index");
+  assert.equal(summary.daysSkippedAfter, days.length - 1);
+  assert.equal(summary.shortCircuitAt, days[0]);
 });
 
 test("isTransientStoreReadError: inverted — only clear integrity is non-transient", () => {
@@ -949,4 +982,234 @@ test("buildBase/runner: REPLY_DUST_FILE_MISSING (manifest present, file gone) �
     JSON.stringify(report.corrupt),
   );
   assert.equal((await readTenMinDayPicks(dust, D)).status, "TENMIN_DAY_NOT_SEALED");
+});
+
+test("runner: Oct grouped_reply misses alone do NOT short-circuit when an index exists", async () => {
+  const inner = new MemoryObjectClient();
+  const dust = immutableReplyDustStore(inner);
+  // Index present (asOf covers Nov); Oct has no grouped dust.
+  await plantIndex(inner, "2024-11-01", UNIVERSE);
+  const oct = "2024-10-15";
+  const nov = "2024-11-04";
+  await plantGrouped(inner, nov, UNIVERSE.map((u) => u.ticker));
+
+  const report = await runTenMinDailyPicks({
+    store: dust,
+    storage: memoryStorage(),
+    days: [oct, nov],
+    env: { TENMIN_DAILY_PICKS: "true" },
+    now: SETTLED_NOW,
+    clock: settledClock,
+    limit: 5,
+    fetchReply: async (sec) =>
+      new TextEncoder().encode(
+        JSON.stringify({
+          ticker: sec.symbol,
+          results: [{ t: 1, o: 1, h: 1, l: 1, c: 1, v: 1, n: 1 }],
+          status: "OK",
+          request_id: `req-${sec.symbol}`,
+        }),
+      ),
+  });
+
+  assert.notEqual(report.shortCircuited, true);
+  assert.ok(
+    report.skippedBaseInput.some((s) => s.sessionDate === oct && s.input === "grouped_reply"),
+    JSON.stringify(report.skippedBaseInput),
+  );
+  assert.ok(report.sealed.includes(nov) || report.days.some((d) => d.sessionDate === nov), JSON.stringify(report));
+});
+
+test("runner: with ticker index present, days still process (no short-circuit)", async () => {
+  const inner = new MemoryObjectClient();
+  const dust = immutableReplyDustStore(inner);
+  await plantIndex(inner, "2024-11-01", UNIVERSE);
+  const days = ["2024-11-04", "2024-11-05"];
+  for (const d of days) {
+    await plantGrouped(inner, d, UNIVERSE.map((u) => u.ticker));
+  }
+
+  const report = await runTenMinDailyPicks({
+    store: dust,
+    storage: memoryStorage(),
+    days,
+    env: { TENMIN_DAILY_PICKS: "true" },
+    now: SETTLED_NOW,
+    clock: settledClock,
+    limit: 5,
+    fetchReply: async (sec) =>
+      new TextEncoder().encode(
+        JSON.stringify({
+          ticker: sec.symbol,
+          results: [{ t: 1, o: 1, h: 1, l: 1, c: 1, v: 1, n: 1 }],
+          status: "OK",
+          request_id: `req-${sec.symbol}`,
+        }),
+      ),
+  });
+
+  assert.notEqual(report.shortCircuited, true);
+  assert.equal(report.daysSkippedAfter, undefined);
+  assert.ok(report.sealed.length >= 1, JSON.stringify(report));
+  assert.ok(report.days.length >= 1);
+});
+
+function okFetchReply() {
+  let calls = 0;
+  return {
+    calls: () => calls,
+    fetchReply: async (sec: { symbol: string }) => {
+      calls += 1;
+      return new TextEncoder().encode(
+        JSON.stringify({
+          ticker: sec.symbol,
+          results: [{ t: 1, o: 1, h: 1, l: 1, c: 1, v: 1, n: 1 }],
+          status: "OK",
+          request_id: `req-${sec.symbol}`,
+        }),
+      );
+    },
+  };
+}
+
+test("runner: October grouped_reply-only misses never trip the short-circuit (even with no index)", async () => {
+  const inner = new MemoryObjectClient();
+  const dust = immutableReplyDustStore(inner);
+  // No index and no grouped dust: every day stops at grouped_reply before the index is consulted.
+  const days = ["2024-10-08", "2024-10-09", "2024-10-10", "2024-10-11"];
+  let probes = 0;
+  const report = await runTenMinDailyPicks({
+    store: dust,
+    storage: memoryStorage(),
+    days,
+    env: { TENMIN_DAILY_PICKS: "true" },
+    now: SETTLED_NOW,
+    clock: settledClock,
+    limit: 5,
+    loadIndexAsOf: async () => {
+      probes += 1;
+      return undefined;
+    },
+    fetchReply: async () => {
+      throw new Error("SHOULD_NOT_FETCH_REPLY");
+    },
+  });
+  assert.equal(report.shortCircuited, undefined);
+  assert.equal(probes, 0, "grouped_reply misses never probe the index");
+  assert.deepEqual(
+    report.days.map((d) => [d.sessionDate, d.outcome, d.baseInput]),
+    days.map((d) => [d, "SKIPPED_BASE_INPUT", "grouped_reply"]),
+  );
+  assert.equal(report.totalRequests, 0);
+  assert.equal(tenMinDailyPicksSummaryOf(report).shortCircuited, undefined);
+});
+
+test("runner: mixed — October grouped misses, then the first Nov day with no index trips; rest skipped", async () => {
+  const inner = new MemoryObjectClient();
+  const dust = immutableReplyDustStore(inner);
+  const oct = ["2024-10-30", "2024-10-31"];
+  const nov = ["2024-11-04", "2024-11-05", "2024-11-06", "2024-11-07"];
+  for (const d of nov) await plantGrouped(inner, d, UNIVERSE.map((u) => u.ticker));
+  // No index at all.
+  const probed: string[] = [];
+  const built: string[] = [];
+  const report = await runTenMinDailyPicks({
+    store: dust,
+    storage: memoryStorage(),
+    days: [...nov, ...oct], // backlog sorts oldest-first
+    env: { TENMIN_DAILY_PICKS: "true" },
+    now: SETTLED_NOW,
+    clock: settledClock,
+    limit: 5,
+    loadIndexAsOf: async (d) => {
+      probed.push(d);
+      return undefined;
+    },
+    buildBase: async (d) => {
+      built.push(d);
+      const { buildTenMinDailyPicksBaseFromStored } = await import("./tenmin-daily-picks-base");
+      return buildTenMinDailyPicksBaseFromStored({ store: dust, sessionDate: d });
+    },
+    fetchReply: async () => {
+      throw new Error("SHOULD_NOT_FETCH_REPLY");
+    },
+  });
+  assert.deepEqual(
+    report.days.map((d) => [d.sessionDate, d.baseInput]),
+    [
+      ["2024-10-30", "grouped_reply"],
+      ["2024-10-31", "grouped_reply"],
+      ["2024-11-04", "ticker_index"],
+    ],
+  );
+  assert.deepEqual(built, ["2024-10-30", "2024-10-31", "2024-11-04"], "later Nov days never loaded");
+  assert.deepEqual(probed, ["2024-11-07"], "one probe, of the newest backlog day");
+  assert.equal(report.shortCircuited, true);
+  assert.equal(report.shortCircuitReason, "no_ticker_index");
+  assert.equal(report.shortCircuitAt, "2024-11-04");
+  assert.equal(report.daysSkippedAfter, 3);
+  assert.equal(report.totalRequests, 0);
+  const summary = tenMinDailyPicksSummaryOf(report);
+  assert.deepEqual(
+    [summary.shortCircuited, summary.shortCircuitReason, summary.daysSkippedAfter, summary.shortCircuitAt],
+    [true, "no_ticker_index", 3, "2024-11-04"],
+  );
+});
+
+test("runner: a ticker_index miss does not trip when the newest backlog day has an index (those days still seal)", async () => {
+  const inner = new MemoryObjectClient();
+  const dust = immutableReplyDustStore(inner);
+  // Only an index asOf 2024-12-01: Nov days miss it, Dec days have it.
+  await plantIndex(inner, "2024-12-01", UNIVERSE);
+  const days = ["2024-11-04", "2024-11-05", "2024-12-02", "2024-12-03"];
+  for (const d of days) await plantGrouped(inner, d, UNIVERSE.map((u) => u.ticker));
+  const replies = okFetchReply();
+  const report = await runTenMinDailyPicks({
+    store: dust,
+    storage: memoryStorage(),
+    days,
+    env: { TENMIN_DAILY_PICKS: "true" },
+    now: SETTLED_NOW,
+    clock: settledClock,
+    limit: 5,
+    fetchReply: replies.fetchReply,
+  });
+  assert.equal(report.shortCircuited, undefined);
+  assert.deepEqual(
+    report.skippedBaseInput.map((s) => [s.sessionDate, s.input]),
+    [
+      ["2024-11-04", "ticker_index"],
+      ["2024-11-05", "ticker_index"],
+    ],
+  );
+  assert.deepEqual(report.sealed, ["2024-12-02", "2024-12-03"]);
+  assert.ok(report.totalRequests > 0);
+  assert.equal(report.totalRequests, replies.calls());
+});
+
+test("runner: a probe error never trips the short-circuit", async () => {
+  const inner = new MemoryObjectClient();
+  const dust = immutableReplyDustStore(inner);
+  const days = ["2024-11-04", "2024-11-05"];
+  for (const d of days) await plantGrouped(inner, d, UNIVERSE.map((u) => u.ticker));
+  const report = await runTenMinDailyPicks({
+    store: dust,
+    storage: memoryStorage(),
+    days,
+    env: { TENMIN_DAILY_PICKS: "true" },
+    now: SETTLED_NOW,
+    clock: settledClock,
+    limit: 5,
+    loadIndexAsOf: async () => {
+      throw new Error("R2_TRANSIENT");
+    },
+    fetchReply: async () => {
+      throw new Error("SHOULD_NOT_FETCH_REPLY");
+    },
+  });
+  assert.equal(report.shortCircuited, undefined);
+  assert.deepEqual(
+    report.days.map((d) => [d.sessionDate, d.baseInput]),
+    days.map((d) => [d, "ticker_index"]),
+  );
 });
