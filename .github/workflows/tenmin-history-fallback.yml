@@ -1,4 +1,5 @@
 name: Ten-minute history fallback
+# Re-enabled 2026-10-09
 
 # Restarts an auto re-dispatch chain for scanner.yml tenmin_history that a guard window, a queued
 # run, or a lost pending run broke. It only decides and dispatches; the dispatched run is an
