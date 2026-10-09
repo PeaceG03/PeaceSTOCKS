@@ -244,10 +244,13 @@ export interface DatedTickerRunSummary {
   corrupt: number;
   failed: number;
   requests: number;
+  /** Dated-list pages stored this run (all dates). Older reports lack it: read as 0. */
+  pagesStored?: number;
   dates: Array<{
     date: string;
     status: DatedTickerDateReport["status"];
     requests: number;
+    pagesStored?: number;
     indexAsOf?: string;
     indexSealed?: boolean;
   }>;
@@ -287,10 +290,12 @@ export function tenMinDatedTickerSummary(report: DatedTickerRunReport): DatedTic
     ...(last ? { lastPlanned: last } : {}),
     ...counts,
     requests: report.requests,
+    pagesStored: report.dates.reduce((sum, d) => sum + d.pagesStored, 0),
     dates: report.dates.map((d) => ({
       date: d.date,
       status: d.status,
       requests: d.requests,
+      pagesStored: d.pagesStored,
       ...(d.indexAsOf ? { indexAsOf: d.indexAsOf } : {}),
       ...(d.indexSealed !== undefined ? { indexSealed: d.indexSealed } : {}),
     })),

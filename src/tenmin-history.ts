@@ -738,6 +738,11 @@ export interface TenMinHistoryRunReport {
   /** TENMIN_HISTORY_MAX_RANGE_END for this run, and the ranges it held back. */
   rangeEndCap?: TenMinHistoryPlan["rangeEndCap"];
   yieldedForScan?: string;
+  /**
+   * Set when the run yielded before the range phase (dated ticker-index phase): no range was
+   * attempted, so "no range left" must not be inferred from this report.
+   */
+  yieldedInPhase?: "dated_ticker_index";
   outageStop?: string;
   stoppedOnError: boolean;
   error?: string;
@@ -875,7 +880,15 @@ export async function runTenMinHistory(options: {
       shouldYield,
     });
     if (datedTickerIndex.yieldedForScan) {
-      // Still emit a minimal history report shell so the host can stop cleanly.
+      // Still emit a minimal history report shell so the host can stop cleanly. It carries the
+      // real (pure, no I/O) range plan and yieldedInPhase so redispatch sees an unfinished run,
+      // never "no range left" (rangesPlanned 0 used to map to STOP_DONE and end the chain).
+      const configured = options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START;
+      const earlyPlan = planTenMinHistoryRanges({
+        windowStart: configured,
+        lastCompletedSession: lastCompleted,
+        ...(maxRangeEnd ? { maxRangeEnd } : {}),
+      });
       const report: TenMinHistoryRunReport = {
         groupedDailyRequests: 0,
         groupedDailyStored: 0,
@@ -883,15 +896,19 @@ export async function runTenMinHistory(options: {
         schemaVersion: TENMIN_HISTORY_RUN_SCHEMA,
         runId: `tenmin-history-${(options.nowIso ?? (() => new Date().toISOString()))().replaceAll(/[^0-9]/gu, "").slice(0, 17)}`,
         provider: providerName,
-        configuredWindowStart: options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START,
-        windowStart: options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START,
+        configuredWindowStart: configured,
+        windowStart: earlyPlan.windowStart,
         lastCompletedSession: lastCompleted,
-        skippedBefore: [],
+        skippedBefore: earlyPlan.skippedBefore,
+        ...(earlyPlan.skippedBeforeFirstRange ? { skippedBeforeFirstRange: earlyPlan.skippedBeforeFirstRange } : {}),
         reopen: options.reopen === true,
         securityLink: TENMIN_SECURITY_LINK,
         ranges: [],
-        rangesPlanned: 0,
+        rangesPlanned: earlyPlan.ranges.length,
+        ...(options.maxRanges !== undefined ? { maxRanges: options.maxRanges } : {}),
+        ...(earlyPlan.rangeEndCap ? { rangeEndCap: earlyPlan.rangeEndCap } : {}),
         yieldedForScan: datedTickerIndex.yieldedForScan,
+        yieldedInPhase: "dated_ticker_index",
         stoppedOnError: false,
         warnings: [],
         zstdVersion,

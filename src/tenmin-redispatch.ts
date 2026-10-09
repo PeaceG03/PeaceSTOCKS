@@ -9,6 +9,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SCAN_GUARD_WINDOWS_UTC } from "./scan-yield";
+import type { DatedTickerRunSummary } from "./ticker-reference-dated";
 import {
   type TenMinHistoryRunReport,
   type TenMinRangeRemaining,
@@ -56,9 +57,25 @@ export interface TenMinRunOutcome {
   madeProgress: boolean;
   /** Seal progress for the range this run worked (tolerated when absent on older records). */
   rangeRemaining?: TenMinRangeRemaining;
+  /**
+   * Dated ticker-index work this run (FULL mode only; absent on older records or when the phase
+   * was off). Counts toward madeProgress: see tenMinDatedIndexMadeProgress.
+   */
+  datedTickerIndexProgress?: { sealed: number; pagesStored: number; requests: number };
 }
 
 const SEALED = new Set(["SEALED", "ALREADY_SEALED", "REOPENED"]);
+
+/**
+ * Pure: did the dated ticker-index phase do work that stuck this run? FULL mode only: a month
+ * SEALED this run (ALREADY_SEALED does not count) or dated-list pages stored (pagesStored > 0).
+ * Raw requests never count: a month that keeps coming out FAILED/CORRUPT after fetching would
+ * otherwise keep the chain spending Massive requests forever. PROBE mode never counts.
+ */
+export function tenMinDatedIndexMadeProgress(summary: DatedTickerRunSummary | undefined): boolean {
+  if (!summary || summary.mode !== "full") return false;
+  return summary.sealed > 0 || (summary.pagesStored ?? 0) > 0;
+}
 
 /**
  * Pure: classify a finished run. Continue only on a clean partial (time budget, scan yield, or
@@ -67,14 +84,29 @@ const SEALED = new Set(["SEALED", "ALREADY_SEALED", "REOPENED"]);
  */
 export function tenMinRunOutcome(report: TenMinHistoryRunReport): TenMinRunOutcome {
   const rangesSealed = report.ranges.filter((r) => SEALED.has(r.status)).length;
-  const rangesRemaining = Math.max(0, report.rangesPlanned - rangesSealed);
-  const madeProgress = report.ranges.some(
+  // A yield in the dated ticker-index phase returns before any range is looked at: the run is
+  // unfinished, never "no range left". Older reports from that path had rangesPlanned 0 and no
+  // yieldedInPhase; recognize them by a dated-phase yield with no ranges attempted.
+  const earlyPhaseYield =
+    !!report.yieldedForScan &&
+    report.ranges.length === 0 &&
+    (report.yieldedInPhase === "dated_ticker_index" || !!report.datedTickerIndex?.yieldedForScan);
+  // At least 1 so the decision step's no-range-left stop cannot fire; the next run replans.
+  const rangesRemaining = earlyPhaseYield
+    ? Math.max(1, report.rangesPlanned - rangesSealed)
+    : Math.max(0, report.rangesPlanned - rangesSealed);
+  const rangeProgress = report.ranges.some(
     (r) =>
       r.status === "SEALED" ||
       r.status === "REOPENED" ||
       r.securitiesWritten > 0 ||
       (r.groupedDailyStored ?? 0) > 0,
   );
+  // A run that spends its budget sealing dated ticker indexes (0 range fetches) still advanced
+  // the chain; without this, run 37526098534 (24/24 SEALED, 301 requests) stranded it.
+  const indexProgress = tenMinDatedIndexMadeProgress(report.datedTickerIndex);
+  const madeProgress = rangeProgress || indexProgress;
+  const dated = report.datedTickerIndex;
   const out = (nextAction: TenMinRunOutcome["nextAction"], reason: string): TenMinRunOutcome => ({
     schemaVersion: TENMIN_OUTCOME_SCHEMA,
     runId: report.runId,
@@ -85,6 +117,15 @@ export function tenMinRunOutcome(report: TenMinHistoryRunReport): TenMinRunOutco
     rangesRemaining,
     madeProgress,
     ...(report.rangeRemaining ? { rangeRemaining: report.rangeRemaining } : {}),
+    ...(dated && dated.mode === "full"
+      ? {
+          datedTickerIndexProgress: {
+            sealed: dated.sealed,
+            pagesStored: dated.pagesStored ?? 0,
+            requests: dated.requests,
+          },
+        }
+      : {}),
   });
   if (report.stoppedOnError || report.error) {
     const message = report.error ?? "UNKNOWN";
@@ -94,9 +135,9 @@ export function tenMinRunOutcome(report: TenMinHistoryRunReport): TenMinRunOutco
   if (report.outageStop) return out("stop", `STOP_OUTAGE:${report.outageStop.slice(0, 160)}`);
   if (report.reopen) return out("stop", "STOP_BOUNDED_MANUAL_RUN:reopen");
   if (report.maxRanges !== undefined) return out("stop", `STOP_BOUNDED_MANUAL_RUN:maxRanges=${report.maxRanges}`);
-  if (rangesRemaining === 0 && report.rangeEndCap && report.rangeEndCap.rangesBeyondCap > 0)
+  if (!earlyPhaseYield && rangesRemaining === 0 && report.rangeEndCap && report.rangeEndCap.rangesBeyondCap > 0)
     return out("stop", `${TENMIN_STOP_RANGE_END_CAP}:${report.rangeEndCap.maxRangeEnd}`);
-  if (rangesRemaining === 0) return out("stop", "STOP_DONE:no-range-left");
+  if (!earlyPhaseYield && rangesRemaining === 0) return out("stop", "STOP_DONE:no-range-left");
   const yielded = report.yieldedForScan;
   if (yielded?.startsWith("TIME_BUDGET")) {
     return madeProgress ? out("continue", "CONTINUE_TIME_BUDGET") : out("stop", "STOP_NO_PROGRESS:TIME_BUDGET");

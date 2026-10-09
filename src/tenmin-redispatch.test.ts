@@ -16,8 +16,10 @@ import {
   maxChainOf,
   planCancelDispatchedRun,
   stopRecordForScanCancelled,
+  tenMinDatedIndexMadeProgress,
   tenMinRunOutcome,
 } from "./tenmin-redispatch";
+import type { DatedTickerRunSummary } from "./ticker-reference-dated";
 
 function range(status: TenMinHistoryRangeReport["status"], extra: Partial<TenMinHistoryRangeReport> = {}): TenMinHistoryRangeReport {
   return {
@@ -115,6 +117,203 @@ test("outcome: every stop reason", () => {
     assert.deepEqual([outcome.nextAction, outcome.reason], ["stop", reason], reason);
     const decision = decideTenMinRedispatch(input({ outcome }));
     assert.deepEqual([decision.dispatch, decision.nextAction, decision.reason], [false, "stop", reason], reason);
+  }
+});
+
+// ---- dated ticker-index work counts as progress ----
+
+/** 24 monthly dated indexes from 2024-11-01; every month gets `status`; totals land on the first month. */
+function datedSummary(
+  status: DatedTickerRunSummary["dates"][number]["status"],
+  requests: number,
+  pagesStored: number,
+  mode: DatedTickerRunSummary["mode"] = "full",
+): DatedTickerRunSummary {
+  const dates = Array.from({ length: 24 }, (_, i) => ({
+    date: new Date(Date.UTC(2024, 10 + i, 1)).toISOString().slice(0, 10),
+    status,
+    requests: i === 0 ? requests : 0,
+    pagesStored: i === 0 ? pagesStored : 0,
+  }));
+  const count = (s: string) => (status === s ? 24 : 0);
+  return {
+    enabled: true,
+    mode,
+    datesPlanned: 24,
+    firstPlanned: dates[0]!.date,
+    lastPlanned: dates[23]!.date,
+    sealed: count("SEALED"),
+    alreadySealed: count("ALREADY_SEALED"),
+    partial: count("PARTIAL"),
+    probe: count("PROBE"),
+    skippedWindow: 0,
+    skippedGuard: count("SKIPPED_GUARD"),
+    corrupt: count("CORRUPT"),
+    failed: count("FAILED"),
+    requests,
+    pagesStored,
+    dates,
+  };
+}
+
+/** Shaped like run 37526098534: 0 range fetches, time budget spent sealing all 24 dated indexes. */
+const indexOnlyReport = report({
+  ranges: [range("PARTIAL")],
+  yieldedForScan: "TIME_BUDGET:2026-10-06T22:14:00Z",
+  massiveRequests: 301,
+  datedTickerIndex: datedSummary("SEALED", 301, 301),
+});
+
+test("dated index: 24 SEALED / 301 requests with 0 range fetches continues (not STOP_NO_PROGRESS)", () => {
+  const outcome = tenMinRunOutcome(indexOnlyReport);
+  assert.deepEqual(
+    [outcome.nextAction, outcome.reason, outcome.madeProgress, outcome.datedTickerIndexProgress],
+    ["continue", "CONTINUE_TIME_BUDGET", true, { sealed: 24, pagesStored: 301, requests: 301 }],
+  );
+  const decision = decideTenMinRedispatch(input({ outcome }));
+  assert.deepEqual([decision.dispatch, decision.nextAction, decision.reason], [true, "continue", "CONTINUE_TIME_BUDGET"]);
+  // Either signal alone is enough: a month SEALED from already-stored pages (0 requests, 0 stored) ...
+  assert.equal(tenMinRunOutcome(report({ ...indexOnlyReport, datedTickerIndex: datedSummary("SEALED", 0, 0) })).nextAction, "continue");
+  // ... or pages stored for a month that is still PARTIAL (or yielded) when the budget ran out.
+  assert.equal(tenMinRunOutcome(report({ ...indexOnlyReport, datedTickerIndex: datedSummary("PARTIAL", 40, 40) })).nextAction, "continue");
+});
+
+test("dated index: all ALREADY_SEALED with 0 dated requests and 0 range fetches still stops STOP_NO_PROGRESS", () => {
+  const outcome = tenMinRunOutcome(report({ ...indexOnlyReport, datedTickerIndex: datedSummary("ALREADY_SEALED", 0, 0) }));
+  assert.deepEqual(
+    [outcome.nextAction, outcome.reason, outcome.madeProgress, outcome.datedTickerIndexProgress],
+    ["stop", "STOP_NO_PROGRESS:TIME_BUDGET", false, { sealed: 0, pagesStored: 0, requests: 0 }],
+  );
+  for (const trigger of ["chain", "fallback"] as const)
+    assert.deepEqual(
+      [decideTenMinRedispatch(input({ trigger, outcome })).dispatch, decideTenMinRedispatch(input({ trigger, outcome })).reason],
+      [false, "STOP_NO_PROGRESS:TIME_BUDGET"],
+    );
+  // PROBE mode re-fetches page 1 every run: never progress.
+  const probe = tenMinRunOutcome(report({ ...indexOnlyReport, datedTickerIndex: datedSummary("PROBE", 1, 1, "probe") }));
+  assert.deepEqual([probe.nextAction, probe.reason, probe.datedTickerIndexProgress], ["stop", "STOP_NO_PROGRESS:TIME_BUDGET", undefined]);
+  // An older summary without pagesStored and no SEALED month: not progress.
+  const legacy = { ...datedSummary("PARTIAL", 12, 0) };
+  delete legacy.pagesStored;
+  assert.equal(tenMinDatedIndexMadeProgress(legacy), false);
+  // No dated section at all (phase off): unchanged.
+  assert.equal(tenMinDatedIndexMadeProgress(undefined), false);
+  // Index work never overrides a harder stop (error, outage, done).
+  assert.equal(tenMinRunOutcome(report({ ...indexOnlyReport, stoppedOnError: true, error: "X" })).reason, "STOP_ERROR:X");
+  assert.equal(tenMinRunOutcome(report({ ...indexOnlyReport, outageStop: "MASSIVE_OUTAGE:x" })).reason, "STOP_OUTAGE:MASSIVE_OUTAGE:x");
+  assert.equal(
+    tenMinRunOutcome(report({ ...indexOnlyReport, rangesPlanned: 1, ranges: [range("ALREADY_SEALED")] })).reason,
+    "STOP_DONE:no-range-left",
+  );
+});
+
+test("dated index: requests that stored no page (FAILED/CORRUPT/PARTIAL), 0 SEALED, 0 range fetches still stop", () => {
+  for (const status of ["FAILED", "CORRUPT", "PARTIAL", "SKIPPED_GUARD"] as const) {
+    const outcome = tenMinRunOutcome(report({ ...indexOnlyReport, datedTickerIndex: datedSummary(status, 37, 0) }));
+    assert.deepEqual(
+      [outcome.nextAction, outcome.reason, outcome.madeProgress, outcome.datedTickerIndexProgress],
+      ["stop", "STOP_NO_PROGRESS:TIME_BUDGET", false, { sealed: 0, pagesStored: 0, requests: 37 }],
+      status,
+    );
+    for (const trigger of ["chain", "fallback"] as const)
+      assert.equal(decideTenMinRedispatch(input({ trigger, outcome })).reason, "STOP_NO_PROGRESS:TIME_BUDGET", `${status}:${trigger}`);
+  }
+});
+
+test("dated index: range-progress cases are unchanged with or without a dated section", () => {
+  for (const dated of [undefined, datedSummary("ALREADY_SEALED", 0, 0)]) {
+    const extra = dated ? { datedTickerIndex: dated } : {};
+    for (const r of [range("PARTIAL", { securitiesWritten: 3 }), range("PARTIAL", { groupedDailyStored: 2 }), range("SEALED"), range("REOPENED")]) {
+      const outcome = tenMinRunOutcome(report({ ranges: [r, range("PARTIAL")], yieldedForScan: "TIME_BUDGET:x", ...extra }));
+      assert.deepEqual([outcome.nextAction, outcome.reason, outcome.madeProgress], ["continue", "CONTINUE_TIME_BUDGET", true]);
+    }
+    const none = tenMinRunOutcome(report({ ranges: [range("PARTIAL")], yieldedForScan: "TIME_BUDGET:x", ...extra }));
+    assert.deepEqual([none.nextAction, none.reason], ["stop", "STOP_NO_PROGRESS:TIME_BUDGET"]);
+  }
+});
+
+test("dated index: the fallback restarts from a lastRun record like 37526098534 (same outcome rule)", () => {
+  // The chain step stores tenMinRunOutcome(report) in the record; the fallback decides from it.
+  const record: TenMinRunRecord = {
+    outcome: tenMinRunOutcome(indexOnlyReport),
+    jobResult: "success",
+    chain: 3,
+    githubRunId: "37526098534",
+    finishedAt: "2026-10-06T22:14:30.000Z",
+    decision: { dispatch: true, nextAction: "continue", reason: "CONTINUE_TIME_BUDGET", nextChain: 4 },
+  };
+  const fallback = decideTenMinRedispatch(
+    input({ trigger: "fallback", outcome: record.outcome, jobResult: record.jobResult, chain: record.chain, nowUtc: at("14:17:00") }),
+  );
+  assert.deepEqual(fallback, { dispatch: true, nextAction: "continue", reason: "CONTINUE_TIME_BUDGET", nextChain: 4 });
+  // Guard window still waits for the fallback's 05:17 tick.
+  assert.equal(
+    decideTenMinRedispatch(input({ trigger: "fallback", outcome: record.outcome, chain: 3, nowUtc: at("05:17:00") })).reason,
+    "WAIT_GUARD_WINDOW",
+  );
+});
+
+// ---- dated phase yields before ranges (early-return report) ----
+
+/** Shaped like runTenMinHistory's dated-phase early return (now carries the real plan). */
+function datedPhaseYieldReport(yieldedForScan: string, dated: DatedTickerRunSummary, extra: Partial<TenMinHistoryRunReport> = {}) {
+  return report({
+    ranges: [],
+    rangesPlanned: 1,
+    yieldedForScan,
+    yieldedInPhase: "dated_ticker_index",
+    datedTickerIndex: { ...dated, yieldedForScan },
+    ...extra,
+  });
+}
+
+test("dated-phase yield: guard → CONTINUE_YIELD (not STOP_DONE); chain waits in the window, fallback dispatches after", () => {
+  const guard = "SCAN_GUARD_WINDOW:2026-10-06T05:20:00Z";
+  for (const rangesPlanned of [1, 0]) {
+    // rangesPlanned 0 = an old-style early return (before the plan was recorded): still not done.
+    const r = datedPhaseYieldReport(guard, datedSummary("ALREADY_SEALED", 0, 0), { rangesPlanned });
+    if (rangesPlanned === 0) delete r.yieldedInPhase;
+    const outcome = tenMinRunOutcome(r);
+    assert.deepEqual([outcome.nextAction, outcome.reason, outcome.rangesRemaining], ["continue", "CONTINUE_YIELD:SCAN_GUARD_WINDOW", 1], `planned=${rangesPlanned}`);
+    // Chain step runs inside the window: wait (no dispatch, not a stop).
+    const inWindow = decideTenMinRedispatch(input({ outcome, nowUtc: at("05:21:00") }));
+    assert.deepEqual([inWindow.dispatch, inWindow.nextAction, inWindow.reason], [false, "wait", "WAIT_GUARD_WINDOW"]);
+    // Fallback: 05:17 tick waits; the next tick after the window dispatches.
+    assert.equal(decideTenMinRedispatch(input({ trigger: "fallback", outcome, nowUtc: at("05:17:00") })).reason, "WAIT_GUARD_WINDOW");
+    const after = decideTenMinRedispatch(input({ trigger: "fallback", outcome, chain: 2, nowUtc: at("06:17:00") }));
+    assert.deepEqual(after, { dispatch: true, nextAction: "continue", reason: "CONTINUE_YIELD:SCAN_GUARD_WINDOW", nextChain: 3 });
+  }
+});
+
+test("dated-phase yield: TIME_BUDGET after sealing a month → CONTINUE_TIME_BUDGET; without stuck work → STOP_NO_PROGRESS", () => {
+  const sealedOne = { ...datedSummary("ALREADY_SEALED", 0, 0), sealed: 1, alreadySealed: 22, requests: 12, pagesStored: 12 };
+  const outcome = tenMinRunOutcome(datedPhaseYieldReport("TIME_BUDGET:x", sealedOne));
+  assert.deepEqual([outcome.nextAction, outcome.reason, outcome.madeProgress, outcome.rangesRemaining], ["continue", "CONTINUE_TIME_BUDGET", true, 1]);
+  for (const trigger of ["chain", "fallback"] as const)
+    assert.deepEqual(
+      decideTenMinRedispatch(input({ trigger, outcome, chain: 4 })),
+      { dispatch: true, nextAction: "continue", reason: "CONTINUE_TIME_BUDGET", nextChain: 5 },
+      trigger,
+    );
+  // Same yield with nothing stuck (requests but 0 pages, 0 SEALED): a genuine no-progress stop.
+  const nothing = tenMinRunOutcome(datedPhaseYieldReport("TIME_BUDGET:x", datedSummary("FAILED", 9, 0)));
+  assert.deepEqual([nothing.nextAction, nothing.reason], ["stop", "STOP_NO_PROGRESS:TIME_BUDGET"]);
+  for (const trigger of ["chain", "fallback"] as const)
+    assert.equal(decideTenMinRedispatch(input({ trigger, outcome: nothing })).reason, "STOP_NO_PROGRESS:TIME_BUDGET");
+});
+
+test("dated-phase yield: genuinely no range left and no yield is still STOP_DONE:no-range-left (chain and fallback)", () => {
+  const cases = [
+    report({ ranges: [], rangesPlanned: 0, datedTickerIndex: datedSummary("ALREADY_SEALED", 0, 0) }),
+    report({ ranges: [range("ALREADY_SEALED")], rangesPlanned: 1, datedTickerIndex: datedSummary("ALREADY_SEALED", 0, 0) }),
+    // A range-phase yield after every range was already sealed is still done (not an early return).
+    report({ ranges: [range("ALREADY_SEALED")], rangesPlanned: 1, yieldedForScan: "TIME_BUDGET:x", datedTickerIndex: datedSummary("ALREADY_SEALED", 0, 0) }),
+  ];
+  for (const r of cases) {
+    const outcome = tenMinRunOutcome(r);
+    assert.deepEqual([outcome.nextAction, outcome.reason, outcome.rangesRemaining], ["stop", "STOP_DONE:no-range-left", 0]);
+    for (const trigger of ["chain", "fallback"] as const)
+      assert.equal(decideTenMinRedispatch(input({ trigger, outcome })).reason, "STOP_DONE:no-range-left");
   }
 });
 

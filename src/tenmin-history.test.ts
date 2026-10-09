@@ -1620,3 +1620,84 @@ test("history: TENMIN_DAILY_PICKS writes concise dailyPicks onto R2 report and s
   });
 });
 
+
+// ---- dated ticker-index phase yields before ranges: never "no range left" ----
+
+async function runDatedPhaseYield(root: string, shouldYieldAfterPages: number | "always", reason: string) {
+  const { tenMinRunOutcome } = await import("./tenmin-redispatch");
+  const store = new MemoryObjectClient();
+  let pagesServed = 0;
+  let tenMinCalls = 0;
+  const noon = new Date("2026-10-06T18:00:00.000Z"); // outside both guard windows
+  const result = await runTenMinHistory({
+    root,
+    store,
+    securities: [master("AAA")],
+    loadDailyBarSessions: async () => new Map(),
+    windowStart: "2024-10-07",
+    lastCompletedSession: "2026-10-05",
+    maxRangeEnd: "2024-12-31",
+    zstdVersionProbe: pinnedZstd,
+    env: { TICKER_INDEX_DATED: "true", TICKER_INDEX_DATED_FULL: "true" },
+    now: noon,
+    clock: () => noon,
+    nowIso: () => AT,
+    shouldYield: async () =>
+      shouldYieldAfterPages === "always" || pagesServed >= shouldYieldAfterPages ? reason : undefined,
+    provider: {
+      providerName: PROVIDER,
+      async getDatedTickerReferencePage({ date }: { date: string }) {
+        pagesServed += 1;
+        return {
+          status: 200,
+          body: encoder.encode(
+            JSON.stringify({
+              status: "OK",
+              request_id: `req-${date}`,
+              results: [{ ticker: "AAA", name: "AAA Co", market: "stocks", locale: "us", type: "CS", active: true }],
+              count: 1,
+            }),
+          ),
+          request: `/v3/reference/tickers?date=${date}`,
+          fetchedAt: "2026-10-06T18:00:00.000Z",
+        };
+      },
+    } as never,
+    fetchPages: async () => {
+      tenMinCalls += 1;
+      throw new Error("SHOULD_NOT_FETCH");
+    },
+    fetchGroupedDaily: async () => {
+      throw new Error("SHOULD_NOT_GROUPED");
+    },
+  });
+  assert.equal(tenMinCalls, 0);
+  return { report: result.report, outcome: tenMinRunOutcome(result.report), pagesServed };
+}
+
+test("history: a guard yield in the dated phase records the range plan + yieldedInPhase; outcome is a yield, not STOP_DONE", async () => {
+  await withRoot(async (root) => {
+    const { report, outcome, pagesServed } = await runDatedPhaseYield(root, "always", "SCAN_GUARD_WINDOW:2026-10-06T05:20:00.000Z");
+    assert.equal(pagesServed, 0);
+    assert.deepEqual(report.ranges, []);
+    assert.equal(report.yieldedInPhase, "dated_ticker_index");
+    assert.equal(report.yieldedForScan, "SCAN_GUARD_WINDOW:2026-10-06T05:20:00.000Z");
+    assert.equal(report.rangesPlanned, 1, "Nov–Dec 2024 under the 2024-12-31 cap");
+    assert.equal(report.rangeEndCap?.maxRangeEnd, "2024-12-31");
+    assert.deepEqual([outcome.nextAction, outcome.reason, outcome.rangesRemaining], ["continue", "CONTINUE_YIELD:SCAN_GUARD_WINDOW", 1]);
+  });
+});
+
+test("history: a TIME_BUDGET yield in the dated phase after sealing a month → CONTINUE_TIME_BUDGET", async () => {
+  await withRoot(async (root) => {
+    const { report, outcome, pagesServed } = await runDatedPhaseYield(root, 1, "TIME_BUDGET:2026-10-06T18:00:00.000Z");
+    assert.equal(pagesServed, 1);
+    assert.equal(report.yieldedInPhase, "dated_ticker_index");
+    assert.equal(report.datedTickerIndex?.sealed, 1);
+    assert.equal(report.datedTickerIndex?.pagesStored, 1);
+    assert.deepEqual(
+      [outcome.nextAction, outcome.reason, outcome.madeProgress, outcome.rangesRemaining],
+      ["continue", "CONTINUE_TIME_BUDGET", true, 1],
+    );
+  });
+});
