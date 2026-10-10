@@ -8,7 +8,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { TenMinRunRecord } from "./tenmin-redispatch";
+import { type TenMinRunRecord, countOtherActiveScannerRuns } from "./tenmin-redispatch";
 
 export const SCANNER_ALERT_LABEL = "scanner-alert";
 export const SCANNER_ALERT_ASSIGNEE = "PeaceG03";
@@ -107,7 +107,7 @@ export function alertText(opts: {
     `The ten-minute history chain stopped and did not start a next run.`,
     ``,
     `- Reason: \`${opts.reason}\``,
-    `- Seen by: ${opts.trigger === "chain" ? "the history run's chain step" : "the 2-hourly fallback check"}`,
+    `- Seen by: ${opts.trigger === "chain" ? "the history run's chain step" : "the restarter/fallback check"}`,
     `- Run: ${opts.runUrl}`,
     ...(opts.record?.githubRunId ? [`- Last history run: ${opts.record.githubRunId} (chain #${opts.record.chain})`] : []),
     ...(r
@@ -166,13 +166,13 @@ export async function runTenMinAlert(trigger: "chain" | "fallback"): Promise<str
   const record = readJson<TenMinRunRecord>(env.TENMIN_RECORD_FILE);
   let otherActiveRuns: number | undefined;
   if (trigger === "fallback") {
-    const runs = await ok<{ workflow_runs?: { status: string }[] }>(
+    const runs = await ok<{ workflow_runs?: { id: number; status: string; display_title?: string | null }[] }>(
       await gh(`/actions/workflows/scanner.yml/runs?per_page=30`),
       "runs",
     );
-    otherActiveRuns = (runs.workflow_runs ?? []).filter((r) =>
-      ["queued", "in_progress", "waiting", "pending", "requested"].includes(r.status),
-    ).length;
+    // Not this run (scanner.yml restarter calls the fallback) and not other restarter runs.
+    const self = Number(env.GITHUB_RUN_ID);
+    otherActiveRuns = countOtherActiveScannerRuns(runs.workflow_runs ?? [], Number.isFinite(self) ? self : undefined);
   }
   const plan =
     env.SCANNER_ALERT_FORCE_REASON

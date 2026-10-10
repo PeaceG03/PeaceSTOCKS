@@ -3,12 +3,26 @@ name: Ten-minute history fallback
 # Restarts an auto re-dispatch chain for scanner.yml tenmin_history that a guard window, a queued
 # run, or a lost pending run broke. It only decides and dispatches; the dispatched run is an
 # ordinary scanner.yml run in the peacestocks-r2-writer group. This workflow is deliberately NOT in
-# that group: joining it would replace (cancel) a pending scan. It has its own schedule in its own
-# file so scanner.yml's schedule-triggered scan job never fires on these crons.
+# that group: joining it would replace (cancel) a pending scan.
+# Triggers (all run the same decide job):
+# - workflow_call: scanner.yml's hourly restarter job (cron "47 * * * *"), the primary trigger.
+# - workflow_dispatch with wait_for_guard_window_end=true: the heal dispatch a tenmin_history run's
+#   chain step sends when it waits on a guard window; guard_wait sleeps until the window ends.
+# - workflow_dispatch (manual) and this file's own schedule (best effort; it has never fired).
 on:
-  # Manual trigger: lets anyone run the same decide-and-dispatch check on demand. Having a second
-  # trigger also makes GitHub re-index this file's triggers, so the schedule below registers.
   workflow_dispatch:
+    inputs:
+      wait_for_guard_window_end:
+        description: "Sleep until the current/next guard window ends before deciding (heal dispatch)"
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      wait_for_guard_window_end:
+        required: false
+        default: false
+        type: boolean
   schedule:
     # Daily picks (TENMIN_DAILY_PICKS) ride along when history restarts; still requires
     # the repo var to be exactly "true". Guard windows still skip fetches.
@@ -25,14 +39,37 @@ permissions:
   # issues: write lets the stop-alert step open/close the scanner-alert issue.
   issues: write
 
-concurrency:
-  group: tenmin-history-fallback
-  cancel-in-progress: false
-
 jobs:
+  # Heal path only: sleep (outside every concurrency group, so no scan or history run waits on it)
+  # until the guard window that blocked the chain has ended, plus a 2 min margin. No-op otherwise.
+  guard_wait:
+    if: ${{ vars.TENMIN_AUTO_REDISPATCH == 'true' && inputs.wait_for_guard_window_end }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Wait for the guard window to end
+        run: pnpm exec tsx src/tenmin-redispatch.ts guard-wait
+
   decide:
-    # Kill switch: nothing runs unless the repo variable is exactly "true".
-    if: ${{ vars.TENMIN_AUTO_REDISPATCH == 'true' }}
+    needs: guard_wait
+    # Kill switch: nothing runs unless the repo variable is exactly "true". Runs when guard_wait
+    # finished or was skipped (not on the heal path).
+    if: ${{ always() && vars.TENMIN_AUTO_REDISPATCH == 'true' && (needs.guard_wait.result == 'success' || needs.guard_wait.result == 'skipped') }}
+    # One decide at a time across every trigger (restarter, heal, manual, schedule). Job level, so a
+    # sleeping guard_wait never holds it. Deliberately NOT peacestocks-r2-writer: joining it would
+    # replace (cancel) a pending scan.
+    concurrency:
+      group: tenmin-history-fallback
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

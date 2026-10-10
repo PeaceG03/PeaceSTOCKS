@@ -24,6 +24,17 @@ export function inScanGuardWindow(at: Date): boolean {
 const ACTIVE_RUN_STATES = new Set(["queued", "in_progress", "waiting", "pending", "requested"]);
 
 /**
+ * scanner.yml run-name for runs started by the hourly restarter cron. They only decide whether to
+ * restart the ten-minute history chain (no Massive, no R2), so no yield or active-run check counts them.
+ */
+export const TENMIN_RESTARTER_RUN_NAME = "Scanner restarter" as const;
+
+/** Pure: a scanner.yml run started by the restarter cron (matched by its run-name). */
+export function isTenMinRestarterRun(run: { display_title?: string | null }): boolean {
+  return run.display_title === TENMIN_RESTARTER_RUN_NAME;
+}
+
+/**
  * Returns why backfill must yield, or undefined when it may continue. On Actions it also asks the
  * GitHub API whether any other run of this workflow is queued or running; a failed check yields.
  */
@@ -44,10 +55,13 @@ export async function scanYieldReason(options: ScanYieldOptions = {}): Promise<s
       { headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json" } },
     );
     if (!response.ok) return `SCAN_CHECK_FAILED:http-${response.status}`;
-    const body = (await response.json()) as { workflow_runs?: { id: number; status: string; event: string }[] };
+    const body = (await response.json()) as {
+      workflow_runs?: { id: number; status: string; event: string; display_title?: string | null }[];
+    };
     const self = Number(env.GITHUB_RUN_ID);
+    // Restarter runs never write R2 or call Massive: yielding to them would break the chain hourly.
     const waiting = (body.workflow_runs ?? []).find(
-      (run) => run.id !== self && ACTIVE_RUN_STATES.has(run.status),
+      (run) => run.id !== self && !isTenMinRestarterRun(run) && ACTIVE_RUN_STATES.has(run.status),
     );
     return waiting ? `SCAN_RUN_WAITING:${waiting.id}:${waiting.event}:${waiting.status}` : undefined;
   } catch (error) {

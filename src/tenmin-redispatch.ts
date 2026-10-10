@@ -1,14 +1,18 @@
 // Auto re-dispatch for tenmin_history. Two triggers share one pure decision:
 // - chain: the last step of a tenmin_history run dispatches the next run;
-// - fallback: a separate scheduled workflow (tenmin-history-fallback.yml) restarts a chain that a
-//   guard window, a queued run, or a lost pending run broke.
+// - fallback: tenmin-history-fallback.yml restarts a chain that a guard window, a queued run, or a
+//   lost pending run broke. It runs from scanner.yml's hourly restarter cron (TENMIN_RESTARTER_CRON,
+//   via workflow_call), from a heal dispatch the chain step sends when it waits on a guard window
+//   (guard-wait sleeps until the window ends, then decides), and on manual dispatch.
 // Dispatched runs are ordinary scanner.yml workflow_dispatch runs (mode tenmin_history), so they
 // stay in the peacestocks-r2-writer concurrency group and keep the in-run scanYieldReason.
 
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SCAN_GUARD_WINDOWS_UTC } from "./scan-yield";
+import { SCAN_GUARD_WINDOWS_UTC, TENMIN_RESTARTER_RUN_NAME, isTenMinRestarterRun } from "./scan-yield";
+
+export { TENMIN_RESTARTER_RUN_NAME, isTenMinRestarterRun };
 import type { DatedTickerRunSummary } from "./ticker-reference-dated";
 import {
   type TenMinHistoryRunReport,
@@ -44,6 +48,15 @@ export const TENMIN_REFUSAL_CODES = [
   "TENMIN_UNIVERSE_EMPTY",
   "TENMIN_UNIVERSE_TOO_SMALL",
 ] as const;
+
+/** scanner.yml cron that runs only the restarter job (never a scan). Must match scanner.yml. */
+export const TENMIN_RESTARTER_CRON = "47 * * * *" as const;
+/** Chain wait reasons that send a heal dispatch (restart right after the guard window ends). */
+export const TENMIN_HEAL_REASONS: ReadonlySet<string> = new Set(["WAIT_GUARD_WINDOW", "WAIT_NEAR_GUARD_WINDOW"]);
+/** Heal decides this long after the window ends (clock skew, late window edges). */
+export const TENMIN_HEAL_MARGIN_MINUTES = 2;
+/** Upper bound for one guard-wait sleep (a window is 60 min plus the 10 min lead before it). */
+export const TENMIN_HEAL_MAX_WAIT_MINUTES = 80;
 
 export interface TenMinRunOutcome {
   schemaVersion: typeof TENMIN_OUTCOME_SCHEMA;
@@ -159,6 +172,50 @@ export function guardWindowState(nowUtc: Date): { inside: boolean; minutesUntilN
   return { inside, minutesUntilNext: until };
 }
 
+/**
+ * Pure: minutes until the guard window that blocks a dispatch now has ended, or undefined when no
+ * window blocks (outside every window and its TENMIN_REDISPATCH_LEAD_MINUTES lead).
+ */
+export function minutesUntilGuardWindowEnd(nowUtc: Date): number | undefined {
+  const minute = nowUtc.getUTCHours() * 60 + nowUtc.getUTCMinutes() + nowUtc.getUTCSeconds() / 60;
+  let best: number | undefined;
+  for (const [start, end] of SCAN_GUARD_WINDOWS_UTC) {
+    let wait: number | undefined;
+    if (minute >= start && minute < end) wait = end - minute;
+    else {
+      const untilStart = (start - minute + 1440) % 1440;
+      if (untilStart <= TENMIN_REDISPATCH_LEAD_MINUTES) wait = untilStart + (end - start);
+    }
+    if (wait !== undefined && (best === undefined || wait > best)) best = wait;
+  }
+  return best;
+}
+
+/** Pure: seconds a heal run sleeps before deciding (0 = decide now). Capped at the max wait. */
+export function healWaitSeconds(nowUtc: Date): number {
+  const minutes = minutesUntilGuardWindowEnd(nowUtc);
+  if (minutes === undefined) return 0;
+  return Math.ceil(Math.min(minutes + TENMIN_HEAL_MARGIN_MINUTES, TENMIN_HEAL_MAX_WAIT_MINUTES) * 60);
+}
+
+const ACTIVE_STATUSES = new Set(["queued", "in_progress", "waiting", "pending", "requested"]);
+
+/**
+ * Pure: scanner.yml runs that are active and could write R2: excludes this run (selfRunId) and
+ * restarter runs (they only decide, never scan or fetch history).
+ */
+export function countOtherActiveScannerRuns(
+  runs: readonly { id: number; status: string; display_title?: string | null }[],
+  selfRunId?: number,
+): number {
+  return runs.filter((r) => r.id !== selfRunId && !isTenMinRestarterRun(r) && ACTIVE_STATUSES.has(r.status)).length;
+}
+
+/** Pure: does this chain decision send a heal dispatch? */
+export function shouldDispatchHeal(decision: TenMinRedispatchDecision): boolean {
+  return !decision.dispatch && decision.nextAction === "wait" && TENMIN_HEAL_REASONS.has(decision.reason);
+}
+
 export interface TenMinRedispatchInput {
   trigger: "chain" | "fallback";
   /** The last finished tenmin_history run's outcome (chain: this run's; fallback: newest stored). */
@@ -251,6 +308,8 @@ export interface ScannerRunSummary {
   status: string;
   conclusion: string | null;
   created_at: string;
+  /** Run name; restarter runs are "Scanner restarter" (see TENMIN_RESTARTER_RUN_NAME). */
+  display_title?: string | null;
 }
 
 /**
@@ -266,7 +325,13 @@ export function cancelledScheduledScan(
   const since = nowUtc.getTime() - windowMinutes * 60_000;
   return runs.find((run) => {
     const created = Date.parse(run.created_at);
-    return run.event === "schedule" && run.conclusion === "cancelled" && Number.isFinite(created) && created >= since;
+    return (
+      run.event === "schedule" &&
+      !isTenMinRestarterRun(run) &&
+      run.conclusion === "cancelled" &&
+      Number.isFinite(created) &&
+      created >= since
+    );
   });
 }
 
@@ -373,7 +438,6 @@ export function assertCancelRunAccepted(httpStatus: number, runId: number): void
 
 // ---- CLI (thin I/O around the pure functions) ----
 
-const ACTIVE = new Set(["queued", "in_progress", "waiting", "pending", "requested"]);
 const FAILED = new Set(["failure", "timed_out", "startup_failure"]);
 
 interface Run {
@@ -382,6 +446,7 @@ interface Run {
   conclusion: string | null;
   event: string;
   created_at: string;
+  display_title?: string | null;
 }
 
 async function gh(path: string, init: RequestInit = {}): Promise<Response> {
@@ -480,6 +545,20 @@ async function dispatch(chain: number): Promise<void> {
   if (response.status !== 204) throw new Error(`TENMIN_REDISPATCH_FAILED:http-${response.status}`);
 }
 
+async function dispatchHeal(): Promise<void> {
+  const ref = process.env.TENMIN_DISPATCH_REF || process.env.GITHUB_REF_NAME || "main";
+  if (process.env.TENMIN_REDISPATCH_DRY_RUN === "1") {
+    process.stdout.write(`DRY_RUN: would dispatch tenmin-history-fallback.yml ref=${ref} wait_for_guard_window_end=true\n`);
+    return;
+  }
+  const response = await gh(`/actions/workflows/tenmin-history-fallback.yml/dispatches`, {
+    method: "POST",
+    body: JSON.stringify({ ref, inputs: { wait_for_guard_window_end: "true" } }),
+  });
+  if (response.status !== 204) throw new Error(`TENMIN_HEAL_DISPATCH_FAILED:http-${response.status}`);
+  process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", heal: "dispatched", ref })}\n`);
+}
+
 function readJson<T>(path: string | undefined): T | undefined {
   if (!path || !existsSync(path)) return undefined;
   try {
@@ -503,7 +582,7 @@ async function main(mode: string | undefined): Promise<void> {
       jobResult: env.TENMIN_STEP_OUTCOME ?? "unknown",
       nowUtc: now,
       queue: {
-        otherActiveRuns: runs.filter((r) => r.id !== self && ACTIVE.has(r.status)).length,
+        otherActiveRuns: countOtherActiveScannerRuns(runs, Number.isFinite(self) ? self : undefined),
         ...(checkFailed ? { checkFailed } : {}),
       },
       killSwitch: env.TENMIN_AUTO_REDISPATCH,
@@ -522,6 +601,12 @@ async function main(mode: string | undefined): Promise<void> {
     output("next_action", decision.nextAction);
     output("reason", decision.reason);
     process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", trigger: "chain", ...decision })}\n`);
+    if (shouldDispatchHeal(decision)) {
+      // Self-heal: a fallback run (outside peacestocks-r2-writer) sleeps until the window ends, then
+      // decides with the same rules. A failed heal dispatch fails this step, so the stop alert fires.
+      await dispatchHeal();
+      output("heal", "dispatched");
+    }
     if (decision.dispatch) {
       const dispatchedAfterIso = new Date().toISOString();
       await dispatch(decision.nextChain);
@@ -539,6 +624,8 @@ async function main(mode: string | undefined): Promise<void> {
     const currentMaxRangeEnd = parseTenMinMaxRangeEnd(env.TENMIN_HISTORY_MAX_RANGE_END);
     const record = readJson<TenMinRunRecord>(env.TENMIN_RECORD_FILE);
     const { runs, checkFailed } = await scannerRuns();
+    // Called from scanner.yml's restarter job, GITHUB_RUN_ID is that scanner.yml run: never count it.
+    const self = Number(env.GITHUB_RUN_ID);
     const recordRun = runs.find((r) => String(r.id) === record?.githubRunId);
     const newerFailed = record
       ? runs.find(
@@ -555,7 +642,10 @@ async function main(mode: string | undefined): Promise<void> {
       outcome: record?.outcome,
       jobResult: record?.jobResult ?? "unknown",
       nowUtc: now,
-      queue: { otherActiveRuns: runs.filter((r) => ACTIVE.has(r.status)).length, ...(checkFailed ? { checkFailed } : {}) },
+      queue: {
+        otherActiveRuns: countOtherActiveScannerRuns(runs, Number.isFinite(self) ? self : undefined),
+        ...(checkFailed ? { checkFailed } : {}),
+      },
       killSwitch: env.TENMIN_AUTO_REDISPATCH,
       chain: record?.chain ?? 0,
       maxChain: env.TENMIN_AUTO_REDISPATCH_MAX_CHAIN,
@@ -585,7 +675,14 @@ async function main(mode: string | undefined): Promise<void> {
     }
     return;
   }
-  throw new Error("TENMIN_REDISPATCH_MODE:chain|fallback");
+  if (mode === "guard-wait") {
+    const seconds = healWaitSeconds(now);
+    const until = new Date(now.getTime() + seconds * 1000).toISOString();
+    process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", trigger: "guard-wait", waitSeconds: seconds, until })}\n`);
+    if (seconds > 0 && env.TENMIN_REDISPATCH_DRY_RUN !== "1") await new Promise((done) => setTimeout(done, seconds * 1000));
+    return;
+  }
+  throw new Error("TENMIN_REDISPATCH_MODE:chain|fallback|guard-wait");
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {

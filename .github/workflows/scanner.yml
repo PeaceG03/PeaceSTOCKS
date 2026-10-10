@@ -1,4 +1,8 @@
 name: Scanner
+# Restarter runs (cron "47 * * * *") are named "Scanner restarter" so the history chain, the
+# restarter itself, and the stop alert never count them as a scan/history run (src/tenmin-redispatch.ts
+# TENMIN_RESTARTER_RUN_NAME). Every other run keeps the name "Scanner".
+run-name: ${{ github.event.schedule == '47 * * * *' && 'Scanner restarter' || 'Scanner' }}
 
 on:
   # Intentionally no push trigger: online work is schedule + workflow_dispatch only.
@@ -50,16 +54,25 @@ on:
     - cron: "30 5 * * 2-6"
     # Later UTC morning retry if Massive was not ready yet (04:30 EST / 05:30 EDT). Saturday covers Friday.
     - cron: "30 9 * * 2-6"
+    # Ten-minute history restarter: hourly at :47 (off the :00/:30 marks). Runs ONLY the restarter
+    # job (tenmin-history-fallback.yml via workflow_call); the scan job skips this cron. The decide
+    # step waits (no dispatch) inside or just before a guard window and while any scan/history run
+    # is active. Must match TENMIN_RESTARTER_CRON in src/tenmin-redispatch.ts.
+    - cron: "47 * * * *"
 
 # One writer at a time: scans and backfills both write R2 (month files, cursor), so they queue
 # instead of overlapping. A run already in progress is never canceled.
+# Restarter runs (cron "47 * * * *") write nothing to R2 and get their own per-run group: joining
+# peacestocks-r2-writer would let a restarter run replace (cancel) a pending scan or history run.
+# Every other run is in peacestocks-r2-writer exactly as before.
 concurrency:
-  group: peacestocks-r2-writer
+  group: ${{ github.event.schedule == '47 * * * *' && format('scanner-restarter-{0}', github.run_id) || 'peacestocks-r2-writer' }}
   cancel-in-progress: false
 
 jobs:
   scan:
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.mode == 'scan' }}
+    # Not on the restarter cron: that tick only runs the restarter job below.
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule != '47 * * * *') || github.event.inputs.mode == 'scan' }}
     # Pinned so the runner image cannot change mid-rollout; move to 26.04 deliberately later.
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -124,6 +137,17 @@ jobs:
         env:
           PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
         run: pnpm scheduler
+
+  # Hourly ten-minute history restarter (cron "47 * * * *" only). Same decide-and-dispatch and stop
+  # alert as tenmin-history-fallback.yml (reused via workflow_call, not duplicated). It rides on this
+  # workflow's schedule because the fallback file's own schedule never fired.
+  restarter:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '47 * * * *' }}
+    permissions:
+      contents: read
+      actions: write
+      issues: write
+    uses: ./.github/workflows/tenmin-history-fallback.yml
 
   backfill:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'backfill' }}
@@ -201,7 +225,9 @@ jobs:
   # Dispatch only: never on this workflow's schedule. Shares peacestocks-r2-writer concurrency with
   # scan/backfill so it queues behind (or ahead of) them; the host also yields via scanYieldReason.
   # Auto re-dispatch (repo variable TENMIN_AUTO_REDISPATCH == "true"): the last step dispatches the
-  # next run on a clean partial; tenmin-history-fallback.yml restarts a chain a guard window broke.
+  # next run on a clean partial. When it waits on a guard window it also dispatches
+  # tenmin-history-fallback.yml (wait_for_guard_window_end), which sleeps outside this concurrency
+  # group until the window ends and then restarts the chain; the hourly restarter covers the rest.
   tenmin_history:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'tenmin_history' }}
     runs-on: ubuntu-24.04
