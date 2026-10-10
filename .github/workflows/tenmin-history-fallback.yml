@@ -1,5 +1,4 @@
 name: Ten-minute history fallback
-# Re-enabled 2026-10-09
 
 # Restarts an auto re-dispatch chain for scanner.yml tenmin_history that a guard window, a queued
 # run, or a lost pending run broke. It only decides and dispatches; the dispatched run is an
@@ -7,14 +6,18 @@ name: Ten-minute history fallback
 # that group: joining it would replace (cancel) a pending scan. It has its own schedule in its own
 # file so scanner.yml's schedule-triggered scan job never fires on these crons.
 on:
+  # Manual trigger: lets anyone run the same decide-and-dispatch check on demand. Having a second
+  # trigger also makes GitHub re-index this file's triggers, so the schedule below registers.
+  workflow_dispatch:
   schedule:
     # Daily picks (TENMIN_DAILY_PICKS) ride along when history restarts; still requires
     # the repo var to be exactly "true". Guard windows still skip fetches.
-    # Every 2 hours at :17 (00:17, 02:17, ..., 22:17 UTC): off the :00/:30 marks. The 05:17 and
-    # 09:17 ticks fall inside the 05:15–06:15 / 09:15–10:15 UTC guard windows (scans at 05:30 /
-    # 09:30); decideTenMinRedispatch skips those with WAIT_GUARD_WINDOW. A late cron is still
-    # checked against the windows.
-    - cron: "17 */2 * * *"
+    # Every 2 hours at :47 on even hours (00:47, 02:47, ..., 22:47 UTC): off the :00/:30 marks
+    # and, on time, outside the 05:15–06:15 / 09:15–10:15 UTC guard windows (scans at 05:30 /
+    # 09:30). A late cron that lands inside a window is still skipped by decideTenMinRedispatch
+    # with WAIT_GUARD_WINDOW. Changed from "17 */2 * * *" (2026-10-10): that schedule never
+    # produced a single run.
+    - cron: "47 */2 * * *"
 
 permissions:
   contents: read
