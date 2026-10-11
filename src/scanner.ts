@@ -67,6 +67,13 @@ export interface MarketsScannerGroupedReplyDustOptions {
   zstdVersionProbe?: ZstdVersionProbe;
 }
 
+/** Where the scanner writes the per-session daily-bars pack (always on when a store is given). */
+export interface MarketsScannerDailyBarsPackOptions {
+  store: ReplyDustStore;
+  backend?: ReplyDustBackend;
+  zstdVersionProbe?: ZstdVersionProbe;
+}
+
 export class MarketsScanner {
   constructor(
     private readonly provider: MarketProvider,
@@ -75,6 +82,8 @@ export class MarketsScanner {
     private readonly groupedReplyDust: MarketsScannerGroupedReplyDustOptions | undefined = undefined,
     /** Injectable clock for the collection-due gate (defaults to Date). */
     private readonly now: () => Date = () => new Date(),
+    /** Daily-bars pack store. Defaults to the grouped Reply Dust store; host always passes one. */
+    private readonly dailyBarsPack: MarketsScannerDailyBarsPackOptions | undefined = undefined,
   ) {}
 
   private rateLimitedAtRunStart = 0;
@@ -273,21 +282,33 @@ export class MarketsScanner {
     if (incomplete) failures.push(`MISSING_SECURITY_EVIDENCE:${incomplete}`);
     const securities = await refreshEligibility(this.storage);
     const allBars = await this.storage.loadBars();
-    // Daily-bars sidecar alongside the JSONL write (which is unchanged): bound to the day's grouped
-    // Reply Dust when sealed, otherwise a pure pack. Warnings only.
+    // Daily-bars pack alongside the JSONL write (which is unchanged): not gated on grouped Reply Dust;
+    // bound to the day's grouped Dust when sealed, otherwise a pure pack. A different existing pack or
+    // any write error FAILS the run (non-zero exit) with a code and the session date only.
+    const packOptions =
+      this.dailyBarsPack ??
+      (this.groupedReplyDust?.store
+        ? {
+            store: this.groupedReplyDust.store,
+            ...(this.groupedReplyDust.backend ? { backend: this.groupedReplyDust.backend } : {}),
+            ...(this.groupedReplyDust.zstdVersionProbe
+              ? { zstdVersionProbe: this.groupedReplyDust.zstdVersionProbe }
+              : {}),
+          }
+        : undefined);
     let dailyBarsSidecar: ScanDailyBarsSidecarReport | undefined;
-    if (this.groupedReplyDust?.enabled)
+    if (packOptions)
       dailyBarsSidecar = await maybeWriteScanDailyBarsSidecar({
         enabled: true,
-        ...(this.groupedReplyDust.store ? { store: this.groupedReplyDust.store } : {}),
+        store: packOptions.store,
         sessionDate,
         bars: allBars,
         securities,
-        ...(this.groupedReplyDust.backend ? { backend: this.groupedReplyDust.backend } : {}),
-        ...(this.groupedReplyDust.zstdVersionProbe
-          ? { zstdVersionProbe: this.groupedReplyDust.zstdVersionProbe }
-          : {}),
+        ...(packOptions.backend ? { backend: packOptions.backend } : {}),
+        ...(packOptions.zstdVersionProbe ? { zstdVersionProbe: packOptions.zstdVersionProbe } : {}),
       });
+    const packFailure = dailyBarsSidecar?.failure;
+    if (packFailure) failures.push(packFailure);
     const spyId = resolveSpyBenchmarkId(securities);
     const benchmark = spyId ? allBars.filter((bar) => bar.securityId === spyId) : [];
     const spySessions = new Set(benchmark.map((bar) => bar.sessionDate));
@@ -387,7 +408,9 @@ export class MarketsScanner {
     }
     const status: RunStatus = providerNotReady
       ? "PROVIDER_NOT_READY"
-      : failures.length === 0
+      : packFailure
+        ? "FAILED"
+        : failures.length === 0
         ? "COMPLETE"
         : received.size > 0
           ? "COMPLETE_WITH_WARNINGS"

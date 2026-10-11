@@ -176,6 +176,8 @@ export async function runScannerHost(
     readonly env?: NodeJS.ProcessEnv;
     /** Tests inject the Reply Dust object store when SCAN_GROUPED_REPLY_DUST is on. */
     readonly groupedReplyDustStore?: ReplyDustStore;
+    /** Daily-bars pack store (tests); defaults to the grouped Dust store, else R2 / the local root. */
+    readonly dailyBarsPackStore?: ReplyDustStore;
     readonly intraday?: {
       readonly from: string;
       readonly to: string;
@@ -269,6 +271,11 @@ export async function runScannerHost(
         ? R2ObjectClient.fromEnv(env)
         : new FileReplyDustStore(root));
   }
+  // Daily-bars pack store: always on (not gated on SCAN_GROUPED_REPLY_DUST); same R2 bucket.
+  const dailyBarsPackStore: ReplyDustStore =
+    options.dailyBarsPackStore ??
+    groupedReplyDustStore ??
+    (env.PEACESTOCKS_R2_BUCKET?.trim() ? R2ObjectClient.fromEnv(env) : new FileReplyDustStore(root));
   const scanner = new MarketsScanner(
     provider,
     storage,
@@ -277,6 +284,7 @@ export async function runScannerHost(
       ? { enabled: true, ...(groupedReplyDustStore ? { store: groupedReplyDustStore } : {}) }
       : undefined,
     () => now,
+    { store: dailyBarsPackStore },
   );
   const collected: ScannerRunReport[] = [];
   const collectedSessions = new Set<string>();
@@ -413,8 +421,12 @@ async function main(): Promise<void> {
   const output = await runScannerHost(
     intradayFrom && intradayTo ? { intraday: { from: intradayFrom, to: intradayTo } } : {},
   );
+  // Pack failures are codes + session dates only (no values).
+  const packFailures = (output.reports ?? [])
+    .map((report) => report.dailyBarsSidecar?.failure)
+    .filter((failure): failure is string => Boolean(failure));
   process.stdout.write(
-    `${JSON.stringify({ status: output.status, reason: output.reason, sessions: output.sessions })}\n`,
+    `${JSON.stringify({ status: output.status, reason: output.reason, sessions: output.sessions, ...(packFailures.length ? { packFailures } : {}) })}\n`,
   );
   process.exitCode = output.status === "FAILED" || output.status === "NOT_READY" ? 2 : 0;
 }

@@ -574,3 +574,74 @@ test("daily-bars sidecar: feature off writes nothing", async () => {
   const report = await new MarketsScanner(harness([groupedBody("off")]).provider, new ObjectMarketStorage(new MemoryObjectClient()), US_EQUITY_CALENDAR, undefined, () => beforeNextSessionOpen(DAY)).run(DAY);
   assert.equal(report.dailyBarsSidecar, undefined);
 });
+
+test("daily-bars pack: written even with grouped Reply Dust OFF (pure pack); JSONL unchanged", async () => {
+  const { decodeDailyBarsPack } = await import("./daily-bars-pack-decode");
+  const { dailyBarsSidecarFileKey, dailyBarsSidecarManifestKey } = await import("./daily-bars-sidecar");
+  const barsOff = new MemoryObjectClient();
+  const off = await new MarketsScanner(harness([groupedBody("u")]).provider, new ObjectMarketStorage(barsOff), US_EQUITY_CALENDAR, undefined, () => beforeNextSessionOpen(DAY)).run(DAY);
+  const barsClient = new MemoryObjectClient();
+  const packStore = new MemoryObjectClient();
+  const report = await new MarketsScanner(harness([groupedBody("u")]).provider, new ObjectMarketStorage(barsClient), US_EQUITY_CALENDAR, undefined,
+    () => beforeNextSessionOpen(DAY), { store: packStore, zstdVersionProbe: pinnedZstd }).run(DAY);
+  assert.equal(report.groupedReplyDust, undefined);
+  assert.equal(report.dailyBarsSidecar?.status, "stored");
+  assert.equal(report.dailyBarsSidecar?.source, "pack");
+  assert.equal(report.status, off.status);
+  const key = `permanent/daily-bars/${DAY.slice(0, 7)}.jsonl`;
+  assert.deepEqual(await barsClient.get(key), await barsOff.get(key));
+  const lines = new TextDecoder().decode((await barsClient.get(key))!).split("\n").filter((l) => l.includes(`"sessionDate":"${DAY}"`));
+  assert.deepEqual(decodeDailyBarsPack({ file: (await packStore.get(dailyBarsSidecarFileKey(DAY)))!, manifest: (await packStore.get(dailyBarsSidecarManifestKey(DAY)))! }).lines, lines);
+});
+
+test("daily-bars pack: a different existing pack FAILS the run with DAILY_BARS_PACK_EXISTS_DIFFERENT:<date> (no values)", async () => {
+  const { writeDailyBarsSidecar, dailyBarsSidecarFileKey } = await import("./daily-bars-sidecar");
+  const packStore = new MemoryObjectClient();
+  const other = { securityId: "sec_other", sessionDate: DAY, open: 1, high: 1, low: 1, close: 1, volume: 1, observedAt: AT, ingestedAt: AT,
+    dataQuality: "GOOD", corporateActionIds: [], flags: [], schemaVersion: "x", revision: 1,
+    provenance: { provider: PROVIDER, dataset: "stocks-grouped-daily", retrievalId: "r", ingestionVersion: "v", normalizerVersion: "n" } } as any;
+  await writeDailyBarsSidecar({ store: packStore, sessionDate: DAY, rows: [other], dust: null });
+  const before = await packStore.get(dailyBarsSidecarFileKey(DAY));
+  const barsClient = new MemoryObjectClient();
+  const report = await new MarketsScanner(harness([groupedBody("d")]).provider, new ObjectMarketStorage(barsClient), US_EQUITY_CALENDAR, undefined,
+    () => beforeNextSessionOpen(DAY), { store: packStore, zstdVersionProbe: pinnedZstd }).run(DAY);
+  assert.equal(report.status, "FAILED");
+  assert.equal(report.dailyBarsSidecar?.status, "exists-different");
+  assert.ok(report.unresolvedFailures.includes(`DAILY_BARS_PACK_EXISTS_DIFFERENT:${DAY}`));
+  assert.deepEqual(await packStore.get(dailyBarsSidecarFileKey(DAY)), before); // never overwritten
+  assert.ok((await barsClient.get(`permanent/daily-bars/${DAY.slice(0, 7)}.jsonl`))?.length); // JSONL still written
+});
+
+test("daily-bars pack: a write error FAILS the run with DAILY_BARS_PACK_WRITE_FAILED:<date>:<code> only", async () => {
+  class FailPack extends MemoryObjectClient {
+    override async put(key: string, body: Uint8Array, metadata?: ObjectMetadata): Promise<void> {
+      if (key.startsWith("permanent/daily-bars-sidecar/")) throw new Error("R2_PUT_503 secret-detail 123.45");
+      await super.put(key, body, metadata);
+    }
+  }
+  const report = await new MarketsScanner(harness([groupedBody("e")]).provider, new ObjectMarketStorage(new MemoryObjectClient()), US_EQUITY_CALENDAR, undefined,
+    () => beforeNextSessionOpen(DAY), { store: new FailPack(), zstdVersionProbe: pinnedZstd }).run(DAY);
+  assert.equal(report.status, "FAILED");
+  const codes = report.unresolvedFailures.filter((f) => f.startsWith("DAILY_BARS_PACK_"));
+  assert.deepEqual(codes, [`DAILY_BARS_PACK_WRITE_FAILED:${DAY}:R2_PUT_503`]);
+  // Missing pinned zstd is a write error too.
+  const noZstd = await new MarketsScanner(harness([groupedBody("z")]).provider, new ObjectMarketStorage(new MemoryObjectClient()), US_EQUITY_CALENDAR, undefined,
+    () => beforeNextSessionOpen(DAY), { store: new MemoryObjectClient(), zstdVersionProbe: () => undefined }).run(DAY);
+  assert.equal(noZstd.status, "FAILED");
+  assert.ok(noZstd.unresolvedFailures.includes(`DAILY_BARS_PACK_WRITE_FAILED:${DAY}:REPLY_DUST_ZSTD_MISSING`));
+});
+
+test("daily-bars pack: exists-same on a rescan is fine (run not failed by the pack)", async () => {
+  const packStore = new MemoryObjectClient(); const barsClient = new MemoryObjectClient();
+  const run = () => new MarketsScanner(harness([groupedBody("s")]).provider, new ObjectMarketStorage(barsClient), US_EQUITY_CALENDAR, undefined,
+    () => beforeNextSessionOpen(DAY), { store: packStore, zstdVersionProbe: pinnedZstd }).run(DAY);
+  await run();
+  const again = await run();
+  assert.ok(!again.unresolvedFailures.some((f) => f.startsWith("DAILY_BARS_PACK_")));
+  // Direct: same rows again => exists-same, no failure.
+  const { maybeWriteScanDailyBarsSidecar } = await import("./daily-bars-sidecar");
+  const bars = new TextDecoder().decode((await barsClient.get(`permanent/daily-bars/${DAY.slice(0, 7)}.jsonl`))!).split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  const same = await maybeWriteScanDailyBarsSidecar({ enabled: true, store: packStore, sessionDate: DAY, bars, securities: [], zstdVersionProbe: pinnedZstd });
+  assert.equal(same.status, "exists-same");
+  assert.equal(same.failure, undefined);
+});

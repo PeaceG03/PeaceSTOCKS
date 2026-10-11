@@ -19,6 +19,14 @@ export const DAILY_BARS_SIDECAR_SCHEMA = "daily-bars-sidecar-v1" as const;
 export const DAILY_BARS_SIDECAR_MANIFEST_SCHEMA = "daily-bars-sidecar-manifest-v1" as const;
 export const DAILY_BARS_SIDECAR_PREFIX = "permanent/daily-bars-sidecar";
 export const DAILY_BARS_SIDECAR_WARNING = "DAILY_BARS_SIDECAR_WARNING" as const;
+/** Run-failing codes (the scan FAILS and exits non-zero). Format: <CODE>:<sessionDate>[:<ERROR_CODE>]. */
+export const DAILY_BARS_PACK_EXISTS_DIFFERENT = "DAILY_BARS_PACK_EXISTS_DIFFERENT" as const;
+export const DAILY_BARS_PACK_WRITE_FAILED = "DAILY_BARS_PACK_WRITE_FAILED" as const;
+/** Leading upper-case code of an error message only (never values). */
+export function errorCode(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return /^[A-Z][A-Z0-9_]*/u.exec(message)?.[0] ?? "UNKNOWN";
+}
 
 const sha256Hex = (bytes: Uint8Array | string): string => createHash("sha256").update(bytes).digest("hex");
 
@@ -370,12 +378,15 @@ export interface ScanDailyBarsSidecarReport {
   rows?: number;
   bytesWritten: number;
   warnings: string[];
+  /** Set when the run must fail: exists-different or any write error (exists-same/no-rows are fine). */
+  failure?: string;
 }
 
 /**
  * Scanner step: after the session's daily-bars rows are appended (the JSONL write is unchanged), store the
- * session's sidecar, bound to that day's grouped-daily Reply Dust when it is sealed. Never throws; any
- * failure is a warning and the scan result is otherwise unchanged.
+ * session's sidecar, bound to that day's grouped-daily Reply Dust when it is sealed. Never throws; a
+ * different existing pack or any write error is returned as `failure` (codes and the session date only)
+ * and the scanner fails the run with it.
  */
 export async function maybeWriteScanDailyBarsSidecar(options: {
   enabled: boolean;
@@ -389,7 +400,10 @@ export async function maybeWriteScanDailyBarsSidecar(options: {
 }): Promise<ScanDailyBarsSidecarReport> {
   const base = { enabled: options.enabled, sessionDate: options.sessionDate, bytesWritten: 0 };
   if (!options.enabled) return { ...base, warnings: [] };
-  if (!options.store) return { ...base, warnings: [`${DAILY_BARS_SIDECAR_WARNING}:STORE_UNAVAILABLE`] };
+  if (!options.store) {
+    const failure = `${DAILY_BARS_PACK_WRITE_FAILED}:${options.sessionDate}:STORE_UNAVAILABLE`;
+    return { ...base, warnings: [failure], failure };
+  }
   try {
     const { assertPinnedZstdForWriting } = await import("./reply-dust-pin");
     const { readDailyReplyDustManifest, readDailyReplyDustReply } = await import("./daily-reply-dust");
@@ -414,16 +428,18 @@ export async function maybeWriteScanDailyBarsSidecar(options: {
       symbolsFor: securitySymbols(options.securities),
       backend,
     });
-    const warnings =
-      result.status === "exists-different" ? [`${DAILY_BARS_SIDECAR_WARNING}:EXISTS_DIFFERENT:${options.sessionDate}`] : [];
+    const failure =
+      result.status === "exists-different" ? `${DAILY_BARS_PACK_EXISTS_DIFFERENT}:${options.sessionDate}` : undefined;
     return {
       ...base,
       status: result.status,
       ...(result.manifest ? { source: result.manifest.source, rows: result.manifest.rows } : {}),
       bytesWritten: result.bytesWritten,
-      warnings,
+      warnings: failure ? [failure] : [],
+      ...(failure ? { failure } : {}),
     };
   } catch (error) {
-    return { ...base, warnings: [`${DAILY_BARS_SIDECAR_WARNING}:${String(error instanceof Error ? error.message : error).slice(0, 160)}`] };
+    const failure = `${DAILY_BARS_PACK_WRITE_FAILED}:${options.sessionDate}:${errorCode(error)}`;
+    return { ...base, warnings: [failure], failure };
   }
 }
