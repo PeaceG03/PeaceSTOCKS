@@ -154,6 +154,12 @@ jobs:
         env:
           PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
         run: pnpm scheduler
+      # Every NYSE trading session from the first stored one to the last that should be stored must
+      # have its month JSONL and daily-bars pack (src/daily-bars-coverage.ts; LIST only, no Massive).
+      # A hole or a stale store fails this job loudly (annotation + failed run), after the scan wrote.
+      - name: Daily-bars coverage check
+        if: ${{ always() }}
+        run: pnpm exec tsx src/daily-bars-coverage.ts
 
   # Daily liquid 10-minute step: the just-closed session(s) for the top TENMIN_DAILY_LIQUID_N names
   # (default 500, cap 1000) by trailing dollar volume from sessions strictly before each session.
