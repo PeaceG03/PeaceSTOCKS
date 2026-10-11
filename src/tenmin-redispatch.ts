@@ -17,7 +17,9 @@ import type { DatedTickerRunSummary } from "./ticker-reference-dated";
 import {
   type TenMinHistoryRunReport,
   type TenMinRangeRemaining,
+  lastCompletedSessionDate,
   parseTenMinMaxRangeEnd,
+  planTenMinHistoryRanges,
 } from "./tenmin-history";
 
 export const TENMIN_OUTCOME_SCHEMA = "tenmin-history-outcome-v1" as const;
@@ -238,6 +240,37 @@ export interface TenMinRedispatchInput {
    * at an older, lower cap restarts the chain when the variable is raised or cleared.
    */
   currentMaxRangeEnd?: string;
+  /**
+   * fallback: a two-month range closed after a chain finished with STOP_DONE:no-range-left (see
+   * tenMinNewRangeClosedSince). Restarts the finished chain so the new range is fetched with no
+   * gap; without it a finished chain stayed stopped forever.
+   */
+  newRangeClosed?: { from: string; to: string };
+}
+
+/** Decision reason prefix: a finished chain restarts because a new two-month range closed. */
+export const TENMIN_CONTINUE_NEW_RANGE_CLOSED = "CONTINUE_NEW_RANGE_CLOSED" as const;
+
+/** Pure: calendarTo of the newest range the planner plans for this last completed session. */
+export function tenMinNewestClosedRangeTo(lastCompletedSession: string): string | undefined {
+  return planTenMinHistoryRanges({ lastCompletedSession }).ranges.at(-1)?.calendarTo;
+}
+
+/**
+ * Pure: has a range closed since a run finished at finishedAtIso? Compares the newest plannable
+ * range then and now (same planner rule: calendarTo < lastCompletedSession). "none" when none was
+ * plannable then.
+ */
+export function tenMinNewRangeClosedSince(
+  finishedAtIso: string,
+  now: Date,
+): { from: string; to: string } | undefined {
+  const finished = new Date(finishedAtIso);
+  if (Number.isNaN(finished.getTime())) return undefined;
+  const then = tenMinNewestClosedRangeTo(lastCompletedSessionDate(finished));
+  const today = tenMinNewestClosedRangeTo(lastCompletedSessionDate(now));
+  if (!today || (then !== undefined && today <= then)) return undefined;
+  return { from: then ?? "none", to: today };
 }
 
 export interface TenMinRedispatchDecision {
@@ -262,16 +295,20 @@ export function decideTenMinRedispatch(input: TenMinRedispatchInput): TenMinRedi
   if (input.killSwitch !== "true") return stop("KILL_SWITCH_OFF");
   if (!input.outcome) return stop("STOP_NO_OUTCOME");
   const capRaised = rangeEndCapRaised(input);
-  if (input.outcome.nextAction !== "continue" && !capRaised) return stop(input.outcome.reason);
+  const newRange = newRangeClosed(input);
+  const restart = capRaised ?? newRange;
+  if (input.outcome.nextAction !== "continue" && !restart) return stop(input.outcome.reason);
   if (input.jobResult !== "success") return stop(`STOP_JOB_${input.jobResult.toUpperCase() || "UNKNOWN"}`);
   if (input.newerFailedRun) return stop(`STOP_NEWER_RUN_FAILED:${input.newerFailedRun}`);
-  if (input.outcome.rangesRemaining <= 0 && !capRaised) return stop("STOP_DONE:no-range-left");
+  if (input.outcome.rangesRemaining <= 0 && !restart) return stop("STOP_DONE:no-range-left");
   const maxChain = maxChainOf(input.maxChain);
-  // Raising the cap is a human action: the restarted chain counts from 1 again.
-  const chainNext = capRaised ? 1 : nextChain;
+  // Raising the cap is a human action and a closed range is a new chain: both count from 1 again.
+  const chainNext = restart ? 1 : nextChain;
   if (chainNext > maxChain) return stop(`STOP_CHAIN_CAP:${maxChain}`);
-  if (capRaised) {
-    const reason = `CONTINUE_RANGE_END_CAP_RAISED:${capRaised.from}->${capRaised.to}`;
+  if (restart) {
+    const reason = capRaised
+      ? `CONTINUE_RANGE_END_CAP_RAISED:${capRaised.from}->${capRaised.to}`
+      : `${TENMIN_CONTINUE_NEW_RANGE_CLOSED}:${restart.from}->${restart.to}`;
     const gate = queueAndGuard(input);
     return gate
       ? { dispatch: false, nextAction: "wait", reason: gate, nextChain: chainNext }
@@ -289,6 +326,13 @@ function queueAndGuard(input: TenMinRedispatchInput): string | undefined {
   if (guard.inside) return "WAIT_GUARD_WINDOW";
   if (guard.minutesUntilNext <= TENMIN_REDISPATCH_LEAD_MINUTES) return "WAIT_NEAR_GUARD_WINDOW";
   return undefined;
+}
+
+/** fallback only: the chain finished (STOP_DONE:no-range-left) and a new range has closed since. */
+function newRangeClosed(input: TenMinRedispatchInput): { from: string; to: string } | undefined {
+  if (input.trigger !== "fallback" || !input.outcome || !input.newRangeClosed) return undefined;
+  if (!input.outcome.reason.startsWith("STOP_DONE:no-range-left")) return undefined;
+  return input.newRangeClosed;
 }
 
 /** fallback only: the outcome stopped at a range-end cap lower than today's (or today has none). */
@@ -637,6 +681,10 @@ async function main(mode: string | undefined): Promise<void> {
             FAILED.has(r.conclusion),
         )
       : undefined;
+    const newRangeClosedSinceRecord =
+      record?.outcome?.reason.startsWith("STOP_DONE:no-range-left") && record.finishedAt
+        ? tenMinNewRangeClosedSince(record.finishedAt, now)
+        : undefined;
     const decision = decideTenMinRedispatch({
       trigger: "fallback",
       outcome: record?.outcome,
@@ -651,6 +699,7 @@ async function main(mode: string | undefined): Promise<void> {
       maxChain: env.TENMIN_AUTO_REDISPATCH_MAX_CHAIN,
       ...(newerFailed ? { newerFailedRun: `${newerFailed.id}:${newerFailed.conclusion}` } : {}),
       ...(currentMaxRangeEnd ? { currentMaxRangeEnd } : {}),
+      ...(newRangeClosedSinceRecord ? { newRangeClosed: newRangeClosedSinceRecord } : {}),
     });
     output("next_action", decision.nextAction);
     output("reason", decision.reason);

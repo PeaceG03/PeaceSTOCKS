@@ -17,8 +17,11 @@ import {
   planCancelDispatchedRun,
   stopRecordForScanCancelled,
   tenMinDatedIndexMadeProgress,
+  tenMinNewRangeClosedSince,
+  tenMinNewestClosedRangeTo,
   tenMinRunOutcome,
 } from "./tenmin-redispatch";
+import { lastCompletedSessionDate, planTenMinHistoryRanges } from "./tenmin-history";
 import type { DatedTickerRunSummary } from "./ticker-reference-dated";
 
 function range(status: TenMinHistoryRangeReport["status"], extra: Partial<TenMinHistoryRangeReport> = {}): TenMinHistoryRangeReport {
@@ -610,4 +613,95 @@ test("scan-cancelled: cancel API failure fails loudly; no cancelled scan is unch
   const record = sampleContinueRecord();
   assert.equal(record.decision.nextAction, "continue");
   assert.equal(record.outcome?.nextAction, "continue");
+});
+
+// ---- no end cap: a finished chain picks up each new two-month range as it closes ----
+
+const doneOutcome: TenMinRunOutcome = tenMinRunOutcome(report({ rangesPlanned: 0 }));
+
+test("new range closed: newest closed range follows the planner rule (calendarTo < last completed session)", () => {
+  // On 2026-10-31 (a Friday) the Sep–Oct range ends that day: not closed yet.
+  assert.equal(tenMinNewestClosedRangeTo("2026-10-09"), "2026-08-31");
+  assert.equal(tenMinNewestClosedRangeTo("2026-10-30"), "2026-08-31");
+  assert.equal(tenMinNewestClosedRangeTo("2026-10-31"), "2026-08-31");
+  // The next session after it closes plans it.
+  assert.equal(tenMinNewestClosedRangeTo("2026-11-02"), "2026-10-31");
+  // Finished 2026-10-10 (last completed 10-09); fallback on 2026-11-03 12:00Z (last completed 11-02).
+  assert.deepEqual(tenMinNewRangeClosedSince("2026-10-10T04:00:00.000Z", new Date("2026-11-03T12:00:00Z")), {
+    from: "2026-08-31",
+    to: "2026-10-31",
+  });
+  // Same day, a later hour, or a weekend: no new range.
+  assert.equal(tenMinNewRangeClosedSince("2026-10-10T04:00:00.000Z", new Date("2026-10-30T12:00:00Z")), undefined);
+  assert.equal(tenMinNewRangeClosedSince("not-a-date", new Date("2026-11-03T12:00:00Z")), undefined);
+});
+
+test("new range closed: fallback restarts a finished chain once (chain 1); chain trigger and other stops never", () => {
+  const newRangeClosed = { from: "2026-08-31", to: "2026-10-31" };
+  assert.equal(doneOutcome.reason, "STOP_DONE:no-range-left");
+  const restarted = decideTenMinRedispatch(input({ trigger: "fallback", outcome: doneOutcome, chain: 9, newRangeClosed }));
+  assert.deepEqual(restarted, {
+    dispatch: true,
+    nextAction: "continue",
+    reason: "CONTINUE_NEW_RANGE_CLOSED:2026-08-31->2026-10-31",
+    nextChain: 1,
+  });
+  // No new range: stays stopped (same as before).
+  assert.deepEqual(
+    [decideTenMinRedispatch(input({ trigger: "fallback", outcome: doneOutcome })).nextAction, decideTenMinRedispatch(input({ trigger: "fallback", outcome: doneOutcome })).reason],
+    ["stop", "STOP_DONE:no-range-left"],
+  );
+  // The chain trigger never uses it (only the fallback decides restarts).
+  assert.equal(decideTenMinRedispatch(input({ trigger: "chain", outcome: doneOutcome, newRangeClosed })).nextAction, "stop");
+  // Only a clean STOP_DONE restarts: refusals, errors and outages stay stopped for a human.
+  const refusal = tenMinRunOutcome(report({ stoppedOnError: true, error: "TENMIN_UNIVERSE_TOO_SMALL:x" }));
+  assert.equal(decideTenMinRedispatch(input({ trigger: "fallback", outcome: refusal, newRangeClosed })).nextAction, "stop");
+  const outage = tenMinRunOutcome(report({ outageStop: "MASSIVE_DOWN" }));
+  assert.equal(decideTenMinRedispatch(input({ trigger: "fallback", outcome: outage, newRangeClosed })).nextAction, "stop");
+  // A failed job, a newer failed run, the kill switch, guard window and queue still apply.
+  assert.equal(decideTenMinRedispatch(input({ trigger: "fallback", outcome: doneOutcome, newRangeClosed, jobResult: "failure" })).reason, "STOP_JOB_FAILURE");
+  assert.match(decideTenMinRedispatch(input({ trigger: "fallback", outcome: doneOutcome, newRangeClosed, newerFailedRun: "1:failure" })).reason, /^STOP_NEWER_RUN_FAILED/);
+  assert.equal(decideTenMinRedispatch(input({ trigger: "fallback", outcome: doneOutcome, newRangeClosed, killSwitch: "" })).reason, "KILL_SWITCH_OFF");
+  assert.equal(decideTenMinRedispatch(input({ trigger: "fallback", outcome: doneOutcome, newRangeClosed, nowUtc: at("05:30:00") })).reason, "WAIT_GUARD_WINDOW");
+  assert.equal(decideTenMinRedispatch(input({ trigger: "fallback", outcome: doneOutcome, newRangeClosed, queue: { otherActiveRuns: 1 } })).reason, "WAIT_RUN_ACTIVE:1");
+});
+
+test("handoff: chain finishes, days keep closing, every range is planned with no gap and no manual step", () => {
+  // Simulate: chain reaches STOP_DONE on 2026-10-10; the hourly fallback then runs once a day for
+  // 6 months. Each restart "runs" the chain to STOP_DONE again (record finishedAt = that day).
+  let finishedAt = "2026-10-10T04:00:00.000Z";
+  let sealedThrough: string = tenMinNewestClosedRangeTo(lastCompletedSessionDate(new Date(finishedAt)))!;
+  assert.equal(sealedThrough, "2026-08-31");
+  const restarts: string[] = [];
+  for (let d = new Date("2026-10-10T12:00:00Z"); d < new Date("2027-04-15T12:00:00Z"); d = new Date(d.getTime() + 86_400_000)) {
+    const closed = tenMinNewRangeClosedSince(finishedAt, d);
+    const decision = decideTenMinRedispatch(
+      input({ trigger: "fallback", outcome: doneOutcome, chain: 3, nowUtc: d, ...(closed ? { newRangeClosed: closed } : {}) }),
+    );
+    if (!decision.dispatch) {
+      assert.equal(decision.reason, "STOP_DONE:no-range-left");
+      continue;
+    }
+    // The restarted run plans every range through the newest closed one, contiguous from the first.
+    const plan = planTenMinHistoryRanges({ lastCompletedSession: lastCompletedSessionDate(d) });
+    const planned = [...plan.skippedBefore, ...plan.ranges];
+    for (let i = 1; i < planned.length; i += 1) {
+      const prevEnd = new Date(`${planned[i - 1]!.calendarTo}T00:00:00Z`);
+      prevEnd.setUTCDate(prevEnd.getUTCDate() + 1);
+      assert.equal(planned[i]!.calendarFrom, prevEnd.toISOString().slice(0, 10), "ranges are contiguous");
+    }
+    const newest: { calendarFrom: string; calendarTo: string } = plan.ranges.at(-1)!;
+    const expectedFrom: Date = new Date(`${sealedThrough}T00:00:00Z`);
+    expectedFrom.setUTCDate(expectedFrom.getUTCDate() + 1);
+    assert.equal(newest.calendarFrom, expectedFrom.toISOString().slice(0, 10), "new range starts the day after the last sealed one");
+    restarts.push(`${d.toISOString().slice(0, 10)}:${newest.calendarFrom}_${newest.calendarTo}`);
+    sealedThrough = newest.calendarTo;
+    finishedAt = d.toISOString();
+  }
+  // Exactly one restart per closed range, the first fallback after the range's next session.
+  assert.deepEqual(restarts, [
+    "2026-11-03:2026-09-01_2026-10-31",
+    "2027-01-05:2026-11-01_2026-12-31",
+    "2027-03-02:2027-01-01_2027-02-28",
+  ]);
 });

@@ -243,6 +243,9 @@ export const TENMIN_HISTORY_FIRST_RANGE_START = "2024-11-01";
 export const TENMIN_RANGE_END_CAP = "RANGE_END_CAP" as const;
 
 /**
+ * RETIRED (2026-10-11): the workflows no longer pass TENMIN_HISTORY_MAX_RANGE_END, so the chain has
+ * no end cap. Kept so a manual/local value still parses and an old STOP_RANGE_END_CAP record
+ * restarts when the cap is cleared.
  * Repo variable TENMIN_HISTORY_MAX_RANGE_END (YYYY-MM-DD): the last calendarTo the planner may plan.
  * Unset, empty or whitespace = no cap. Anything else that is not a real calendar date throws
  * TENMIN_HISTORY_MAX_RANGE_END_INVALID (the run fails before any Massive request).

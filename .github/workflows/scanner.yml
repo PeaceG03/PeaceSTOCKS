@@ -250,10 +250,8 @@ jobs:
       # Dated ticker reference index phase (off unless exactly "true"). Probe unless FULL=true.
       TICKER_INDEX_DATED: ${{ vars.TICKER_INDEX_DATED }}
       TICKER_INDEX_DATED_FULL: ${{ vars.TICKER_INDEX_DATED_FULL }}
-      # Repo variable (YYYY-MM-DD): ranges ending after it are not planned; at the cap the chain
-      # stops with STOP_RANGE_END_CAP. Empty = no cap. Invalid = the run fails before any request.
-      # Raising it later is a variable change only (the fallback restarts the chain).
-      TENMIN_HISTORY_MAX_RANGE_END: ${{ vars.TENMIN_HISTORY_MAX_RANGE_END }}
+      # TENMIN_HISTORY_MAX_RANGE_END is retired (2026-10-11): the chain has no end cap. Unset = no
+      # cap in code; the parser stays only so an old STOP_RANGE_END_CAP record restarts cleanly.
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
