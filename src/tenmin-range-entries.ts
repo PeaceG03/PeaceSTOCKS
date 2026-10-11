@@ -393,6 +393,11 @@ export const TENMIN_RANGE_OVERLAPPING_FETCHES = "TENMIN_RANGE_OVERLAPPING_FETCHE
 
 /** rd-origin of the daily liquid step's one-session objects (src/tenmin-daily-liquid.ts). */
 export const TENMIN_DAILY_CLOSE_ORIGIN = "daily-close" as const;
+/**
+ * Entries rebuild refused: a daily-close object in a sealed range is not covered by a chain fetch,
+ * so the rebuild cannot prove which data the range sealed (fail closed, never a mixed series).
+ */
+export const TENMIN_DAILY_IN_RANGE_UNRESOLVED = "TENMIN_DAILY_IN_RANGE_UNRESOLVED" as const;
 
 /** Inclusive date-span overlap on YYYY-MM-DD strings (lexicographic works for ISO dates). */
 function spansOverlap(aFrom: string, aTo: string, bFrom: string, bTo: string): boolean {
@@ -793,8 +798,7 @@ export async function rebuildTenMinRangeEntriesFromStore(
   const prefix = `${tenMinRangePrefix(rangeFrom, rangeTo)}/`;
   const listed = await store.list(prefix);
   const records: TenMinRangeEntryRecord[] = [];
-  // Daily liquid step objects (rd-origin=daily-close): kept only where no chain fetch of the same
-  // security overlaps them, so a chain fetch supersedes the daily one-session objects it covers.
+  // Daily liquid step objects (rd-origin=daily-close): never kept by the rebuild (see below).
   const dailyOrigin = new Set<TenMinRangeEntryRecord>();
   let skippedNoMetadata = 0;
   let supersededDaily = 0;
@@ -840,6 +844,11 @@ export async function rebuildTenMinRangeEntriesFromStore(
     records.push(record);
     if (m["rd-origin"] === TENMIN_DAILY_CLOSE_ORIGIN) dailyOrigin.add(record);
   }
+  // Fail closed on daily-close objects: every one sits inside this sealed range's calendar span,
+  // so the range owns its session. Drop it when a chain fetch of the same security covers it (the
+  // range data wins); otherwise the listing cannot tell a chain-reused object from a stale daily
+  // one, so refuse to rebuild rather than return a mixed series.
+  const unresolved: string[] = [];
   const kept = records.filter((record) => {
     if (!dailyOrigin.has(record)) return true;
     const covered = records.some(
@@ -851,8 +860,13 @@ export async function rebuildTenMinRangeEntriesFromStore(
         record.fetchFrom <= other.fetchTo,
     );
     if (covered) supersededDaily += 1;
-    return !covered;
+    else unresolved.push(`${record.securityId}:${record.symbol}:${record.fetchFrom}_${record.fetchTo}:p${record.pageNumber}`);
+    return false;
   });
+  if (unresolved.length)
+    throw new Error(
+      `${TENMIN_DAILY_IN_RANGE_UNRESOLVED}:${rangeFrom}_${rangeTo}:${unresolved.length}:${unresolved.slice(0, 3).join(",")}`,
+    );
   const sorted = sortTenMinRangeEntries(kept);
   const warnings: string[] = [];
   if (supersededDaily > 0) warnings.push(`TENMIN_DAILY_SUPERSEDED:${supersededDaily}`);

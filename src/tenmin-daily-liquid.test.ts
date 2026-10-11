@@ -21,7 +21,12 @@ import {
   tenMinDailyYieldReason,
   tradingSessionsBefore,
 } from "./tenmin-daily-liquid";
-import { assertNoOverlappingTenMinRangeStoredFetches, rebuildTenMinRangeEntriesFromStore } from "./tenmin-range-entries";
+import {
+  assertNoOverlappingTenMinRangeStoredFetches,
+  loadTenMinRangeEntries,
+  parseTenMinRangeCompactManifest,
+  rebuildTenMinRangeEntriesFromStore,
+} from "./tenmin-range-entries";
 import {
   readTenMinRangeManifest,
   tenMinRangeFileKey,
@@ -455,15 +460,13 @@ test("history chain reuse: chain fetches its full span once, daily objects are s
     // Daily objects are never deleted or rewritten.
     for (const [k, bytes] of dailyBytes) assert.deepEqual(await store.get(k), bytes);
 
-    // The entries rebuild (read-only fallback) lets the chain fetch supersede AAA's daily objects
-    // and keeps BBB's reused one: no overlap.
-    const rebuilt = await rebuildTenMinRangeEntriesFromStore(store, RANGE_FROM, RANGE_TO);
-    assert.doesNotThrow(() => assertNoOverlappingTenMinRangeStoredFetches(rebuilt.records));
-    assert.deepEqual(
-      rebuilt.records.map((r) => `${r.securityId}:${r.fetchFrom}_${r.fetchTo}`),
-      ["sec_aaa:2026-09-01_2026-10-30", "sec_bbb:2026-10-08_2026-10-08", "sec_bbb:2026-10-09_2026-10-09"],
+    // The entries rebuild (read-only fallback) never keeps a daily-close object: AAA's are
+    // superseded by the chain fetch, but BBB's (one reused by the chain, one not covered) cannot be
+    // resolved from a listing, so the rebuild fails closed.
+    await assert.rejects(
+      rebuildTenMinRangeEntriesFromStore(store, RANGE_FROM, RANGE_TO),
+      /^Error: TENMIN_DAILY_IN_RANGE_UNRESOLVED:2026-09-01_2026-10-31:2:/u,
     );
-    assert.ok(rebuilt.warnings.includes("TENMIN_DAILY_SUPERSEDED:2"));
 
     // After the seal the daily step leaves the range alone.
     dailyCalls.length = 0;
@@ -518,4 +521,102 @@ test("workflow: tenmin_daily job is kill-switched, in the R2 writer group, reads
   const { TENMIN_DAILY_DEFAULT_BUDGET_MS } = await import("./tenmin-daily-liquid");
   assert.ok(Date.parse("2026-10-13T06:20:00Z") + TENMIN_DAILY_DEFAULT_BUDGET_MS < Date.parse("2026-10-13T09:15:00Z"));
   assert.ok(TENMIN_DAILY_DEFAULT_BUDGET_MS < 170 * 60_000, "budget ends before the job timeout");
+});
+
+async function sealedRangeWithDaily(plan: Array<{ securityId: string; symbol: string; fetchFrom: string; fetchTo: string }>, root: string) {
+  const store = new MemoryObjectClient();
+  await baseRun(store, [], { n: 2 }); // daily files: AAA + BBB on 10-08 and 10-09
+  const chainBars = (symbol: string) =>
+    ["2026-09-01", "2026-10-08", "2026-10-09", "2026-10-30"].flatMap((d) => dayBars(symbol, d).map((b) => b.replace('"v":100', '"v":777')));
+  await writeTenMinRangeReplyDust({
+    store,
+    root,
+    provider: PROVIDER,
+    from: RANGE_FROM,
+    to: RANGE_TO,
+    fetches: plan,
+    zstdVersionProbe: pinnedZstd,
+    now: ISO,
+    fetchPages: async (sec, from, to) => replyPages(sec.symbol, sec.securityId, from, to, chainBars(sec.symbol), "2026-11-02T03:00:00.000Z"),
+  });
+  // Make the range index unreadable: corrupt the entries object the compact manifest points at.
+  const compact = parseTenMinRangeCompactManifest((await store.get(tenMinRangeManifestKey(RANGE_FROM, RANGE_TO)))!);
+  await store.put(compact.entriesKey, new Uint8Array([0, 1, 2, 3]));
+  return store;
+}
+
+test("unreadable range index + overlapping daily file: rebuild takes the range data, readers fail closed, never the daily file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tenmin-daily-fallback-"));
+  try {
+    const plan = ["AAA", "BBB"].map((symbol) => ({
+      securityId: `sec_${symbol.toLowerCase()}`,
+      symbol,
+      fetchFrom: "2026-09-01",
+      fetchTo: "2026-10-30",
+    }));
+    const store = await sealedRangeWithDaily(plan, root);
+    // Fallback rebuild: only the chain fetches; all four daily files are superseded.
+    const loaded = await loadTenMinRangeEntries(store, RANGE_FROM, RANGE_TO);
+    assert.equal(loaded.usedFallback, true);
+    assert.deepEqual(
+      [...new Set(loaded.records.map((r) => `${r.securityId}:${r.fetchFrom}_${r.fetchTo}`))],
+      ["sec_aaa:2026-09-01_2026-10-30", "sec_bbb:2026-09-01_2026-10-30"],
+    );
+    assert.ok(loaded.warnings.includes("TENMIN_DAILY_SUPERSEDED:4"));
+    assert.doesNotThrow(() => assertNoOverlappingTenMinRangeStoredFetches(loaded.records));
+    // Every key the fallback hands out is a chain object, never a daily-close one.
+    for (const key of loaded.keys) assert.equal((await store.head(key))!.metadata["rd-origin"], undefined, key);
+    // Readers never serve the daily file for a covered session: the sealed range is unreadable, so they fail closed.
+    for (const d of ["2026-10-08", "2026-10-09"])
+      await assert.rejects(readTenMinSecurityDay(store, "sec_aaa", d), /TENMIN_MANIFEST_V2_ENTRIES_UNREADABLE/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("unreadable range index + a daily file no chain fetch covers: rebuild fails closed (no mixed result)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tenmin-daily-fallback2-"));
+  try {
+    // BBB's chain span stops before 10-08, so its two daily files are not covered.
+    const store = await sealedRangeWithDaily(
+      [
+        { securityId: "sec_aaa", symbol: "AAA", fetchFrom: "2026-09-01", fetchTo: "2026-10-30" },
+        { securityId: "sec_bbb", symbol: "BBB", fetchFrom: "2026-09-01", fetchTo: "2026-10-07" },
+      ],
+      root,
+    );
+    await assert.rejects(loadTenMinRangeEntries(store, RANGE_FROM, RANGE_TO), /TENMIN_DAILY_IN_RANGE_UNRESOLVED:2026-09-01_2026-10-31:2:sec_bbb:BBB:2026-10-08/u);
+    await assert.rejects(readTenMinSecurityDay(store, "sec_bbb", "2026-10-08"), /TENMIN_DAILY_IN_RANGE_UNRESOLVED/u);
+    await assert.rejects(readTenMinSecurityDay(store, "sec_aaa", "2026-10-08"), /TENMIN_DAILY_IN_RANGE_UNRESOLVED/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("readable range index: the reader returns the range data for a session the daily step also stored", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tenmin-daily-fallback3-"));
+  try {
+    const store = new MemoryObjectClient();
+    await baseRun(store, [], { n: 1, catchupSessions: 1 });
+    const daily = await readTenMinSecurityDay(store, "sec_aaa", "2026-10-09");
+    await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: RANGE_FROM,
+      to: RANGE_TO,
+      fetches: [{ securityId: "sec_aaa", symbol: "AAA", fetchFrom: "2026-09-01", fetchTo: "2026-10-30" }],
+      zstdVersionProbe: pinnedZstd,
+      now: ISO,
+      fetchPages: async (sec, from, to) =>
+        replyPages(sec.symbol, sec.securityId, from, to, dayBars("AAA", "2026-10-09").map((b) => b.replace('"v":100', '"v":777'))),
+    });
+    const after = await readTenMinSecurityDay(store, "sec_aaa", "2026-10-09");
+    assert.equal(after.source, "range");
+    assert.ok(after.bars.some((b) => b.volume === 777), "range data");
+    assert.ok(!after.bars.some((b) => b.volume === 100), "never the daily file's values");
+    assert.ok(daily.bars.some((b) => b.volume === 100));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
