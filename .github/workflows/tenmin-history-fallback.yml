@@ -24,8 +24,7 @@ on:
         default: false
         type: boolean
   schedule:
-    # Daily picks (TENMIN_DAILY_PICKS) ride along when history restarts; still requires
-    # the repo var to be exactly "true". Guard windows still skip fetches.
+    # Guard windows still skip fetches.
     # Every 2 hours at :47 on even hours (00:47, 02:47, ..., 22:47 UTC): off the :00/:30 marks
     # and, on time, outside the 05:15–06:15 / 09:15–10:15 UTC guard windows (scans at 05:30 /
     # 09:30). A late cron that lands inside a window is still skipped by decideTenMinRedispatch

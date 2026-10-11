@@ -608,7 +608,7 @@ export async function runDatedTickerIndexBuild(
   const providerName =
     options.providerName ?? options.provider?.providerName ?? "massive-stocks";
   const backend = options.backend ?? nodeReplyDustBackend;
-  // Default: live clock scan-guard (same windows as picks/history). Callers may add their own;
+  // Default: live clock scan-guard (same windows as history). Callers may add their own;
   // yield if either the default guard or the caller says so.
   const callerYield = options.shouldYield;
   const shouldYield = async (): Promise<string | undefined> => {

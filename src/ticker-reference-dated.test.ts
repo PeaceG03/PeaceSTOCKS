@@ -4,7 +4,7 @@ import type { SecurityMasterRecord } from "./contracts";
 import { MemoryObjectClient } from "./object-store";
 import {
   loadTickerReferenceIndexAsOf,
-} from "./tenmin-daily-picks-base";
+} from "./ticker-reference-as-of";
 import {
   MASSIVE_TICKER_PAGE_LIMIT,
 } from "./massive-provider";
