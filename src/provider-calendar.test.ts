@@ -3,7 +3,7 @@ import test from "node:test";
 import { securityId } from "./identity";
 import { MassiveMarketProvider } from "./massive-provider";
 import { collectionDue } from "./scheduler";
-import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
+import { US_EQUITY_MARKET_CALENDAR, usEquityCalendarRulesTable } from "./us-calendar";
 
 function response(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -157,4 +157,28 @@ test("collectionDue targets the previous ET calendar session (due only after mid
   const afterMidnight = collectionDue({ now: new Date("2026-08-27T04:00:00.000Z") });
   assert.equal(afterMidnight.due, true);
   assert.equal(afterMidnight.session.sessionDate, "2026-08-26");
+});
+
+test("NYSE New Year: a Saturday Jan 1 is not observed (Dec 31 trades); a Sunday Jan 1 closes Monday Jan 2", () => {
+  // Every Saturday New Year 2010-2040: Dec 31 before it is a normal session and no rule lists it.
+  const table = usEquityCalendarRulesTable(2010, 2040);
+  const saturdayYears: number[] = [];
+  for (let year = 2010; year <= 2040; year += 1) {
+    if (new Date(Date.UTC(year, 0, 1)).getUTCDay() !== 6) continue;
+    saturdayYears.push(year);
+    const eve = `${year - 1}-12-31`;
+    assert.equal(US_EQUITY_MARKET_CALENDAR.getSession(eve).kind, "NORMAL", eve);
+    assert.equal(US_EQUITY_MARKET_CALENDAR.getSession(`${year}-01-03`).kind, "NORMAL", `${year}-01-03`);
+    assert.ok(!table.closedByYear[String(year)]!.includes(eve), `${year} lists ${eve}`);
+  }
+  assert.deepEqual(saturdayYears, [2011, 2022, 2028, 2033, 2039]);
+  assert.equal(US_EQUITY_MARKET_CALENDAR.getSession("2027-12-31").kind, "NORMAL");
+  // Every rule date belongs to its own year (the old rule put 2027-12-31 in 2028's closures).
+  for (const [year, dates] of Object.entries(table.closedByYear))
+    for (const date of dates) assert.ok(date.startsWith(`${year}-`), `${year}: ${date}`);
+  // Sunday New Year: observed Monday Jan 2. Weekday New Year: closed that day.
+  for (const date of ["2017-01-02", "2023-01-02", "2034-01-02", "2026-01-01", "2027-01-01"])
+    assert.equal(US_EQUITY_MARKET_CALENDAR.getSession(date).kind, "CLOSED", date);
+  // Christmas on Saturday is still observed Friday Dec 24 (same year), e.g. 2027.
+  assert.equal(US_EQUITY_MARKET_CALENDAR.getSession("2027-12-24").kind, "CLOSED");
 });

@@ -23,6 +23,16 @@ function observedFixed(year: number, month: number, day: number): string {
   if (date.getUTCDay() === 0) date.setUTCDate(day + 1);
   return format(date);
 }
+/**
+ * New Year's Day: Sunday -> Monday Jan 2; Saturday -> no holiday. NYSE Rule 7.2 does not move a
+ * Saturday New Year back to Friday Dec 31 (that would be a close in the prior year), so Dec 31 is
+ * a normal session (e.g. 2010-12-31, 2021-12-31, 2027-12-31, 2032-12-31, 2038-12-31).
+ */
+function observedNewYear(year: number): string[] {
+  const date = new Date(Date.UTC(year, 0, 1));
+  if (date.getUTCDay() === 6) return [];
+  return [observedFixed(year, 1, 1)];
+}
 function easterSunday(year: number): Date {
   const a = year % 19,
     b = Math.floor(year / 100),
@@ -52,7 +62,7 @@ function nyseClosedDates(year: number): Set<string> {
   const goodFriday = easterSunday(year);
   goodFriday.setUTCDate(goodFriday.getUTCDate() - 2);
   return new Set([
-    observedFixed(year, 1, 1),
+    ...observedNewYear(year),
     nthWeekday(year, 1, 1, 3),
     nthWeekday(year, 2, 1, 3),
     format(goodFriday),
