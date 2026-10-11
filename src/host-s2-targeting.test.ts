@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -162,7 +163,7 @@ test("S2 host: 21:30Z Tue 10-06 lastObserved 10-04 → 10-05 EVIDENCE_ONLY once;
     assert.equal(result.reports.length, 1);
     const storage = new MarketStorage(root);
     assert.equal((await storage.loadPredictions("2026-10-05")).length, 0);
-    assert.equal((await storage.loadBeliefs("2026-10-05")).length, 0);
+    assert.equal(existsSync(join(root, "permanent", "beliefs")), false);
   } finally {
     if (previous === undefined) delete process.env.MASSIVE_API_KEY;
     else process.env.MASSIVE_API_KEY = previous;
@@ -322,7 +323,8 @@ test("S2 host: 13:29Z Wed 10-07 (09:29 EDT, 1m before open) lastObserved 10-05 �
     assert.deepEqual(provider.barSessions, ["2026-10-06"]);
     const storage = new MarketStorage(root);
     assert.ok((await storage.loadPredictions("2026-10-06")).length > 0);
-    assert.ok((await storage.loadBeliefs("2026-10-06")).length > 0);
+    // Beliefs are retired: a FORWARD scan freezes predictions but writes no beliefs.
+    assert.equal(existsSync(join(root, "permanent", "beliefs")), false);
     assert.ok((await storage.loadPredictionStatuses("2026-10-06")).some((s) => s.status === "FROZEN"));
   } finally {
     if (previous === undefined) delete process.env.MASSIVE_API_KEY;
@@ -349,7 +351,7 @@ test("S2 host: exactly 13:30Z Wed 10-07 (09:30 EDT open) lastObserved 10-05 → 
     assert.deepEqual(provider.barSessions, ["2026-10-06"]);
     const storage = new MarketStorage(root);
     assert.equal((await storage.loadPredictions("2026-10-06")).length, 0);
-    assert.equal((await storage.loadBeliefs("2026-10-06")).length, 0);
+    assert.equal(existsSync(join(root, "permanent", "beliefs")), false);
   } finally {
     if (previous === undefined) delete process.env.MASSIVE_API_KEY;
     else process.env.MASSIVE_API_KEY = previous;

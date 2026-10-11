@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -81,25 +82,33 @@ test("a rerun keeps one belief and the read API returns tickers", async () => {
     const storage = new MarketStorage(root);
     const scanner = new MarketsScanner(provider, storage, undefined, undefined, () => beforeNextSessionOpen("2026-01-22"));
     const first = await scanner.run("2026-01-22");
-    const beliefs = await storage.loadBeliefs("2026-01-22");
     const predictions = await storage.loadPredictions("2026-01-22");
     await scanner.run("2026-01-22");
-    assert.equal((await storage.loadBeliefs("2026-01-22")).length, beliefs.length);
+    // Beliefs are retired: the scan writes no permanent/beliefs/ files.
+    assert.equal(existsSync(join(root, "permanent", "beliefs")), false);
     assert.equal((await storage.loadPredictions("2026-01-22")).length, predictions.length);
     assert.equal(new Set(predictions.map((item) => item.predictionId)).size, 5);
-    const top = await readScannerRoute(storage, "/scanner/top15");
-    const rows = top.body as Array<{ ticker: string; securityId: string; overallRank: number | null }>;
-    assert.equal(top.status, 200);
-    assert.ok(rows.length >= 1);
-    assert.notEqual(rows[0]?.ticker, "UNKNOWN");
-    assert.equal(rows[0]?.securityId.startsWith("sec_"), true);
-    assert.equal(typeof rows[0]?.overallRank, "number");
     const health = await readScannerRoute(storage, "/scanner/health");
     assert.equal((health.body as { sourceCommit: string; sessionDate: string }).sessionDate, "2026-01-22");
-    const byTicker = await readScannerRoute(storage, "/scanner/ticker/AAA");
-    assert.equal(byTicker.status, 200);
-    assert.equal((byTicker.body as { ticker: string }).ticker, "AAA");
-    assert.equal(await readScannerRoute(storage, "/scanner/ticker/MISSING").then((result) => result.status), 404);
+    // The scanner never ranks: the retired rank routes answer exactly like an unknown path.
+    for (const retired of [
+      "/scanner/top15",
+      "/scanner/top50",
+      "/scanner/ticker/AAA",
+      "/scanner/ticker/MISSING",
+    ]) {
+      assert.deepEqual(await readScannerRoute(storage, retired), {
+        status: 404,
+        body: { error: "NOT_FOUND" },
+      });
+    }
+    for (const kept of [
+      "/scanner/latest",
+      "/scanner/latest-success",
+      "/scanner/last-failure",
+      "/scanner/provider-health",
+    ])
+      assert.equal((await readScannerRoute(storage, kept)).status, 200);
     assert.equal(await readScannerRoute(storage, "/nope").then((result) => result.status), 404);
     assert.equal(first.status === "COMPLETE" || first.status === "COMPLETE_WITH_WARNINGS", true);
   } finally {

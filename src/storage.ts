@@ -15,7 +15,6 @@ import type {
   PredictionSet,
   PredictionStatus,
   ScannerRunReport,
-  ScannerBelief,
   SecurityMasterRecord,
   StorageReport,
   UniverseMembershipEvidence,
@@ -55,10 +54,8 @@ export interface MarketStore {
   loadDailyBarSessions(month: string): Promise<DailyBarSessionIndex>;
   appendBars(records: CanonicalDailyBar[]): Promise<void>;
   appendActions(records: CorporateAction[]): Promise<void>;
-  writeBeliefs(records: ScannerBelief[]): Promise<void>;
   writePredictions(records: PredictionSet[]): Promise<void>;
   writePredictionStatus(record: PredictionStatus): Promise<void>;
-  loadBeliefs(sessionDate?: string): Promise<ScannerBelief[]>;
   loadPredictions(sessionDate?: string): Promise<PredictionSet[]>;
   loadPredictionStatuses(sessionDate?: string): Promise<PredictionStatus[]>;
   writePartitionManifest(manifest: PartitionManifest): Promise<void>;
@@ -79,7 +76,6 @@ type StoredRecord =
   | CanonicalDailyBar
   | CorporateAction
   | CorrectionRecord
-  | ScannerBelief
   | PredictionSet
   | PredictionStatus;
 
@@ -163,7 +159,6 @@ export class MarketStorage implements MarketStore {
     this.guardRoot();
     for (const directory of [
       join(this.permanentRoot, "daily-bars"),
-      join(this.permanentRoot, "beliefs"),
       join(this.permanentRoot, "predictions"),
       join(this.permanentRoot, "prediction-status"),
       join(this.permanentRoot, "decisions"),
@@ -299,17 +294,6 @@ export class MarketStorage implements MarketStore {
       .sort((a, b) => a.sessionDate.localeCompare(b.sessionDate) || a.revision - b.revision);
   }
 
-  async writeBeliefs(records: ScannerBelief[]): Promise<void> {
-    if (!records.length) return;
-    const sessionDate = records[0]?.sessionDate;
-    if (!sessionDate) return;
-    await this.writeImmutableJsonLines(
-      `beliefs/${sessionDate}.jsonl`,
-      records,
-      (record) => record.decisionId,
-    );
-  }
-
   async writePredictions(records: PredictionSet[]): Promise<void> {
     if (!records.length) return;
     const sessionDate = records[0]?.sessionDate;
@@ -327,11 +311,6 @@ export class MarketStorage implements MarketStore {
       [record],
       (item) => item.predictionStatusId,
     );
-  }
-
-  async loadBeliefs(sessionDate?: string): Promise<ScannerBelief[]> {
-    if (sessionDate) return readJsonLines<ScannerBelief>(this.path(`beliefs/${sessionDate}.jsonl`));
-    return this.readTree("beliefs", async (file) => readJsonLines<ScannerBelief>(file));
   }
 
   async loadPredictions(sessionDate?: string): Promise<PredictionSet[]> {

@@ -46,7 +46,7 @@ If value Z can be reconstructed deterministically from preserved X and Y, do not
 - corporate actions;
 - provider revisions/corrections;
 - prediction sets;
-- scanner beliefs;
+- scanner beliefs (retired 2026-10: `permanent/beliefs/` and `permanent/decisions/` are no longer written; existing objects are kept, not deleted);
 - strategy experiment results;
 - failures/health events;
 - data-quality states;
@@ -282,7 +282,7 @@ root/
 │  ├─ daily-bars/
 │  ├─ corporate-actions.jsonl
 │  ├─ corrections.jsonl
-│  ├─ beliefs/
+│  ├─ beliefs/            (retired 2026-10: no longer written; existing files kept)
 │  ├─ predictions/
 │  ├─ prediction-status/
 │  ├─ partitions/

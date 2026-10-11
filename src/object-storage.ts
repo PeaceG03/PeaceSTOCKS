@@ -6,7 +6,6 @@ import type {
   PartitionManifest,
   PredictionSet,
   PredictionStatus,
-  ScannerBelief,
   ScannerRunReport,
   SecurityMasterRecord,
   StorageReport,
@@ -30,7 +29,6 @@ type StoredRecord =
   | CanonicalDailyBar
   | CorporateAction
   | CorrectionRecord
-  | ScannerBelief
   | PredictionSet
   | PredictionStatus;
 
@@ -173,12 +171,6 @@ export class ObjectMarketStorage implements MarketStore {
     await this.appendUnique("permanent/corporate-actions.jsonl", records, (record) => record.actionId);
   }
 
-  async writeBeliefs(records: ScannerBelief[]): Promise<void> {
-    const sessionDate = records[0]?.sessionDate;
-    if (!sessionDate) return;
-    await this.writeImmutable(`permanent/beliefs/${sessionDate}.jsonl`, records, (record) => record.decisionId);
-  }
-
   async writePredictions(records: PredictionSet[]): Promise<void> {
     const sessionDate = records[0]?.sessionDate;
     if (!sessionDate) return;
@@ -202,12 +194,6 @@ export class ObjectMarketStorage implements MarketStore {
     const rows: T[] = [];
     for (const key of keys) rows.push(...lines<T>(await this.readText(key)));
     return rows;
-  }
-
-  async loadBeliefs(sessionDate?: string): Promise<ScannerBelief[]> {
-    return sessionDate
-      ? this.readJsonl(`permanent/beliefs/${sessionDate}.jsonl`, true)
-      : this.readJsonl("permanent/beliefs/", false);
   }
 
   async loadPredictions(sessionDate?: string): Promise<PredictionSet[]> {

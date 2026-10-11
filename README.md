@@ -44,7 +44,7 @@ Standalone repository for the PeaceSTOCKS markets scanner. Migrated from PeaceAI
 
 # PeaceAI Markets Scanner V0
 
-This package is the provider-neutral Foundation D evidence layer for approved U.S. stocks and ETFs. It stores source OHLCV observations, security lifecycle and universe membership evidence, corporate actions, correction lineage, immutable scanner beliefs, frozen candidate sets, partition manifests, and measured storage reports.
+This package is the provider-neutral Foundation D evidence layer for approved U.S. stocks and ETFs. It stores source OHLCV observations, security lifecycle and universe membership evidence, corporate actions, correction lineage, frozen candidate sets, partition manifests, and measured storage reports.
 
 The package intentionally contains no brokerage or trading connector. MarketProvider is the ingestion boundary: a licensed provider adapter normalizes its records into this contract before a scheduled daily run. MassiveMarketProvider is the read-only Stocks REST adapter for the initial live collection path. It requires the operator to supply MASSIVE_API_KEY outside the repository; the key is never persisted in evidence, reports, logs, or Git. FileMarketProvider remains available for deterministic fixture certification.
 

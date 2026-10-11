@@ -103,7 +103,8 @@ async function runForward(opts: {
   historySessions: string[];
 }) {
   const clock = { ms: opts.start.getTime() };
-  const storage = new ObjectMarketStorage(new MemoryObjectClient());
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
   await storage.initialize();
   const provider = new AdvancingClockProvider(
     clock,
@@ -117,7 +118,7 @@ async function runForward(opts: {
     undefined,
     () => new Date(clock.ms),
   ).run(opts.sessionDate, "FORWARD");
-  return { report, storage, clock };
+  return { report, storage, clock, client };
 }
 
 const CAL_SHA = usEquityCalendarSha256();
@@ -147,7 +148,7 @@ test("S4: D=Friday freeze Sat 05:40Z → FROZEN with correct nextSessionOpen", a
   const start = new Date("2026-10-03T05:30:00.000Z");
   const freeze = new Date("2026-10-03T05:40:00.000Z");
   const expectedOpen = etWallClockToUtc("2026-10-05", 9, 30);
-  const { report, storage } = await runForward({
+  const { report, storage, client } = await runForward({
     sessionDate: D,
     start,
     freeze,
@@ -170,7 +171,8 @@ test("S4: D=Friday freeze Sat 05:40Z → FROZEN with correct nextSessionOpen", a
   assert.equal(frozen!.nextSessionDate, "2026-10-05");
   assert.equal(frozen!.calendarSha256, CAL_SHA);
   assert.ok((await storage.loadPredictions(D)).length > 0);
-  assert.ok((await storage.loadBeliefs(D)).length > 0);
+  // Beliefs are retired: a frozen forward scan writes no permanent/beliefs/ object.
+  assert.deepEqual(await client.list("permanent/beliefs/"), []);
 });
 
 test("S4: D=Fri before Labor Day → nextSessionOpen is Tue 09-08 09:30 ET", async () => {
@@ -209,7 +211,7 @@ test("S4: run starts 09:20 ET (passes gate) but freeze exactly at 09:30 ET → F
   assert.equal(open.toISOString(), "2026-10-07T13:30:00.000Z");
   const start = new Date(open.getTime() - 10 * 60_000); // 09:20 ET
   const freeze = new Date(open.getTime()); // exactly 09:30:00
-  const { report, storage } = await runForward({
+  const { report, storage, client } = await runForward({
     sessionDate: D,
     start,
     freeze,
@@ -222,7 +224,7 @@ test("S4: run starts 09:20 ET (passes gate) but freeze exactly at 09:30 ET → F
   assert.equal(report.nextSessionDate, "2026-10-07");
   assert.equal(report.calendarSha256, CAL_SHA);
   assert.equal((await storage.loadPredictions(D)).length, 0);
-  assert.equal((await storage.loadBeliefs(D)).length, 0);
+  assert.deepEqual(await client.list("permanent/beliefs/"), []);
   const statuses = await storage.loadPredictionStatuses(D);
   assert.ok(statuses.some((s) => s.reason === "FREEZE_AFTER_OPEN" && s.status === "UNAVAILABLE"));
   assert.ok(statuses.every((s) => s.status !== "FROZEN"));

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -569,12 +570,20 @@ test("scanner uses the SPY security id as the market benchmark", async () => {
     ).run(session);
     assert.equal(report.status, "COMPLETE");
     assert.equal(report.skips, undefined);
-    const beliefs = (await readFile(join(root, "permanent", "beliefs", `${session}.jsonl`), "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as { securityId: string; familyScores: { relativeStrength?: number } });
-    const aaaScore = beliefs.find((item) => item.securityId === aaa)?.familyScores.relativeStrength;
-    const bbbScore = beliefs.find((item) => item.securityId === bbb)?.familyScores.relativeStrength;
+    // Beliefs are retired (never persisted); check the benchmark wiring on the in-memory ranking
+    // over the same stored securities and bars the scan used.
+    assert.equal(existsSync(join(root, "permanent", "beliefs")), false);
+    const securities = await storage.loadSecurities();
+    const allBars = await storage.loadBars();
+    assert.equal(securities.find((item) => item.currentSymbol === "SPY")?.securityId, spy);
+    const ranking = rankSecurities(
+      securities,
+      allBars,
+      allBars.filter((item) => item.securityId === spy),
+      session,
+    );
+    const aaaScore = ranking.beliefs.find((item) => item.securityId === aaa)?.familyScores.relativeStrength;
+    const bbbScore = ranking.beliefs.find((item) => item.securityId === bbb)?.familyScores.relativeStrength;
     assert.equal(typeof aaaScore, "number");
     assert.equal(typeof bbbScore, "number");
     assert.notEqual(aaaScore, bbbScore);

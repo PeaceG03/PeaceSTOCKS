@@ -45,7 +45,6 @@ export const MARKET_STORAGE_LAYOUT = {
   universeMembership: "permanent/universe-membership.jsonl",
   corporateActions: "permanent/corporate-actions.jsonl",
   corrections: "permanent/corrections.jsonl",
-  scannerBeliefs: "permanent/beliefs/YYYY-MM-DD.jsonl",
   predictions: "permanent/predictions/YYYY-MM-DD.jsonl",
   predictionStatus: "permanent/prediction-status/YYYY-MM-DD.jsonl",
   partitionManifests: "permanent/partitions/*.json",

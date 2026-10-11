@@ -237,7 +237,8 @@ test("S1.1: NOT_READY then successful FROZEN — both status records, one frozen
 test("S1.2: FROZEN then retry → ALREADY_FROZEN, zero provider calls, no new decision writes", async () => {
   const dir = await root();
   try {
-    const storage = new ObjectMarketStorage(new MemoryObjectClient());
+    const client = new MemoryObjectClient();
+    const storage = new ObjectMarketStorage(client);
     await storage.initialize();
     const id = securityId("fixture-provider", "issuer-1", "STOCK");
     const stamps = {
@@ -253,14 +254,14 @@ test("S1.2: FROZEN then retry → ALREADY_FROZEN, zero provider calls, no new de
     assert.equal(first.predictionStatus, "FROZEN");
     const callsAfterFirst = provider.totalCalls();
     assert.ok(callsAfterFirst > 0);
-    const beliefs1 = await storage.loadBeliefs(SESSION);
     const preds1 = await storage.loadPredictions(SESSION);
     const statuses1 = await storage.loadPredictionStatuses(SESSION);
 
     const retry = await new MarketsScanner(provider, storage, undefined, undefined, freezeNow(SESSION)).run(SESSION, "EVIDENCE_ONLY");
     assert.equal(retry.status, "ALREADY_FROZEN");
     assert.equal(provider.totalCalls(), callsAfterFirst); // zero new provider calls
-    assert.deepEqual(await storage.loadBeliefs(SESSION), beliefs1);
+    // Beliefs are retired: neither the frozen run nor the retry writes permanent/beliefs/.
+    assert.deepEqual(await client.list("permanent/beliefs/"), []);
     assert.deepEqual(await storage.loadPredictions(SESSION), preds1);
     assert.deepEqual(await storage.loadPredictionStatuses(SESSION), statuses1);
   } finally {

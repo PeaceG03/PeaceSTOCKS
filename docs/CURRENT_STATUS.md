@@ -29,7 +29,7 @@ Implemented areas include:
 - eligibility ladder;
 - deterministic feature recipes;
 - deterministic rankings;
-- scanner beliefs;
+- scanner beliefs (retired 2026-10: no longer written, and the rank read routes `/scanner/top15`, `/scanner/top50`, `/scanner/ticker/:t` are removed; the scanner never ranks; existing beliefs objects are kept);
 - prediction sets;
 - prediction availability status;
 - partition manifests/checksums;

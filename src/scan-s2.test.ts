@@ -120,7 +120,8 @@ test("DST: 05:30Z winter and summer are both due for previous ET date", () => {
 });
 
 test("S2: run at 22:00 ET on D → NOT_DUE, 0 requests, nothing written", async () => {
-  const storage = new ObjectMarketStorage(new MemoryObjectClient());
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
   await storage.initialize();
   const provider = new CountingProvider([providerRecord("i1", "AAA")], []);
   // 22:00 ET on 2026-10-05 (EDT) = 02:00Z on 2026-10-06
@@ -129,7 +130,7 @@ test("S2: run at 22:00 ET on D → NOT_DUE, 0 requests, nothing written", async 
   assert.equal(report.status, "NOT_DUE");
   assert.equal(provider.calls, 0);
   assert.equal((await storage.loadPredictionStatuses(D)).length, 0);
-  assert.equal((await storage.loadBeliefs(D)).length, 0);
+  assert.deepEqual(await client.list("permanent/beliefs/"), []);
   assert.equal((await storage.loadPredictions(D)).length, 0);
 });
 
