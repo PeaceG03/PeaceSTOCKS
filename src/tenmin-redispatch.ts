@@ -667,7 +667,7 @@ async function main(mode: string | undefined): Promise<void> {
     if (env.TENMIN_RECORD_FILE) writeFileSync(env.TENMIN_RECORD_FILE, `${JSON.stringify(record, null, 2)}\n`);
     output("next_action", decision.nextAction);
     output("reason", decision.reason);
-    process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", trigger: "chain", ...decision })}\n`);
+    process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", trigger: "chain", queueCheck: checkFailed ? `failed:${checkFailed}` : "ok", runsListed: runs.length, ...decision })}\n`);
     if (shouldDispatchHeal(decision)) {
       // Self-heal: a fallback run (outside peacestocks-r2-writer) sleeps until the window ends, then
       // decides with the same rules. A failed heal dispatch fails this step, so the stop alert fires.
@@ -726,7 +726,9 @@ async function main(mode: string | undefined): Promise<void> {
     });
     output("next_action", decision.nextAction);
     output("reason", decision.reason);
-    process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", trigger: "fallback", lastRun: record?.githubRunId, ...decision })}\n`);
+    // queueCheck is logged even when the decision does not depend on it (e.g. KILL_SWITCH_OFF), so
+    // every restarter tick shows whether the workflow token can list scanner.yml runs.
+    process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", trigger: "fallback", lastRun: record?.githubRunId, queueCheck: checkFailed ? `failed:${checkFailed}` : "ok", runsListed: runs.length, ...decision })}\n`);
     if (decision.dispatch) {
       // Build a record so a cancelled-scan stop can be written for the next fallback to read.
       const fallbackRecord: TenMinRunRecord = record ?? {
