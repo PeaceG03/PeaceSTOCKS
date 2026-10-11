@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { MarketProvider, ProviderSecurityRecord, ScannerRunReport } from "./contracts";
 import {
+  dailyBarsFromReply,
   dailyReplyDustFileKey,
   dailyReplyDustHashedFileKey,
   dailyReplyDustManifestKey,
@@ -13,7 +14,7 @@ import {
 } from "./daily-reply-dust";
 import { fakeR2 } from "./fake-r2.test-helper";
 import { sha256Hex } from "./intraday-reply-dust";
-import { MassiveMarketProvider } from "./massive-provider";
+import { MassiveMarketProvider, groupedDailySymbolIndex, symbolBySecurityIdFor } from "./massive-provider";
 import { MemoryObjectClient, type ObjectMetadata } from "./object-store";
 import { ObjectMarketStorage } from "./object-storage";
 import { MarketsScanner, US_EQUITY_CALENDAR } from "./scanner";
@@ -74,7 +75,7 @@ function reply(body: Uint8Array, requestId = "req-1") {
   };
 }
 
-function harness(bodies: Uint8Array[]) {
+function harness(bodies: Uint8Array[], now: () => string = () => AT) {
   let i = 0;
   let requests = 0;
   const massive = new MassiveMarketProvider({
@@ -82,7 +83,7 @@ function harness(bodies: Uint8Array[]) {
     minRequestIntervalMs: 0,
     retryBackoffMs: 0,
     keepRawReplies: true,
-    now: () => AT,
+    now,
     fetchImpl: async (input) => {
       const url = String(input);
       if (url.includes("/v3/reference/tickers")) {
@@ -487,4 +488,51 @@ test("A,B,C,B,A: every non-first copy always has resultsMatchFirst; C stays fals
   const finalManifest = await readDailyReplyDustManifest(store, DAY);
   assert.equal(finalManifest!.replySha256, sha256Hex(A.body));
   assert.equal(finalManifest!.copies?.length, 2); // B and C
+});
+
+test("scan: grouped Dust manifest carries the daily-bars observedAt/retrievalId; rows rebuild exactly from Dust", async () => {
+  // A ticking clock: the provider stamps bars (observedAt) and the reply (fetchedAt) at different
+  // instants, as in production. Before the fix the manifest kept fetchedAt and rebuilt rows differed.
+  let tick = 0;
+  const now = () => new Date(Date.parse(AT) + 1000 * tick++).toISOString();
+  const h = harness([groupedBody("req-scan")], now);
+  const store = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(new MemoryObjectClient());
+  const report = await new MarketsScanner(h.provider, storage, US_EQUITY_CALENDAR, {
+    enabled: true,
+    store,
+    zstdVersionProbe: pinnedZstd,
+  }, () => beforeNextSessionOpen(DAY)).run(DAY);
+  assert.equal(report.groupedReplyDust?.copies[0]?.status, "stored");
+  const rows = await storage.loadBars(DAY);
+  assert.ok(rows.length > 0);
+  const manifest = (await readDailyReplyDustManifest(store, DAY))!;
+  assert.equal(manifest.observedAt, rows[0]!.observedAt);
+  assert.notEqual(manifest.observedAt, AT, "clock ticked: fetchedAt alone would differ");
+  assert.equal(manifest.retrievalId, "req-scan");
+  for (const row of rows) assert.equal(row.provenance.retrievalId, manifest.retrievalId);
+  const bySymbol = groupedDailySymbolIndex(symbolBySecurityIdFor(universe), rows.map((row) => row.securityId));
+  const rebuilt = dailyBarsFromReply({
+    provider: manifest.provider,
+    sessionDate: DAY,
+    observedAt: manifest.observedAt,
+    reply: await readDailyReplyDustReply(store, manifest),
+    bySymbol,
+  });
+  assert.deepEqual(rebuilt, rows);
+});
+
+test("maybeStore: observedAt given → manifest uses it; absent → fetchedAt (backfill rule)", async () => {
+  const held = (body: Uint8Array) => ({ providerName: PROVIDER, takeRawReplies: () => [reply(body)] });
+  const a = new MemoryObjectClient();
+  await maybeStoreScanGroupedReplyDust({
+    enabled: true, store: a, provider: held(groupedBody("x")), sessionDate: DAY,
+    observedAt: "2026-01-20T23:00:05.000Z", zstdVersionProbe: pinnedZstd,
+  });
+  assert.equal((await readDailyReplyDustManifest(a, DAY))!.observedAt, "2026-01-20T23:00:05.000Z");
+  const b = new MemoryObjectClient();
+  await maybeStoreScanGroupedReplyDust({
+    enabled: true, store: b, provider: held(groupedBody("x")), sessionDate: DAY, zstdVersionProbe: pinnedZstd,
+  });
+  assert.equal((await readDailyReplyDustManifest(b, DAY))!.observedAt, AT);
 });

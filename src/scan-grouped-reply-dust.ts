@@ -444,6 +444,12 @@ export async function maybeStoreScanGroupedReplyDust(options: {
   store?: ReplyDustStore;
   provider: { providerName: string; takeRawReplies?: () => ProviderRawReply[] };
   sessionDate: string;
+  /**
+   * observedAt the scan's daily-bars rows carry (the provider stamps it on every bar, separate
+   * from the reply's fetchedAt). Stored on the manifest so rows rebuild exactly from Dust, the
+   * same as backfill. Absent (no matching bar): falls back to fetchedAt, as backfill does.
+   */
+  observedAt?: string;
   backend?: ReplyDustBackend;
   zstdVersionProbe?: ZstdVersionProbe;
 }): Promise<ScanGroupedReplyDustReport> {
@@ -489,6 +495,7 @@ export async function maybeStoreScanGroupedReplyDust(options: {
       store: options.store,
       reply,
       provider: options.provider.providerName,
+      ...(options.observedAt ? { observedAt: options.observedAt } : {}),
       ...(options.backend ? { backend: options.backend } : {}),
       ...(options.zstdVersionProbe ? { zstdVersionProbe: options.zstdVersionProbe } : {}),
     });

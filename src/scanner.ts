@@ -237,11 +237,15 @@ export class MarketsScanner {
     // corporate-actions failed after getDailyBars kept raw bytes).
     let groupedReplyDust: ScanGroupedReplyDustReport | undefined;
     if (this.groupedReplyDust) {
+      // Same observedAt the daily-bars rows got (backfill uses bars[0].observedAt too); the
+      // retrievalId on both sides is the reply's request_id. Rows then rebuild exactly from Dust.
+      const barsObservedAt = bars.find((bar) => bar.sessionDate === sessionDate)?.observedAt;
       groupedReplyDust = await maybeStoreScanGroupedReplyDust({
         enabled: this.groupedReplyDust.enabled,
         ...(this.groupedReplyDust.store ? { store: this.groupedReplyDust.store } : {}),
         provider: this.provider,
         sessionDate,
+        ...(barsObservedAt ? { observedAt: barsObservedAt } : {}),
         ...(this.groupedReplyDust.backend ? { backend: this.groupedReplyDust.backend } : {}),
         ...(this.groupedReplyDust.zstdVersionProbe
           ? { zstdVersionProbe: this.groupedReplyDust.zstdVersionProbe }
