@@ -54,6 +54,8 @@ export interface MarketStore {
   loadDailyBarSessions(month: string): Promise<DailyBarSessionIndex>;
   appendBars(records: CanonicalDailyBar[]): Promise<void>;
   appendActions(records: CorporateAction[]): Promise<void>;
+  /** Optional: record sessions whose corporate actions were fetched (object store only). */
+  recordCorporateActionCoverage?(records: import("./corporate-action-coverage").CorporateActionCoverageRecord[]): Promise<void>;
   writePredictions(records: PredictionSet[]): Promise<void>;
   writePredictionStatus(record: PredictionStatus): Promise<void>;
   loadPredictions(sessionDate?: string): Promise<PredictionSet[]>;

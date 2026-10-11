@@ -1,6 +1,7 @@
 // Daily-bars coverage check: every NYSE trading session from the first stored session to the last
 // one that should be stored must have its daily-bars pack (written for every stored session) and
-// its month JSONL. LIST only (two prefixes): no GET, no Massive, no writes.
+// its month JSONL (LIST of two prefixes), and its corporate actions (splits + dividends) must have been
+// fetched: a coverage line or at least one stored action (two GETs). No Massive, no writes.
 //
 // Why: backfill was dispatched as hand-picked ranges (default 2026-08-21..2026-10-02, max_sessions
 // 35/60) and nothing checked that the ranges joined up, so 2025-09-22..09-30 (a range cut by
@@ -8,6 +9,7 @@
 // with no signal. This check makes any such hole fail the scan job loudly.
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { CORPORATE_ACTIONS_KEY, CORPORATE_ACTION_COVERAGE_KEY, actionEffectiveDates, coverageSessions } from "./corporate-action-coverage";
 import { DAILY_BARS_SIDECAR_PREFIX } from "./daily-bars-sidecar";
 import { R2ObjectClient } from "./object-store";
 import type { SessionCalendar } from "./scanner";
@@ -17,6 +19,7 @@ import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 export const DAILY_BARS_MONTH_PREFIX = "permanent/daily-bars/";
 export const DAILY_BARS_COVERAGE_GAP = "DAILY_BARS_COVERAGE_GAP" as const;
 export const DAILY_BARS_COVERAGE_STALE = "DAILY_BARS_COVERAGE_STALE" as const;
+export const CORPORATE_ACTIONS_COVERAGE_GAP = "CORPORATE_ACTIONS_COVERAGE_GAP" as const;
 
 /** Pure: NYSE trading sessions (normal and half days) in [from, to], by the scanner calendar. */
 export function tradingSessionsInRange(from: string, to: string, calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR): string[] {
@@ -56,6 +59,12 @@ export interface DailyBarsCoverageReport {
   missingMonthFiles: string[];
   /** Newest stored session is older than the last session that should be stored. */
   stale?: { latestStored: string; expectedAtLeast: string };
+  /**
+   * Present when corporate-action inputs were given: trading sessions in range with neither a
+   * coverage line nor any stored action (splits + dividends never fetched), oldest first.
+   */
+  missingCorporateActionSessions?: string[];
+  missingCorporateActionRanges?: { from: string; to: string; sessions: number }[];
   /** Stored sessions that are not trading sessions (calendar mismatch). */
   notTradingSessions: string[];
   failures: string[];
@@ -72,6 +81,10 @@ export function dailyBarsCoverage(input: {
   from?: string;
   expectedLatest?: string;
   calendar?: SessionCalendar;
+  /** effectiveDate of every stored corporate action; with coverageSessions, enables the action check. */
+  actionDates?: ReadonlySet<string>;
+  /** Sessions with a corporate-actions-coverage line. */
+  actionCoverageSessions?: ReadonlySet<string>;
 }): DailyBarsCoverageReport {
   const calendar = input.calendar ?? US_EQUITY_MARKET_CALENDAR;
   const stored = new Set<string>();
@@ -96,15 +109,24 @@ export function dailyBarsCoverage(input: {
   const expected = tradingSessionsInRange(from, to, calendar);
   // A session without its month file is missing too, even if a pack exists.
   const missing = expected.filter((d) => !stored.has(d) || !months.has(d.slice(0, 7)));
-  const ranges: DailyBarsCoverageReport["missingRanges"] = [];
   const index = new Map(expected.map((d, i) => [d, i]));
-  for (const d of missing) {
-    const last = ranges.at(-1);
-    if (last && index.get(last.to)! + 1 === index.get(d)) {
-      last.to = d;
-      last.sessions += 1;
-    } else ranges.push({ from: d, to: d, sessions: 1 });
-  }
+  const rangesOf = (dates: readonly string[]) => {
+    const ranges: DailyBarsCoverageReport["missingRanges"] = [];
+    for (const d of dates) {
+      const last = ranges.at(-1);
+      if (last && index.get(last.to)! + 1 === index.get(d)) {
+        last.to = d;
+        last.sessions += 1;
+      } else ranges.push({ from: d, to: d, sessions: 1 });
+    }
+    return ranges;
+  };
+  const ranges = rangesOf(missing);
+  const checkActions = input.actionDates !== undefined || input.actionCoverageSessions !== undefined;
+  const missingActions = checkActions
+    ? expected.filter((d) => !input.actionDates?.has(d) && !input.actionCoverageSessions?.has(d))
+    : [];
+  const actionRanges = rangesOf(missingActions);
   const missingMonthFiles = [...new Set(missing.map((d) => d.slice(0, 7)))].filter((m) => !months.has(m)).sort();
   const notTradingSessions = storedSorted.filter((d) => calendar.getSession(d).kind === "CLOSED");
   if (missing.length)
@@ -114,6 +136,8 @@ export function dailyBarsCoverage(input: {
     stale = { latestStored: latest, expectedAtLeast: input.expectedLatest };
     failures.push(`${DAILY_BARS_COVERAGE_STALE}:latest=${latest}:expected=${input.expectedLatest}`);
   }
+  if (missingActions.length)
+    failures.push(`${CORPORATE_ACTIONS_COVERAGE_GAP}:${missingActions.length}:${actionRanges.map((r) => (r.from === r.to ? r.from : `${r.from}..${r.to}`)).join(",")}`);
   if (notTradingSessions.length) failures.push(`DAILY_BARS_COVERAGE_NOT_TRADING_SESSION:${notTradingSessions.join(",")}`);
   return {
     ok: failures.length === 0,
@@ -125,6 +149,7 @@ export function dailyBarsCoverage(input: {
     missingRanges: ranges,
     missingMonthFiles,
     ...(stale ? { stale } : {}),
+    ...(checkActions ? { missingCorporateActionSessions: missingActions, missingCorporateActionRanges: actionRanges } : {}),
     notTradingSessions,
     failures,
   };
@@ -140,25 +165,34 @@ export function dailyBarsExpectedLatest(now: Date, calendar: SessionCalendar = U
 }
 
 export async function checkDailyBarsCoverage(
-  client: { list(prefix: string): Promise<string[]> },
+  client: { list(prefix: string): Promise<string[]>; get?(key: string): Promise<Uint8Array | undefined> },
   options: { from?: string; now?: Date; calendar?: SessionCalendar } = {},
 ): Promise<DailyBarsCoverageReport> {
   const [packKeys, monthKeys] = await Promise.all([client.list(`${DAILY_BARS_SIDECAR_PREFIX}/`), client.list(DAILY_BARS_MONTH_PREFIX)]);
+  // Corporate actions: two GETs (the actions file and the coverage file) when the client can read.
+  const actions = client.get
+    ? {
+        actionDates: actionEffectiveDates(await client.get(CORPORATE_ACTIONS_KEY)),
+        actionCoverageSessions: coverageSessions(await client.get(CORPORATE_ACTION_COVERAGE_KEY)),
+      }
+    : {};
   return dailyBarsCoverage({
     packKeys,
     monthKeys,
     ...(options.from ? { from: options.from } : {}),
     expectedLatest: dailyBarsExpectedLatest(options.now ?? new Date(), options.calendar),
+    ...actions,
     ...(options.calendar ? { calendar: options.calendar } : {}),
   });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
   const env = process.env;
-  checkDailyBarsCoverage(R2ObjectClient.fromEnv(env), env.DAILY_BARS_COVERAGE_FROM ? { from: env.DAILY_BARS_COVERAGE_FROM } : {})
+  Promise.resolve()
+    .then(() => checkDailyBarsCoverage(R2ObjectClient.fromEnv(env), env.DAILY_BARS_COVERAGE_FROM ? { from: env.DAILY_BARS_COVERAGE_FROM } : {}))
     .then((report) => {
-      const { missingSessions, ...summary } = report;
-      process.stdout.write(`${JSON.stringify({ mode: "daily-bars-coverage", ...summary, missingSessionsCount: missingSessions.length })}\n`);
+      const { missingSessions, missingCorporateActionSessions, ...summary } = report;
+      process.stdout.write(`${JSON.stringify({ mode: "daily-bars-coverage", ...summary, missingSessionsCount: missingSessions.length, missingCorporateActionSessionsCount: missingCorporateActionSessions?.length })}\n`);
       if (!report.ok) {
         // Loud: annotation + failed step (GitHub's failed-run notification). Codes and dates only.
         process.stdout.write(`::error title=Daily bars missing sessions::${report.failures.join(" | ").slice(0, 900)}\n`);

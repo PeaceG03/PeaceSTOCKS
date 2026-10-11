@@ -1,3 +1,4 @@
+import { CORPORATE_ACTION_COVERAGE_KEY, type CorporateActionCoverageRecord } from "./corporate-action-coverage";
 import { createHash } from "node:crypto";
 import type {
   CanonicalDailyBar,
@@ -169,6 +170,16 @@ export class ObjectMarketStorage implements MarketStore {
 
   async appendActions(records: CorporateAction[]): Promise<void> {
     await this.appendUnique("permanent/corporate-actions.jsonl", records, (record) => record.actionId);
+  }
+
+  /** One line per session whose splits + dividends were fetched and stored (see corporate-action-coverage.ts). */
+  async recordCorporateActionCoverage(records: CorporateActionCoverageRecord[]): Promise<void> {
+    if (!records.length) return;
+    await this.appendUnique(
+      CORPORATE_ACTION_COVERAGE_KEY,
+      records as unknown as StoredRecord[],
+      (record) => (record as unknown as CorporateActionCoverageRecord).sessionDate,
+    );
   }
 
   async writePredictions(records: PredictionSet[]): Promise<void> {

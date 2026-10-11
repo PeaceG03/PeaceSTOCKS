@@ -22,6 +22,7 @@ import type { MarketStore } from "./storage";
 import { US_EQUITY_MARKET_CALENDAR, usEquityCalendarSha256 } from "./us-calendar";
 import type { DustReader } from "./reader";
 import { type ScanDailyBarsSidecarReport, maybeWriteScanDailyBarsSidecar } from "./daily-bars-sidecar";
+import { corporateActionCoverageRecords } from "./corporate-action-coverage";
 import type { ReplyDustStore } from "./intraday-reply-dust";
 import type { ReplyDustBackend } from "./reply-dust";
 import type { ZstdVersionProbe } from "./reply-dust-pin";
@@ -231,6 +232,17 @@ export class MarketsScanner {
       [bars, actions] = await Promise.all([barsPromise, actionsPromise]);
       await this.storage.appendBars(bars);
       await this.storage.appendActions(actions);
+      // Coverage line for the session (zero actions leaves no line in corporate-actions.jsonl).
+      // Not fatal here: a missing line is flagged by the daily-bars coverage check instead.
+      await this.storage
+        .recordCorporateActionCoverage?.(
+          corporateActionCoverageRecords([sessionDate], actions, {
+            provider: this.provider.providerName,
+            source: "scan",
+            recordedAt: new Date().toISOString(),
+          }),
+        )
+        .catch((error: unknown) => console.warn(`CORPORATE_ACTION_COVERAGE_WRITE_FAILED:${sessionDate}:${String(error)}`));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       failures.push(

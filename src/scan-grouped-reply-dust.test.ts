@@ -645,3 +645,20 @@ test("daily-bars pack: exists-same on a rescan is fine (run not failed by the pa
   assert.equal(same.status, "exists-same");
   assert.equal(same.failure, undefined);
 });
+
+test("scan records corporate-action coverage for its session (also with zero actions), idempotently", async () => {
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
+  const h = harness([groupedBody("cov")]);
+  await new MarketsScanner(h.provider, storage, US_EQUITY_CALENDAR, undefined, () => beforeNextSessionOpen(DAY)).run(DAY);
+  const body = new TextDecoder().decode((await client.get("permanent/corporate-actions-coverage.jsonl"))!);
+  const lines = body.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].sessionDate, DAY);
+  assert.equal(lines[0].actions, 0);
+  assert.equal(lines[0].source, "scan");
+  assert.deepEqual(lines[0].datasets, ["stocks-splits", "stocks-dividends"]);
+  // A second record for the same session keeps the first line (appendUnique by sessionDate).
+  await storage.recordCorporateActionCoverage([{ ...lines[0], recordedAt: "2099-01-01T00:00:00.000Z" }]);
+  assert.equal(new TextDecoder().decode((await client.get("permanent/corporate-actions-coverage.jsonl"))!), body);
+});

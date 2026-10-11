@@ -19,6 +19,7 @@ import {
   symbolBySecurityIdFor,
 } from "./massive-provider";
 import { openMarketStore } from "./object-storage";
+import { corporateActionCoverageRecords } from "./corporate-action-coverage";
 import { REPLY_DUST_FALLBACK_VERSION, type ReplyDustBackend } from "./reply-dust";
 import {
   type ZstdVersionProbe,
@@ -367,6 +368,15 @@ export async function backfillHistoricalEvidence(options: {
         const actions = await provider.getCorporateActions(sessionDate, activeIds);
         await storage.appendActions(actions);
         actionsStored += actions.length;
+        await storage
+          .recordCorporateActionCoverage?.(
+            corporateActionCoverageRecords([sessionDate], actions, {
+              provider: provider.providerName,
+              source: "backfill",
+              recordedAt: new Date().toISOString(),
+            }),
+          )
+          .catch((error: unknown) => console.warn(`CORPORATE_ACTION_COVERAGE_WRITE_FAILED:${sessionDate}:${String(error)}`));
       } catch (error) {
         const message = String(error);
         if (message.includes("PROVIDER_NOT_READY") || message.includes("MASSIVE_CREDENTIAL_REJECTED"))

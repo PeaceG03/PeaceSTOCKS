@@ -9,6 +9,7 @@ import {
   tradingSessionsInRange,
 } from "./daily-bars-coverage";
 import { MemoryObjectClient } from "./object-store";
+import { actionEffectiveDates, corporateActionCoverageRecords, coverageSessions } from "./corporate-action-coverage";
 
 const pack = (d: string) => [`permanent/daily-bars-sidecar/${d}/manifest.json`, `permanent/daily-bars-sidecar/${d}/sidecar.dbs`];
 const month = (m: string) => `permanent/daily-bars/${m}.jsonl`;
@@ -81,17 +82,23 @@ test("expected latest: one session of slack behind the last completed ET session
   assert.equal(previousTradingSession("2025-11-28"), "2025-11-26");
 });
 
-test("checkDailyBarsCoverage lists the two prefixes only (no GET)", async () => {
+test("checkDailyBarsCoverage lists the two prefixes and reads only the two corporate-action objects", async () => {
   const client = new MemoryObjectClient();
   for (const d of tradingSessionsInRange("2026-10-01", "2026-10-09").filter((x) => x !== "2026-10-06")) {
     for (const key of pack(d)) await client.put(key, new Uint8Array([1]));
     await client.put(month(d.slice(0, 7)), new Uint8Array([1]));
   }
-  let gets = 0;
-  const wrapped = { list: (p: string) => client.list(p), get: async () => { gets += 1; return undefined; } };
+  const gets: string[] = [];
+  const wrapped = { list: (p: string) => client.list(p), get: async (k: string) => { gets.push(k); return client.get(k); } };
   const report = await checkDailyBarsCoverage(wrapped, { now: new Date("2026-10-11T13:00:00Z") });
   assert.deepEqual(report.missingSessions, ["2026-10-06"]);
-  assert.equal(gets, 0);
+  // Only the two corporate-action objects are read; packs and month files are listed, never read.
+  assert.deepEqual(gets, ["permanent/corporate-actions.jsonl", "permanent/corporate-actions-coverage.jsonl"]);
+  // Nothing stored for actions: every session is a corporate-action gap.
+  assert.equal(report.missingCorporateActionSessions?.length, 7); // 2026-10-01..10-09 (10-06 included: no pack, no actions)
+  // A list-only client skips the action check.
+  const listOnly = await checkDailyBarsCoverage({ list: (p: string) => client.list(p) }, { now: new Date("2026-10-11T13:00:00Z") });
+  assert.equal(listOnly.missingCorporateActionSessions, undefined);
 });
 
 test("scanner.yml: the scan job runs the coverage check after the scan, even when the scan failed", async () => {
@@ -104,4 +111,30 @@ test("scanner.yml: the scan job runs the coverage check after the scan, even whe
   assert.match(step, /if: \$\{\{ always\(\) \}\}/u);
   assert.match(step, /run: pnpm exec tsx src\/daily-bars-coverage\.ts/u);
   assert.doesNotMatch(step, /continue-on-error/u);
+});
+
+test("corporate actions: a session is covered by a coverage line or by any stored action; others are gaps", () => {
+  const sessions = tradingSessionsInRange("2025-09-15", "2025-10-31");
+  const s = store(sessions);
+  const actions = sessions.filter((d) => d !== "2025-10-14" && !(d >= "2025-09-22" && d <= "2025-09-30") && !(d >= "2025-10-29"));
+  const actionsBody = new TextEncoder().encode(actions.map((d) => JSON.stringify({ actionId: `a-${d}`, actionType: "DIVIDEND", effectiveDate: d })).join("\n") + "\n");
+  // 2025-10-14 had zero actions but was fetched: its coverage line covers it.
+  const cov = corporateActionCoverageRecords(["2025-10-14"], [], { provider: "massive-stocks", source: "scan", recordedAt: "2026-10-11T00:00:00.000Z" });
+  const covBody = new TextEncoder().encode(cov.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  const r = dailyBarsCoverage({ ...s, actionDates: actionEffectiveDates(actionsBody), actionCoverageSessions: coverageSessions(covBody) });
+  assert.deepEqual(r.missingSessions, []);
+  assert.deepEqual(r.missingCorporateActionRanges, [
+    { from: "2025-09-22", to: "2025-09-30", sessions: 7 },
+    { from: "2025-10-29", to: "2025-10-31", sessions: 3 },
+  ]);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.failures, ["CORPORATE_ACTIONS_COVERAGE_GAP:10:2025-09-22..2025-09-30,2025-10-29..2025-10-31"]);
+  // Without the coverage line, the zero-action day is a gap too.
+  const r2 = dailyBarsCoverage({ ...s, actionDates: actionEffectiveDates(actionsBody), actionCoverageSessions: new Set() });
+  assert.ok(r2.missingCorporateActionSessions!.includes("2025-10-14"));
+  // Refilled: coverage lines for the missing ten -> OK.
+  const filled = corporateActionCoverageRecords(r.missingCorporateActionSessions!, [], { provider: "massive-stocks", source: "daily-gap-refill", recordedAt: "x" });
+  const r3 = dailyBarsCoverage({ ...s, actionDates: actionEffectiveDates(actionsBody), actionCoverageSessions: new Set([...coverageSessions(covBody), ...filled.map((f) => f.sessionDate)]) });
+  assert.equal(r3.ok, true);
+  assert.equal(filled[0]!.actions, 0);
 });
