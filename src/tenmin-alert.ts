@@ -8,7 +8,14 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type TenMinRunRecord, countOtherActiveScannerRuns } from "./tenmin-redispatch";
+import {
+  TENMIN_SCAN_CHECK_AUTO_RESTARTS,
+  TENMIN_STOP_SCAN_CHECK_FAILED,
+  TENMIN_STOP_SCAN_CHECK_NEEDS_PERSON,
+  type TenMinRunRecord,
+  countOtherActiveScannerRuns,
+  tenMinScanCheckRestartAt,
+} from "./tenmin-redispatch";
 
 export const SCANNER_ALERT_LABEL = "scanner-alert";
 export const SCANNER_ALERT_ASSIGNEE = "PeaceG03";
@@ -117,11 +124,27 @@ export function alertText(opts: {
       ? [`- Ranges: ${opts.record.outcome.rangesSealed} sealed of ${opts.record.outcome.rangesPlanned} planned, ${opts.record.outcome.rangesRemaining} remaining`]
       : []),
     `- Time: ${mountainTime(opts.now)}`,
+    ...scanCheckNote(opts.reason, opts.record),
     ``,
     `This issue closes itself with "Chain running again" when a later run chains successfully.`,
     alertMarker(opts.key),
   ];
   return { title: `Scanner stopped: ${short}`, body: lines.join("\n") };
+}
+
+/** Pure: what happens next after an active-run check stop (one auto-restart, then a person). */
+export function scanCheckNote(reason: string, record: TenMinRunRecord | undefined): string[] {
+  if (reason.startsWith(`${TENMIN_STOP_SCAN_CHECK_NEEDS_PERSON}:`))
+    return [``, `**Needs a person.** The active-run check failed again right after the one automatic restart. The chain stays stopped until someone fixes the cause and dispatches tenmin_history.`];
+  if (!reason.startsWith(`${TENMIN_STOP_SCAN_CHECK_FAILED}:`)) return [];
+  const stops = record?.scanCheckStops ?? 1;
+  if (stops > TENMIN_SCAN_CHECK_AUTO_RESTARTS)
+    return [``, `**Needs a person.** This is consecutive active-run check failure #${stops}; the restarter will not restart the chain again. Fix the cause and dispatch tenmin_history.`];
+  const at = record?.finishedAt ? tenMinScanCheckRestartAt(reason, record.finishedAt) : undefined;
+  return [
+    ``,
+    `The restarter will restart the chain once by itself${at ? ` at or after ${mountainTime(at)}` : ""} (GitHub's API limit resets hourly). If that run fails the same way, the chain stops for good and needs a person.`,
+  ];
 }
 
 // ---- CLI (thin I/O) ----

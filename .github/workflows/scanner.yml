@@ -53,6 +53,10 @@ on:
         description: "tenmin_history only: run number in an auto re-dispatch chain (0 = started by a human; set by the chain)"
         required: false
         default: "0"
+      tenmin_scan_check_stops:
+        description: "tenmin_history only: consecutive STOP_SCAN_CHECK_FAILED runs before this one (set by the restarter's one auto-restart; 0 otherwise)"
+        required: false
+        default: "0"
   schedule:
     # 05:30 UTC Tue–Sat: just after midnight ET (00:30 EST / 01:30 EDT) so collectionDue targets the
     # previous ET trading day (S2: due only when ET date strictly after D). Saturday covers Friday.
@@ -424,6 +428,7 @@ jobs:
           TENMIN_AUTO_REDISPATCH: ${{ vars.TENMIN_AUTO_REDISPATCH }}
           TENMIN_AUTO_REDISPATCH_MAX_CHAIN: ${{ vars.TENMIN_AUTO_REDISPATCH_MAX_CHAIN }}
           TENMIN_CHAIN: ${{ github.event.inputs.tenmin_history_chain }}
+          TENMIN_SCAN_CHECK_STOPS: ${{ github.event.inputs.tenmin_scan_check_stops }}
           TENMIN_STEP_OUTCOME: ${{ steps.history.outcome }}
           TENMIN_OUTCOME_FILE: ${{ runner.temp }}/tenmin-history-outcome.json
           TENMIN_RECORD_FILE: ${{ runner.temp }}/tenmin-history-record.json

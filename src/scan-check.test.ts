@@ -13,11 +13,15 @@ import {
   rateLimitInfo,
   scanYieldReason,
 } from "./scan-yield";
-import { planTenMinAlert } from "./tenmin-alert";
+import { alertText, planTenMinAlert, scanCheckNote } from "./tenmin-alert";
 import type { TenMinHistoryRunReport } from "./tenmin-history";
 import {
   TENMIN_STOP_SCAN_CHECK_FAILED,
+  type TenMinRedispatchInput,
+  type TenMinRunRecord,
   decideTenMinRedispatch,
+  tenMinScanCheckRestartAt,
+  tenMinScanCheckStops,
   tenMinRunOutcome,
   tenMinScanCheckFailure,
 } from "./tenmin-redispatch";
@@ -207,7 +211,7 @@ test("fail closed: a rate limit resetting in 40 min stops at once (no sleep), wi
   const slept: number[] = [];
   const check = createScanYieldCheck({ env: ENV, now: () => new Date("2026-10-11T07:15:00Z"), fetchImpl, sleep: async (ms) => void slept.push(ms) });
   const reason = await check();
-  assert.equal(reason, "SCAN_CHECK_FAILED:http-403:rate-limited:attempts=1");
+  assert.equal(reason, "SCAN_CHECK_FAILED:http-403:rate-limited:attempts=1:reset=2026-10-11T07:55:00.000Z");
   assert.deepEqual(slept, []);
   assert.equal(isScanCheckFailure(reason), true);
   assert.equal(isScanCheckFailure("SCAN_GUARD_WINDOW:x"), false);
@@ -297,11 +301,120 @@ test("a persistent check failure stops the chain and alerts (paused or not); a s
   const paused = decideTenMinRedispatch({ ...base, jobResult: "failure", killSwitch: "false" });
   const alertPaused = planTenMinAlert({ trigger: "chain", record: { ...record, decision: paused }, historyStep: "failure", redispatchStep: "success", nextAction: paused.nextAction, reason: paused.reason, killSwitch: "false" });
   assert.equal(alertPaused.action, "alert");
-  // The fallback never restarts it.
-  const fallback = decideTenMinRedispatch({ ...base, trigger: "fallback", jobResult: "failure", killSwitch: "true" });
-  assert.equal(fallback.nextAction, "stop");
+  // The fallback does not restart it right away (one auto-restart only after the reset: see below).
+  const fallback = decideTenMinRedispatch({ ...base, trigger: "fallback", jobResult: "failure", killSwitch: "true", finishedAt: "2026-10-11T07:15:56Z", scanCheckStops: 1 });
+  assert.equal(fallback.dispatch, false);
 
   const scanYield = tenMinRunOutcome(historyReport({ yieldedForScan: "SCAN_RUN_WAITING:42:schedule:queued" }));
   assert.equal(scanYield.nextAction, "continue");
   assert.equal(tenMinScanCheckFailure(historyReport({ yieldedForScan: "SCAN_GUARD_WINDOW:x" })), undefined);
+});
+
+// ---- one auto-restart after STOP_SCAN_CHECK_FAILED (GitHub's API limit resets hourly) ----
+
+const FAILED_AT = "2026-10-11T07:15:56.000Z";
+const failReason = (reset?: string) => `SCAN_CHECK_FAILED:http-403:rate-limited:attempts=1${reset ? `:reset=${reset}` : ""}`;
+const failedOutcome = (reset?: string) => tenMinRunOutcome(historyReport({ yieldedForScan: failReason(reset) }));
+// A run that got past the check (it later yielded to a queued scan): the chain continues.
+const okOutcome = tenMinRunOutcome(historyReport({ yieldedForScan: "SCAN_RUN_WAITING:42:schedule:queued" }));
+
+/** The fallback reading a stored record (as the restarter does), at a given time. */
+function fallbackAt(record: Pick<TenMinRunRecord, "outcome" | "jobResult" | "chain" | "finishedAt"> & { scanCheckStops?: number }, nowIso: string, extra: Partial<TenMinRedispatchInput> = {}) {
+  return decideTenMinRedispatch({
+    trigger: "fallback",
+    outcome: record.outcome,
+    jobResult: record.jobResult,
+    nowUtc: new Date(nowIso),
+    queue: { otherActiveRuns: 0 },
+    killSwitch: "true",
+    chain: record.chain,
+    maxChain: undefined,
+    finishedAt: record.finishedAt,
+    ...(record.scanCheckStops !== undefined ? { scanCheckStops: record.scanCheckStops } : {}),
+    ...extra,
+  });
+}
+
+test("scan-check stop: the first failure gets exactly one auto-restart, not before 1 h after the stop", () => {
+  const outcome = failedOutcome();
+  // The chain step of the failed run records the count durably in its run record (artifact).
+  const stops = tenMinScanCheckStops(outcome, 0);
+  assert.equal(stops, 1);
+  const record = { outcome, jobResult: "failure", chain: 8, finishedAt: FAILED_AT, scanCheckStops: stops };
+  const early = fallbackAt(record, "2026-10-11T08:00:00Z");
+  assert.deepEqual([early.dispatch, early.nextAction, early.reason], [false, "wait", "WAIT_SCAN_CHECK_RESET:until=2026-10-11T08:15:56.000Z"]);
+  const due = fallbackAt(record, "2026-10-11T08:47:00Z");
+  assert.deepEqual([due.dispatch, due.nextAction, due.reason, due.scanCheckStops, due.nextChain], [true, "continue", "CONTINUE_SCAN_CHECK_RETRY:attempt=1", 1, 9]);
+  // An older record without the count is a first failure.
+  const { scanCheckStops: _drop, ...older } = record;
+  assert.equal(fallbackAt(older, "2026-10-11T08:47:00Z").dispatch, true);
+});
+
+test("scan-check stop: waits for GitHub's reported reset when it is later than 1 h", () => {
+  const reset = "2026-10-11T08:40:00.000Z";
+  assert.equal(tenMinScanCheckRestartAt(failReason(reset), FAILED_AT)?.toISOString(), reset);
+  assert.equal(tenMinScanCheckRestartAt(failReason("2026-10-11T07:30:00.000Z"), FAILED_AT)?.toISOString(), "2026-10-11T08:15:56.000Z");
+  const record = { outcome: failedOutcome(reset), jobResult: "failure", chain: 8, finishedAt: FAILED_AT, scanCheckStops: 1 };
+  assert.equal(fallbackAt(record, "2026-10-11T08:30:00Z").reason, `WAIT_SCAN_CHECK_RESET:until=${reset}`);
+  assert.equal(fallbackAt(record, "2026-10-11T08:41:00Z").dispatch, true);
+});
+
+test("scan-check stop: a second consecutive failure is not restarted (needs a person, and the alert says so)", () => {
+  // The restarted run was dispatched with tenmin_scan_check_stops=1 and failed the same way.
+  const outcome = failedOutcome();
+  const stops = tenMinScanCheckStops(outcome, 1);
+  assert.equal(stops, 2);
+  const record = { outcome, jobResult: "failure", chain: 9, finishedAt: "2026-10-11T09:00:00.000Z", scanCheckStops: stops };
+  for (const now of ["2026-10-11T10:30:00Z", "2026-10-11T12:47:00Z", "2026-10-12T12:47:00Z"]) {
+    const d = fallbackAt(record, now);
+    assert.deepEqual([d.dispatch, d.nextAction, d.reason], [false, "stop", "STOP_SCAN_CHECK_NEEDS_PERSON:stops=2"]);
+  }
+  const full = { ...record, githubRunId: "2", decision: fallbackAt(record, "2026-10-11T10:30:00Z") };
+  const plan = planTenMinAlert({ trigger: "fallback", record: full, redispatchStep: "success", nextAction: "stop", reason: full.decision.reason, killSwitch: "true", otherActiveRuns: 0 });
+  assert.equal(plan.action, "alert");
+  assert.match(scanCheckNote(full.decision.reason, full).join("\n"), /Needs a person/u);
+  // The chain step's own alert for the second failure says the same.
+  const chainText = alertText({ reason: outcome.reason, key: "k", runUrl: "u", trigger: "chain", record: full, now: new Date("2026-10-11T09:00:00Z") });
+  assert.match(chainText.body, /Needs a person/u);
+  // The first failure's alert says it will restart once.
+  const firstText = alertText({ reason: outcome.reason, key: "k", runUrl: "u", trigger: "chain", record: { ...full, scanCheckStops: 1, finishedAt: FAILED_AT }, now: new Date(FAILED_AT) });
+  assert.match(firstText.body, /restart the chain once by itself at or after/u);
+  assert.match(firstText.body, /stops for good and needs a person/u);
+});
+
+test("scan-check stop: a successful run in between resets the count, so a later failure gets its restart again", () => {
+  // Restarted run (dispatched with 1) gets past the check: its record carries 0.
+  assert.equal(tenMinScanCheckStops(okOutcome, 1), 0);
+  assert.equal(okOutcome.nextAction, "continue");
+  // The chain continues with normal dispatches (no input => 0). A later failure is a first failure.
+  const later = tenMinScanCheckStops(failedOutcome(), 0);
+  assert.equal(later, 1);
+  const d = fallbackAt({ outcome: failedOutcome(), jobResult: "failure", chain: 3, finishedAt: "2026-10-12T01:00:00.000Z", scanCheckStops: later }, "2026-10-12T02:10:00Z");
+  assert.equal(d.dispatch, true);
+  // Non-check stops never count.
+  assert.equal(tenMinScanCheckStops(tenMinRunOutcome(historyReport({ stoppedOnError: true, error: "boom" })), 1), 0);
+  assert.equal(tenMinScanCheckStops(undefined, 1), 0);
+});
+
+test("scan-check restart respects the kill switch, guard windows, a queued run, a newer failed run and the chain cap", () => {
+  const record = { outcome: failedOutcome(), jobResult: "failure", chain: 8, finishedAt: FAILED_AT, scanCheckStops: 1 };
+  for (const killSwitch of ["false", "", undefined]) {
+    const d = fallbackAt(record, "2026-10-11T08:47:00Z", { killSwitch });
+    assert.deepEqual([d.dispatch, d.nextAction, d.reason], [false, "stop", "KILL_SWITCH_OFF"]);
+  }
+  // Redispatch resumed later: the one restart is still available.
+  assert.equal(fallbackAt(record, "2026-10-11T14:47:00Z").dispatch, true);
+  assert.deepEqual(
+    [fallbackAt(record, "2026-10-11T09:30:00Z").dispatch, fallbackAt(record, "2026-10-11T09:30:00Z").reason],
+    [false, "WAIT_GUARD_WINDOW"],
+  );
+  assert.equal(fallbackAt(record, "2026-10-11T05:40:00Z", { finishedAt: "2026-10-11T04:00:00.000Z" }).reason, "WAIT_GUARD_WINDOW");
+  assert.equal(fallbackAt(record, "2026-10-11T09:05:00Z").reason, "WAIT_NEAR_GUARD_WINDOW");
+  assert.equal(fallbackAt(record, "2026-10-11T08:47:00Z", { queue: { otherActiveRuns: 1 } }).reason, "WAIT_RUN_ACTIVE:1");
+  assert.match(fallbackAt(record, "2026-10-11T08:47:00Z", { queue: { otherActiveRuns: 0, checkFailed: "http-403" } }).reason, /^WAIT_QUEUE_CHECK_FAILED/u);
+  assert.equal(fallbackAt(record, "2026-10-11T08:47:00Z", { newerFailedRun: "5:failure" }).reason, "STOP_NEWER_RUN_FAILED:5:failure");
+  assert.equal(fallbackAt({ ...record, chain: 24 }, "2026-10-11T08:47:00Z").reason, "STOP_CHAIN_CAP:24");
+  // The chain step itself never restarts: only the fallback/restarter does, after the reset.
+  const chainDecision = decideTenMinRedispatch({ trigger: "chain", outcome: record.outcome, jobResult: "failure", nowUtc: new Date("2026-10-11T08:47:00Z"), queue: { otherActiveRuns: 0 }, killSwitch: "true", chain: 8, maxChain: undefined });
+  assert.equal(chainDecision.dispatch, false);
 });

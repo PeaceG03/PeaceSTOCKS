@@ -170,7 +170,7 @@ export interface ScanYieldCheckOptions extends ScanYieldOptions {
  * saying "nothing waiting"; a run found waiting is never cached. A failed call is retried
  * (SCAN_CHECK_RETRY_DELAYS_MS, or GitHub's retry-after / rate-limit reset when longer). If it still
  * fails, or GitHub asks for a wait over maxRetryWaitMs, it returns
- * "SCAN_CHECK_FAILED:<failure>:attempts=<n>": fail closed, no Massive request is made on an
+ * "SCAN_CHECK_FAILED:<failure>:attempts=<n>[:reset=<ISO>]": fail closed, no Massive request is made on an
  * unverified check, and the caller stops the run and alerts.
  */
 export function createScanYieldCheck(options: ScanYieldCheckOptions = {}): () => Promise<string | undefined> {
@@ -198,7 +198,12 @@ export function createScanYieldCheck(options: ScanYieldCheckOptions = {}): () =>
       lastClearAt = undefined;
       const planned = delays[attempt - 1];
       const wait = planned === undefined ? undefined : Math.max(planned, result.retryAfterMs ?? 0);
-      if (wait === undefined || wait > maxWait) return `${SCAN_CHECK_FAILED}:${result.failure}:attempts=${attempt}`;
+      if (wait === undefined || wait > maxWait) {
+        // GitHub's reset time (when it gave one) rides in the reason so the restarter can wait for it.
+        const reset =
+          result.retryAfterMs !== undefined ? `:reset=${new Date(clock().getTime() + result.retryAfterMs).toISOString()}` : "";
+        return `${SCAN_CHECK_FAILED}:${result.failure}:attempts=${attempt}${reset}`;
+      }
       await sleep(wait);
       const after = clock();
       if (inScanGuardWindow(after)) return `SCAN_GUARD_WINDOW:${after.toISOString()}`;

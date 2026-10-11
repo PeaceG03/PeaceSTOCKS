@@ -41,6 +41,36 @@ export const TENMIN_SCAN_CANCELLED_WINDOW_MINUTES = 10;
 export const TENMIN_REDISPATCH_SCAN_CANCELLED = "TENMIN_REDISPATCH_SCAN_CANCELLED" as const;
 /** Hard stop written into the run record when a post-dispatch cancelled-scan check fires. */
 export const TENMIN_STOP_SCAN_CANCELLED = "STOP_SCAN_CANCELLED" as const;
+/**
+ * A STOP_SCAN_CHECK_FAILED chain is restarted by the fallback/restarter this many times in a row
+ * (GitHub's API limit resets hourly). A further consecutive failure stops for good: a person fixes it.
+ */
+export const TENMIN_SCAN_CHECK_AUTO_RESTARTS = 1;
+/** The auto-restart waits at least this long after the failed run finished (or GitHub's reset, if later). */
+export const TENMIN_SCAN_CHECK_RESTART_DELAY_MS = 3_600_000;
+export const TENMIN_CONTINUE_SCAN_CHECK_RETRY = "CONTINUE_SCAN_CHECK_RETRY" as const;
+export const TENMIN_WAIT_SCAN_CHECK_RESET = "WAIT_SCAN_CHECK_RESET" as const;
+export const TENMIN_STOP_SCAN_CHECK_NEEDS_PERSON = "STOP_SCAN_CHECK_NEEDS_PERSON" as const;
+
+/**
+ * Pure: consecutive STOP_SCAN_CHECK_FAILED runs including this one. `prior` is the count the run was
+ * dispatched with (scanner.yml input tenmin_scan_check_stops; 0 for normal chain runs). Any other
+ * outcome (a run that got past the check) resets it to 0.
+ */
+export function tenMinScanCheckStops(outcome: TenMinRunOutcome | undefined, prior: number): number {
+  if (!outcome?.reason.startsWith(`${TENMIN_STOP_SCAN_CHECK_FAILED}:`)) return 0;
+  return (Number.isSafeInteger(prior) && prior > 0 ? prior : 0) + 1;
+}
+
+/** Pure: earliest auto-restart time: finishedAt + 1 h, or GitHub's reported reset if later. */
+export function tenMinScanCheckRestartAt(reason: string, finishedAtIso: string): Date | undefined {
+  const finished = Date.parse(finishedAtIso);
+  if (!Number.isFinite(finished)) return undefined;
+  const reset = /:reset=([0-9T:.\-]+Z)/u.exec(reason)?.[1];
+  const resetMs = reset ? Date.parse(reset) : Number.NaN;
+  return new Date(Math.max(finished + TENMIN_SCAN_CHECK_RESTART_DELAY_MS, Number.isFinite(resetMs) ? resetMs : 0));
+}
+
 /** Outcome reason: the history run stopped because its active-run check failed for good. */
 export const TENMIN_STOP_SCAN_CHECK_FAILED = "STOP_SCAN_CHECK_FAILED" as const;
 /** Dispatched tenmin_history run statuses that must be cancelled on SCAN_CANCELLED (incl. in_progress). */
@@ -269,6 +299,12 @@ export interface TenMinRedispatchInput {
    * gap; without it a finished chain stayed stopped forever.
    */
   newRangeClosed?: { from: string; to: string };
+  /**
+   * fallback: from the stored record. scanCheckStops = consecutive STOP_SCAN_CHECK_FAILED runs
+   * (missing on older records = 1); finishedAt = when that run finished.
+   */
+  scanCheckStops?: number;
+  finishedAt?: string;
 }
 
 /** Decision reason prefix: a finished chain restarts because a new two-month range closed. */
@@ -298,6 +334,8 @@ export function tenMinNewRangeClosedSince(
 
 export interface TenMinRedispatchDecision {
   dispatch: boolean;
+  /** Set on a scan-check auto-restart: passed to the dispatched run (input tenmin_scan_check_stops). */
+  scanCheckStops?: number;
   /** continue: dispatching now; wait: chain intact, not now (fallback may pick it up); stop: chain over. */
   nextAction: "continue" | "wait" | "stop";
   reason: string;
@@ -317,6 +355,8 @@ export function decideTenMinRedispatch(input: TenMinRedispatchInput): TenMinRedi
   const wait = (reason: string): TenMinRedispatchDecision => ({ dispatch: false, nextAction: "wait", reason, nextChain });
   if (input.killSwitch !== "true") return stop("KILL_SWITCH_OFF");
   if (!input.outcome) return stop("STOP_NO_OUTCOME");
+  const scanRetry = scanCheckRetry(input);
+  if (scanRetry) return scanRetry;
   const capRaised = rangeEndCapRaised(input);
   const newRange = newRangeClosed(input);
   const restart = capRaised ?? newRange;
@@ -340,6 +380,36 @@ export function decideTenMinRedispatch(input: TenMinRedispatchInput): TenMinRedi
   const gate = queueAndGuard(input);
   if (gate) return wait(gate);
   return { dispatch: true, nextAction: "continue", reason: input.outcome.reason, nextChain };
+}
+
+/**
+ * fallback only: a chain stopped by STOP_SCAN_CHECK_FAILED (GitHub API limit, hourly reset). The
+ * first consecutive stop restarts once at/after tenMinScanCheckRestartAt (same kill switch, queue,
+ * guard-window and chain-cap rules); a second consecutive stop stays stopped for a person.
+ */
+function scanCheckRetry(input: TenMinRedispatchInput): TenMinRedispatchDecision | undefined {
+  const outcome = input.outcome;
+  if (input.trigger !== "fallback" || !outcome) return undefined;
+  if (!outcome.reason.startsWith(`${TENMIN_STOP_SCAN_CHECK_FAILED}:`)) return undefined;
+  const nextChain = input.chain + 1;
+  const stops = input.scanCheckStops !== undefined && input.scanCheckStops > 0 ? input.scanCheckStops : 1;
+  const stop = (reason: string): TenMinRedispatchDecision => ({ dispatch: false, nextAction: "stop", reason, nextChain });
+  const wait = (reason: string): TenMinRedispatchDecision => ({ dispatch: false, nextAction: "wait", reason, nextChain });
+  if (stops > TENMIN_SCAN_CHECK_AUTO_RESTARTS) return stop(`${TENMIN_STOP_SCAN_CHECK_NEEDS_PERSON}:stops=${stops}`);
+  if (input.newerFailedRun) return stop(`STOP_NEWER_RUN_FAILED:${input.newerFailedRun}`);
+  const restartAt = tenMinScanCheckRestartAt(outcome.reason, input.finishedAt ?? "");
+  if (!restartAt) return stop(`${TENMIN_STOP_SCAN_CHECK_NEEDS_PERSON}:no-finish-time`);
+  if (input.nowUtc.getTime() < restartAt.getTime()) return wait(`${TENMIN_WAIT_SCAN_CHECK_RESET}:until=${restartAt.toISOString()}`);
+  if (nextChain > maxChainOf(input.maxChain)) return stop(`STOP_CHAIN_CAP:${maxChainOf(input.maxChain)}`);
+  const gate = queueAndGuard(input);
+  if (gate) return wait(gate);
+  return {
+    dispatch: true,
+    nextAction: "continue",
+    reason: `${TENMIN_CONTINUE_SCAN_CHECK_RETRY}:attempt=${stops}`,
+    nextChain,
+    scanCheckStops: stops,
+  };
 }
 
 function queueAndGuard(input: TenMinRedispatchInput): string | undefined {
@@ -459,6 +529,8 @@ export interface TenMinRunRecord {
   githubRunId: string;
   finishedAt: string;
   decision: TenMinRedispatchDecision;
+  /** Consecutive STOP_SCAN_CHECK_FAILED runs ending with this one (0 = this run got past the check). */
+  scanCheckStops?: number;
 }
 
 /**
@@ -599,15 +671,22 @@ async function checkNoScheduledScanCancelled(opts: {
   throw new Error(`${TENMIN_REDISPATCH_SCAN_CANCELLED}:run=${cancelled.id}:created=${cancelled.created_at}`);
 }
 
-async function dispatch(chain: number): Promise<void> {
+async function dispatch(chain: number, scanCheckStops = 0): Promise<void> {
   const ref = process.env.TENMIN_DISPATCH_REF || process.env.GITHUB_REF_NAME || "main";
   if (process.env.TENMIN_REDISPATCH_DRY_RUN === "1") {
-    process.stdout.write(`DRY_RUN: would dispatch scanner.yml ref=${ref} chain=${chain}\n`);
+    process.stdout.write(`DRY_RUN: would dispatch scanner.yml ref=${ref} chain=${chain} scanCheckStops=${scanCheckStops}\n`);
     return;
   }
   const response = await gh(`/actions/workflows/scanner.yml/dispatches`, {
     method: "POST",
-    body: JSON.stringify({ ref, inputs: { mode: "tenmin_history", tenmin_history_chain: String(chain) } }),
+    body: JSON.stringify({
+      ref,
+      inputs: {
+        mode: "tenmin_history",
+        tenmin_history_chain: String(chain),
+        ...(scanCheckStops > 0 ? { tenmin_scan_check_stops: String(scanCheckStops) } : {}),
+      },
+    }),
   });
   if (response.status !== 204) throw new Error(`TENMIN_REDISPATCH_FAILED:http-${response.status}`);
 }
@@ -663,6 +742,7 @@ async function main(mode: string | undefined): Promise<void> {
       githubRunId: env.GITHUB_RUN_ID ?? "",
       finishedAt: now.toISOString(),
       decision,
+      scanCheckStops: tenMinScanCheckStops(outcome, Number(env.TENMIN_SCAN_CHECK_STOPS || "0") || 0),
     };
     if (env.TENMIN_RECORD_FILE) writeFileSync(env.TENMIN_RECORD_FILE, `${JSON.stringify(record, null, 2)}\n`);
     output("next_action", decision.nextAction);
@@ -723,6 +803,8 @@ async function main(mode: string | undefined): Promise<void> {
       ...(newerFailed ? { newerFailedRun: `${newerFailed.id}:${newerFailed.conclusion}` } : {}),
       ...(currentMaxRangeEnd ? { currentMaxRangeEnd } : {}),
       ...(newRangeClosedSinceRecord ? { newRangeClosed: newRangeClosedSinceRecord } : {}),
+      ...(record?.scanCheckStops !== undefined ? { scanCheckStops: record.scanCheckStops } : {}),
+      ...(record?.finishedAt ? { finishedAt: record.finishedAt } : {}),
     });
     output("next_action", decision.nextAction);
     output("reason", decision.reason);
@@ -740,7 +822,7 @@ async function main(mode: string | undefined): Promise<void> {
         decision,
       };
       const dispatchedAfterIso = new Date().toISOString();
-      await dispatch(decision.nextChain);
+      await dispatch(decision.nextChain, decision.scanCheckStops ?? 0);
       await checkNoScheduledScanCancelled({
         record: { ...fallbackRecord, decision },
         recordFile: env.TENMIN_RECORD_FILE,

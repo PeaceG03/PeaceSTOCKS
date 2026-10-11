@@ -157,3 +157,10 @@ test("workflows: scanner.yml restarter cron, run-name, scan gate, concurrency, a
   assert.ok(!fallback.includes("peacestocks-r2-writer\n  cancel"), "fallback never joins the writer group");
   assert.ok(!/^concurrency:/m.test(fallback), "no workflow-level concurrency: guard_wait must not hold a group");
 });
+
+test("scanner.yml: tenmin_scan_check_stops input reaches the chain step (durable scan-check restart count)", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const yml = await readFile(new URL("../.github/workflows/scanner.yml", import.meta.url), "utf8");
+  assert.match(yml, /\n      tenmin_scan_check_stops:\n/u);
+  assert.match(yml, /TENMIN_SCAN_CHECK_STOPS: \$\{\{ github\.event\.inputs\.tenmin_scan_check_stops \}\}/u);
+});
