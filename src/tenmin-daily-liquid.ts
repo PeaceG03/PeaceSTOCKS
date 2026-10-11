@@ -676,12 +676,25 @@ export const pickWaitingScheduledScan: ScanRunPick = (runs, self) => {
   return scan ? `SCAN_RUN_WAITING:${scan.id}:${scan.status}` : undefined;
 };
 
+/** Skip reason while TENMIN_AUTO_REDISPATCH is not exactly "true" (unset counts as paused). */
+export const TENMIN_DAILY_SKIP_REDISPATCH_PAUSED = "SKIP_REDISPATCH_PAUSED" as const;
+
+/** Pure: why the daily step must not run now because the history redispatch is paused, else undefined. */
+export function tenMinDailyRedispatchHold(env: NodeJS.ProcessEnv): string | undefined {
+  const value = env.TENMIN_AUTO_REDISPATCH;
+  return value === "true" ? undefined : `${TENMIN_DAILY_SKIP_REDISPATCH_PAUSED}:TENMIN_AUTO_REDISPATCH=${value === undefined ? "unset" : JSON.stringify(value)}`;
+}
+
 /** Host entry: kill switch, config parse (before any request), R2 store, shared Massive pace. */
 export async function runTenMinDailyFromEnv(env: NodeJS.ProcessEnv = process.env): Promise<Record<string, unknown>> {
   if (!tenMinDailyEnabled(env)) return { mode: "tenmin-daily", status: "DISABLED", reason: "TENMIN_DAILY_ENABLED is not exactly true" };
   const n = parseTenMinDailyLiquidN(env.TENMIN_DAILY_LIQUID_N);
   const maxRequests = parseTenMinDailyMaxRequests(env.TENMIN_DAILY_MAX_REQUESTS);
   const budgetMs = parseBoundedInt("TENMIN_DAILY_BUDGET_MS", env.TENMIN_DAILY_BUDGET_MS, TENMIN_DAILY_DEFAULT_BUDGET_MS, 10_200_000);
+  // Hold while the history chain's redispatch is paused (e.g. a separate Oct 2024 fetch owns the
+  // shared key; its watcher sets TENMIN_AUTO_REDISPATCH back to true only after sealing and read-back).
+  const hold = tenMinDailyRedispatchHold(env);
+  if (hold) return { mode: "tenmin-daily", status: "SKIPPED", reason: hold, massiveRequests: 0 };
   const now = new Date();
   if (inScanGuardWindow(now)) return { mode: "tenmin-daily", status: "WAIT_GUARD_WINDOW", at: now.toISOString() };
   const deadlineMs = now.getTime() + budgetMs;

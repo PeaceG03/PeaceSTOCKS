@@ -177,6 +177,9 @@ jobs:
       TENMIN_DAILY_ENABLED: ${{ vars.TENMIN_DAILY_ENABLED }}
       TENMIN_DAILY_LIQUID_N: ${{ vars.TENMIN_DAILY_LIQUID_N }}
       TENMIN_DAILY_MAX_REQUESTS: ${{ vars.TENMIN_DAILY_MAX_REQUESTS }}
+      # The step skips (0 Massive requests) unless this is exactly "true": the history redispatch is
+      # paused while another job owns the shared key (src/tenmin-daily-liquid.ts tenMinDailyRedispatchHold).
+      TENMIN_AUTO_REDISPATCH: ${{ vars.TENMIN_AUTO_REDISPATCH }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

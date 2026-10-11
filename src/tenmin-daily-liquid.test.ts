@@ -14,6 +14,7 @@ import {
   readTenMinDailyIndex,
   readTenMinSecurityDay,
   runTenMinDailyFromEnv,
+  tenMinDailyRedispatchHold,
   runTenMinDailyLiquid,
   selectTenMinDailyLiquidNames,
   tenMinDailyCatchupSessions,
@@ -145,6 +146,48 @@ test("kill switch: anything but exactly 'true' does nothing; config is validated
     runTenMinDailyFromEnv({ TENMIN_DAILY_ENABLED: "true", TENMIN_DAILY_LIQUID_N: "5000" } as NodeJS.ProcessEnv),
     /TENMIN_DAILY_LIQUID_N_INVALID/u,
   );
+});
+
+test("redispatch paused: TENMIN_AUTO_REDISPATCH false or unset skips with a reason and 0 requests (TENMIN_DAILY_ENABLED=true)", async () => {
+  const realFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = (async () => {
+    requests += 1;
+    throw new Error("no network in this test");
+  }) as typeof fetch;
+  try {
+    const base = {
+      TENMIN_DAILY_ENABLED: "true",
+      MASSIVE_API_KEY: "dummy",
+      // If the step went past the hold it would need R2 and fail here: the skip returns before it.
+      PEACESTOCKS_REQUIRE_OBJECT_STORE: "1",
+      GITHUB_ACTIONS: "true",
+      GITHUB_TOKEN: "t",
+      GITHUB_REPOSITORY: "PeaceG03/PeaceSTOCKS",
+      GITHUB_WORKFLOW_REF: "PeaceG03/PeaceSTOCKS/.github/workflows/scanner.yml@refs/heads/main",
+    };
+    for (const value of [undefined, "false", "", "TRUE", "1"]) {
+      const env = { ...base, ...(value === undefined ? {} : { TENMIN_AUTO_REDISPATCH: value }) } as NodeJS.ProcessEnv;
+      const summary = await runTenMinDailyFromEnv(env);
+      assert.equal(summary.status, "SKIPPED");
+      assert.equal(summary.massiveRequests, 0);
+      assert.equal(summary.reason, tenMinDailyRedispatchHold(env));
+      assert.match(String(summary.reason), /^SKIP_REDISPATCH_PAUSED:TENMIN_AUTO_REDISPATCH=/u);
+    }
+    assert.equal(tenMinDailyRedispatchHold({} as NodeJS.ProcessEnv), "SKIP_REDISPATCH_PAUSED:TENMIN_AUTO_REDISPATCH=unset");
+    assert.equal(tenMinDailyRedispatchHold({ TENMIN_AUTO_REDISPATCH: "false" } as NodeJS.ProcessEnv), 'SKIP_REDISPATCH_PAUSED:TENMIN_AUTO_REDISPATCH="false"');
+    assert.equal(tenMinDailyRedispatchHold({ TENMIN_AUTO_REDISPATCH: "true" } as NodeJS.ProcessEnv), undefined);
+    // Control: with "true" the step goes on (here it stops at the missing R2 store, or a guard window).
+    try {
+      const ran = await runTenMinDailyFromEnv({ ...base, TENMIN_AUTO_REDISPATCH: "true" } as NodeJS.ProcessEnv);
+      assert.equal(ran.status, "WAIT_GUARD_WINDOW");
+    } catch (error) {
+      assert.match(String(error), /OBJECT_STORE_REQUIRED/u);
+    }
+    assert.equal(requests, 0);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 test("sessions: trailing window is strictly before D and skips weekends/holidays; catch-up is oldest first", () => {
