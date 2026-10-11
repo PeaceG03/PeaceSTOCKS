@@ -21,6 +21,7 @@ import { refreshEligibility, refreshUniverse } from "./universe";
 import type { MarketStore } from "./storage";
 import { US_EQUITY_MARKET_CALENDAR, usEquityCalendarSha256 } from "./us-calendar";
 import type { DustReader } from "./reader";
+import { type ScanDailyBarsSidecarReport, maybeWriteScanDailyBarsSidecar } from "./daily-bars-sidecar";
 import type { ReplyDustStore } from "./intraday-reply-dust";
 import type { ReplyDustBackend } from "./reply-dust";
 import type { ZstdVersionProbe } from "./reply-dust-pin";
@@ -272,6 +273,21 @@ export class MarketsScanner {
     if (incomplete) failures.push(`MISSING_SECURITY_EVIDENCE:${incomplete}`);
     const securities = await refreshEligibility(this.storage);
     const allBars = await this.storage.loadBars();
+    // Daily-bars sidecar alongside the JSONL write (which is unchanged): bound to the day's grouped
+    // Reply Dust when sealed, otherwise a pure pack. Warnings only.
+    let dailyBarsSidecar: ScanDailyBarsSidecarReport | undefined;
+    if (this.groupedReplyDust?.enabled)
+      dailyBarsSidecar = await maybeWriteScanDailyBarsSidecar({
+        enabled: true,
+        ...(this.groupedReplyDust.store ? { store: this.groupedReplyDust.store } : {}),
+        sessionDate,
+        bars: allBars,
+        securities,
+        ...(this.groupedReplyDust.backend ? { backend: this.groupedReplyDust.backend } : {}),
+        ...(this.groupedReplyDust.zstdVersionProbe
+          ? { zstdVersionProbe: this.groupedReplyDust.zstdVersionProbe }
+          : {}),
+      });
     const spyId = resolveSpyBenchmarkId(securities);
     const benchmark = spyId ? allBars.filter((bar) => bar.securityId === spyId) : [];
     const spySessions = new Set(benchmark.map((bar) => bar.sessionDate));
@@ -416,6 +432,7 @@ export class MarketsScanner {
       scannerVersion: SCANNER_VERSION,
       ...reportPrediction,
       ...(groupedReplyDust ? { groupedReplyDust } : {}),
+      ...(dailyBarsSidecar ? { dailyBarsSidecar } : {}),
     });
   }
 

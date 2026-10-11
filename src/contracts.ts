@@ -423,6 +423,7 @@ export interface ScannerRunReport {
    * other report fields.
    */
   groupedReplyDust?: import("./scan-grouped-reply-dust").ScanGroupedReplyDustReport;
+  dailyBarsSidecar?: import("./daily-bars-sidecar").ScanDailyBarsSidecarReport;
   /** Present when the Massive provider recorded grouped-daily readiness probes for this run. */
   providerReadiness?: ProviderReadinessReport;
 }

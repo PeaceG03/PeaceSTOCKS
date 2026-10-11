@@ -131,7 +131,7 @@ function harness(bodies: Uint8Array[], now: () => string = () => AT) {
 }
 
 function coreReport(report: ScannerRunReport) {
-  const { groupedReplyDust: _g, completedAt: _c, storage: _s, ...rest } = report;
+  const { groupedReplyDust: _g, dailyBarsSidecar: _d, completedAt: _c, storage: _s, ...rest } = report;
   return rest;
 }
 
@@ -535,4 +535,42 @@ test("maybeStore: observedAt given → manifest uses it; absent → fetchedAt (b
     enabled: true, store: b, provider: held(groupedBody("x")), sessionDate: DAY, zstdVersionProbe: pinnedZstd,
   });
   assert.equal((await readDailyReplyDustManifest(b, DAY))!.observedAt, AT);
+});
+
+test("daily-bars sidecar: the scan writes it beside the JSONL rows, bound to the day's Dust; decoder rebuilds the lines", async () => {
+  const { decodeDailyBarsPack } = await import("./daily-bars-pack-decode");
+  const { dailyBarsSidecarFileKey, dailyBarsSidecarManifestKey } = await import("./daily-bars-sidecar");
+  const body = groupedBody("sidecar");
+  const h = harness([body]);
+  const barsClient = new MemoryObjectClient();
+  const store = new MemoryObjectClient();
+  const report = await new MarketsScanner(h.provider, new ObjectMarketStorage(barsClient), US_EQUITY_CALENDAR, {
+    enabled: true,
+    store,
+    zstdVersionProbe: pinnedZstd,
+  }, () => beforeNextSessionOpen(DAY)).run(DAY);
+  assert.equal(report.dailyBarsSidecar?.status, "stored");
+  assert.equal(report.dailyBarsSidecar?.source, "dust");
+  const jsonl = new TextDecoder().decode((await barsClient.get(`permanent/daily-bars/${DAY.slice(0, 7)}.jsonl`))!);
+  const lines = jsonl.split("\n").filter((line) => line.includes(`"sessionDate":"${DAY}"`));
+  assert.ok(lines.length > 0);
+  const manifest = await readDailyReplyDustManifest(store, DAY);
+  const decoded = decodeDailyBarsPack({
+    file: (await store.get(dailyBarsSidecarFileKey(DAY)))!,
+    manifest: (await store.get(dailyBarsSidecarManifestKey(DAY)))!,
+    dustReply: await readDailyReplyDustReply(store, manifest!),
+  });
+  assert.deepEqual(decoded.lines, lines);
+  // A second scan of the same day never overwrites the sealed sidecar.
+  const again = await new MarketsScanner(harness([body]).provider, new ObjectMarketStorage(barsClient), US_EQUITY_CALENDAR, {
+    enabled: true,
+    store,
+    zstdVersionProbe: pinnedZstd,
+  }, () => beforeNextSessionOpen(DAY)).run(DAY);
+  assert.notEqual(again.dailyBarsSidecar?.status, "stored");
+});
+
+test("daily-bars sidecar: feature off writes nothing", async () => {
+  const report = await new MarketsScanner(harness([groupedBody("off")]).provider, new ObjectMarketStorage(new MemoryObjectClient()), US_EQUITY_CALENDAR, undefined, () => beforeNextSessionOpen(DAY)).run(DAY);
+  assert.equal(report.dailyBarsSidecar, undefined);
 });

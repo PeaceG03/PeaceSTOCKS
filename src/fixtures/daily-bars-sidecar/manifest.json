@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "daily-bars-sidecar-manifest-v1",
+  "sessionDate": "2030-02-04",
+  "version": 33,
+  "zstd": "1.5.7",
+  "source": "dust+pack",
+  "dustReplySha256": "f5bb837f798b0ad9f25e60f27ea31f605eaa1107a08f69d971fc3fffd6175f9c",
+  "rows": 4,
+  "packedRows": 1,
+  "correctionRows": 1,
+  "exceptionRows": 1,
+  "byteLength": 568,
+  "fileSha256": "792852a9f23bc2c8a197c3181352436f9b7ccdefcbce53e2826c9f4367cae301",
+  "payloadSha256": "16d259af8aa7d11cdfc0a3577a601b25c354ad3541f92ef1ab98885726c6a083",
+  "payloadByteLength": 997,
+  "linesSha256": "985e5279462ed1d021f9d4aa4afc4338519339c633405fe1c290e0b9b035cf4a",
+  "checksum": "7a7b202c691e08741ae02246977dedc1a41da738c500559bf6092d4c72cb4d02"
+}
