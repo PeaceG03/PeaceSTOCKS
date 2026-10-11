@@ -222,14 +222,6 @@ export class ObjectMarketStorage implements MarketStore {
       : this.readJsonl("permanent/prediction-status/", false);
   }
 
-  async writeDecisions(records: ScannerBelief[]): Promise<void> {
-    await this.writeImmutable(
-      `permanent/decisions/${records[0]?.sessionDate ?? "empty"}.jsonl`,
-      records,
-      (record) => record.decisionId,
-    );
-  }
-
   async writePartitionManifest(manifest: PartitionManifest): Promise<void> {
     await this.writeText(
       `permanent/partitions/${manifest.partitionId}.json`,

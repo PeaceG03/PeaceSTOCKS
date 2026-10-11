@@ -349,7 +349,6 @@ export class MarketsScanner {
         }));
         await this.storage.writeBeliefs(result.beliefs);
         await this.storage.writePredictions(predictions);
-        await this.storage.writeDecisions(result.beliefs);
         await this.storage.writePredictionStatus(
           makePredictionStatus(runId, {
             sessionDate,
