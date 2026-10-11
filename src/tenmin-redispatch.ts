@@ -10,7 +10,7 @@
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SCAN_GUARD_WINDOWS_UTC, TENMIN_RESTARTER_RUN_NAME, isTenMinRestarterRun } from "./scan-yield";
+import { SCAN_GUARD_WINDOWS_UTC, TENMIN_RESTARTER_RUN_NAME, isIdleScannerRun, isTenMinRestarterRun } from "./scan-yield";
 
 export { TENMIN_RESTARTER_RUN_NAME, isTenMinRestarterRun };
 import type { DatedTickerRunSummary } from "./ticker-reference-dated";
@@ -210,7 +210,7 @@ export function countOtherActiveScannerRuns(
   runs: readonly { id: number; status: string; display_title?: string | null }[],
   selfRunId?: number,
 ): number {
-  return runs.filter((r) => r.id !== selfRunId && !isTenMinRestarterRun(r) && ACTIVE_STATUSES.has(r.status)).length;
+  return runs.filter((r) => r.id !== selfRunId && !isIdleScannerRun(r) && ACTIVE_STATUSES.has(r.status)).length;
 }
 
 /** Pure: does this chain decision send a heal dispatch? */
@@ -371,7 +371,7 @@ export function cancelledScheduledScan(
     const created = Date.parse(run.created_at);
     return (
       run.event === "schedule" &&
-      !isTenMinRestarterRun(run) &&
+      !isIdleScannerRun(run) &&
       run.conclusion === "cancelled" &&
       Number.isFinite(created) &&
       created >= since

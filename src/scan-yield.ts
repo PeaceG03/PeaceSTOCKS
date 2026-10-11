@@ -35,6 +35,18 @@ export function isTenMinRestarterRun(run: { display_title?: string | null }): bo
 }
 
 /**
+ * scanner.yml run-name for a daily liquid 10-minute cron tick while its kill switch
+ * (vars.TENMIN_DAILY_ENABLED) is off: the job is skipped, nothing calls Massive or writes R2.
+ * When on, the run is named "Scanner tenmin daily" and counts as a working run.
+ */
+export const TENMIN_DAILY_OFF_RUN_NAME = "Scanner tenmin daily (off)" as const;
+
+/** Pure: a scanner.yml run that never calls Massive or writes R2 (restarter, or daily tick switched off). */
+export function isIdleScannerRun(run: { display_title?: string | null }): boolean {
+  return isTenMinRestarterRun(run) || run.display_title === TENMIN_DAILY_OFF_RUN_NAME;
+}
+
+/**
  * Returns why backfill must yield, or undefined when it may continue. On Actions it also asks the
  * GitHub API whether any other run of this workflow is queued or running; a failed check yields.
  */
@@ -61,7 +73,7 @@ export async function scanYieldReason(options: ScanYieldOptions = {}): Promise<s
     const self = Number(env.GITHUB_RUN_ID);
     // Restarter runs never write R2 or call Massive: yielding to them would break the chain hourly.
     const waiting = (body.workflow_runs ?? []).find(
-      (run) => run.id !== self && !isTenMinRestarterRun(run) && ACTIVE_RUN_STATES.has(run.status),
+      (run) => run.id !== self && !isIdleScannerRun(run) && ACTIVE_RUN_STATES.has(run.status),
     );
     return waiting ? `SCAN_RUN_WAITING:${waiting.id}:${waiting.event}:${waiting.status}` : undefined;
   } catch (error) {

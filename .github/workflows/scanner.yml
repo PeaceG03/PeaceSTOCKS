@@ -1,8 +1,13 @@
 name: Scanner
 # Restarter runs (cron "47 * * * *") are named "Scanner restarter" so the history chain, the
 # restarter itself, and the stop alert never count them as a scan/history run (src/tenmin-redispatch.ts
-# TENMIN_RESTARTER_RUN_NAME). Every other run keeps the name "Scanner".
-run-name: ${{ github.event.schedule == '47 * * * *' && 'Scanner restarter' || 'Scanner' }}
+# TENMIN_RESTARTER_RUN_NAME). Daily liquid 10-minute runs (crons "20 6 * * 2-6" / "20 10 * * 2-6")
+# are named "Scanner tenmin daily": they still count as an active run (a history run yields to them
+# and the chain waits), but the daily step itself only yields to a waiting scheduled "Scanner" run.
+# With its kill switch off (vars.TENMIN_DAILY_ENABLED not "true") a daily tick is named
+# "Scanner tenmin daily (off)", skips its job, joins no shared group, and is ignored like the
+# restarter (src/scan-yield.ts isIdleScannerRun). Every other run keeps the name "Scanner".
+run-name: ${{ github.event.schedule == '47 * * * *' && 'Scanner restarter' || ((github.event.schedule == '20 6 * * 2-6' || github.event.schedule == '20 10 * * 2-6') && (vars.TENMIN_DAILY_ENABLED == 'true' && 'Scanner tenmin daily' || 'Scanner tenmin daily (off)') || 'Scanner') }}
 
 on:
   # Intentionally no push trigger: online work is schedule + workflow_dispatch only.
@@ -10,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "scan (online scheduler), backfill (daily historical evidence), or tenmin_history (10-minute range history)"
+        description: "scan (online scheduler), backfill (daily historical evidence), tenmin_history (10-minute range history), or tenmin_daily (daily liquid 10-minute step)"
         required: true
         default: scan
         type: choice
@@ -18,6 +23,7 @@ on:
           - scan
           - backfill
           - tenmin_history
+          - tenmin_daily
       from:
         description: "Backfill from date (YYYY-MM-DD inclusive)"
         required: false
@@ -58,20 +64,28 @@ on:
     # step waits (no dispatch) inside or just before a guard window and while any scan/history run
     # is active. Must match TENMIN_RESTARTER_CRON in src/tenmin-redispatch.ts.
     - cron: "47 * * * *"
+    # Daily liquid 10-minute step (src/tenmin-daily-liquid.ts): 5 min after each scan guard window
+    # ends, Tue–Sat (Mon–Fri sessions; no Sun/Mon run). The scan's slot is always first: these join
+    # peacestocks-r2-writer and queue behind a running scan. 06:20 + 155 min budget = 08:55Z, before
+    # the 09:15Z guard window; the 10:20 run catches up anything the first run left (idempotent).
+    - cron: "20 6 * * 2-6"
+    - cron: "20 10 * * 2-6"
 
 # One writer at a time: scans and backfills both write R2 (month files, cursor), so they queue
 # instead of overlapping. A run already in progress is never canceled.
 # Restarter runs (cron "47 * * * *") write nothing to R2 and get their own per-run group: joining
 # peacestocks-r2-writer would let a restarter run replace (cancel) a pending scan or history run.
 # Every other run is in peacestocks-r2-writer exactly as before.
+# A daily liquid tick with its kill switch off writes nothing either: it gets its own per-run group
+# for the same reason (it must never replace a pending scan or history run).
 concurrency:
-  group: ${{ github.event.schedule == '47 * * * *' && format('scanner-restarter-{0}', github.run_id) || 'peacestocks-r2-writer' }}
+  group: ${{ (github.event.schedule == '47 * * * *' || ((github.event.schedule == '20 6 * * 2-6' || github.event.schedule == '20 10 * * 2-6') && vars.TENMIN_DAILY_ENABLED != 'true')) && format('scanner-idle-{0}', github.run_id) || 'peacestocks-r2-writer' }}
   cancel-in-progress: false
 
 jobs:
   scan:
-    # Not on the restarter cron: that tick only runs the restarter job below.
-    if: ${{ (github.event_name == 'schedule' && github.event.schedule != '47 * * * *') || github.event.inputs.mode == 'scan' }}
+    # Not on the restarter or daily liquid crons: those ticks only run their own jobs below.
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule != '47 * * * *' && github.event.schedule != '20 6 * * 2-6' && github.event.schedule != '20 10 * * 2-6') || github.event.inputs.mode == 'scan' }}
     # Pinned so the runner image cannot change mid-rollout; move to 26.04 deliberately later.
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -136,6 +150,89 @@ jobs:
         env:
           PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
         run: pnpm scheduler
+
+  # Daily liquid 10-minute step: the just-closed session(s) for the top TENMIN_DAILY_LIQUID_N names
+  # (default 500, cap 1000) by trailing dollar volume from sessions strictly before each session.
+  # Same Reply Dust range format the history chain uses (rd-origin=daily-close). Kill switch: off
+  # unless vars.TENMIN_DAILY_ENABLED is exactly "true". Never runs inside a guard window, yields to a
+  # waiting scheduled scan, stops at TENMIN_DAILY_MAX_REQUESTS (default 720) or the 155 min budget,
+  # and never refetches or overwrites a stored session. Shares the R2 writer group, so it never runs
+  # at the same time as a scan or history run (one Massive key, one pace).
+  tenmin_daily:
+    if: ${{ vars.TENMIN_DAILY_ENABLED == 'true' && ((github.event_name == 'schedule' && (github.event.schedule == '20 6 * * 2-6' || github.event.schedule == '20 10 * * 2-6')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'tenmin_daily')) }}
+    runs-on: ubuntu-24.04
+    # actions: read lets the step see a waiting scheduled scan and yield to it.
+    permissions:
+      contents: read
+      actions: read
+    timeout-minutes: 170
+    env:
+      MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+      PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+      PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+      PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+      PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+      PEACESTOCKS_SOURCE_COMMIT: ${{ github.sha }}
+      PEACESTOCKS_REQUIRE_OBJECT_STORE: "1"
+      TENMIN_DAILY_ENABLED: ${{ vars.TENMIN_DAILY_ENABLED }}
+      TENMIN_DAILY_LIQUID_N: ${{ vars.TENMIN_DAILY_LIQUID_N }}
+      TENMIN_DAILY_MAX_REQUESTS: ${{ vars.TENMIN_DAILY_MAX_REQUESTS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Reply Dust writes need exactly zstd 1.5.7; the step refuses to start without it.
+      - name: Restore pinned zstd 1.5.7
+        id: zstd-cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/zstd-1.5.7
+          key: zstd-1.5.7-eb33e51f49a15e02-${{ runner.os }}-ubuntu-24.04
+      - name: Build pinned zstd 1.5.7
+        if: ${{ steps.zstd-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+          echo "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3  zstd-1.5.7.tar.gz" | sha256sum -c -
+          tar xzf zstd-1.5.7.tar.gz
+          make -C zstd-1.5.7 -j"$(nproc)" zstd-release
+          install -D -m 0755 zstd-1.5.7/programs/zstd ~/.local/zstd-1.5.7/bin/zstd
+      - name: Use pinned zstd 1.5.7
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ~/.local/zstd-1.5.7/bin/zstd --version | grep -F ' v1.5.7,'
+          echo "$HOME/.local/zstd-1.5.7/bin" >> "$GITHUB_PATH"
+      - name: Refuse a run that would write the store to the runner disk
+        run: |
+          test -n "$PEACESTOCKS_R2_BUCKET"
+          test -n "$PEACESTOCKS_R2_ACCOUNT_ID"
+          test -n "$PEACESTOCKS_R2_ACCESS_KEY_ID"
+          test -n "$PEACESTOCKS_R2_SECRET_ACCESS_KEY"
+          test -n "$MASSIVE_API_KEY"
+      - name: Daily liquid 10-minute step
+        env:
+          PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
+          GITHUB_TOKEN: ${{ github.token }}
+          TENMIN_DAILY_REPORT_FILE: ${{ runner.temp }}/tenmin-daily-report.json
+        run: pnpm exec tsx src/tenmin-daily-liquid.ts
+      - name: Keep this run's report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tenmin-daily-report
+          path: ${{ runner.temp }}/tenmin-daily-report.json
+          retention-days: 14
+          if-no-files-found: warn
 
   # Hourly ten-minute history restarter (cron "47 * * * *" only). Same decide-and-dispatch and stop
   # alert as tenmin-history-fallback.yml (reused via workflow_call, not duplicated). It rides on this

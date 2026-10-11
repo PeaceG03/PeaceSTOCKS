@@ -40,6 +40,7 @@ Implemented areas include:
 - storage accounting;
 - NYSE-aware calendar;
 - 10-minute intraday schema/normalization;
+- daily liquid 10-minute step (`src/tenmin-daily-liquid.ts`, scanner.yml `tenmin_daily`, crons 06:20/10:20Z Tue–Sat): after each close, the just-closed session's 10-minute bars for the top `TENMIN_DAILY_LIQUID_N` names (default 500, cap 1000) by trailing 20-session dollar volume from sessions strictly before that session, one request per name (~104 key-minutes/day at N=500). Same Reply Dust range format/paths as the history chain plus `rd-origin=daily-close`; per-session index `permanent/tenmin-reply-dust/<range>/daily/<D>.json` (frozen selection + stored list). Off unless `TENMIN_DAILY_ENABLED` is exactly `true`; never in guard windows; yields to a waiting scheduled scan; `TENMIN_DAILY_MAX_REQUESTS` (default 720) per run; catches up the last 10 sessions oldest first; never refetches or overwrites. When the history chain seals the range it fetches each ticker's full span (one request) and its manifest supersedes the daily objects (kept, not deleted); `readTenMinSecurityDay` reads the sealed manifest when present, else the daily index;
 - Dust reader/codec/validation foundation;
 - storage benchmark fixtures/tests.
 

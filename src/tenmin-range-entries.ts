@@ -391,6 +391,9 @@ export function assertNoDuplicateTenMinRangeEntryPages(records: readonly TenMinR
 
 export const TENMIN_RANGE_OVERLAPPING_FETCHES = "TENMIN_RANGE_OVERLAPPING_FETCHES" as const;
 
+/** rd-origin of the daily liquid step's one-session objects (src/tenmin-daily-liquid.ts). */
+export const TENMIN_DAILY_CLOSE_ORIGIN = "daily-close" as const;
+
 /** Inclusive date-span overlap on YYYY-MM-DD strings (lexicographic works for ISO dates). */
 function spansOverlap(aFrom: string, aTo: string, bFrom: string, bTo: string): boolean {
   return aFrom <= bTo && bFrom <= aTo;
@@ -790,10 +793,16 @@ export async function rebuildTenMinRangeEntriesFromStore(
   const prefix = `${tenMinRangePrefix(rangeFrom, rangeTo)}/`;
   const listed = await store.list(prefix);
   const records: TenMinRangeEntryRecord[] = [];
+  // Daily liquid step objects (rd-origin=daily-close): kept only where no chain fetch of the same
+  // security overlaps them, so a chain fetch supersedes the daily one-session objects it covers.
+  const dailyOrigin = new Set<TenMinRangeEntryRecord>();
   let skippedNoMetadata = 0;
+  let supersededDaily = 0;
   for (const key of listed) {
     if (!key.endsWith(".rdust")) continue;
     const name = key.slice(prefix.length);
+    // Only objects directly in the range folder (the daily index lives in daily/ and is .json).
+    if (name.includes("/")) continue;
     const hashed = /\.c([0-9a-f]{64})\.rdust$/u.exec(name);
     const head = await store.head(key);
     if (!head) continue;
@@ -816,7 +825,7 @@ export async function rebuildTenMinRangeEntriesFromStore(
       continue;
     }
     const copySha256 = hashed?.[1];
-    records.push({
+    const record: TenMinRangeEntryRecord = {
       securityId,
       symbol,
       fetchFrom,
@@ -827,10 +836,26 @@ export async function rebuildTenMinRangeEntriesFromStore(
       byteLength: head.size,
       status: TENMIN_RANGE_STATUS_STORED,
       ...(copySha256 ? { copySha256 } : {}),
-    });
+    };
+    records.push(record);
+    if (m["rd-origin"] === TENMIN_DAILY_CLOSE_ORIGIN) dailyOrigin.add(record);
   }
-  const sorted = sortTenMinRangeEntries(records);
+  const kept = records.filter((record) => {
+    if (!dailyOrigin.has(record)) return true;
+    const covered = records.some(
+      (other) =>
+        !dailyOrigin.has(other) &&
+        !other.copySha256 &&
+        other.securityId === record.securityId &&
+        other.fetchFrom <= record.fetchTo &&
+        record.fetchFrom <= other.fetchTo,
+    );
+    if (covered) supersededDaily += 1;
+    return !covered;
+  });
+  const sorted = sortTenMinRangeEntries(kept);
   const warnings: string[] = [];
+  if (supersededDaily > 0) warnings.push(`TENMIN_DAILY_SUPERSEDED:${supersededDaily}`);
   if (skippedNoMetadata > 0)
     warnings.push(`${TENMIN_MANIFEST_V2_ENTRIES_FALLBACK}:skippedNoMetadata=${skippedNoMetadata}`);
   if (

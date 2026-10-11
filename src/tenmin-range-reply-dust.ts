@@ -407,9 +407,17 @@ export function tenMinRangeObjectMetadata(input: {
   file: Pick<TenMinRangeFileEntry, "page" | "request" | "fetchedAt" | "version" | "replySha256" | "replyByteLength">;
   /** rd-link, e.g. provisional-master-2026-10-05. Optional: readers accept objects without it. */
   link?: string;
+  /**
+   * rd-origin, e.g. daily-close for the daily liquid step's one-session objects. Absent on the
+   * history chain's own fetches. Readers and resume ignore it; the entries rebuild uses it to let a
+   * chain fetch supersede an overlapping daily object.
+   */
+  origin?: string;
 }): ObjectMetadata {
   if (input.link !== undefined && !/^[a-z0-9][a-z0-9.-]{0,79}$/u.test(input.link))
     throw new Error("TENMIN_RANGE_LINK_INVALID");
+  if (input.origin !== undefined && !/^[a-z0-9][a-z0-9.-]{0,39}$/u.test(input.origin))
+    throw new Error("TENMIN_RANGE_ORIGIN_INVALID");
   return {
     "rd-schema": TENMIN_RANGE_OBJECT_SCHEMA,
     "rd-provider": input.provider,
@@ -428,6 +436,7 @@ export function tenMinRangeObjectMetadata(input: {
     "rd-page": String(input.file.page),
     "rd-page-count": String(input.pageCount),
     ...(input.link !== undefined ? { "rd-link": input.link } : {}),
+    ...(input.origin !== undefined ? { "rd-origin": input.origin } : {}),
   };
 }
 
@@ -443,6 +452,8 @@ export async function writeTenMinRangeFetch(
     observedAt?: string;
     backend?: ReplyDustBackend;
     link?: string;
+    /** rd-origin (see tenMinRangeObjectMetadata). */
+    origin?: string;
   },
 ): Promise<{ securityId: string; fetch: TenMinRangeTickerFetch }> {
   const { calendarFrom, calendarTo, fetchFrom, fetchTo, provider } = options;
@@ -507,6 +518,7 @@ export async function writeTenMinRangeFetch(
           pageCount: pages.length,
           file: entryFor(bytes),
           ...(options.link !== undefined ? { link: options.link } : {}),
+          ...(options.origin !== undefined ? { origin: options.origin } : {}),
         }),
     );
     files.push(entryFor(encoded));

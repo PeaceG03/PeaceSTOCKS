@@ -15,6 +15,7 @@ import {
   shouldDispatchHeal,
 } from "./tenmin-redispatch";
 import { planTenMinAlert } from "./tenmin-alert";
+import { TENMIN_DAILY_OFF_RUN_NAME } from "./scan-yield";
 
 const at = (hhmmss: string) => new Date(`2026-10-06T${hhmmss}Z`);
 
@@ -106,6 +107,11 @@ test("restarter runs never count as active scan/history runs, nor as a cancelled
   });
   assert.equal(cancelledScheduledScan([cancelled(7, TENMIN_RESTARTER_RUN_NAME)], now), undefined);
   assert.equal(cancelledScheduledScan([cancelled(7, TENMIN_RESTARTER_RUN_NAME), cancelled(8, "Scanner")], now)?.id, 8);
+  // A daily liquid tick switched off is idle like the restarter; a working one is protected like a scan.
+  assert.equal(cancelledScheduledScan([cancelled(9, TENMIN_DAILY_OFF_RUN_NAME)], now), undefined);
+  assert.equal(cancelledScheduledScan([cancelled(9, "Scanner tenmin daily")], now)?.id, 9);
+  assert.equal(countOtherActiveScannerRuns([{ id: 11, status: "in_progress", display_title: TENMIN_DAILY_OFF_RUN_NAME }]), 0);
+  assert.equal(countOtherActiveScannerRuns([{ id: 12, status: "queued", display_title: "Scanner tenmin daily" }]), 1);
 });
 
 test("alert: a fallback stop seen only next to restarter runs still alerts (count excludes them)", () => {
@@ -118,22 +124,32 @@ test("workflows: scanner.yml restarter cron, run-name, scan gate, concurrency, a
   const scanner = readFileSync(new URL("../.github/workflows/scanner.yml", import.meta.url), "utf8");
   const cron = TENMIN_RESTARTER_CRON;
   assert.ok(scanner.includes(`    - cron: "${cron}"`), "cron in on.schedule");
-  assert.ok(scanner.includes(`run-name: \${{ github.event.schedule == '${cron}' && '${TENMIN_RESTARTER_RUN_NAME}' || 'Scanner' }}`));
+  const daily = "(github.event.schedule == '20 6 * * 2-6' || github.event.schedule == '20 10 * * 2-6')";
   assert.ok(
-    scanner.includes(`group: \${{ github.event.schedule == '${cron}' && format('scanner-restarter-{0}', github.run_id) || 'peacestocks-r2-writer' }}`),
-    "restarter runs never join peacestocks-r2-writer",
+    scanner.includes(
+      `run-name: \${{ github.event.schedule == '${cron}' && '${TENMIN_RESTARTER_RUN_NAME}' || (${daily} && (vars.TENMIN_DAILY_ENABLED == 'true' && 'Scanner tenmin daily' || '${TENMIN_DAILY_OFF_RUN_NAME}') || 'Scanner') }}`,
+    ),
   );
   assert.ok(
-    scanner.includes(`if: \${{ (github.event_name == 'schedule' && github.event.schedule != '${cron}') || github.event.inputs.mode == 'scan' }}`),
-    "scan skips the restarter cron",
+    scanner.includes(
+      `group: \${{ (github.event.schedule == '${cron}' || (${daily} && vars.TENMIN_DAILY_ENABLED != 'true')) && format('scanner-idle-{0}', github.run_id) || 'peacestocks-r2-writer' }}`,
+    ),
+    "restarter runs and switched-off daily ticks never join peacestocks-r2-writer",
+  );
+  assert.ok(
+    scanner.includes(
+      `if: \${{ (github.event_name == 'schedule' && github.event.schedule != '${cron}' && github.event.schedule != '20 6 * * 2-6' && github.event.schedule != '20 10 * * 2-6') || github.event.inputs.mode == 'scan' }}`,
+    ),
+    "scan skips the restarter and daily liquid crons",
   );
   const job = scanner.slice(scanner.indexOf("\n  restarter:\n"), scanner.indexOf("\n  backfill:\n"));
   assert.ok(job.includes(`if: \${{ github.event_name == 'schedule' && github.event.schedule == '${cron}' }}`));
   assert.ok(job.includes("uses: ./.github/workflows/tenmin-history-fallback.yml"));
   for (const p of ["contents: read", "actions: write", "issues: write"]) assert.ok(job.includes(p), p);
-  // Every other cron is a scan cron (05:30 / 09:30) and none sits on :00.
+  // Scan crons (05:30 / 09:30), the restarter, and the daily liquid crons (06:20 / 10:20, right
+  // after each guard window); none sits on :00.
   const crons = [...scanner.matchAll(/- cron: "([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(crons, ["30 5 * * 2-6", "30 9 * * 2-6", cron]);
+  assert.deepEqual(crons, ["30 5 * * 2-6", "30 9 * * 2-6", cron, "20 6 * * 2-6", "20 10 * * 2-6"]);
 
   const fallback = readFileSync(new URL("../.github/workflows/tenmin-history-fallback.yml", import.meta.url), "utf8");
   assert.ok(fallback.includes("\n  workflow_call:\n"));
