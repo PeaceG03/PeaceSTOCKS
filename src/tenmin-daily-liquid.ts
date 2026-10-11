@@ -28,7 +28,7 @@ import { R2ObjectClient } from "./object-store";
 import { openMarketStore } from "./object-storage";
 import { type ReplyDustBackend, decodeReplyDust, nodeReplyDustBackend } from "./reply-dust";
 import { type ZstdVersionProbe, assertPinnedZstdForWriting } from "./reply-dust-pin";
-import { inScanGuardWindow } from "./scan-yield";
+import { type ScanRunPick, checkScannerRuns, createScanYieldCheck, inScanGuardWindow, isScanCheckFailure } from "./scan-yield";
 import type { SessionCalendar } from "./scanner";
 import { TENMIN_DAILY_CLOSE_ORIGIN } from "./tenmin-range-entries";
 import { lastCompletedSessionDate, pairRangeForDate } from "./tenmin-history";
@@ -663,33 +663,18 @@ export async function tenMinDailyYieldReason(options: {
   const now = (options.now ?? (() => new Date()))();
   if (options.deadlineMs !== undefined && now.getTime() >= options.deadlineMs) return `TIME_BUDGET:${now.toISOString()}`;
   if (inScanGuardWindow(now)) return `SCAN_GUARD_WINDOW:${now.toISOString()}`;
-  const env = options.env ?? process.env;
-  const token = env.GITHUB_TOKEN;
-  const repository = env.GITHUB_REPOSITORY;
-  const workflowRef = env.GITHUB_WORKFLOW_REF;
-  if (!token || !repository || !workflowRef) return undefined;
-  const workflowFile = workflowRef.split("@")[0]?.split("/").pop();
-  if (!workflowFile) return "SCAN_CHECK_FAILED:workflow-ref";
-  const api = env.GITHUB_API_URL ?? "https://api.github.com";
-  try {
-    const response = await (options.fetchImpl ?? fetch)(
-      `${api}/repos/${repository}/actions/workflows/${workflowFile}/runs?per_page=30`,
-      { headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json" } },
-    );
-    if (!response.ok) return `SCAN_CHECK_FAILED:http-${response.status}`;
-    const body = (await response.json()) as {
-      workflow_runs?: { id: number; status: string; event: string; display_title?: string | null }[];
-    };
-    const self = Number(env.GITHUB_RUN_ID);
-    const scan = (body.workflow_runs ?? []).find(
-      (run) =>
-        run.id !== self && run.event === "schedule" && run.display_title === "Scanner" && ACTIVE_RUN_STATES.has(run.status),
-    );
-    return scan ? `SCAN_RUN_WAITING:${scan.id}:${scan.status}` : undefined;
-  } catch (error) {
-    return `SCAN_CHECK_FAILED:${String(error).slice(0, 120)}`;
-  }
+  const result = await checkScannerRuns({ ...options, now: () => now, pick: pickWaitingScheduledScan });
+  if (!result) return undefined;
+  return result.ok ? result.waiting : `SCAN_CHECK_FAILED:${result.failure}`;
 }
+
+/** The daily step yields only to a waiting scheduled scan (history runs yield to it instead). */
+export const pickWaitingScheduledScan: ScanRunPick = (runs, self) => {
+  const scan = runs.find(
+    (run) => run.id !== self && run.event === "schedule" && run.display_title === "Scanner" && ACTIVE_RUN_STATES.has(run.status),
+  );
+  return scan ? `SCAN_RUN_WAITING:${scan.id}:${scan.status}` : undefined;
+};
 
 /** Host entry: kill switch, config parse (before any request), R2 store, shared Massive pace. */
 export async function runTenMinDailyFromEnv(env: NodeJS.ProcessEnv = process.env): Promise<Record<string, unknown>> {
@@ -709,6 +694,7 @@ export async function runTenMinDailyFromEnv(env: NodeJS.ProcessEnv = process.env
   await storage.initialize();
   const securities = await storage.loadSecurities();
   const massive = new MassiveMarketProvider({ keepRawReplies: false });
+  const dailyScanCheck = createScanYieldCheck({ env, pick: pickWaitingScheduledScan });
   const report = await runTenMinDailyLiquid({
     store,
     securities,
@@ -716,7 +702,11 @@ export async function runTenMinDailyFromEnv(env: NodeJS.ProcessEnv = process.env
     n,
     maxRequests,
     now,
-    shouldYield: () => tenMinDailyYieldReason({ env, deadlineMs }),
+    // Throttled + retried active-run check (at most one GitHub API call a minute); it fails closed.
+    shouldYield: async () => {
+      if (Date.now() >= deadlineMs) return `TIME_BUDGET:${new Date().toISOString()}`;
+      return dailyScanCheck();
+    },
     fetchPages: (security, from, to) => massive.getTenMinuteRangeReplies(security, from, to),
   });
   return { mode: "tenmin-daily", status: "RAN", ...report, rateLimitedResponses: massive.rateLimitedResponses };
@@ -728,6 +718,12 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import
       const line = `${JSON.stringify(summary)}\n`;
       process.stdout.write(line);
       if (process.env.TENMIN_DAILY_REPORT_FILE) await writeFile(process.env.TENMIN_DAILY_REPORT_FILE, line, "utf8");
+      // Fail closed and loud on a persistent active-run check failure (same rule as the history run).
+      const yielded = typeof summary.yielded === "string" ? summary.yielded : undefined;
+      if (isScanCheckFailure(yielded)) {
+        process.stdout.write(`::error title=Daily 10-minute step stopped: active-run check failed::${yielded}\n`);
+        process.exitCode = 2;
+      }
     })
     .catch((error: unknown) => {
       process.stderr.write(`TENMIN_DAILY_FAILED:${error instanceof Error ? error.message : String(error)}\n`);

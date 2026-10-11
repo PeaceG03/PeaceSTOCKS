@@ -10,7 +10,13 @@
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SCAN_GUARD_WINDOWS_UTC, TENMIN_RESTARTER_RUN_NAME, isIdleScannerRun, isTenMinRestarterRun } from "./scan-yield";
+import {
+  SCAN_GUARD_WINDOWS_UTC,
+  TENMIN_RESTARTER_RUN_NAME,
+  isIdleScannerRun,
+  isScanCheckFailure,
+  isTenMinRestarterRun,
+} from "./scan-yield";
 
 export { TENMIN_RESTARTER_RUN_NAME, isTenMinRestarterRun };
 import type { DatedTickerRunSummary } from "./ticker-reference-dated";
@@ -35,6 +41,8 @@ export const TENMIN_SCAN_CANCELLED_WINDOW_MINUTES = 10;
 export const TENMIN_REDISPATCH_SCAN_CANCELLED = "TENMIN_REDISPATCH_SCAN_CANCELLED" as const;
 /** Hard stop written into the run record when a post-dispatch cancelled-scan check fires. */
 export const TENMIN_STOP_SCAN_CANCELLED = "STOP_SCAN_CANCELLED" as const;
+/** Outcome reason: the history run stopped because its active-run check failed for good. */
+export const TENMIN_STOP_SCAN_CHECK_FAILED = "STOP_SCAN_CHECK_FAILED" as const;
 /** Dispatched tenmin_history run statuses that must be cancelled on SCAN_CANCELLED (incl. in_progress). */
 export const TENMIN_CANCELABLE_DISPATCH_STATUSES = new Set([
   "queued",
@@ -97,6 +105,16 @@ export function tenMinDatedIndexMadeProgress(summary: DatedTickerRunSummary | un
  * ranges left after a clean stop); stop on any refusal or error, an outage stop, a bounded manual
  * run (reopen or maxRanges), a time-budget stop with no progress, or nothing left to fetch.
  */
+/**
+ * Pure: the yield reason when a history run stopped because its active-run check failed for good
+ * (createScanYieldCheck retried and gave up), else undefined. The host fails the step on it.
+ */
+export function tenMinScanCheckFailure(report: Pick<TenMinHistoryRunReport, "yieldedForScan" | "datedTickerIndex">): string | undefined {
+  if (isScanCheckFailure(report.yieldedForScan)) return report.yieldedForScan;
+  const dated = report.datedTickerIndex?.yieldedForScan;
+  return isScanCheckFailure(dated) ? dated : undefined;
+}
+
 export function tenMinRunOutcome(report: TenMinHistoryRunReport): TenMinRunOutcome {
   const rangesSealed = report.ranges.filter((r) => SEALED.has(r.status)).length;
   // A yield in the dated ticker-index phase returns before any range is looked at: the run is
@@ -154,6 +172,11 @@ export function tenMinRunOutcome(report: TenMinHistoryRunReport): TenMinRunOutco
     return out("stop", `${TENMIN_STOP_RANGE_END_CAP}:${report.rangeEndCap.maxRangeEnd}`);
   if (!earlyPhaseYield && rangesRemaining === 0) return out("stop", "STOP_DONE:no-range-left");
   const yielded = report.yieldedForScan;
+  // Fail closed: the active-run check kept failing (e.g. GitHub 403), so the run could not tell
+  // whether a scan needs the key. Stop the chain and alert instead of a silent continue/wait loop
+  // that re-spends each run's budget on the same failure. A human restarts it after the fix.
+  const checkFailure = tenMinScanCheckFailure(report);
+  if (checkFailure) return out("stop", `${TENMIN_STOP_SCAN_CHECK_FAILED}:${checkFailure.slice(0, 160)}`);
   if (yielded?.startsWith("TIME_BUDGET")) {
     return madeProgress ? out("continue", "CONTINUE_TIME_BUDGET") : out("stop", "STOP_NO_PROGRESS:TIME_BUDGET");
   }

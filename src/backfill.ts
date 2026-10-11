@@ -29,7 +29,7 @@ import { MarketStorage, type MarketStore } from "./storage";
 import { refreshEligibility, refreshUniverse } from "./universe";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import { finalizeDailyPartition } from "./scanner";
-import { ScanYieldError, scanYieldReason } from "./scan-yield";
+import { ScanYieldError, createScanYieldCheck } from "./scan-yield";
 
 const STATE_VERSION = "markets-scanner-backfill-v1" as const;
 export const MARKET_BACKFILL_PATH_ERROR = "MARKET_BACKFILL_PATH_INVALID";
@@ -247,7 +247,7 @@ export async function backfillHistoricalEvidence(options: {
   // On Actions the scan always wins the Massive budget; local/test runs opt in via shouldYield.
   const shouldYield =
     options.shouldYield ??
-    (env.GITHUB_ACTIONS === "true" ? () => scanYieldReason({ env }) : async () => undefined);
+    (env.GITHUB_ACTIONS === "true" ? createScanYieldCheck({ env }) : async () => undefined);
   const yieldedBeforeSessions = (reason: string): BackfillResult => ({
     provider: provider.providerName,
     requestedFrom: options.from,

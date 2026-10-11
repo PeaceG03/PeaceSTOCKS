@@ -32,7 +32,7 @@ import {
   runTenMinHistoryFromEnv,
   tenMinHistorySummary,
 } from "./tenmin-history";
-import { tenMinRunOutcome } from "./tenmin-redispatch";
+import { tenMinRunOutcome, tenMinScanCheckFailure } from "./tenmin-redispatch";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 
 export const DEFAULT_MARKETS_ROOT = "C:\\ProgramData\\PeaceAI\\Markets";
@@ -413,7 +413,16 @@ async function main(): Promise<void> {
           `range_remaining=${JSON.stringify(history.report.rangeRemaining)}\n`,
         );
     }
-    process.exitCode = history.report.stoppedOnError ? 2 : 0;
+    // Fail closed and loud: a persistent active-run check failure fails this step (red run, GitHub's
+    // failed-run notification, and the chain step records a stop that the stop alert reports). The
+    // annotation works even when the token's API budget is used up and the issue alert cannot post.
+    const checkFailure = tenMinScanCheckFailure(history.report);
+    if (checkFailure) {
+      process.stdout.write(
+        `::error title=Ten-minute history stopped: active-run check failed::${checkFailure} (no Massive request was made after it; the chain stops until restarted)\n`,
+      );
+    }
+    process.exitCode = history.report.stoppedOnError || checkFailure ? 2 : 0;
     return;
   }
   const intradayFrom = process.env.PEACEAI_MARKETS_INTRADAY_FROM;

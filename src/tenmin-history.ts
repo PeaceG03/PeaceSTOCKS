@@ -12,7 +12,7 @@ import { MassiveMarketProvider } from "./massive-provider";
 import { R2ObjectClient } from "./object-store";
 import { openMarketStore } from "./object-storage";
 import { type ZstdVersionProbe, assertPinnedZstdForWriting } from "./reply-dust-pin";
-import { scanYieldReason } from "./scan-yield";
+import { createScanYieldCheck } from "./scan-yield";
 import {
   type DatedTickerRunReport,
   type DatedTickerRunSummary,
@@ -819,13 +819,17 @@ export async function runTenMinHistory(options: {
       return provider.getTenMinuteRangeReplies(security, from, to);
     });
 
+  // One throttled check for the whole run: the active-run API call is made at most once a minute
+  // (it used to run before every planned fetch, re-verified ones included, and hit GitHub's
+  // GITHUB_TOKEN rate limit). A check that still fails after retries fails closed (see host.ts).
+  const scanCheck = env.GITHUB_ACTIONS === "true" ? createScanYieldCheck({ env }) : undefined;
   const shouldYield =
     options.shouldYield ??
-    (env.GITHUB_ACTIONS === "true"
+    (scanCheck
       ? async () => {
           if (options.deadlineMs !== undefined && Date.now() >= options.deadlineMs)
             return `TIME_BUDGET:${stamp()}`;
-          return scanYieldReason({ env });
+          return scanCheck();
         }
       : async () => {
           if (options.deadlineMs !== undefined && Date.now() >= options.deadlineMs)
