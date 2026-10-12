@@ -1,0 +1,174 @@
+name: Oct 2024 ten-minute fetch (one-off)
+
+# One-off (Peace's Oct 5 re-fetch approval; Architect decision 2026-10-12): finishes the 2024-10 ten-minute Reply
+# Dust range (permanent/tenmin-reply-dust/2024-09-01_2024-10-31/) that the box started, with the chain's own writer
+# (src/oct2024-tenmin-oneoff.ts). Dispatch only, main only. Delete this file once the range is sealed and the
+# redispatch backstop has passed.
+# Modes:
+#   run            fetch/resume-by-verify for at most ONEOFF budget (5 h 15 min), then (budget) dispatch the next
+#                  run, (sealed) start the backstop, (anything else) alert. One run at a time (concurrency group).
+#   backstop_wait  sleeps until sealed_at + 3 h, then dispatches backstop_check (a new run reads vars fresh).
+#   backstop_check alerts (scanner-alert issue) if TENMIN_AUTO_REDISPATCH is still not "true" 3 h after the seal.
+# The history chain stays paused (TENMIN_AUTO_REDISPATCH=false) until the box refill restores it after the seal.
+# Logs: counts and PASS/FAIL only (no tickers, bar values, URLs or secrets). Inputs reach scripts only via env.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run | backstop_wait | backstop_check"
+        required: true
+        default: run
+        type: choice
+        options: [run, backstop_wait, backstop_check]
+      floor:
+        description: "Floor session (YYYY-MM-DD, 2024-10-11 or later)"
+        required: false
+        default: "2024-10-11"
+        type: string
+      chain_index:
+        description: "Run number in this chain (1 = first)"
+        required: false
+        default: "1"
+        type: string
+      sealed_at:
+        description: "Seal time, epoch seconds (backstop modes)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    if: ${{ github.ref == 'refs/heads/main' && inputs.mode == 'run' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    # One fetch at a time; a dispatched successor waits (pending) until this run ends. Never cancels a running one.
+    # Deliberately not peacestocks-r2-writer: joining it would replace (cancel) a pending scan or history run.
+    concurrency:
+      group: oct2024-tenmin-fetch
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      # actions: read the scanner.yml runs (pause while active) and dispatch this workflow's next run.
+      actions: write
+      # issues: the stop alert (scanner-alert issue, same as scanner.yml).
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Restore pinned zstd 1.5.7
+        id: zstd-cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/zstd-1.5.7
+          key: zstd-1.5.7-eb33e51f49a15e02-${{ runner.os }}-ubuntu-24.04
+      - name: Build pinned zstd 1.5.7
+        if: ${{ steps.zstd-cache.outputs.cache-hit != 'true' }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+          echo "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3  zstd-1.5.7.tar.gz" | sha256sum -c -
+          tar xzf zstd-1.5.7.tar.gz
+          make -C zstd-1.5.7 -j"$(nproc)" zstd-release > /dev/null
+          install -D -m 0755 zstd-1.5.7/programs/zstd ~/.local/zstd-1.5.7/bin/zstd
+      - name: Use pinned zstd 1.5.7
+        run: |
+          set -euo pipefail
+          ~/.local/zstd-1.5.7/bin/zstd --version | grep -F ' v1.5.7,'
+          echo "$HOME/.local/zstd-1.5.7/bin" >> "$GITHUB_PATH"
+      - name: Fetch / resume (chain writer)
+        id: fetch
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+          PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+          PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+          PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+          PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          ONEOFF_FLOOR: ${{ inputs.floor }}
+          ONEOFF_CHAIN_INDEX: ${{ inputs.chain_index }}
+        run: |
+          test -n "$MASSIVE_API_KEY" && test -n "$PEACESTOCKS_R2_BUCKET" && test -n "$PEACESTOCKS_R2_ACCOUNT_ID"
+          test -n "$PEACESTOCKS_R2_ACCESS_KEY_ID" && test -n "$PEACESTOCKS_R2_SECRET_ACCESS_KEY"
+          pnpm exec tsx src/oct2024-tenmin-oneoff.ts run
+      - name: Next step (dispatch next run / start backstop / alert)
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ steps.fetch.outputs.result }}
+          FETCH_OUTCOME: ${{ steps.fetch.outcome }}
+          FLOOR: ${{ steps.fetch.outputs.floor }}
+          CHAIN_INDEX: ${{ steps.fetch.outputs.chain_index }}
+          SEALED_AT: ${{ steps.fetch.outputs.sealed_at }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          next="$(pnpm -s exec tsx src/oct2024-tenmin-oneoff.ts next)"
+          echo "result=${RESULT:-none} outcome=$FETCH_OUTCOME next=$next"
+          case "$next" in
+            dispatch)
+              gh workflow run oct2024-tenmin.yml --repo "$GITHUB_REPOSITORY" --ref main -f mode=run -f floor="$FLOOR" -f chain_index="$((CHAIN_INDEX + 1))" && echo "DISPATCH PASS next chain_index=$((CHAIN_INDEX + 1))" && exit 0
+              reason="the next run could not be dispatched";;
+            backstop)
+              gh workflow run oct2024-tenmin.yml --repo "$GITHUB_REPOSITORY" --ref main -f mode=backstop_wait -f sealed_at="$SEALED_AT" && echo "SEALED; BACKSTOP DISPATCH PASS" && exit 0
+              reason="the range SEALED but the redispatch backstop could not be dispatched (the box refill handoff still applies)";;
+            *) reason="the fetch stopped unsealed (result ${RESULT:-none}, outcome $FETCH_OUTCOME)";;
+          esac
+          body="Oct 2024 ten-minute one-off: $reason. TENMIN_AUTO_REDISPATCH stays paused until a person checks. Run: $RUN_URL"
+          n="$(gh issue list --repo "$GITHUB_REPOSITORY" --label scanner-alert --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$n" ]; then gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else gh issue create --repo "$GITHUB_REPOSITORY" --title "Oct 2024 ten-minute one-off needs a person" --label scanner-alert --assignee PeaceG03 --body "$body"; fi
+          exit 1
+
+  backstop_wait:
+    if: ${{ github.ref == 'refs/heads/main' && inputs.mode == 'backstop_wait' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Sleep until sealed_at + 3 h, then dispatch the check (fresh vars)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEALED_AT: ${{ inputs.sealed_at }}
+        run: |
+          set -euo pipefail
+          [[ "$SEALED_AT" =~ ^[0-9]{10}$ ]] || { echo "sealed_at invalid"; exit 1; }
+          left=$(( SEALED_AT + 10800 - $(date +%s) ))
+          [ "$left" -gt 0 ] && [ "$left" -le 12600 ] && sleep "$left"
+          gh workflow run oct2024-tenmin.yml --repo "$GITHUB_REPOSITORY" --ref main -f mode=backstop_check -f sealed_at="$SEALED_AT"
+          echo "BACKSTOP CHECK DISPATCHED"
+
+  backstop_check:
+    if: ${{ github.ref == 'refs/heads/main' && inputs.mode == 'backstop_check' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Alert if the history chain is still paused 3 h after the seal
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REDISPATCH: ${{ vars.TENMIN_AUTO_REDISPATCH }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$REDISPATCH" = "true" ]; then echo "BACKSTOP PASS: TENMIN_AUTO_REDISPATCH is true"; exit 0; fi
+          body="Oct 2024 ten-minute range sealed over 3 h ago, but TENMIN_AUTO_REDISPATCH is still not true (the box refill/restore did not run). Restore it after checking the refill: gh variable set TENMIN_AUTO_REDISPATCH -R PeaceG03/PeaceSTOCKS --body true. Run: $RUN_URL"
+          n="$(gh issue list --repo "$GITHUB_REPOSITORY" --label scanner-alert --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$n" ]; then gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else gh issue create --repo "$GITHUB_REPOSITORY" --title "History chain still paused after the Oct 2024 seal" --label scanner-alert --assignee PeaceG03 --body "$body"; fi
+          echo "BACKSTOP FAIL: alert raised"; exit 1
