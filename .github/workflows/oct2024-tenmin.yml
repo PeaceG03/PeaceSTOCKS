@@ -14,7 +14,7 @@ name: Oct 2024 ten-minute fetch (one-off)
 #                  On FAIL: scanner-alert issue; the gate stays off. scanner.yml restarter_guard alerts hourly-deduped
 #                  if the gate is off with no one-off run for over 30 min.
 # Logs: counts and PASS/FAIL only (no tickers, bar values, URLs or secrets). Inputs reach scripts only via env.
-run-name: ${{ inputs.mode == 'post_seal' && 'One-off ten-minute fetch: sealed (post-seal)' || format('Oct 2024 ten-minute fetch (one-off) {0}', inputs.mode) }}
+run-name: "${{ inputs.mode == 'post_seal' && 'One-off ten-minute fetch: sealed (post-seal)' || format('Oct 2024 ten-minute fetch (one-off) {0}', inputs.mode) }}"
 on:
   workflow_dispatch:
     inputs:
