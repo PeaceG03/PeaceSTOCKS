@@ -70,3 +70,12 @@ test("no decision deletes: every reachable mode only continues, waits, stops or 
   for (const o of ["ok", "rate_limited", "failed", "cancelled", "lost_handoff", "refused", "none"] as const)
     assert.ok(["continue", "wait", "stop", "alert"].includes(decideTenMinMode({ ...base, lastOutcome: o, consecutiveFailures: 1 }).next));
 });
+
+import { lastOutcomeFromRecord } from "./tenmin-mode";
+test("shadow adapter: run records map to outcomes", () => {
+  assert.equal(lastOutcomeFromRecord(undefined, undefined), "none");
+  assert.equal(lastOutcomeFromRecord("STOP_MASSIVE_RATE_LIMITED", "success"), "rate_limited");
+  assert.equal(lastOutcomeFromRecord("CONTINUE", "failure"), "failed");
+  assert.equal(lastOutcomeFromRecord("CONTINUE", "cancelled"), "cancelled");
+  assert.equal(lastOutcomeFromRecord("CONTINUE", "success"), "ok");
+});

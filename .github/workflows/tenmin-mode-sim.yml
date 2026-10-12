@@ -1,0 +1,23 @@
+name: Ten-minute mode simulation (dry run)
+# Box-off proof: runs the simulated-cursor handoff tests (catch-up -> daily, gap fill, daily -> plan-upgrade
+# backfill -> daily, recovery) and the redispatch-gate tests entirely in Actions. No secrets, no R2, no Massive.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sim:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Simulated-cursor handoffs + gate
+        run: pnpm -s exec tsx --test src/tenmin-mode.test.ts src/tenmin-gate.test.ts 2>&1 | grep -E '^# (pass|fail)|^not ok'; test "${PIPESTATUS[0]}" -eq 0

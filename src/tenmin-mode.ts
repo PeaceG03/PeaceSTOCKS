@@ -66,3 +66,13 @@ export function decideTenMinMode(i: ModeInput): ModeDecision {
   if (i.plan.windowStart < i.storedFloor) return { ...base, mode: "BACKFILL_OLDER", next: "continue", reason: `BACKFILL_OLDER:${i.plan.windowStart}..${i.storedFloor}` };
   return { ...base, mode: "DAILY", next: "stop", reason: "DAILY:caught-up; schedule wakes next close" };
 }
+
+/** Map a finished tenmin_history run's reason/job result to the machine's LastOutcome (used in shadow mode). */
+export function lastOutcomeFromRecord(reason: string | undefined, jobResult: string | undefined): LastOutcome {
+  if (!reason && !jobResult) return "none";
+  if (/RATE|429/u.test(reason ?? "")) return "rate_limited";
+  if (/REFUS|STOP_BOUNDED_MANUAL/u.test(reason ?? "")) return "refused";
+  if (jobResult === "cancelled") return "cancelled";
+  if (jobResult && jobResult !== "success") return "failed";
+  return "ok";
+}

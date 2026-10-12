@@ -11,6 +11,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveRedispatchGate } from "./tenmin-gate";
+import { lastOutcomeFromRecord } from "./tenmin-mode";
 import {
   SCAN_GUARD_WINDOWS_UTC,
   TENMIN_RESTARTER_RUN_NAME,
@@ -811,6 +812,8 @@ async function main(mode: string | undefined): Promise<void> {
     output("reason", decision.reason);
     // queueCheck is logged even when the decision does not depend on it (e.g. KILL_SWITCH_OFF), so
     // every restarter tick shows whether the workflow token can list scanner.yml runs.
+    // Shadow mode (observe only, no behaviour change yet): what the mode machine would call this tick.
+    process.stdout.write(`${JSON.stringify({ mode: "tenmin-mode-shadow", lastOutcome: lastOutcomeFromRecord(record?.outcome?.reason, record?.jobResult) })}\n`);
     process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", trigger: "fallback", lastRun: record?.githubRunId, queueCheck: checkFailed ? `failed:${checkFailed}` : "ok", runsListed: runs.length, ...decision })}\n`);
     if (decision.dispatch) {
       // Build a record so a cancelled-scan stop can be written for the next fallback to read.
