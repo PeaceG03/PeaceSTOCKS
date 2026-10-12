@@ -98,8 +98,32 @@ async function listRuns(workflow: string, query: string): Promise<RunLike[]> {
   return ((await r.json()) as { workflow_runs?: RunLike[] }).workflow_runs ?? [];
 }
 
+/** Workflows whose active run holds the history chain (one Massive key user at a time). */
+export const HOLDING_WORKFLOWS = ["gap-refill.yml"] as const;
+export const GATE_HELD = "held:gap-refill";
+
+/** Pure: does any listed run hold the key (queued / waiting / in progress)? */
+export function holdActive(runs: readonly RunLike[]): boolean {
+  return runs.some((r) => r.status !== "completed");
+}
+
 /** Effective TENMIN_AUTO_REDISPATCH (fail closed: API errors leave the raw value, which is not "true"). */
 export async function resolveRedispatchGate(env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  const opened = await resolveSealGate(env);
+  if (opened !== "true" || !env.GITHUB_REPOSITORY || !(env.GITHUB_TOKEN ?? env.GH_TOKEN)) return opened;
+  // A missing holding workflow (404) holds nothing; any other lookup failure holds (fail closed).
+  const runsOrNone = async (w: string, q: string) => {
+    try { return await listRuns(w, q); } catch (e) { if (e instanceof Error && e.message === "http-404") return []; throw e; }
+  };
+  try {
+    for (const w of HOLDING_WORKFLOWS) if (holdActive(await runsOrNone(w, "&status=in_progress")) || holdActive(await runsOrNone(w, "&status=queued"))) return GATE_HELD;
+  } catch {
+    return GATE_HELD;
+  }
+  return opened;
+}
+
+async function resolveSealGate(env: NodeJS.ProcessEnv): Promise<string | undefined> {
   const raw = env.TENMIN_AUTO_REDISPATCH;
   const g = parseGate(raw);
   if (g.kind !== "until_seal") return effectiveGate(raw, undefined);

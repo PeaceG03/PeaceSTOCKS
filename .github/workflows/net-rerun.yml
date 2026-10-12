@@ -36,6 +36,23 @@ jobs:
           [ "$HAS_TOKEN" = true ] || { echo "TOKEN FAIL: NET_RERUN_DISPATCH_TOKEN absent"; exit 1; }
           [[ "$NET_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "NET_REF FAIL"; exit 1; }
           echo "TOKEN PASS"
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # No gaps before computing (same rule as the box waiter): daily bars + corporate actions fully covered.
+      - name: Coverage gap check (read-only)
+        env:
+          PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+          PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+          PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+          PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+        run: pnpm -s exec tsx src/gap-refill.ts --check
       - name: Compute, then results-land (once)
         env:
           GH_TOKEN: ${{ secrets.NET_RERUN_DISPATCH_TOKEN }}

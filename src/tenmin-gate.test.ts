@@ -38,3 +38,11 @@ test("restarter guard: alerts only when off, no one-off active, idle >30 min, no
   assert.equal(planGateGuard({ ...base, oneOffRuns: [], openAlertTitles: [GUARD_ALERT_TITLE] }).action, "none");
   assert.equal(planGateGuard({ ...base, oneOffRuns: { error: "http-403" } }).action, "alert");
 });
+
+import { holdActive } from "./tenmin-gate";
+test("hold: an unfinished gap-refill run holds the chain; finished ones release it", () => {
+  assert.equal(holdActive([{ id: 1, status: "in_progress", conclusion: null }]), true);
+  assert.equal(holdActive([{ id: 1, status: "queued", conclusion: null }]), true);
+  assert.equal(holdActive([{ id: 1, status: "completed", conclusion: "success" }]), false);
+  assert.equal(holdActive([]), false);
+});

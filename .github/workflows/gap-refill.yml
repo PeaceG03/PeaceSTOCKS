@@ -1,0 +1,94 @@
+name: Daily-bars gap refill
+# Replaces the box daily-gap watcher. Refills every session the coverage check reports missing (grouped daily +
+# corporate actions, stored exactly like the scanner; never replaces or deletes a stored object), after checking
+# Net's frozen config on PeaceSTOCKS-Net main. Hold/release with no variable write: while this run is in progress
+# the history gate reads "held" (src/tenmin-gate.ts), each Massive request waits for other scanner.yml runs to
+# finish, and the last step re-dispatches tenmin_history. Pre-images of rewritten month files go to an artifact.
+# Dispatch: manual, or weekly safety net (no-op in seconds when nothing is missing). Logs: counts + PASS/FAIL.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "40 14 * * 0"
+permissions:
+  contents: read
+concurrency:
+  group: gap-refill
+  cancel-in-progress: false
+jobs:
+  refill:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    permissions:
+      contents: read
+      actions: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Restore pinned zstd 1.5.7
+        id: zstd-cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/zstd-1.5.7
+          key: zstd-1.5.7-eb33e51f49a15e02-${{ runner.os }}-ubuntu-24.04
+      - name: Build pinned zstd 1.5.7
+        if: ${{ steps.zstd-cache.outputs.cache-hit != 'true' }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+          echo "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3  zstd-1.5.7.tar.gz" | sha256sum -c -
+          tar xzf zstd-1.5.7.tar.gz
+          make -C zstd-1.5.7 -j"$(nproc)" zstd-release > /dev/null
+          install -D -m 0755 zstd-1.5.7/programs/zstd ~/.local/zstd-1.5.7/bin/zstd
+      - name: Use pinned zstd 1.5.7
+        run: |
+          set -euo pipefail
+          ~/.local/zstd-1.5.7/bin/zstd --version | grep -F ' v1.5.7,'
+          echo "$HOME/.local/zstd-1.5.7/bin" >> "$GITHUB_PATH"
+      - name: Refill missing sessions
+        id: refill
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+          PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+          PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+          PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+          PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+          NET_READ_TOKEN: ${{ secrets.NET_RERUN_DISPATCH_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: pnpm -s exec tsx src/gap-refill.ts
+      - name: Keep pre-images
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: refill-backup
+          path: refill-backup/
+          retention-days: 90
+          if-no-files-found: ignore
+      # Release (only if this run held the key): restart the history chain; its gate stops reading "held" once
+      # this run completes, which is long before that run's chain step (~2 h).
+      - name: Release (dispatch tenmin_history)
+        if: ${{ always() && steps.refill.outputs.held == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scanner.yml --repo "$GITHUB_REPOSITORY" --ref main -f mode=tenmin_history && echo "RELEASE PASS"
+      - name: Alert on FAIL
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          t="Daily-bars gap refill needs a person"
+          n="$(gh issue list --repo "$GITHUB_REPOSITORY" --label scanner-alert --state open --search "$t in:title" --json number --jq '.[0].number // empty')"
+          body="Gap refill FAILED or refused (frozen config, verify, or write guard). Nothing was deleted. Run: $RUN_URL"
+          if [ -n "$n" ]; then gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else gh issue create --repo "$GITHUB_REPOSITORY" --title "$t" --label scanner-alert --assignee PeaceG03 --body "$body"; fi

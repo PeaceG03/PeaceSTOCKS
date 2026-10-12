@@ -177,9 +177,15 @@ test("redispatch paused: TENMIN_AUTO_REDISPATCH false or unset skips with a reas
     assert.equal(tenMinDailyRedispatchHold({} as NodeJS.ProcessEnv), "SKIP_REDISPATCH_PAUSED:TENMIN_AUTO_REDISPATCH=unset");
     assert.equal(tenMinDailyRedispatchHold({ TENMIN_AUTO_REDISPATCH: "false" } as NodeJS.ProcessEnv), 'SKIP_REDISPATCH_PAUSED:TENMIN_AUTO_REDISPATCH="false"');
     assert.equal(tenMinDailyRedispatchHold({ TENMIN_AUTO_REDISPATCH: "true" } as NodeJS.ProcessEnv), undefined);
-    // Control: with "true" the step goes on (here it stops at the missing R2 store, or a guard window).
+    // "true" but the gap-refill hold lookup fails (no network): fail closed, held, 0 Massive requests.
+    const held = await runTenMinDailyFromEnv({ ...base, TENMIN_AUTO_REDISPATCH: "true" } as NodeJS.ProcessEnv);
+    assert.equal(held.status, "SKIPPED");
+    assert.match(String(held.reason), /held:gap-refill/u);
+    requests = 0;
+    // Control: with "true" and no hold lookup (no token) the step goes on (missing R2 store, or a guard window).
     try {
-      const ran = await runTenMinDailyFromEnv({ ...base, TENMIN_AUTO_REDISPATCH: "true" } as NodeJS.ProcessEnv);
+      const { GITHUB_TOKEN: _t, ...noToken } = base;
+      const ran = await runTenMinDailyFromEnv({ ...noToken, TENMIN_AUTO_REDISPATCH: "true" } as NodeJS.ProcessEnv);
       assert.equal(ran.status, "WAIT_GUARD_WINDOW");
     } catch (error) {
       assert.match(String(error), /OBJECT_STORE_REQUIRED/u);
