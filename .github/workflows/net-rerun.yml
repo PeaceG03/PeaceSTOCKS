@@ -1,0 +1,77 @@
+name: Net re-run dispatch
+# Replaces the box rerun-waiter (A+B): dispatches PeaceSTOCKS-Net-Runner compute.yml pinned to net_ref, follows it,
+# and on success (newest successful compute == ours, Runner main == its head) dispatches PeaceSTOCKS-Net
+# results-land.yml once. Cross-repo dispatch needs secret NET_RERUN_DISPATCH_TOKEN (fine-grained: the two target
+# repos only, Actions read/write + Contents read). Absent token -> fail closed with one scanner-alert issue.
+# Never twice: refuses if a compute.yml workflow_dispatch run already exists for the last 24 h.
+# Logs: run ids and PASS/FAIL only.
+on:
+  workflow_dispatch:
+    inputs:
+      net_ref:
+        description: "PeaceSTOCKS-Net commit (40 hex) to pin"
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: net-rerun
+  cancel-in-progress: false
+jobs:
+  rerun:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      issues: write
+    env:
+      RUNNER: PeaceG03/PeaceSTOCKS-Net-Runner
+      NET: PeaceG03/PeaceSTOCKS-Net
+      NET_REF: ${{ inputs.net_ref }}
+      HAS_TOKEN: ${{ secrets.NET_RERUN_DISPATCH_TOKEN != '' }}
+    steps:
+      - name: Token present
+        run: |
+          [ "$HAS_TOKEN" = true ] || { echo "TOKEN FAIL: NET_RERUN_DISPATCH_TOKEN absent"; exit 1; }
+          [[ "$NET_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "NET_REF FAIL"; exit 1; }
+          echo "TOKEN PASS"
+      - name: Compute, then results-land (once)
+        env:
+          GH_TOKEN: ${{ secrets.NET_RERUN_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          since=$(date -u -d '-24 hours' +%FT%TZ)
+          prior=$(gh api "repos/$RUNNER/actions/workflows/compute.yml/runs?event=workflow_dispatch&created=>=$since&per_page=5" --jq '.total_count')
+          [ "$prior" = 0 ] || { echo "ONCE FAIL: $prior compute dispatch(es) in the last 24 h"; exit 1; }
+          t0=$(date -u +%FT%TZ)
+          gh workflow run compute.yml -R "$RUNNER" --ref main -f net_ref="$NET_REF"
+          id=""; for _ in $(seq 1 30); do sleep 10
+            id=$(gh api "repos/$RUNNER/actions/workflows/compute.yml/runs?event=workflow_dispatch&created=>=$t0&per_page=1" --jq '.workflow_runs[0].id // empty'); [ -n "$id" ] && break; done
+          [ -n "$id" ] || { echo "COMPUTE FAIL: run id not found"; exit 1; }
+          echo "COMPUTE DISPATCHED run_id=$id"
+          gh run watch "$id" -R "$RUNNER" --interval 60 > /dev/null || true
+          c=$(gh run view "$id" -R "$RUNNER" --json conclusion --jq .conclusion)
+          echo "COMPUTE $c"; [ "$c" = success ]
+          newest=$(gh api "repos/$RUNNER/actions/workflows/compute.yml/runs?branch=main&status=success&per_page=30" --jq '[.workflow_runs[].id]|max')
+          [ "$newest" = "$id" ] || { echo "LAND FAIL: newer successful compute exists"; exit 1; }
+          head=$(gh run view "$id" -R "$RUNNER" --json headSha --jq .headSha); main=$(gh api "repos/$RUNNER/commits/main" --jq .sha)
+          [ "$head" = "$main" ] || { echo "LAND FAIL: Runner main moved"; exit 1; }
+          t1=$(date -u +%FT%TZ)
+          gh workflow run results-land.yml -R "$NET" --ref main
+          lid=""; for _ in $(seq 1 30); do sleep 10
+            lid=$(gh api "repos/$NET/actions/workflows/results-land.yml/runs?event=workflow_dispatch&created=>=$t1&per_page=1" --jq '.workflow_runs[0].id // empty'); [ -n "$lid" ] && break; done
+          [ -n "$lid" ] || { echo "LAND FAIL: run id not found"; exit 1; }
+          gh run watch "$lid" -R "$NET" --interval 60 > /dev/null || true
+          lc=$(gh run view "$lid" -R "$NET" --json conclusion --jq .conclusion)
+          echo "LAND $lc run_id=$lid"; [ "$lc" = success ]
+      - name: Alert on FAIL
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="Net re-run dispatch FAILED or refused (token, once-only check, compute or landing). Not retried. Run: $RUN_URL"
+          n="$(gh issue list --repo "$GITHUB_REPOSITORY" --label scanner-alert --state open --search 'Net re-run in:title' --json number --jq '.[0].number // empty')"
+          if [ -n "$n" ]; then gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else gh issue create --repo "$GITHUB_REPOSITORY" --title "Net re-run dispatch needs a person" --label scanner-alert --assignee PeaceG03 --body "$body"; fi
