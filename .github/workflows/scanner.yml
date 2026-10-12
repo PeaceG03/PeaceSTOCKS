@@ -258,6 +258,34 @@ jobs:
       issues: write
     uses: ./.github/workflows/tenmin-history-fallback.yml
 
+  # Restarter guard (same reliable :47 cron, never gated on the variable): if the history redispatch gate is off or
+  # still waiting on a one-off seal and no one-off fetch has run for over 30 min, open one scanner-alert issue
+  # (deduped by title while open). Read-only except the issue. Logic: planGateGuard (src/tenmin-gate.ts).
+  restarter_guard:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '47 * * * *' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Gate guard
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TENMIN_AUTO_REDISPATCH: ${{ vars.TENMIN_AUTO_REDISPATCH }}
+          TENMIN_ONEOFF_WORKFLOWS: oct2024-tenmin.yml
+        run: pnpm -s exec tsx src/tenmin-gate.ts guard
+
   backfill:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'backfill' }}
     # Pinned so the runner image cannot change mid-rollout; move to 26.04 deliberately later.

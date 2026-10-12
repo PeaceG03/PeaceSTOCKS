@@ -3,10 +3,12 @@ import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
+  readbackVerdict,
   ONEOFF_PREFIX, ONEOFF_SESSIONS, ONEOFF_DEFAULT_BUDGET_MS, ONEOFF_SPACING_MS, inOneOffGuardWindow, dollarVolumeBySecurity,
   liquidityOrder, nextOneOffFloor, parseOneOffFloor, parseChainIndex, decideOneOffNext, oneOffPauseReason, errorClass,
   timedFetch, guardedStore, storedByFetchFrom,
 } from "./oct2024-tenmin-oneoff";
+import { ONEOFF_SEALED_RUN_NAME } from "./tenmin-gate";
 import { isTenMinRangeAbortError, fetchIdentityKey } from "./tenmin-range-reply-dust";
 
 test("guard windows match the box driver (05:15-06:15Z, 09:15-10:15Z)", () => {
@@ -50,11 +52,11 @@ test("floor: validated input, advance on GONE, none after the last session", () 
   assert.throws(() => parseChainIndex("1x"), /CHAIN_INDEX/u);
 });
 
-test("next step: budget dispatches (below the cap), sealed starts the backstop, anything else alerts", () => {
+test("next step: budget dispatches (below the cap), sealed starts the post-seal run, anything else alerts", () => {
   assert.equal(decideOneOffNext("budget", 1), "dispatch");
   assert.equal(decideOneOffNext("budget", 9), "dispatch");
   assert.equal(decideOneOffNext("budget", 10), "alert");
-  assert.equal(decideOneOffNext("sealed", 3), "backstop");
+  assert.equal(decideOneOffNext("sealed", 3), "post_seal");
   assert.equal(decideOneOffNext("fatal", 1), "alert");
   assert.equal(decideOneOffNext("refused", 1), "alert");
 });
@@ -128,7 +130,12 @@ test("workflow: dispatch-only, main-only, minimal permissions, own concurrency g
   assert.match(on, /workflow_dispatch:/u);
   assert.doesNotMatch(on, /\n  (push|pull_request|pull_request_target|schedule|workflow_run|issue_comment):/u);
   assert.match(y, /\npermissions:\n  contents: read\n/u);
-  assert.equal((y.match(/github\.ref == 'refs\/heads\/main'/gu) ?? []).length, 3);
+  assert.equal((y.match(/github\.ref == 'refs\/heads\/main'/gu) ?? []).length, 2);
+  // post_seal: no Massive key, read-back before the history dispatch, run-name = the gate's marker.
+  const post = y.slice(y.indexOf("\n  post_seal:"));
+  assert.doesNotMatch(post, /MASSIVE_API_KEY/u);
+  assert.ok(post.indexOf("oneoff.ts readback") > 0 && post.indexOf("oneoff.ts readback") < post.indexOf("mode=tenmin_history"));
+  assert.match(y, new RegExp(`'${ONEOFF_SEALED_RUN_NAME.replace(/[()]/gu, "\\$&")}'`, "u"));
   assert.match(y, /group: oct2024-tenmin-fetch\n      cancel-in-progress: false/u);
   assert.doesNotMatch(y, /peacestocks-r2-writer\n/u);
   // No ${{ inputs.* }} / step outputs interpolated into a run: script (only into env:).
@@ -140,4 +147,11 @@ test("workflow: dispatch-only, main-only, minimal permissions, own concurrency g
   assert.equal((y.match(/secrets\.MASSIVE_API_KEY/gu) ?? []).length, 1);
   // The workflow never changes repo variables itself (GITHUB_TOKEN cannot); it only alerts.
   assert.doesNotMatch(y, /^\s*gh variable/mu);
+});
+
+test("post-seal read-back verdict: PASS only sealed + all verified", () => {
+  assert.equal(readbackVerdict({ listed: 7188, verifiedOk: 7188, failed: 0, sealed: true }), "PASS");
+  assert.equal(readbackVerdict({ listed: 7188, verifiedOk: 7188, failed: 0, sealed: false }), "FAIL");
+  assert.equal(readbackVerdict({ listed: 7188, verifiedOk: 7187, failed: 1, sealed: true }), "FAIL");
+  assert.equal(readbackVerdict({ listed: 0, verifiedOk: 0, failed: 0, sealed: true }), "FAIL");
 });

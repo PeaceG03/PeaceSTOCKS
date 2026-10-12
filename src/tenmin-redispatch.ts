@@ -10,6 +10,7 @@
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveRedispatchGate } from "./tenmin-gate";
 import {
   SCAN_GUARD_WINDOWS_UTC,
   TENMIN_RESTARTER_RUN_NAME,
@@ -731,7 +732,7 @@ async function main(mode: string | undefined): Promise<void> {
         otherActiveRuns: countOtherActiveScannerRuns(runs, Number.isFinite(self) ? self : undefined),
         ...(checkFailed ? { checkFailed } : {}),
       },
-      killSwitch: env.TENMIN_AUTO_REDISPATCH,
+      killSwitch: await resolveRedispatchGate(env),
       chain,
       maxChain: env.TENMIN_AUTO_REDISPATCH_MAX_CHAIN,
     });
@@ -797,7 +798,7 @@ async function main(mode: string | undefined): Promise<void> {
         otherActiveRuns: countOtherActiveScannerRuns(runs, Number.isFinite(self) ? self : undefined),
         ...(checkFailed ? { checkFailed } : {}),
       },
-      killSwitch: env.TENMIN_AUTO_REDISPATCH,
+      killSwitch: await resolveRedispatchGate(env),
       chain: record?.chain ?? 0,
       maxChain: env.TENMIN_AUTO_REDISPATCH_MAX_CHAIN,
       ...(newerFailed ? { newerFailedRun: `${newerFailed.id}:${newerFailed.conclusion}` } : {}),

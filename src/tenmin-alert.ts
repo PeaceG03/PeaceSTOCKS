@@ -8,6 +8,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveRedispatchGate } from "./tenmin-gate";
 import {
   TENMIN_SCAN_CHECK_AUTO_RESTARTS,
   TENMIN_STOP_SCAN_CHECK_FAILED,
@@ -197,6 +198,7 @@ export async function runTenMinAlert(trigger: "chain" | "fallback"): Promise<str
     const self = Number(env.GITHUB_RUN_ID);
     otherActiveRuns = countOtherActiveScannerRuns(runs.workflow_runs ?? [], Number.isFinite(self) ? self : undefined);
   }
+  const gateValue = await resolveRedispatchGate(env);
   const plan =
     env.SCANNER_ALERT_FORCE_REASON
       ? ({ action: "alert", reason: env.SCANNER_ALERT_FORCE_REASON, key: `test:${env.GITHUB_RUN_ID}` } as const)
@@ -207,7 +209,7 @@ export async function runTenMinAlert(trigger: "chain" | "fallback"): Promise<str
           redispatchStep: env.TENMIN_REDISPATCH_STEP ?? "unknown",
           ...(env.TENMIN_NEXT_ACTION ? { nextAction: env.TENMIN_NEXT_ACTION } : {}),
           ...(env.TENMIN_REASON ? { reason: env.TENMIN_REASON } : {}),
-          killSwitch: env.TENMIN_AUTO_REDISPATCH,
+          killSwitch: gateValue,
           ...(otherActiveRuns !== undefined ? { otherActiveRuns } : {}),
         });
   const runUrl = `${env.GITHUB_SERVER_URL ?? "https://github.com"}/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}`;

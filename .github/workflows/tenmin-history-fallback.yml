@@ -42,7 +42,7 @@ jobs:
   # Heal path only: sleep (outside every concurrency group, so no scan or history run waits on it)
   # until the guard window that blocked the chain has ended, plus a 2 min margin. No-op otherwise.
   guard_wait:
-    if: ${{ vars.TENMIN_AUTO_REDISPATCH == 'true' && inputs.wait_for_guard_window_end }}
+    if: ${{ (vars.TENMIN_AUTO_REDISPATCH == 'true' || startsWith(vars.TENMIN_AUTO_REDISPATCH, 'until_oneoff_seal:')) && inputs.wait_for_guard_window_end }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -62,7 +62,7 @@ jobs:
     needs: guard_wait
     # Kill switch: nothing runs unless the repo variable is exactly "true". Runs when guard_wait
     # finished or was skipped (not on the heal path).
-    if: ${{ always() && vars.TENMIN_AUTO_REDISPATCH == 'true' && (needs.guard_wait.result == 'success' || needs.guard_wait.result == 'skipped') }}
+    if: ${{ always() && (vars.TENMIN_AUTO_REDISPATCH == 'true' || startsWith(vars.TENMIN_AUTO_REDISPATCH, 'until_oneoff_seal:')) && (needs.guard_wait.result == 'success' || needs.guard_wait.result == 'skipped') }}
     # One decide at a time across every trigger (restarter, heal, manual, schedule). Job level, so a
     # sleeping guard_wait never holds it. Deliberately NOT peacestocks-r2-writer: joining it would
     # replace (cancel) a pending scan.

@@ -18,6 +18,7 @@ import { MassiveMarketProvider } from "./massive-provider";
 import { universeForTenMinRange, tradingSessionsBetween, addCalendarDays } from "./tenmin-history";
 import {
   writeTenMinRangeReplyDust, listStoredTenMinRange, parseFetchIdentityKey, readTenMinRangeManifest,
+  verifyStoredTenMinRangeFetch,
   TENMIN_AGED_OUT, TENMIN_DELISTED_COVERAGE_MISSING,
 } from "./tenmin-range-reply-dust";
 import { assertPinnedZstdForWriting } from "./reply-dust-pin";
@@ -75,9 +76,9 @@ export function parseChainIndex(input: string | undefined): number {
 }
 
 export type OneOffResult = "sealed" | "budget" | "fatal" | "refused" | "chain_cap";
-/** What the workflow does after a run: dispatch the next run, start the redispatch backstop, or stop and alert. */
-export function decideOneOffNext(result: OneOffResult, chainIndex: number, maxChain = ONEOFF_MAX_CHAIN): "dispatch" | "backstop" | "alert" {
-  if (result === "sealed") return "backstop";
+/** What the workflow does after a run: dispatch the next run, start the post-seal run, or stop and alert. */
+export function decideOneOffNext(result: OneOffResult, chainIndex: number, maxChain = ONEOFF_MAX_CHAIN): "dispatch" | "post_seal" | "alert" {
+  if (result === "sealed") return "post_seal";
   if (result === "budget" && chainIndex < maxChain) return "dispatch";
   return "alert";
 }
@@ -138,10 +139,34 @@ export function storedByFetchFrom(stored: ReadonlyMap<string, ReadonlySet<number
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+/** Pure post-seal read-back verdict: PASS only when the manifest is sealed and every stored fetch verifies. */
+export function readbackVerdict(r: { listed: number; verifiedOk: number; failed: number; sealed: boolean }): "PASS" | "FAIL" {
+  return r.sealed && r.listed > 0 && r.failed === 0 && r.verifiedOk === r.listed ? "PASS" : "FAIL";
+}
+
+/** Post-seal read-back (read-only: GET/LIST only, no Massive key): every stored fetch decodes and matches. */
+async function readback(): Promise<number> {
+  const r2 = R2ObjectClient.fromEnv(process.env);
+  let sealed = false;
+  try { sealed = Boolean(await readTenMinRangeManifest(r2 as never, ONEOFF_CAL_FROM, ONEOFF_CAL_TO, { allowEmpty: true })); } catch { sealed = false; }
+  const stored = await listStoredTenMinRange(r2 as never, ONEOFF_CAL_FROM, ONEOFF_CAL_TO);
+  let verifiedOk = 0; let failed = 0;
+  for (const [key, pages] of stored) {
+    const id = parseFetchIdentityKey(key) as never;
+    let v: unknown;
+    try { v = await verifyStoredTenMinRangeFetch(r2 as never, ONEOFF_CAL_FROM, ONEOFF_CAL_TO, id, { provider: "massive-stocks", storedPages: pages }); } catch { v = undefined; }
+    if (v) verifiedOk++; else failed++;
+  }
+  const verdict = readbackVerdict({ listed: stored.size, verifiedOk, failed, sealed });
+  console.log(`READBACK ${verdict} sealed=${sealed} listed=${stored.size} ok=${verifiedOk} failed=${failed}`);
+  return verdict === "PASS" ? 0 : 1;
+}
+
 async function main(): Promise<number> {
   const mode = process.argv[2] ?? "";
+  if (mode === "readback") return readback();
   if (mode === "next") {
-    // Workflow helper: RESULT/FETCH_OUTCOME/CHAIN_INDEX -> dispatch | backstop | alert (anything unknown => alert).
+    // Workflow helper: RESULT/FETCH_OUTCOME/CHAIN_INDEX -> dispatch | post_seal | alert (anything unknown => alert).
     const ok = process.env.FETCH_OUTCOME === "success";
     const r = ok && ["sealed", "budget"].includes(process.env.RESULT ?? "") ? (process.env.RESULT as OneOffResult) : "fatal";
     const idx = /^\d{1,3}$/u.test(process.env.CHAIN_INDEX ?? "") ? Number(process.env.CHAIN_INDEX) : Number.MAX_SAFE_INTEGER;

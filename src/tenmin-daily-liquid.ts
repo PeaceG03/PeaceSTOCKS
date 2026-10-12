@@ -21,6 +21,7 @@
 import { writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveRedispatchGate } from "./tenmin-gate";
 import type { CanonicalDailyBar, CanonicalTenMinuteBar, SecurityMasterRecord, TenMinuteRangeReply } from "./contracts";
 import { FileReplyDustStore, type ReplyDustStore, sha256Hex } from "./intraday-reply-dust";
 import { MassiveMarketProvider, massiveTenMinuteBarsFromReply } from "./massive-provider";
@@ -693,7 +694,7 @@ export async function runTenMinDailyFromEnv(env: NodeJS.ProcessEnv = process.env
   const budgetMs = parseBoundedInt("TENMIN_DAILY_BUDGET_MS", env.TENMIN_DAILY_BUDGET_MS, TENMIN_DAILY_DEFAULT_BUDGET_MS, 10_200_000);
   // Hold while the history chain's redispatch is paused (e.g. a separate Oct 2024 fetch owns the
   // shared key; its watcher sets TENMIN_AUTO_REDISPATCH back to true only after sealing and read-back).
-  const hold = tenMinDailyRedispatchHold(env);
+  const hold = tenMinDailyRedispatchHold({ ...env, TENMIN_AUTO_REDISPATCH: await resolveRedispatchGate(env) });
   if (hold) return { mode: "tenmin-daily", status: "SKIPPED", reason: hold, massiveRequests: 0 };
   const now = new Date();
   if (inScanGuardWindow(now)) return { mode: "tenmin-daily", status: "WAIT_GUARD_WINDOW", at: now.toISOString() };
