@@ -11,7 +11,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveRedispatchGate } from "./tenmin-gate";
-import { lastOutcomeFromRecord } from "./tenmin-mode";
+import { lastOutcomeFromRecord, modeFromChainState } from "./tenmin-mode";
 import {
   SCAN_GUARD_WINDOWS_UTC,
   TENMIN_RESTARTER_RUN_NAME,
@@ -749,6 +749,21 @@ async function main(mode: string | undefined): Promise<void> {
     if (env.TENMIN_RECORD_FILE) writeFileSync(env.TENMIN_RECORD_FILE, `${JSON.stringify(record, null, 2)}\n`);
     output("next_action", decision.nextAction);
     output("reason", decision.reason);
+    {
+      const plan = readJson<{ olderReachable?: boolean; ratePerMin?: number }>(env.TENMIN_PLAN_FILE);
+      const m = modeFromChainState({
+        rangesRemaining: outcome?.rangesRemaining ?? 0,
+        gaps: 0,
+        olderReachable: plan?.olderReachable,
+        probedRatePerMin: plan?.ratePerMin,
+        lastOutcome: lastOutcomeFromRecord(outcome?.reason, env.TENMIN_STEP_OUTCOME),
+        consecutiveFailures: 1,
+        ratePerMin: 5,
+      });
+      output("tenmin_mode", m.mode);
+      output("plan_upgraded", String(m.planUpgraded));
+      process.stdout.write(`${JSON.stringify({ mode: "tenmin-mode", tenminMode: m.mode, planUpgraded: m.planUpgraded })}\n`);
+    }
     process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", trigger: "chain", queueCheck: checkFailed ? `failed:${checkFailed}` : "ok", runsListed: runs.length, ...decision })}\n`);
     if (shouldDispatchHeal(decision)) {
       // Self-heal: a fallback run (outside peacestocks-r2-writer) sleeps until the window ends, then

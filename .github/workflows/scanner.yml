@@ -454,6 +454,14 @@ jobs:
       # TENMIN_REDISPATCH_SCAN_CANCELLED. Cancelling in_progress is safe: that run's always() chain
       # step sees the history step cancelled and records STOP_JOB_CANCELLED. The upload step below
       # runs after this (if: always), so the rewritten stop record is what the fallback reads.
+      # Massive plan probe (1 request, before the chain step): olderReachable => plan window grew.
+      - name: Massive plan probe
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+          TENMIN_PLAN_FILE: ${{ runner.temp }}/tenmin-plan.json
+        run: pnpm -s exec tsx src/massive-plan-probe.ts
       - name: Auto re-dispatch (chain)
         id: redispatch
         if: ${{ always() }}
@@ -466,7 +474,21 @@ jobs:
           TENMIN_STEP_OUTCOME: ${{ steps.history.outcome }}
           TENMIN_OUTCOME_FILE: ${{ runner.temp }}/tenmin-history-outcome.json
           TENMIN_RECORD_FILE: ${{ runner.temp }}/tenmin-history-record.json
+          TENMIN_PLAN_FILE: ${{ runner.temp }}/tenmin-plan.json
         run: pnpm exec tsx src/tenmin-redispatch.ts chain
+      # Plan upgrade: one deduped scanner-alert issue (older history reachable / higher rate). Backfilling older
+      # history needs the range planner's 2-year window and first-range anchor widened (person decision).
+      - name: Plan upgrade notice
+        if: ${{ always() && steps.redispatch.outputs.plan_upgraded == 'true' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          t="Massive plan upgrade detected: older history reachable"
+          n="$(gh issue list --repo "$GITHUB_REPOSITORY" --label scanner-alert --state open --search "$t in:title" --json number --jq '.[0].number // empty')"
+          [ -n "$n" ] && { echo "PLAN NOTICE: already open"; exit 0; }
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$t" --label scanner-alert --assignee PeaceG03 --body "The plan probe reached history older than the current window. Run: $RUN_URL"
       # The fallback workflow reads the newest record to decide whether to restart the chain.
       - name: Keep this run's record for the fallback
         if: ${{ always() }}

@@ -76,3 +76,30 @@ export function lastOutcomeFromRecord(reason: string | undefined, jobResult: str
   if (jobResult && jobResult !== "success") return "failed";
   return "ok";
 }
+
+/**
+ * Chain-state adapter: the history chain plans two-month ranges rather than a single date cursor, so map its
+ * outcome onto the machine. rangesRemaining > 0 => cursor behind the last close; olderReachable (plan probe) =>
+ * plan window starts before the stored floor; gaps = sessions the coverage check reported missing.
+ */
+export function modeFromChainState(s: {
+  rangesRemaining: number;
+  gaps: number;
+  olderReachable: boolean | undefined;
+  probedRatePerMin: number | undefined;
+  lastOutcome: LastOutcome;
+  consecutiveFailures: number;
+  ratePerMin: number;
+}): ModeDecision {
+  const rate = s.probedRatePerMin ?? s.ratePerMin;
+  return decideTenMinMode({
+    cursor: s.rangesRemaining > 0 ? "2000-01-01" : "2000-01-03",
+    lastClosed: "2000-01-02",
+    storedFloor: "2000-01-01",
+    gaps: Array.from({ length: Math.max(0, s.gaps) }, (_, i) => `gap-${i}`),
+    plan: { windowStart: s.olderReachable ? "1999-01-01" : "2000-01-01", ratePerMin: rate },
+    prevPlan: { windowStart: "2000-01-01", ratePerMin: s.ratePerMin },
+    lastOutcome: s.lastOutcome,
+    consecutiveFailures: s.consecutiveFailures,
+  });
+}

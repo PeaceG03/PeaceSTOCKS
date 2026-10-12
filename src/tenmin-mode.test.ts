@@ -79,3 +79,16 @@ test("shadow adapter: run records map to outcomes", () => {
   assert.equal(lastOutcomeFromRecord("CONTINUE", "cancelled"), "cancelled");
   assert.equal(lastOutcomeFromRecord("CONTINUE", "success"), "ok");
 });
+
+import { modeFromChainState } from "./tenmin-mode";
+test("chain-state adapter: catch-up while ranges remain, daily when done, backfill on probe upgrade, recover on failure", () => {
+  const s = { rangesRemaining: 3, gaps: 0, olderReachable: false, probedRatePerMin: undefined, lastOutcome: "ok" as const, consecutiveFailures: 0, ratePerMin: 5 };
+  assert.equal(modeFromChainState(s).mode, "CATCH_UP");
+  assert.equal(modeFromChainState({ ...s, rangesRemaining: 0 }).mode, "DAILY");
+  assert.equal(modeFromChainState({ ...s, rangesRemaining: 0, gaps: 2 }).mode, "GAP_FILL");
+  const up = modeFromChainState({ ...s, rangesRemaining: 0, olderReachable: true });
+  assert.equal(up.mode, "BACKFILL_OLDER"); assert.equal(up.planUpgraded, true);
+  assert.equal(modeFromChainState({ ...s, rangesRemaining: 0, olderReachable: undefined }).mode, "DAILY");
+  assert.equal(modeFromChainState({ ...s, lastOutcome: "failed", consecutiveFailures: 1 }).mode, "RECOVER");
+  assert.equal(modeFromChainState({ ...s, probedRatePerMin: 100 }).ratePerMin, 100);
+});
