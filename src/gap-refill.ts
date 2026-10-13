@@ -61,9 +61,14 @@ async function scannerRuns(): Promise<{ status: string; display_title?: string }
 }
 
 /** R2 client whose every call settles (hard 120 s timeout; the 00:21Z run hung on an untimed call). */
+export const counters = { r2: 0, r2Err: 0, massive: 0, massiveErr: 0, gate: 0 };
+const counted = (f: typeof fetch, ok: "r2" | "massive", err: "r2Err" | "massiveErr"): typeof fetch => async (u, i) => {
+  counters[ok]++;
+  try { return await f(u, i); } catch (e) { counters[err]++; throw e; }
+};
 function r2(): ObjectClient {
   const e = process.env;
-  return new R2ObjectClient({ accountId: e.PEACESTOCKS_R2_ACCOUNT_ID ?? "", bucket: e.PEACESTOCKS_R2_BUCKET ?? "", accessKeyId: e.PEACESTOCKS_R2_ACCESS_KEY_ID ?? "", secretAccessKey: e.PEACESTOCKS_R2_SECRET_ACCESS_KEY ?? "", fetchImpl: timedFetch(120_000) });
+  return new R2ObjectClient({ accountId: e.PEACESTOCKS_R2_ACCOUNT_ID ?? "", bucket: e.PEACESTOCKS_R2_BUCKET ?? "", accessKeyId: e.PEACESTOCKS_R2_ACCESS_KEY_ID ?? "", secretAccessKey: e.PEACESTOCKS_R2_SECRET_ACCESS_KEY ?? "", fetchImpl: counted(timedFetch(120_000), "r2", "r2Err") });
 }
 
 function noDelete(c: ObjectClient): ObjectClient {
@@ -93,7 +98,12 @@ async function main(): Promise<number> {
   fatal.unref();
   // From here this run holds the key; the workflow's release step re-dispatches the chain afterwards.
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, "held=true\n");
+  let fetched = 0;
+  const seen = new Set<string>();
+  const beat = setInterval(() => console.log(`gap-refill: heartbeat ${JSON.stringify(counters)} fetched=${fetched}`), 60_000);
+  beat.unref();
   const gate = async (): Promise<string | undefined> => {
+    counters.gate++;
     for (;;) {
       if (Date.now() >= deadline) return "DEADLINE";
       const why = refillPauseReason(new Date(), await scannerRuns());
@@ -104,11 +114,10 @@ async function main(): Promise<number> {
   };
   mkdirSync("refill-backup", { recursive: true });
   let backups = 0;
-  let fetched = 0;
-  const seen = new Set<string>();
+
   const res = await refill({
     client,
-    provider: new MassiveMarketProvider({ keepRawReplies: true, fetchImpl: timedFetch(90_000) }),
+    provider: new MassiveMarketProvider({ keepRawReplies: true, fetchImpl: counted(timedFetch(90_000), "massive", "massiveErr") }),
     sessions,
     actionSessions: [...new Set([...sessions, ...(cov.missingCorporateActionSessions ?? [])])].sort(),
     gate,
