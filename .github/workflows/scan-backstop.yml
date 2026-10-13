@@ -11,7 +11,28 @@ permissions:
   contents: read
 
 jobs:
+  # Cheap gate (sparse checkout of one script, no install): skips the backstop job when it certainly would not dispatch.
+  precheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      due: ${{ steps.p.outputs.due }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/scan-backstop-precheck.sh
+          sparse-checkout-cone-mode: false
+      - id: p
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/scan-backstop-precheck.sh
+
   backstop:
+    needs: precheck
+    if: ${{ always() && needs.precheck.outputs.due != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # The only job that may dispatch a scan. One at a time, so two callers never both dispatch.
