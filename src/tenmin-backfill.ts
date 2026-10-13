@@ -106,3 +106,7 @@ export function planOlderBackfill(earliestStored: string, reachableFloor: string
 export function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
+
+export function isIsoDateText(s: string): boolean {
+  return s.length === 10 && s.at(4) === "-" && s.at(7) === "-";
+}
