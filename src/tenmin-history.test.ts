@@ -1630,3 +1630,14 @@ test("history: a TIME_BUDGET yield in the dated phase after sealing a month → 
     );
   });
 });
+
+import { isTransientHistoryError as _isT, TENMIN_HISTORY_TRANSIENT_BACKOFF_MS as _B } from "./tenmin-history.ts";
+import { test as _test } from "node:test";
+import _assert from "node:assert/strict";
+_test("transient history errors retry in-run with backoff; config errors do not", () => {
+  _assert.equal(_isT("fetch failed"), true);
+  _assert.equal(_isT("MASSIVE_NETWORK:ECONNRESET"), true);
+  _assert.equal(_isT("STOP_REFUSAL"), false);
+  _assert.equal(_isT("GROUPED_DAILY_PROVIDER_UNSUPPORTED"), false);
+  _assert.deepEqual([..._B], [30000, 90000, 180000]);
+});

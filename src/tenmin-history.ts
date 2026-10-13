@@ -759,6 +759,8 @@ function groupedFields(step: GroupedDailyStepResult) {
 }
 
 export async function runTenMinHistory(options: {
+  /** Test hook for the in-run transient backoff. */
+  sleep?: (ms: number) => Promise<void>;
   root: string;
   store?: ReplyDustStore;
   storage?: MarketStore;
@@ -927,7 +929,11 @@ export async function runTenMinHistory(options: {
       return provider.getGroupedDailyReply(sessionDate);
     });
 
-  for (const range of ranges) {
+  let transientRetries = 0;
+  let transientRetryRange = -1;
+  for (let rangeIndex = 0; rangeIndex < ranges.length; rangeIndex += 1) {
+    const range = ranges[rangeIndex]!;
+    if (transientRetryRange !== rangeIndex) transientRetries = 0;
     const pause = await shouldYield();
     if (pause) {
       yieldedForScan = pause;
@@ -1153,8 +1159,21 @@ export async function runTenMinHistory(options: {
         break;
       }
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (isTransientHistoryError(message) && transientRetries < TENMIN_HISTORY_TRANSIENT_BACKOFF_MS.length) {
+        // Transient network failure: wait and redo the same range in this run. Stored work is
+        // resumed, never refetched or replaced.
+        massiveRequests += tenMinMassiveRequestsOf(err);
+        const wait = TENMIN_HISTORY_TRANSIENT_BACKOFF_MS[transientRetries]!;
+        transientRetries += 1;
+        transientRetryRange = rangeIndex;
+        console.log(`tenmin-history: transient retry ${transientRetries}/${TENMIN_HISTORY_TRANSIENT_BACKOFF_MS.length}`);
+        await (options.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms))))(wait);
+        rangeIndex -= 1;
+        continue;
+      }
       stoppedOnError = true;
-      error = err instanceof Error ? err.message : String(err);
+      error = message;
       // Requests already counted for a finished grouped step stay counted; the thrown error
       // carries the requests of the step that failed.
       const failedStepRequests = tenMinMassiveRequestsOf(err);
@@ -1303,4 +1322,11 @@ export async function runTenMinHistoryFromEnv(
     ...(deadlineMs !== undefined ? { deadlineMs } : {}),
     ...overrides,
   });
+}
+
+/** In-run backoff for transient network errors on one range (then the run fails as before). */
+export const TENMIN_HISTORY_TRANSIENT_BACKOFF_MS = [30_000, 90_000, 180_000] as const;
+
+export function isTransientHistoryError(message: string): boolean {
+  return /fetch failed|MASSIVE_NETWORK|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|UND_ERR|socket hang up|other side closed|timed? ?out|HTTP 5\d\d|\b50[234]\b/iu.test(message);
 }
