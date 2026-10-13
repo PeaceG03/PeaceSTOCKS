@@ -6,7 +6,7 @@
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { R2ObjectClient } from "./object-store";
-import { decideBackfill, earliestStoredPairStart, planBackfillRanges, tenMinPairManifestKey } from "./tenmin-backfill";
+import { decideBackfill, earliestStoredPairStart, planBackfillRanges, planOlderBackfill, tenMinPairManifestKey } from "./tenmin-backfill";
 
 function output(k: string, v: string): void {
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${k}=${v}\n`);
@@ -17,7 +17,8 @@ export function backfillDecisionFromPlan(planJson: string | undefined, earliest:
   try { plan = planJson ? JSON.parse(planJson) : {}; } catch { plan = {}; }
   const floor = plan.olderReachable === true && plan.probedFrom ? plan.probedFrom : earliest;
   const pending = planBackfillRanges(earliest, floor).length;
-  return { action: decideBackfill(plan.olderReachable, pending, keyBusy), pending, floor };
+  const action = decideBackfill(plan.olderReachable, pending, keyBusy);
+  return { action, pending, floor, steps: action === "daily" ? [] : planOlderBackfill(earliest, floor) };
 }
 
 async function main(cmd: string | undefined): Promise<void> {
@@ -33,7 +34,8 @@ async function main(cmd: string | undefined): Promise<void> {
     const f = e.TENMIN_PLAN_FILE;
     const d = backfillDecisionFromPlan(f && existsSync(f) ? readFileSync(f, "utf8") : undefined, e.TENMIN_EARLIEST_STORED || "2024-09-01", e.TENMIN_KEY_BUSY === "true");
     output("backfill_action", d.action);
-    console.log(`backfill-decide: action=${d.action} pending=${d.pending} floor=${d.floor}`);
+    console.log(`backfill-decide: action=${d.action} pending=${d.pending} floor=${d.floor} (log only; nothing dispatched)`);
+    if (d.steps.length) console.log(JSON.stringify({ mode: "tenmin-backfill-plan", logOnly: true, steps: d.steps }));
     return;
   }
   throw new Error("TENMIN_BACKFILL_CLI_USAGE");

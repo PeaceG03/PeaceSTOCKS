@@ -80,3 +80,24 @@ export function tenMinPairManifestKey(pairStart: string): string {
   const { calendarFrom, calendarTo } = pairRangeForDate(pairStart);
   return `permanent/tenmin-reply-dust/${calendarFrom}_${calendarTo}/manifest.json`;
 }
+
+export interface OlderBackfillStep {
+  range: BackfillRange;
+  /** Daily bars needed first (universe selection reads stored daily bars inside the range). */
+  dailyBars: { from: string; to: string };
+  /** Dated ticker index months the range needs (the 2-year clamp must follow the probed floor). */
+  tickerIndexMonths: string[];
+}
+
+/** Logging-only plan (approved design): per older range, the daily-bars backfill and ticker-index months it needs. */
+export function planOlderBackfill(earliestStored: string, reachableFloor: string, maxRanges = 60): OlderBackfillStep[] {
+  return planBackfillRanges(earliestStored, reachableFloor, maxRanges).map((range) => {
+    const months: string[] = [];
+    for (let m = range.fetchFrom.slice(0, 7); m <= range.fetchTo.slice(0, 7); ) {
+      months.push(m);
+      const [y, mo] = m.split("-").map(Number) as [number, number];
+      m = mo === 12 ? `${y + 1}-01` : `${y}-${String(mo + 1).padStart(2, "0")}`;
+    }
+    return { range, dailyBars: { from: range.fetchFrom, to: range.fetchTo }, tickerIndexMonths: months };
+  });
+}
