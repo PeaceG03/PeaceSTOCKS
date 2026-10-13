@@ -110,3 +110,7 @@ export function pad2(n: number): string {
 export function isIsoDateText(s: string): boolean {
   return s.length === 10 && s.at(4) === "-" && s.at(7) === "-";
 }
+
+export function isWeekendIndex(d: number): boolean {
+  return d === 0 || d === 6;
+}
