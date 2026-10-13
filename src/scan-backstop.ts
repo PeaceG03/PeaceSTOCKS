@@ -75,3 +75,40 @@ async function main(): Promise<number> {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().then((c) => process.exit(c), () => { console.error("scan-backstop: FAIL"); process.exit(1); });
 }
+
+// Open-ended backstop (replaces the 30-89 min tick window, which a late or dropped :47 tick skips entirely).
+/** Scan guard windows (UTC minutes): no backstop dispatch inside 05:15-06:15 / 09:15-10:15. */
+export const SCAN_GUARD_WINDOWS_UTC_MIN = [[5 * 60 + 15, 6 * 60 + 15], [9 * 60 + 15, 10 * 60 + 15]] as const;
+export const OPEN_BACKSTOP_MIN_AFTER_SLOT = 30;
+
+/** Most recent scheduled scan slot at or before now (Tue-Sat 05:30/09:30 UTC), looking back at most 4 days. */
+export function lastScanSlot(now: Date): Date {
+  for (let d = 0; d <= 4; d += 1) {
+    const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - d));
+    if (!(SCAN_SLOT_DAYS as readonly number[]).includes(day.getUTCDay())) continue;
+    for (const s of [...SCAN_SLOTS_UTC_MIN].reverse()) {
+      const t = new Date(day.getTime() + s * 60_000);
+      if (t.getTime() <= now.getTime()) return t;
+    }
+  }
+  throw new Error("SCAN_SLOT_NOT_FOUND");
+}
+
+export function inScanGuardWindow(now: Date): boolean {
+  const m = now.getUTCHours() * 60 + now.getUTCMinutes();
+  return SCAN_GUARD_WINDOWS_UTC_MIN.some(([a, b]) => m >= a && m < b);
+}
+
+/**
+ * Plain values: ISO now + created_at of every scan run (scheduled or dispatched; the caller filters to runs whose
+ * scan job ran or is queued) -> "dispatch" | "wait" (guard window) | "none". A run created from 5 min before the
+ * last slot onward counts, so a slot is backed up once, from 30 min after it until the next slot.
+ */
+export function planOpenScanAt(nowIso: string, scanRunCreatedAt: readonly string[]): "dispatch" | "wait" | "none" {
+  const now = new Date(nowIso);
+  if (!Number.isFinite(now.getTime())) throw new Error("SCAN_BACKSTOP_BAD_NOW");
+  const slot = lastScanSlot(now);
+  if (now.getTime() - slot.getTime() < OPEN_BACKSTOP_MIN_AFTER_SLOT * 60_000) return "none";
+  if (scanRunCreatedAt.some((c) => (Date.parse(c) || 0) >= slot.getTime() - 5 * 60_000)) return "none";
+  return inScanGuardWindow(now) ? "wait" : "dispatch";
+}
