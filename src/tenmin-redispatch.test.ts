@@ -380,7 +380,8 @@ test("decision: kill switch off, job failure, missing outcome, ranges done, a ne
       [decideTenMinRedispatch(input({ killSwitch })).dispatch, decideTenMinRedispatch(input({ killSwitch })).reason],
       [false, "KILL_SWITCH_OFF"],
     );
-  assert.equal(decideTenMinRedispatch(input({ jobResult: "failure" })).reason, "STOP_JOB_FAILURE");
+  assert.equal(decideTenMinRedispatch(input({ jobResult: "failure", priorConsecutiveFailures: 3 })).reason, "STOP_TRANSIENT_RETRIES_EXHAUSTED:4");
+  assert.equal(decideTenMinRedispatch(input({ trigger: "fallback", jobResult: "failure" })).reason, "STOP_JOB_FAILURE");
   assert.deepEqual(
     [decideTenMinRedispatch(input({ jobResult: "cancelled" })).dispatch, decideTenMinRedispatch(input({ jobResult: "cancelled" })).reason],
     [false, "STOP_JOB_CANCELLED"],
@@ -704,4 +705,25 @@ test("handoff: chain finishes, days keep closing, every range is planned with no
     "2027-01-05:2026-11-01_2026-12-31",
     "2027-03-02:2027-01-01_2027-02-28",
   ]);
+});
+
+import { decideTenMinRedispatch as decideT, isTransientFailure, priorConsecutiveFailures, TENMIN_TRANSIENT_BACKOFF_MS } from "./tenmin-redispatch";
+test("transient failure: the chain retries itself with backoff up to 3 times, then stops; refusals never retry", () => {
+  assert.equal(isTransientFailure("failure", undefined), true);
+  assert.equal(isTransientFailure("success", "STOP_ERROR:fetch failed"), true);
+  assert.equal(isTransientFailure("success", "STOP_ERROR:TENMIN_X bad plan"), false);
+  assert.equal(isTransientFailure("failure", "STOP_REFUSAL:TENMIN_UNIVERSE_EMPTY"), false);
+  const base = { trigger: "chain" as const, outcome: undefined, jobResult: "failure", nowUtc: new Date("2026-10-13T03:40:00Z"), queue: { otherActiveRuns: 0 }, killSwitch: "true", chain: 2, maxChain: undefined };
+  const d0 = decideT({ ...base, priorConsecutiveFailures: 0 });
+  assert.deepEqual([d0.dispatch, d0.backoffMs, d0.reason], [true, TENMIN_TRANSIENT_BACKOFF_MS[0], "CONTINUE_TRANSIENT_RETRY:attempt=1"]);
+  assert.equal(decideT({ ...base, priorConsecutiveFailures: 2 }).backoffMs, TENMIN_TRANSIENT_BACKOFF_MS[2]);
+  assert.equal(decideT({ ...base, priorConsecutiveFailures: 3 }).nextAction, "stop");
+  assert.equal(decideT({ ...base, killSwitch: "false" }).reason, "KILL_SWITCH_OFF");
+  assert.equal(decideT({ ...base, nowUtc: new Date("2026-10-13T05:20:00Z") }).dispatch, false);
+});
+test("prior consecutive failures: newest-first streak of failed Scanner dispatch runs, self excluded", () => {
+  const r = (id: number, conclusion: string, extra = {}) => ({ id, event: "workflow_dispatch", status: "completed", conclusion, display_title: "Scanner", ...extra });
+  assert.equal(priorConsecutiveFailures([r(9, "failure"), r(8, "failure"), r(7, "success"), r(6, "failure")], 10), 2);
+  assert.equal(priorConsecutiveFailures([{ ...r(10, "failure"), status: "in_progress" }, r(9, "success")], 10), 0);
+  assert.equal(priorConsecutiveFailures([r(9, "failure", { display_title: "Scanner restarter" }), r(8, "failure")]), 1);
 });

@@ -284,6 +284,8 @@ export interface TenMinRedispatchInput {
   queue: { otherActiveRuns: number; checkFailed?: string };
   /** Repo variable TENMIN_AUTO_REDISPATCH; must be exactly "true". */
   killSwitch: string | undefined;
+  /** chain trigger: consecutive failed tenmin_history runs right before this one (from the run list). */
+  priorConsecutiveFailures?: number;
   /** Runs already in this chain (the finished run's number; a manual dispatch is 0). */
   chain: number;
   /** Repo variable TENMIN_AUTO_REDISPATCH_MAX_CHAIN (default 24, capped at 100). */
@@ -342,6 +344,19 @@ export interface TenMinRedispatchDecision {
   nextAction: "continue" | "wait" | "stop";
   reason: string;
   nextChain: number;
+  /** Transient-failure retry: sleep this long in the chain step before dispatching. */
+  backoffMs?: number;
+}
+
+/** Consecutive transient failures the chain retries on its own (no cron, no person) before it stops. */
+export const TENMIN_TRANSIENT_RETRIES = 3;
+export const TENMIN_TRANSIENT_BACKOFF_MS = [60_000, 180_000, 300_000] as const;
+/** Pure: a failed run that is worth retrying (network/outage), never a refusal or a bounded manual run. */
+export function isTransientFailure(jobResult: string, reason: string | undefined): boolean {
+  const r = reason ?? "";
+  if (/STOP_REFUSAL|STOP_BOUNDED_MANUAL_RUN|SCAN_CANCELLED|SCAN_CHECK|KILL_SWITCH/u.test(r)) return false;
+  if (jobResult === "failure") return true;
+  return /^STOP_ERROR:.*(fetch failed|terminated|ECONN|ETIMEDOUT|EAI_AGAIN|socket|timeout|TIMEOUT|429|5\d\d)/u.test(r);
 }
 
 export function maxChainOf(value: string | number | undefined): number {
@@ -356,6 +371,14 @@ export function decideTenMinRedispatch(input: TenMinRedispatchInput): TenMinRedi
   const stop = (reason: string): TenMinRedispatchDecision => ({ dispatch: false, nextAction: "stop", reason, nextChain });
   const wait = (reason: string): TenMinRedispatchDecision => ({ dispatch: false, nextAction: "wait", reason, nextChain });
   if (input.killSwitch !== "true") return stop("KILL_SWITCH_OFF");
+  if (input.trigger === "chain" && isTransientFailure(input.jobResult, input.outcome?.reason)) {
+    const prior = input.priorConsecutiveFailures ?? 0;
+    if (prior >= TENMIN_TRANSIENT_RETRIES) return stop(`STOP_TRANSIENT_RETRIES_EXHAUSTED:${prior + 1}`);
+    if (nextChain > maxChainOf(input.maxChain)) return stop(`STOP_CHAIN_CAP:${maxChainOf(input.maxChain)}`);
+    const gate = queueAndGuard(input);
+    if (gate) return wait(gate);
+    return { dispatch: true, nextAction: "continue", reason: `CONTINUE_TRANSIENT_RETRY:attempt=${prior + 1}`, nextChain, backoffMs: TENMIN_TRANSIENT_BACKOFF_MS[prior] ?? 300_000 };
+  }
   if (!input.outcome) return stop("STOP_NO_OUTCOME");
   const scanRetry = scanCheckRetry(input);
   if (scanRetry) return scanRetry;
@@ -673,6 +696,17 @@ async function checkNoScheduledScanCancelled(opts: {
   throw new Error(`${TENMIN_REDISPATCH_SCAN_CANCELLED}:run=${cancelled.id}:created=${cancelled.created_at}`);
 }
 
+/** Pure: consecutive failed (completed) workflow_dispatch scanner.yml runs, newest first, excluding this run. */
+export function priorConsecutiveFailures(runs: readonly { id: number; event?: string | undefined; status?: string | null | undefined; conclusion?: string | null | undefined; display_title?: string | null | undefined }[], self?: number): number {
+  let n = 0;
+  for (const r of runs) {
+    if (r.id === self || r.event !== "workflow_dispatch" || r.status !== "completed" || r.display_title !== "Scanner") continue;
+    if (r.conclusion === "failure") n++;
+    else break;
+  }
+  return n;
+}
+
 async function dispatch(chain: number, scanCheckStops = 0): Promise<void> {
   const ref = process.env.TENMIN_DISPATCH_REF || process.env.GITHUB_REF_NAME || "main";
   if (process.env.TENMIN_REDISPATCH_DRY_RUN === "1") {
@@ -736,6 +770,7 @@ async function main(mode: string | undefined): Promise<void> {
       killSwitch: await resolveRedispatchGate(env),
       chain,
       maxChain: env.TENMIN_AUTO_REDISPATCH_MAX_CHAIN,
+      priorConsecutiveFailures: priorConsecutiveFailures(runs, Number.isFinite(self) ? self : undefined),
     });
     const record: TenMinRunRecord = {
       outcome,
@@ -772,6 +807,7 @@ async function main(mode: string | undefined): Promise<void> {
       output("heal", "dispatched");
     }
     if (decision.dispatch) {
+      if (decision.backoffMs) await new Promise((r) => setTimeout(r, decision.backoffMs));
       const dispatchedAfterIso = new Date().toISOString();
       await dispatch(decision.nextChain);
       await checkNoScheduledScanCancelled({
