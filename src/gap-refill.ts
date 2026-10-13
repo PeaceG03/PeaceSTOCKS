@@ -11,6 +11,7 @@ import { MassiveMarketProvider } from "./massive-provider";
 import { checkDailyBarsCoverage } from "./daily-bars-coverage";
 import { isIdleScannerRun } from "./scan-yield";
 import { refill, verifySessions } from "./gap-refill-lib";
+import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import { timedFetch } from "./oct2024-tenmin-oneoff";
 
 export type NetFreeze = { ok: true; commit: string } | { ok: false; reason: string };
@@ -22,6 +23,11 @@ export function netFreezeVerdict(contentStatus: number, contentB64: string | und
   if (!Buffer.from(contentB64 ?? "", "base64").toString("utf8").trim()) return { ok: false, reason: "NET_FREEZE_EMPTY" };
   if (!commitSha) return { ok: false, reason: "NET_FREEZE_NO_COMMIT" };
   return { ok: true, commit: commitSha };
+}
+
+/** Pure: the Runner's as-of day is ready when it is not a trading day or its daily Dust is stored. */
+export function asOfVerdict(kind: string, stored: boolean): "PASS" | "ASOF_NOT_STORED" {
+  return kind === "CLOSED" || stored ? "PASS" : "ASOF_NOT_STORED";
 }
 
 /** Pure: guard windows 05:12–06:15Z / 09:12–10:15Z (3 min lead). */
@@ -79,6 +85,13 @@ function noDelete(c: ObjectClient): ObjectClient {
 }
 
 async function main(): Promise<number> {
+  if (process.argv[2] === "--check-asof") {
+    // Runner computes as of UTC yesterday: that session must already be stored (the scan lands it after 05:30Z).
+    const asof = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+    const v = asOfVerdict(US_EQUITY_MARKET_CALENDAR.getSession(asof).kind, Boolean(await noDelete(R2ObjectClient.fromEnv(process.env)).head(`permanent/daily-reply-dust/${asof}/manifest.json`)));
+    console.log(`as-of ${asof}: ${v}`);
+    return v === "PASS" ? 0 : 2;
+  }
   if (process.argv[2] === "--check") {
     const c = await checkDailyBarsCoverage(noDelete(r2()));
     const ca = (c.missingCorporateActionSessions ?? []).length;

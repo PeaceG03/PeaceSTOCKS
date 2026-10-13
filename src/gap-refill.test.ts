@@ -36,3 +36,11 @@ test("write guard: never deletes, never replaces an unrelated stored object, ski
   assert.deepEqual(g.puts, ["permanent/new.json"]);
   assert.equal(new TextDecoder().decode(await inner.get("permanent/other.json")), "a");
 });
+
+import { asOfVerdict } from "./gap-refill";
+test("as-of readiness: a trading day needs its Dust stored; a closed day passes", () => {
+  assert.equal(asOfVerdict("NORMAL", false), "ASOF_NOT_STORED");
+  assert.equal(asOfVerdict("NORMAL", true), "PASS");
+  assert.equal(asOfVerdict("EARLY_CLOSE", false), "ASOF_NOT_STORED");
+  assert.equal(asOfVerdict("CLOSED", false), "PASS");
+});

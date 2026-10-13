@@ -3,7 +3,9 @@ name: Net re-run dispatch
 # and on success (newest successful compute == ours, Runner main == its head) dispatches PeaceSTOCKS-Net
 # results-land.yml once. Cross-repo dispatch needs secret NET_RERUN_DISPATCH_TOKEN (fine-grained: the two target
 # repos only, Actions read/write + Contents read). Absent token -> fail closed with one scanner-alert issue.
-# Never twice: refuses if a compute.yml workflow_dispatch run already exists for the last 24 h.
+# Never twice: refuses if a compute.yml workflow_dispatch run already exists for the last 24 h (override input
+# allow_recent_dispatch=true, owner-approved one-offs only; recorded in the log).
+# Runner computes as of UTC yesterday: that session must already be stored (NET_TARGET_DAY_MISSING otherwise).
 # Logs: run ids and PASS/FAIL only.
 on:
   workflow_dispatch:
@@ -12,6 +14,11 @@ on:
         description: "PeaceSTOCKS-Net commit (40 hex) to pin"
         required: true
         type: string
+      allow_recent_dispatch:
+        description: "Owner-approved override of the once-per-24h check (record why)"
+        required: false
+        default: false
+        type: boolean
 permissions:
   contents: read
 concurrency:
@@ -52,15 +59,21 @@ jobs:
           PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
           PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
           PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
-        run: pnpm -s exec tsx src/gap-refill.ts --check
+        run: |
+          pnpm -s exec tsx src/gap-refill.ts --check
+          pnpm -s exec tsx src/gap-refill.ts --check-asof
       - name: Compute, then results-land (once)
         env:
           GH_TOKEN: ${{ secrets.NET_RERUN_DISPATCH_TOKEN }}
+          ALLOW_RECENT: ${{ inputs.allow_recent_dispatch }}
         run: |
           set -euo pipefail
           since=$(date -u -d '-24 hours' +%FT%TZ)
           prior=$(gh api "repos/$RUNNER/actions/workflows/compute.yml/runs?event=workflow_dispatch&created=>=$since&per_page=5" --jq '.total_count')
-          [ "$prior" = 0 ] || { echo "ONCE FAIL: $prior compute dispatch(es) in the last 24 h"; exit 1; }
+          if [ "$prior" != 0 ]; then
+            [ "$ALLOW_RECENT" = true ] || { echo "ONCE FAIL: $prior compute dispatch(es) in the last 24 h"; exit 1; }
+            echo "ONCE OVERRIDE: $prior prior compute dispatch(es) in 24 h; owner-approved override"
+          fi
           t0=$(date -u +%FT%TZ)
           gh workflow run compute.yml -R "$RUNNER" --ref main -f net_ref="$NET_REF"
           id=""; for _ in $(seq 1 30); do sleep 10
