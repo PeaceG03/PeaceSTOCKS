@@ -286,6 +286,30 @@ jobs:
           TENMIN_ONEOFF_WORKFLOWS: oct2024-tenmin.yml
         run: pnpm -s exec tsx src/tenmin-gate.ts guard
 
+  # Missed-scheduled-scan backstop (same reliable :47 cron): if the 05:30/09:30 UTC scheduled scan never
+  # started, dispatch one mode=scan run. Harmless when redundant (collectionDue). Logic: src/scan-backstop.ts.
+  scan_backstop:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '47 * * * *' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Scan backstop
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: pnpm -s exec tsx src/scan-backstop.ts
+
   backfill:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'backfill' }}
     # Pinned so the runner image cannot change mid-rollout; move to 26.04 deliberately later.
