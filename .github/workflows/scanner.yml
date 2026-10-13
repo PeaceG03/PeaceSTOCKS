@@ -266,6 +266,19 @@ jobs:
       issues: write
     uses: ./.github/workflows/tenmin-history-fallback.yml
 
+  # Chain follow-up (no cron reliance): when a scan, daily liquid step, or markets backfill run ends, run the same
+  # decide-and-dispatch as the restarter. A history run that stopped with WAIT_RUN_ACTIVE behind this run is
+  # restarted right after it (the fallback never counts its own GITHUB_RUN_ID as active; the dispatched run
+  # queues in peacestocks-r2-writer until this run ends). Same kill switch, same rules, same stop alert.
+  chain_followup:
+    needs: [scan, tenmin_daily, backfill]
+    if: ${{ always() && (needs.scan.result != 'skipped' || needs.tenmin_daily.result != 'skipped' || needs.backfill.result != 'skipped') }}
+    permissions:
+      contents: read
+      actions: write
+      issues: write
+    uses: ./.github/workflows/tenmin-history-fallback.yml
+
   # Restarter guard (same reliable :47 cron, never gated on the variable): if the history redispatch gate is off or
   # still waiting on a one-off seal and no one-off fetch has run for over 30 min, open one scanner-alert issue
   # (deduped by title while open). Read-only except the issue. Logic: planGateGuard (src/tenmin-gate.ts).
