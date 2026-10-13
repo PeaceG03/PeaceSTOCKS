@@ -127,23 +127,26 @@ export class ObjectMarketStorage implements MarketStore {
 
   async appendBars(records: CanonicalDailyBar[]): Promise<void> {
     const byMonth = new Map<string, CanonicalDailyBar[]>();
-    for (const record of records)
-      byMonth.set(record.sessionDate.slice(0, 7), [
-        ...(byMonth.get(record.sessionDate.slice(0, 7)) ?? []),
-        record,
-      ]);
+    for (const record of records) {
+      const month = record.sessionDate.slice(0, 7);
+      const list = byMonth.get(month);
+      if (list) list.push(record);
+      else byMonth.set(month, [record]);
+    }
     const corrections: CorrectionRecord[] = [];
     for (const [month, monthRecords] of byMonth) {
       const existing = lines<CanonicalDailyBar>(
         await this.readText(`permanent/daily-bars/${month}.jsonl`),
       );
+      // Index once (was a full-array scan per record: O(month x incoming), minutes per session on a full month).
+      // First match wins, same order as before (existing, then incoming).
+      const firstByKey = new Map<string, CanonicalDailyBar>();
+      for (const item of [...existing, ...monthRecords]) {
+        const k = `${item.securityId}|${item.sessionDate}|${item.revision}`;
+        if (!firstByKey.has(k)) firstByKey.set(k, item);
+      }
       for (const record of monthRecords) {
-        const prior = [...existing, ...monthRecords].find(
-          (item) =>
-            item.securityId === record.securityId &&
-            item.sessionDate === record.sessionDate &&
-            item.revision === record.revision - 1,
-        );
+        const prior = firstByKey.get(`${record.securityId}|${record.sessionDate}|${record.revision - 1}`);
         if (prior)
           corrections.push({
             correctionId: `${record.securityId}|${record.sessionDate}|${record.revision}`,
