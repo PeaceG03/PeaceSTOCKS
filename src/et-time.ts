@@ -47,6 +47,7 @@ export function sessionCollectionDue(sessionDate: string, now: Date): boolean {
  */
 export function etWallClockToUtc(sessionDate: string, hour: number, minute: number, second = 0): Date {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(sessionDate)) throw new Error("INVALID_SESSION_DATE");
+  if (!Number.isInteger(hour) || hour < 0 || 23 < hour || !Number.isInteger(minute) || minute < 0 || 59 < minute) throw new Error("INVALID_WALL_CLOCK");
   const hh = String(hour).padStart(2, "0");
   const mm = String(minute).padStart(2, "0");
   const ss = String(second).padStart(2, "0");
