@@ -26,6 +26,7 @@ export function backfillEndDate(earliestStored: string): string {
  * fetchFrom is clamped to reachableFloor; nothing at or after the earliest stored pair is ever planned.
  */
 export function planBackfillRanges(earliestStored: string, reachableFloor: string, maxRanges = 60): BackfillRange[] {
+  if (reachableFloor < "2003-09-10") throw new Error("TENMIN_BACKFILL_FLOOR_TOO_OLD");
   requireDate(reachableFloor);
   const end = backfillEndDate(earliestStored);
   const out: BackfillRange[] = [];
