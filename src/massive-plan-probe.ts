@@ -4,6 +4,7 @@
 import { writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { addCalendarDays, effectiveHistoryWindowStart, lastCompletedSessionDate } from "./tenmin-history";
+import { backfillProbeDates } from "./tenmin-backfill";
 
 export interface PlanProbe { olderReachable: boolean | undefined; ratePerMin: number | undefined; probedFrom: string; status: number | "error" }
 
@@ -21,9 +22,14 @@ export function probeDates(windowStart: string): { from: string; to: string } {
   return { from: addCalendarDays(windowStart, -40), to: addCalendarDays(windowStart, -30) };
 }
 
-export async function probeMassivePlan(apiKey: string, now = new Date(), f: typeof fetch = fetch, base = "https://api.massive.com"): Promise<PlanProbe> {
-  const start = effectiveHistoryWindowStart(lastCompletedSessionDate(now));
-  const { from, to } = probeDates(start);
+/** Deeper probe: below the earliest stored pair when known (TENMIN_EARLIEST_STORED), else below the window. */
+export function probeRange(now: Date, earliestStored?: string): { from: string; to: string } {
+  if (earliestStored && /^\d{4}-\d{2}-\d{2}$/u.test(earliestStored)) return backfillProbeDates(earliestStored);
+  return probeDates(effectiveHistoryWindowStart(lastCompletedSessionDate(now)));
+}
+
+export async function probeMassivePlan(apiKey: string, now = new Date(), f: typeof fetch = fetch, base = "https://api.massive.com", earliestStored?: string): Promise<PlanProbe> {
+  const { from, to } = probeRange(now, earliestStored);
   const url = new URL(`${base}/v2/aggs/ticker/SPY/range/1/day/${from}/${to}`);
   url.searchParams.set("apiKey", apiKey);
   try {
@@ -35,7 +41,7 @@ export async function probeMassivePlan(apiKey: string, now = new Date(), f: type
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  probeMassivePlan(process.env.MASSIVE_API_KEY ?? "").then((p) => {
+  probeMassivePlan(process.env.MASSIVE_API_KEY ?? "", new Date(), fetch, "https://api.massive.com", process.env.TENMIN_EARLIEST_STORED || undefined).then((p) => {
     if (process.env.TENMIN_PLAN_FILE) writeFileSync(process.env.TENMIN_PLAN_FILE, `${JSON.stringify(p)}\n`);
     console.log(`plan-probe: status=${p.status} olderReachable=${p.olderReachable} rate=${p.ratePerMin ?? "n/a"}`);
   }, () => console.log("plan-probe: FAIL"));

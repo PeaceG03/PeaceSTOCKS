@@ -156,12 +156,25 @@ jobs:
         run: pnpm scheduler
       # Daily Massive plan probe (1 request, key already held by this job; logs booleans only, never the URL).
       # Detection only for now: the plan file feeds the auto-backfill decision (src/tenmin-backfill.ts).
+      - name: Ten-minute stored floor (R2 HEADs only)
+        id: backfill_floor
+        if: ${{ always() }}
+        continue-on-error: true
+        run: pnpm -s exec tsx src/tenmin-backfill-cli.ts floor
       - name: Massive plan probe (daily)
         if: ${{ always() }}
         continue-on-error: true
         env:
           TENMIN_PLAN_FILE: ${{ runner.temp }}/tenmin-plan.json
+          TENMIN_EARLIEST_STORED: ${{ steps.backfill_floor.outputs.earliest_stored }}
         run: pnpm -s exec tsx src/massive-plan-probe.ts
+      - name: Auto-backfill decision (log only; dispatch not wired yet)
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          TENMIN_PLAN_FILE: ${{ runner.temp }}/tenmin-plan.json
+          TENMIN_EARLIEST_STORED: ${{ steps.backfill_floor.outputs.earliest_stored }}
+        run: pnpm -s exec tsx src/tenmin-backfill-cli.ts decide
       # Every NYSE trading session from the first stored one to the last that should be stored must
       # have its month JSONL and daily-bars pack (src/daily-bars-coverage.ts; LIST only, no Massive).
       # A hole or a stale store fails this job loudly (annotation + failed run), after the scan wrote.

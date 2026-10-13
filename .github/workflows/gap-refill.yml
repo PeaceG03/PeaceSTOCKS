@@ -66,6 +66,32 @@ jobs:
           NET_READ_TOKEN: ${{ secrets.NET_RERUN_DISPATCH_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
         run: pnpm -s exec tsx src/gap-refill.ts
+      # Auto-backfill detection while this job holds the key (1 Massive request, R2 HEADs only; never fails the refill).
+      - name: Ten-minute stored floor (R2 HEADs only)
+        id: backfill_floor
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+          PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+          PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+          PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+        run: pnpm -s exec tsx src/tenmin-backfill-cli.ts floor
+      - name: Massive plan probe
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+          TENMIN_PLAN_FILE: ${{ runner.temp }}/tenmin-plan.json
+          TENMIN_EARLIEST_STORED: ${{ steps.backfill_floor.outputs.earliest_stored }}
+        run: pnpm -s exec tsx src/massive-plan-probe.ts
+      - name: Auto-backfill decision (log only; dispatch not wired yet)
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          TENMIN_PLAN_FILE: ${{ runner.temp }}/tenmin-plan.json
+          TENMIN_EARLIEST_STORED: ${{ steps.backfill_floor.outputs.earliest_stored }}
+        run: pnpm -s exec tsx src/tenmin-backfill-cli.ts decide
       - name: Keep pre-images
         if: ${{ always() }}
         uses: actions/upload-artifact@v4

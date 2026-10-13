@@ -53,3 +53,30 @@ export function decideBackfill(olderReachable: boolean | undefined, pendingRange
   if (olderReachable !== true || pendingRanges <= 0) return "daily";
   return keyBusy ? "hold" : "dispatch";
 }
+
+/** Calendar pair start of the Oct 2024 one-off range (always stored; the walk starts below it). */
+export const BACKFILL_KNOWN_STORED_PAIR = "2024-09-01";
+
+/**
+ * Earliest stored pair start: walk back pair by pair from the known stored pair while the older pair is sealed
+ * (has(pairStart) true, e.g. its manifest.json exists). Read-only; a partial (unsealed) older range is re-planned and
+ * the writers' never-overwrite guards keep its stored files (resume by verify).
+ */
+export async function earliestStoredPairStart(
+  has: (pairStart: string) => Promise<boolean>,
+  known: string = BACKFILL_KNOWN_STORED_PAIR,
+  maxSteps = 60,
+): Promise<string> {
+  let floor = pairRangeForDate(known).calendarFrom;
+  for (let i = 0; i < maxSteps; i += 1) {
+    const older = pairRangeForDate(addCalendarDays(floor, -1));
+    if (!(await has(older.calendarFrom))) break;
+    floor = older.calendarFrom;
+  }
+  return floor;
+}
+
+export function tenMinPairManifestKey(pairStart: string): string {
+  const { calendarFrom, calendarTo } = pairRangeForDate(pairStart);
+  return `permanent/tenmin-reply-dust/${calendarFrom}_${calendarTo}/manifest.json`;
+}
