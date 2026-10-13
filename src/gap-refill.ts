@@ -11,6 +11,7 @@ import { MassiveMarketProvider } from "./massive-provider";
 import { checkDailyBarsCoverage } from "./daily-bars-coverage";
 import { isIdleScannerRun } from "./scan-yield";
 import { refill, verifySessions } from "./gap-refill-lib";
+import { timedFetch } from "./oct2024-tenmin-oneoff";
 
 export type NetFreeze = { ok: true; commit: string } | { ok: false; reason: string };
 
@@ -59,6 +60,12 @@ async function scannerRuns(): Promise<{ status: string; display_title?: string }
   } catch { return { error: "network" }; }
 }
 
+/** R2 client whose every call settles (hard 120 s timeout; the 00:21Z run hung on an untimed call). */
+function r2(): ObjectClient {
+  const e = process.env;
+  return new R2ObjectClient({ accountId: e.PEACESTOCKS_R2_ACCOUNT_ID ?? "", bucket: e.PEACESTOCKS_R2_BUCKET ?? "", accessKeyId: e.PEACESTOCKS_R2_ACCESS_KEY_ID ?? "", secretAccessKey: e.PEACESTOCKS_R2_SECRET_ACCESS_KEY ?? "", fetchImpl: timedFetch(120_000) });
+}
+
 function noDelete(c: ObjectClient): ObjectClient {
   const wrap = <A extends unknown[], R>(f: (...a: A) => Promise<R>) => async (...a: A): Promise<R> => {
     for (let i = 0; ; i++) { try { return await f(...a); } catch (e) { if (i >= 5) throw e; await new Promise((r) => setTimeout(r, 5_000 * (i + 1))); } }
@@ -68,13 +75,13 @@ function noDelete(c: ObjectClient): ObjectClient {
 
 async function main(): Promise<number> {
   if (process.argv[2] === "--check") {
-    const c = await checkDailyBarsCoverage(noDelete(R2ObjectClient.fromEnv(process.env)));
+    const c = await checkDailyBarsCoverage(noDelete(r2()));
     const ca = (c.missingCorporateActionSessions ?? []).length;
     console.log(`coverage: ${c.ok && ca === 0 ? "PASS" : "FAIL"} missing=${c.missingSessions.length} corporate-action gaps=${ca}`);
     return c.ok && ca === 0 ? 0 : 2;
   }
   const deadline = Date.now() + (Number(process.env.REFILL_BUDGET_MS) || 5 * 3_600_000);
-  const client = noDelete(R2ObjectClient.fromEnv(process.env));
+  const client = noDelete(r2());
   const cov = await checkDailyBarsCoverage(client);
   const sessions = [...cov.missingSessions].sort();
   console.log(`gap-refill: missing sessions=${sessions.length} corporate-action gaps=${(cov.missingCorporateActionSessions ?? []).length}`);
@@ -82,6 +89,8 @@ async function main(): Promise<number> {
   const net = await netFreeze();
   if (!net.ok) { console.log(`gap-refill: NOT_STARTED ${net.reason}`); return 3; }
   console.log("gap-refill: NET_FREEZE PASS");
+  const fatal = setTimeout(() => { console.log("gap-refill: FAIL budget exceeded"); process.exit(1); }, Math.max(60_000, deadline - Date.now() + 600_000));
+  fatal.unref();
   // From here this run holds the key; the workflow's release step re-dispatches the chain afterwards.
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, "held=true\n");
   const gate = async (): Promise<string | undefined> => {
@@ -89,18 +98,24 @@ async function main(): Promise<number> {
       if (Date.now() >= deadline) return "DEADLINE";
       const why = refillPauseReason(new Date(), await scannerRuns());
       if (!why) return undefined;
+      if (!seen.has(`pause:${why}`)) { seen.add(`pause:${why}`); console.log(`gap-refill: pause ${why}`); }
       await new Promise((r) => setTimeout(r, 60_000));
     }
   };
   mkdirSync("refill-backup", { recursive: true });
   let backups = 0;
+  let fetched = 0;
+  const seen = new Set<string>();
   const res = await refill({
     client,
-    provider: new MassiveMarketProvider({ keepRawReplies: true }),
+    provider: new MassiveMarketProvider({ keepRawReplies: true, fetchImpl: timedFetch(90_000) }),
     sessions,
     actionSessions: [...new Set([...sessions, ...(cov.missingCorporateActionSessions ?? [])])].sort(),
     gate,
-    log: () => undefined,
+    log: (event) => {
+      if (event === "session-fetched") { if (++fetched % 10 === 0) console.log(`gap-refill: sessions fetched=${fetched}/${sessions.length}`); return; }
+      if (!seen.has(event)) { seen.add(event); console.log(`gap-refill: stage ${event.replace(/[^a-z_-]/giu, "").slice(0, 40)}`); }
+    },
     onWrite: () => undefined,
     backup: (key, body) => { writeFileSync(`refill-backup/${key.replace(/\//g, "__")}.${Date.now()}`, body); backups++; },
   });
