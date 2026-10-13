@@ -57,18 +57,38 @@ async function gh(path: string, init: RequestInit = {}): Promise<Response> {
   });
 }
 
+export interface ScannerRunLike extends ScanRunLike { id?: number; name?: string }
+
+/** Scan runs only: scheduled "Scanner" runs (05:30/09:30 crons) and dispatched runs whose scan job is not skipped. */
+export async function scanRunCreatedSince(sinceMs: number, runs: readonly ScannerRunLike[], scanJobRan: (id: number) => Promise<boolean>): Promise<string[]> {
+  const out: string[] = [];
+  for (const r of runs) {
+    if (r.display_title !== SCAN_RUN_NAME || (Date.parse(r.created_at ?? "") || 0) < sinceMs) continue;
+    if (r.event === "schedule" || (r.event === "workflow_dispatch" && r.id !== undefined && await scanJobRan(r.id))) out.push(r.created_at ?? "");
+  }
+  return out;
+}
+
 async function main(): Promise<number> {
   const now = new Date();
-  if (!dueSlot(now)) { console.log("scan-backstop: PASS no scan slot due on this tick"); return 0; }
-  let scanRuns: ScanRunLike[] | { error: string };
+  const slot = lastScanSlot(now);
+  const since = slot.getTime() - 5 * 60_000;
+  let created: string[];
   try {
-    const r = await gh(`/actions/workflows/scanner.yml/runs?event=schedule&per_page=50`);
-    scanRuns = r.ok ? (((await r.json()) as { workflow_runs?: ScanRunLike[] }).workflow_runs ?? []) : { error: `http-${r.status}` };
-  } catch { scanRuns = { error: "fetch" }; }
-  const plan = planMissedScan({ now, scanRuns });
-  if (plan.action === "none") { console.log(`scan-backstop: ${plan.why}`); return plan.why.startsWith("FAIL") ? 1 : 0; }
+    const r = await gh(`/actions/workflows/scanner.yml/runs?created=${encodeURIComponent(`>=${new Date(since).toISOString()}`)}&per_page=100`);
+    if (!r.ok) { console.log(`scan-backstop: FAIL run check failed (http-${r.status}); not dispatching`); return 1; }
+    const runs = ((await r.json()) as { workflow_runs?: ScannerRunLike[] }).workflow_runs ?? [];
+    created = await scanRunCreatedSince(since, runs, async (id) => {
+      const j = await gh(`/actions/runs/${id}/jobs?per_page=50`);
+      if (!j.ok) throw new Error(`jobs-http-${j.status}`);
+      const jobs = ((await j.json()) as { jobs?: Array<{ name?: string; conclusion?: string | null }> }).jobs ?? [];
+      return jobs.some((x) => x.name === "scan" && x.conclusion !== "skipped");
+    });
+  } catch { console.log("scan-backstop: FAIL run check failed (fetch); not dispatching"); return 1; }
+  const action = planOpenScanAt(now.toISOString(), created);
+  if (action !== "dispatch") { console.log(`scan-backstop: PASS ${action} (slot ${slot.toISOString()}, scan runs since ${created.length})`); return 0; }
   const d = await gh(`/actions/workflows/scanner.yml/dispatches`, { method: "POST", body: JSON.stringify({ ref: "main", inputs: { mode: "scan" } }) });
-  console.log(`scan-backstop: DISPATCH ${d.ok ? "PASS" : `FAIL http-${d.status}`} (${plan.why}, slot ${plan.slot})`);
+  console.log(`scan-backstop: DISPATCH ${d.ok ? "PASS" : `FAIL http-${d.status}`} (scan missing since slot ${slot.toISOString()})`);
   return d.ok ? 0 : 1;
 }
 

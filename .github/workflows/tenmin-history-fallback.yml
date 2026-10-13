@@ -135,3 +135,12 @@ jobs:
           TENMIN_REASON: ${{ steps.redispatch.outputs.reason }}
           TENMIN_RECORD_FILE: ${{ runner.temp }}/record/tenmin-history-record.json
         run: pnpm exec tsx src/tenmin-alert.ts fallback
+
+  # Open-ended missed-scan backstop after every decide (restarter, heal, manual, chain_followup): see scan-backstop.yml.
+  scan_backstop:
+    needs: decide
+    if: ${{ always() }}
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/scan-backstop.yml

@@ -324,25 +324,19 @@ jobs:
   # started, dispatch one mode=scan run. Harmless when redundant (collectionDue). Logic: src/scan-backstop.ts.
   scan_backstop:
     if: ${{ github.event_name == 'schedule' && github.event.schedule == '47 * * * *' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
     permissions:
       contents: read
       actions: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9.15.9
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - name: Scan backstop
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: pnpm -s exec tsx src/scan-backstop.ts
+    uses: ./.github/workflows/scan-backstop.yml
+
+  # Same open-ended backstop at the end of every tenmin_history run (dispatched, so it fires when crons do not).
+  scan_backstop_after_history:
+    needs: [tenmin_history]
+    if: ${{ always() && needs.tenmin_history.result != 'skipped' }}
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/scan-backstop.yml
 
   backfill:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'backfill' }}

@@ -1,0 +1,37 @@
+name: Scan backstop
+# Reusable (workflow_call only). Open-ended missed-scan backstop (src/scan-backstop.ts planOpenScanAt): from 30 min
+# after the last 05:30/09:30 UTC Tue-Sat slot until the next one, if no scan run (scheduled, or dispatched with its
+# scan job) was created since the slot, dispatch one scanner.yml mode=scan run with this repo's GITHUB_TOKEN. Never
+# inside 05:15-06:15 / 09:15-10:15 UTC. Called from the :47 tick, the end of every tenmin_history run, and the
+# fallback decide (which chain_followup also calls), so a dropped cron cannot hide a missed slot.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  backstop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # The only job that may dispatch a scan. One at a time, so two callers never both dispatch.
+    concurrency:
+      group: scan-backstop
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Scan backstop (open-ended)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: pnpm -s exec tsx src/scan-backstop.ts
