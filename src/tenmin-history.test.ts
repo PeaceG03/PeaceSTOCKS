@@ -1631,7 +1631,7 @@ test("history: a TIME_BUDGET yield in the dated phase after sealing a month → 
   });
 });
 
-import { isTransientHistoryError as _isT, TENMIN_HISTORY_TRANSIENT_BACKOFF_MS as _B } from "./tenmin-history.ts";
+import { isTransientHistoryError as _isT, TENMIN_HISTORY_TRANSIENT_BACKOFF_MS as _B } from "./tenmin-history";
 import { test as _test } from "node:test";
 import _assert from "node:assert/strict";
 _test("transient history errors retry in-run with backoff; config errors do not", () => {
