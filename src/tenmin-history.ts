@@ -208,6 +208,7 @@ export function addCalendarDays(date: string, days: number): string {
  * (UTC Date.setUTCFullYear clamps).
  */
 export function addCalendarYears(date: string, years: number): string {
+  if (!Number.isInteger(years)) throw new Error("INVALID_CALENDAR_YEARS");
   requireDate(date);
   const year = Number(date.slice(0, 4));
   const month = Number(date.slice(5, 7));
