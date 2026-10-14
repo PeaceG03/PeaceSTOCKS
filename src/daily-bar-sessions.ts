@@ -59,6 +59,7 @@ export function indexDailyBarSessions(
 
 /** YYYY-MM months touched by [from, to] (inclusive). */
 export function monthsBetween(from: string, to: string): string[] {
+  if (to < from) throw new Error("INVALID_MONTH_RANGE");
   const months: string[] = [];
   let year = Number(from.slice(0, 4));
   let month = Number(from.slice(5, 7));
