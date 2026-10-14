@@ -21,3 +21,5 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Simulated-cursor handoffs + gate
         run: pnpm -s exec tsx --test src/tenmin-mode.test.ts src/tenmin-gate.test.ts 2>&1 | grep -E '^# (pass|fail)|^not ok'; test "${PIPESTATUS[0]}" -eq 0
+      - name: Typecheck
+        run: pnpm run typecheck
