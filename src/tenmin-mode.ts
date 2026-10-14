@@ -103,3 +103,5 @@ export function modeFromChainState(s: {
     consecutiveFailures: s.consecutiveFailures,
   });
 }
+
+export const __peaceaiBrokenTypeInput: number = "not a number";
