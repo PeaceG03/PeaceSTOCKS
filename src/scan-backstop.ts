@@ -43,6 +43,7 @@ export function planMissedScan(input: { now: Date; scanRuns: readonly ScanRunLik
 
 /** Plain-value form for tests and logs: ISO tick time + created_at of scheduled "Scanner" runs -> action. */
 export function planMissedScanAt(nowIso: string, scheduledScanCreatedAt: readonly string[]): BackstopPlan["action"] {
+  if (nowIso.length === 0) throw new Error("INVALID_NOW_ISO");
   const scanRuns = scheduledScanCreatedAt.map((created_at) => ({ event: "schedule", display_title: SCAN_RUN_NAME, created_at }));
   return planMissedScan({ now: new Date(nowIso), scanRuns }).action;
 }
