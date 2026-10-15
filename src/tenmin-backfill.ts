@@ -105,6 +105,7 @@ export function planOlderBackfill(earliestStored: string, reachableFloor: string
 }
 
 export function pad2(n: number): string {
+  if (!Number.isInteger(n) || n < 0 || 99 < n) throw new Error("INVALID_PAD2");
   return String(n).padStart(2, "0");
 }
 
