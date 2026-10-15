@@ -114,5 +114,6 @@ export function isIsoDateText(s: string): boolean {
 }
 
 export function isWeekendIndex(d: number): boolean {
+  if (!Number.isInteger(d) || d < 0 || 6 < d) throw new Error("INVALID_WEEKDAY_INDEX");
   return d === 0 || d === 6;
 }
