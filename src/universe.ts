@@ -12,6 +12,7 @@ import type { TickerReferenceCapture } from "./ticker-reference-index";
 import type { MarketStore } from "./storage";
 
 export function eligibilityForBarCount(barCount: number): HistoryEligibility {
+  if (!Number.isInteger(barCount) || barCount < 0) throw new Error("INVALID_BAR_COUNT");
   if (barCount <= 0) return "LEVEL_0";
   if (barCount < 20) return "LEVEL_1";
   if (barCount < 252) return "LEVEL_2";
