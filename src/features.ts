@@ -64,5 +64,6 @@ export function reconstructFeatures(
 }
 
 export function featureRecipe(featureId: string): FeatureRecipe | undefined {
+  if (featureId.length === 0) throw new Error("INVALID_FEATURE_ID");
   return FEATURE_RECIPES.find((recipe) => recipe.featureId === featureId);
 }
