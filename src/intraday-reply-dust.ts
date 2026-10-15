@@ -79,6 +79,9 @@ function sessionPrefix(sessionDate: string): string {
 }
 
 export function replyDustFileName(securityId: string): string {
+  if (securityId.trim() === '') {
+    throw new Error("INVALID_SECURITY_ID");
+  }
   return `${Buffer.from(securityId, "utf8").toString("base64url")}.rdust`;
 }
 export function replyDustFileKey(sessionDate: string, securityId: string): string {
