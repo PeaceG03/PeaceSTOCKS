@@ -53,6 +53,7 @@ export function backfillProbeDates(earliestStored: string): { from: string; to: 
  */
 export function decideBackfill(olderReachable: boolean | undefined, pendingRanges: number, keyBusy: boolean): BackfillAction {
   if (olderReachable !== true || pendingRanges <= 0) return "daily";
+  if (!Number.isInteger(pendingRanges)) throw new Error("INVALID_PENDING_RANGES");
   return keyBusy ? "hold" : "dispatch";
 }
 
