@@ -69,6 +69,15 @@ export function parseOneOffFloor(input: string | undefined): string {
   return f;
 }
 
+/** ONEOFF_BUDGET_MS: unset/blank -> default; otherwise plain digits, 1..6h (the Actions job limit). Fail closed. */
+export function parseOneOffBudgetMs(input: string | undefined): number {
+  const s = input?.trim();
+  if (!s) return ONEOFF_DEFAULT_BUDGET_MS;
+  if (!/^\d{1,8}$/u.test(s) || Number(s) < 1 || Number(s) > 6 * 3_600_000)
+    throw new Error(`ONEOFF_BUDGET_MS_INVALID:${JSON.stringify(s.slice(0, 20))}`);
+  return Number(s);
+}
+
 export function parseChainIndex(input: string | undefined): number {
   const s = (input ?? "").trim() || "1";
   if (!/^\d{1,3}$/u.test(s) || Number(s) < 1) throw new Error(`ONEOFF_CHAIN_INDEX_INVALID:${s}`);
@@ -178,7 +187,7 @@ async function main(): Promise<number> {
   const log = (s: string) => console.log(`${new Date().toISOString()} ${s}`);
   const out = (k: string, v: string | number) => { if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${k}=${v}\n`); };
   const t0 = Date.now();
-  const budgetMs = Number(process.env.ONEOFF_BUDGET_MS) > 0 ? Number(process.env.ONEOFF_BUDGET_MS) : ONEOFF_DEFAULT_BUDGET_MS;
+  const budgetMs = parseOneOffBudgetMs(process.env.ONEOFF_BUDGET_MS);
   let floor = parseOneOffFloor(process.env.ONEOFF_FLOOR);
   const chainIndex = parseChainIndex(process.env.ONEOFF_CHAIN_INDEX);
   const repo = process.env.GITHUB_REPOSITORY ?? "PeaceG03/PeaceSTOCKS";

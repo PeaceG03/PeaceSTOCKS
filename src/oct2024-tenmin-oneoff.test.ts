@@ -5,7 +5,7 @@ import test from "node:test";
 import {
   readbackVerdict,
   ONEOFF_PREFIX, ONEOFF_SESSIONS, ONEOFF_DEFAULT_BUDGET_MS, ONEOFF_SPACING_MS, inOneOffGuardWindow, dollarVolumeBySecurity,
-  liquidityOrder, nextOneOffFloor, parseOneOffFloor, parseChainIndex, decideOneOffNext, oneOffPauseReason, errorClass,
+  liquidityOrder, nextOneOffFloor, parseOneOffFloor, parseChainIndex, parseOneOffBudgetMs, decideOneOffNext, oneOffPauseReason, errorClass,
   timedFetch, guardedStore, storedByFetchFrom,
 } from "./oct2024-tenmin-oneoff";
 import { ONEOFF_SEALED_RUN_NAME } from "./tenmin-gate";
@@ -154,4 +154,14 @@ test("post-seal read-back verdict: PASS only sealed + all verified", () => {
   assert.equal(readbackVerdict({ listed: 7188, verifiedOk: 7188, failed: 0, sealed: false }), "FAIL");
   assert.equal(readbackVerdict({ listed: 7188, verifiedOk: 7187, failed: 1, sealed: true }), "FAIL");
   assert.equal(readbackVerdict({ listed: 0, verifiedOk: 0, failed: 0, sealed: true }), "FAIL");
+});
+
+test("parseOneOffBudgetMs: blank -> default, digits 1..6h, anything else fails closed", () => {
+  assert.equal(parseOneOffBudgetMs(undefined), ONEOFF_DEFAULT_BUDGET_MS);
+  assert.equal(parseOneOffBudgetMs("  "), ONEOFF_DEFAULT_BUDGET_MS);
+  assert.equal(parseOneOffBudgetMs("60000"), 60_000);
+  assert.equal(parseOneOffBudgetMs(" 60000 "), 60_000);
+  assert.equal(parseOneOffBudgetMs(String(6 * 3_600_000)), 6 * 3_600_000);
+  for (const bad of ["Infinity", "1e12", "0x10", "0", "-5", "1.5", "21600001", "abc"])
+    assert.throws(() => parseOneOffBudgetMs(bad), /ONEOFF_BUDGET_MS_INVALID/u, bad);
 });
