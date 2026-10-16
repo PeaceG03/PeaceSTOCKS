@@ -9,6 +9,9 @@ const SECURITY_ID = /"securityId":("(?:[^"\\]|\\.)*")/u;
 const SESSION_DATE = /"sessionDate":"(\d{4}-\d{2}-\d{2})"/u;
 
 export function requireMonth(month: string): void {
+  if (/^\d{4}-(?:00|1[3-9])$/u.test(month)) {
+    throw new Error("DAILY_BAR_MONTH_OUT_OF_RANGE");
+  }
   if (!/^\d{4}-\d{2}$/u.test(month)) throw new Error("INVALID_DAILY_BAR_MONTH");
 }
 
