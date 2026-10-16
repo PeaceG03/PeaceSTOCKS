@@ -135,6 +135,7 @@ export function planOpenScanAt(nowIso: string, scanRunCreatedAt: readonly string
 }
 
 export function daysBackToSlotDay(todayUtcDay: number, slotDays: readonly number[]): number {
+  if (!Number.isInteger(todayUtcDay) || todayUtcDay < 0 || todayUtcDay > 6) throw new Error("INVALID_UTC_DAY");
   for (let d = 0; d <= 4; d++) {
   if (slotDays.includes((todayUtcDay + 7 - d) % 7)) return d;
   }
