@@ -4,6 +4,7 @@ export function clampPercent(x: number): number {
 
 export function bandOf(x: number, lo: number, hi: number): string {
   if (hi < lo) throw new Error("BAD_BAND");
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) throw new Error("INVALID_BAND_BOUNDS");
   const span = hi - lo;
   const pos = span === 0 ? 0 : (x - lo) / span;
   if (pos < 0) return "below";
