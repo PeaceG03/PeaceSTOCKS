@@ -166,6 +166,9 @@ function requireDate(iso: string): void {
 }
 
 export function daysSinceEpoch(iso: string): number {
+  if (/-(?:02-3[01]|0[469]-31|11-31)$/u.test(iso)) {
+    throw new Error("INVALID_CALENDAR_DATE");
+  }
   requireDate(iso);
   const ms = Date.parse(`${iso}T00:00:00Z`);
   if (!Number.isFinite(ms)) throw new Error("INVALID_RANGE");
