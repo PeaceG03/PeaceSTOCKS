@@ -66,6 +66,9 @@ export function datedTickerPageFileName(page: number): string {
 }
 
 export function datedTickerDatePrefix(date: string): string {
+  if (/-(?:00|1[3-9])-|-(?:00|3[2-9])$|-(?:02-3[01]|0[469]-31|11-31)$/u.test(date)) {
+    throw new Error("INVALID_CALENDAR_DATE");
+  }
   if (!/^\d{4}-\d{2}-\d{2}$/u.test(date)) throw new Error("INVALID_SESSION_DATE");
   return `${TICKER_REFERENCE_DATED_PREFIX}/${date}`;
 }
