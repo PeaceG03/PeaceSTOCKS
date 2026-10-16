@@ -707,9 +707,17 @@ export function priorConsecutiveFailures(runs: readonly { id: number; event?: st
   return n;
 }
 
+/** TENMIN_REDISPATCH_DRY_RUN: unset/""/"0" -> real dispatch, "1" -> dry run; anything else throws (no silent real dispatch). */
+export function redispatchDryRun(value: string | undefined): boolean {
+  const s = value?.trim() ?? "";
+  if (s === "" || s === "0") return false;
+  if (s === "1") return true;
+  throw new Error(`TENMIN_REDISPATCH_DRY_RUN_INVALID:${JSON.stringify(s.slice(0, 20))}`);
+}
+
 async function dispatch(chain: number, scanCheckStops = 0): Promise<void> {
   const ref = process.env.TENMIN_DISPATCH_REF || process.env.GITHUB_REF_NAME || "main";
-  if (process.env.TENMIN_REDISPATCH_DRY_RUN === "1") {
+  if (redispatchDryRun(process.env.TENMIN_REDISPATCH_DRY_RUN)) {
     process.stdout.write(`DRY_RUN: would dispatch scanner.yml ref=${ref} chain=${chain} scanCheckStops=${scanCheckStops}\n`);
     return;
   }
@@ -729,7 +737,7 @@ async function dispatch(chain: number, scanCheckStops = 0): Promise<void> {
 
 async function dispatchHeal(): Promise<void> {
   const ref = process.env.TENMIN_DISPATCH_REF || process.env.GITHUB_REF_NAME || "main";
-  if (process.env.TENMIN_REDISPATCH_DRY_RUN === "1") {
+  if (redispatchDryRun(process.env.TENMIN_REDISPATCH_DRY_RUN)) {
     process.stdout.write(`DRY_RUN: would dispatch tenmin-history-fallback.yml ref=${ref} wait_for_guard_window_end=true\n`);
     return;
   }
@@ -890,7 +898,7 @@ async function main(mode: string | undefined): Promise<void> {
     const seconds = healWaitSeconds(now);
     const until = new Date(now.getTime() + seconds * 1000).toISOString();
     process.stdout.write(`${JSON.stringify({ mode: "tenmin-redispatch", trigger: "guard-wait", waitSeconds: seconds, until })}\n`);
-    if (seconds > 0 && env.TENMIN_REDISPATCH_DRY_RUN !== "1") await new Promise((done) => setTimeout(done, seconds * 1000));
+    if (seconds > 0 && !redispatchDryRun(env.TENMIN_REDISPATCH_DRY_RUN)) await new Promise((done) => setTimeout(done, seconds * 1000));
     return;
   }
   throw new Error("TENMIN_REDISPATCH_MODE:chain|fallback|guard-wait");

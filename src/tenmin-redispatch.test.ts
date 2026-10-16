@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { TenMinHistoryRangeReport, TenMinHistoryRunReport } from "./tenmin-history";
+import { redispatchDryRun } from "./tenmin-redispatch";
 import {
   TENMIN_REDISPATCH_DEFAULT_MAX_CHAIN,
   TENMIN_STOP_SCAN_CANCELLED,
@@ -726,4 +727,14 @@ test("prior consecutive failures: newest-first streak of failed Scanner dispatch
   assert.equal(priorConsecutiveFailures([r(9, "failure"), r(8, "failure"), r(7, "success"), r(6, "failure")], 10), 2);
   assert.equal(priorConsecutiveFailures([{ ...r(10, "failure"), status: "in_progress" }, r(9, "success")], 10), 0);
   assert.equal(priorConsecutiveFailures([r(9, "failure", { display_title: "Scanner restarter" }), r(8, "failure")]), 1);
+});
+
+test("redispatchDryRun: only unset/\"\"/0/1 accepted; any other value throws instead of a silent real dispatch", () => {
+  assert.equal(redispatchDryRun(undefined), false);
+  assert.equal(redispatchDryRun(""), false);
+  assert.equal(redispatchDryRun("0"), false);
+  assert.equal(redispatchDryRun("1"), true);
+  assert.equal(redispatchDryRun(" 1 "), true);
+  for (const bad of ["true", "yes", "TRUE", "2", "on"])
+    assert.throws(() => redispatchDryRun(bad), /TENMIN_REDISPATCH_DRY_RUN_INVALID/u, bad);
 });
