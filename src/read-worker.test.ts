@@ -3,7 +3,7 @@ import test from "node:test";
 import type { ScannerRunReport } from "./contracts";
 import { MemoryObjectClient } from "./object-store";
 import { ObjectMarketStorage } from "./object-storage";
-import { createReadWorker, type ReadOnlyBucket } from "./read-worker";
+import { BindingObjectClient, createReadWorker, type ReadOnlyBucket } from "./read-worker";
 
 function bucket(client: MemoryObjectClient): ReadOnlyBucket {
   return {
@@ -65,4 +65,34 @@ test("the read worker serves scanner routes and refuses writes", async () => {
   );
   assert.equal(denied.status, 405);
   assert.deepEqual(await client.list(""), before);
+});
+
+function pagedBucket(pages: number | "endless"): ReadOnlyBucket & { calls: number } {
+  const b = {
+    calls: 0,
+    async get() {
+      return null;
+    },
+    async list(options: { prefix: string; cursor?: string }) {
+      b.calls += 1;
+      const n = options.cursor === undefined ? 1 : Number(options.cursor.slice(1));
+      const more = pages === "endless" || n < pages;
+      return { objects: [{ key: `${options.prefix}k${String(1000 - n).padStart(4, "0")}` }], ...(more ? { truncated: true, cursor: `c${n + 1}` } : { truncated: false }) };
+    },
+  };
+  return b;
+}
+
+test("read worker listing follows truncated pages and returns every key sorted", async () => {
+  const b = pagedBucket(3);
+  assert.deepEqual(await new BindingObjectClient(b).list("p/"), ["p/k0997", "p/k0998", "p/k0999"]);
+  assert.equal(b.calls, 3);
+});
+
+test("read worker listing is bounded: a cursor that never ends fails closed after 1000 pages", async () => {
+  const b = pagedBucket("endless");
+  await assert.rejects(new BindingObjectClient(b).list("p/"), /^Error: READ_BUCKET_LIST_PAGE_CAP$/u);
+  assert.equal(b.calls, 1000);
+  const ok = pagedBucket(1000);
+  assert.equal((await new BindingObjectClient(ok).list("p/")).length, 1000);
 });

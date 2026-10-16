@@ -19,7 +19,7 @@ export interface ReadOnlyBucket {
   list(options: { prefix: string; cursor?: string }): Promise<ReadOnlyObjectList>;
 }
 
-class BindingObjectClient implements ObjectClient {
+export class BindingObjectClient implements ObjectClient {
   constructor(private readonly bucket: ReadOnlyBucket) {}
 
   async get(key: string): Promise<Uint8Array | undefined> {
@@ -45,14 +45,18 @@ class BindingObjectClient implements ObjectClient {
   async list(prefix: string): Promise<string[]> {
     const keys: string[] = [];
     let cursor: string | undefined;
-    do {
+    // Bounded listing: a bucket that keeps returning truncated pages (a cursor that never ends) fails closed after
+    // 1000 pages instead of spinning the Worker.
+    let pages = 0;
+    while (pages < 1000) {
+      pages += 1;
       const page = await this.bucket.list(cursor === undefined ? { prefix } : { prefix, cursor });
       for (const object of page.objects) keys.push(object.key);
-      if (!page.truncated) break;
+      if (!page.truncated) return keys.sort();
       if (!page.cursor) throw new Error("READ_BUCKET_CURSOR_MISSING");
       cursor = page.cursor;
-    } while (cursor);
-    return keys.sort();
+    }
+    throw new Error("READ_BUCKET_LIST_PAGE_CAP");
   }
 }
 
