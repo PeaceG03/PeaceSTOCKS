@@ -97,6 +97,7 @@ export function mountainTime(date: Date): string {
 }
 
 export function alertMarker(key: string): string {
+  if (key.length === 0) throw new Error("INVALID_ALERT_KEY");
   return `<!-- scanner-alert-key: ${key} -->`;
 }
 
