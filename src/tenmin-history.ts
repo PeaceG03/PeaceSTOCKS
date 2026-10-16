@@ -196,6 +196,9 @@ function requireDate(value: string): void {
 
 /** Add `days` (may be negative) to a YYYY-MM-DD using UTC calendar arithmetic. */
 export function addCalendarDays(date: string, days: number): string {
+  if (/-(?:02-3[01]|0[469]-31|11-31)$/u.test(date)) {
+    throw new Error("INVALID_CALENDAR_DATE");
+  }
   if (!Number.isInteger(days)) throw new Error("INVALID_CALENDAR_DAYS");
   requireDate(date);
   const cursor = new Date(`${date}T00:00:00Z`);
