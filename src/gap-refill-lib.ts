@@ -14,7 +14,7 @@ import { dailyBarsFromReply, readDailyReplyDustBars, readDailyReplyDustManifest,
 import { maybeWriteScanDailyBarsSidecar } from "./daily-bars-sidecar";
 import { decodeDailyBarsPack } from "./daily-bars-pack-decode";
 import { decodeReplyDust } from "./reply-dust";
-import { MassiveMarketProvider, groupedDailySymbolIndex, symbolBySecurityIdFor } from "./massive-provider";
+import { type MassiveMarketProvider, groupedDailySymbolIndex, symbolBySecurityIdFor } from "./massive-provider";
 import type { ObjectClient, ObjectHead, ObjectMetadata } from "./object-store";
 import { ObjectMarketStorage } from "./object-storage";
 import { finalizeDailyPartition } from "./scanner";
