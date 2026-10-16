@@ -1,5 +1,5 @@
 import { performance } from "node:perf_hooks";
-import type { CanonicalTenMinuteBar } from "./contracts";
+import { type CanonicalTenMinuteBar } from "./contracts";
 import { decodeDust, encodeDust } from "./dust";
 
 export interface EncodingBenchmarkResult {
