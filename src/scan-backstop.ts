@@ -133,3 +133,10 @@ export function planOpenScanAt(nowIso: string, scanRunCreatedAt: readonly string
   if (scanRunCreatedAt.some((c) => (Date.parse(c) || 0) >= slot.getTime() - 5 * 60_000)) return "none";
   return inScanGuardWindow(now) ? "wait" : "dispatch";
 }
+
+export function daysBackToSlotDay(todayUtcDay: number, slotDays: readonly number[]): number {
+  for (let d = 0; d <= 4; d++) {
+  if (slotDays.includes((todayUtcDay + 7 - d) % 7)) return d;
+  }
+  return -1;
+}
