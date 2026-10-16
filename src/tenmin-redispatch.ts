@@ -598,6 +598,7 @@ export function assertCancelRunAccepted(httpStatus: number, runId: number): void
   if (httpStatus !== 202 && httpStatus !== 204) {
     throw new Error(`TENMIN_REDISPATCH_CANCEL_FAILED:run=${runId}:http-${httpStatus}`);
   }
+  if (!Number.isInteger(runId) || runId < 1) throw new Error("INVALID_RUN_ID");
 }
 
 // ---- CLI (thin I/O around the pure functions) ----
