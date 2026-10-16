@@ -598,3 +598,23 @@ test("ten-minute range fetch accepts exactly the page cap", async () => {
   assert.equal(pages.length, 8);
   assert.equal(fetches, 8);
 });
+
+test("Massive ticker listing is bounded: a next_url cycle (A -> B -> A) fails closed after 1000 pages", async () => {
+  let calls = 0;
+  const provider = new MassiveMarketProvider({
+    apiKey: "test-key",
+    minRequestIntervalMs: 0,
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(
+        JSON.stringify({
+          results: [{ ticker: `T${calls}`, type: "CS", market: "stocks", locale: "us", active: true }],
+          next_url: `https://api.massive.com/v3/reference/tickers?cursor=${calls % 2 === 0 ? "a" : "b"}`,
+        }),
+        { status: 200 },
+      );
+    },
+  });
+  await assert.rejects(provider.listApprovedSecurities(), /^Error: MASSIVE_TICKER_PAGE_CAP:active$/u);
+  assert.equal(calls, 1000);
+});

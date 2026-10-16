@@ -539,7 +539,10 @@ export class MassiveMarketProvider implements MarketProvider {
       const pass: TickerReferencePass = active === "true" ? "active" : "inactive";
       let next: string | undefined = "/v3/reference/tickers";
       let first = true;
-      while (next) {
+      // Bounded pagination: at most 1000 pages per pass (1M tickers at PAGE_LIMIT), then fail closed below.
+      let passPages = 0;
+      while (passPages < 1000) {
+        passPages += 1;
         // The caller checked before calling; re-check at every later page boundary. Stopping
         // throws away everything read so far and leaves the bound universe untouched.
         if (pagesFetched > 0 && options.shouldStop) {
@@ -577,7 +580,10 @@ export class MassiveMarketProvider implements MarketProvider {
         }
         const candidate = text(response.next_url);
         next = candidate && candidate !== next ? candidate : undefined;
+        if (!next) break;
       }
+      // More than 1000 pages in one pass (a next_url cycle A -> B -> A, or a runaway cursor) fails closed.
+      if (next) throw new Error(`MASSIVE_TICKER_PAGE_CAP:${pass}`);
     }
     const result = [...output.values()].sort((a, b) => a.symbol.localeCompare(b.symbol));
     if (captureError) this.tickerReferenceCaptureError = captureError;
