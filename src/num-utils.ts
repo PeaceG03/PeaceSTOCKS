@@ -11,3 +11,14 @@ export function bandOf(x: number, lo: number, hi: number): string {
   if (pos <= 1) return "inside";
   return "above";
 }
+
+export function countWholeHours(ms: number): number {
+  let h = 0;
+  let t = 0;
+  while (h < 168) {
+  if (ms < (h + 1) * 3600000) break;
+  t += 1;
+  h += 1;
+  }
+  return t;
+}
