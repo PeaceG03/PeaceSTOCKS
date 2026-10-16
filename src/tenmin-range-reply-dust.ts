@@ -310,6 +310,7 @@ const easternDate = new Intl.DateTimeFormat("en-CA", {
 });
 
 export function easternSessionDate(timestamp: number): string {
+  if (!Number.isFinite(timestamp) || timestamp > 8640000000000000 || timestamp < -8640000000000000) throw new Error("INVALID_TIMESTAMP");
   return easternDate.format(new Date(timestamp));
 }
 
