@@ -39,6 +39,7 @@ export function replyDustRunReport(filesWritten: number, fallbackFiles: number, 
   replyDustZstdVersion: string;
   warnings?: string[];
 } {
+  if (!Number.isInteger(filesWritten) || filesWritten < 0 || fallbackFiles > filesWritten) throw new Error("INVALID_REPLY_DUST_COUNTS");
   return {
     replyDustFilesWritten: filesWritten,
     replyDustFallbackFiles: fallbackFiles,
