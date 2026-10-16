@@ -751,7 +751,7 @@ export interface TenMinHistoryRunResult {
 
 function openTenMinReplyDustStore(root: string, env: NodeJS.ProcessEnv): ReplyDustStore {
   if (env.PEACESTOCKS_R2_BUCKET?.trim()) return R2ObjectClient.fromEnv(env);
-  if (env.PEACESTOCKS_REQUIRE_OBJECT_STORE === "1") throw new Error("OBJECT_STORE_REQUIRED");
+  if (strictPeacestocksRequireObjectStore(env.PEACESTOCKS_REQUIRE_OBJECT_STORE)) throw new Error("OBJECT_STORE_REQUIRED");
   return new FileReplyDustStore(root);
 }
 
@@ -810,7 +810,7 @@ export async function runTenMinHistory(options: {
   await storage.initialize();
   const store = options.store ?? openTenMinReplyDustStore(root, env);
   if (
-    env.PEACESTOCKS_REQUIRE_OBJECT_STORE === "1" &&
+    strictPeacestocksRequireObjectStore(env.PEACESTOCKS_REQUIRE_OBJECT_STORE) &&
     !env.PEACESTOCKS_R2_BUCKET?.trim() &&
     !(storage instanceof MarketStorage) &&
     !options.store
@@ -1334,4 +1334,12 @@ export const TENMIN_HISTORY_TRANSIENT_BACKOFF_MS = [30_000, 90_000, 180_000] as 
 
 export function isTransientHistoryError(message: string): boolean {
   return /fetch failed|MASSIVE_NETWORK|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|UND_ERR|socket hang up|other side closed|timed? ?out|HTTP 5\d\d|\b50[234]\b/iu.test(message);
+}
+
+/** PEACESTOCKS_REQUIRE_OBJECT_STORE: unset, "" or "0" -> false; "1" -> true; anything else throws (fail closed). */
+export function strictPeacestocksRequireObjectStore(value: string | undefined): boolean {
+  const s = value?.trim() ?? "";
+  if (s === "" || s === "0") return false;
+  if (s === "1") return true;
+  throw new Error(`PEACESTOCKS_REQUIRE_OBJECT_STORE_INVALID:${JSON.stringify(s.slice(0, 20))}`);
 }
