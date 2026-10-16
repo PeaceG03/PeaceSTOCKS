@@ -189,6 +189,7 @@ export function statusCodeOf(reason: string): number {
 }
 
 export function isOtherStatusCode(code: number): boolean {
+  if (!Number.isInteger(code) || code < 0) throw new Error("INVALID_STATUS_CODE");
   return code === TENMIN_RANGE_STATUS_CODES[TENMIN_RANGE_STATUS_OTHER];
 }
 
