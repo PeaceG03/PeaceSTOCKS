@@ -269,3 +269,12 @@ test("backfill that yields mid ticker-list paging discards the partial list and 
   assert.deepEqual(await storage.loadSecurities(), masterBefore);
   assert.deepEqual(await storage.loadMembership(), membershipBefore);
 });
+
+test("backfillRequiresObjectStore: only unset/\"\"/0/1; a typo throws instead of turning the requirement off", async () => {
+  const { backfillRequiresObjectStore } = await import("./backfill");
+  assert.equal(backfillRequiresObjectStore(undefined), false);
+  assert.equal(backfillRequiresObjectStore("0"), false);
+  assert.equal(backfillRequiresObjectStore("1"), true);
+  for (const bad of ["true", "yes", "2"])
+    assert.throws(() => backfillRequiresObjectStore(bad), /PEACESTOCKS_REQUIRE_OBJECT_STORE_INVALID/u, bad);
+});

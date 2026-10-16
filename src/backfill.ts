@@ -198,8 +198,16 @@ async function writeProgress(storage: MarketStore, state: BackfillState): Promis
   await storage.saveBackfillProgress({ ...state, updatedAt: new Date().toISOString() });
 }
 
+/** PEACESTOCKS_REQUIRE_OBJECT_STORE: unset/""/"0" -> off, "1" -> on; anything else throws (a typo must not turn the requirement off). */
+export function backfillRequiresObjectStore(value: string | undefined): boolean {
+  const s = value?.trim() ?? "";
+  if (s === "" || s === "0") return false;
+  if (s === "1") return true;
+  throw new Error(`PEACESTOCKS_REQUIRE_OBJECT_STORE_INVALID:${JSON.stringify(s.slice(0, 20))}`);
+}
+
 function requireObjectStore(env: NodeJS.ProcessEnv): void {
-  if (env.PEACESTOCKS_REQUIRE_OBJECT_STORE === "1" && !env.PEACESTOCKS_R2_BUCKET?.trim()) {
+  if (backfillRequiresObjectStore(env.PEACESTOCKS_REQUIRE_OBJECT_STORE) && !env.PEACESTOCKS_R2_BUCKET?.trim()) {
     throw new Error("OBJECT_STORE_REQUIRED");
   }
 }
