@@ -669,3 +669,12 @@ test("readable range index: the reader returns the range data for a session the 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("liquidRequiresObjectStore: only unset/\"\"/0/1; a typo throws instead of turning the requirement off", async () => {
+  const { liquidRequiresObjectStore } = await import("./tenmin-daily-liquid");
+  assert.equal(liquidRequiresObjectStore(undefined), false);
+  assert.equal(liquidRequiresObjectStore("0"), false);
+  assert.equal(liquidRequiresObjectStore("1"), true);
+  for (const bad of ["true", "yes", "2"])
+    assert.throws(() => liquidRequiresObjectStore(bad), /PEACESTOCKS_REQUIRE_OBJECT_STORE_INVALID/u, bad);
+});

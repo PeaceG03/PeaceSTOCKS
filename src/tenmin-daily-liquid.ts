@@ -99,6 +99,14 @@ function parseBoundedInt(name: string, value: string | undefined, fallback: numb
 }
 
 /** TENMIN_DAILY_LIQUID_N: empty = 500; otherwise an integer 1..1000 (invalid fails before any request). */
+/** PEACESTOCKS_REQUIRE_OBJECT_STORE: unset/""/"0" -> off, "1" -> on; anything else throws (a typo must not turn the requirement off). */
+export function liquidRequiresObjectStore(value: string | undefined): boolean {
+  const s = value?.trim() ?? "";
+  if (s === "" || s === "0") return false;
+  if (s === "1") return true;
+  throw new Error(`PEACESTOCKS_REQUIRE_OBJECT_STORE_INVALID:${JSON.stringify(s.slice(0, 20))}`);
+}
+
 export function parseTenMinDailyLiquidN(value: string | undefined): number {
   return parseBoundedInt("TENMIN_DAILY_LIQUID_N", value, TENMIN_DAILY_LIQUID_N_DEFAULT, TENMIN_DAILY_LIQUID_N_MAX);
 }
@@ -702,7 +710,7 @@ export async function runTenMinDailyFromEnv(env: NodeJS.ProcessEnv = process.env
   const root = env.PEACEAI_MARKETS_ROOT ?? env.MARKETS_STORAGE_ROOT ?? "C:\\ProgramData\\PeaceAI\\Markets";
   let store: ReplyDustStore;
   if (env.PEACESTOCKS_R2_BUCKET?.trim()) store = R2ObjectClient.fromEnv(env);
-  else if (env.PEACESTOCKS_REQUIRE_OBJECT_STORE === "1") throw new Error("OBJECT_STORE_REQUIRED");
+  else if (liquidRequiresObjectStore(env.PEACESTOCKS_REQUIRE_OBJECT_STORE)) throw new Error("OBJECT_STORE_REQUIRED");
   else store = new FileReplyDustStore(root);
   const storage = openMarketStore(root, env);
   await storage.initialize();
