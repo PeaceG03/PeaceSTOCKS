@@ -149,3 +149,12 @@ test("failed evidence does not move the scheduler cursor forward", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("hostRequiresObjectStore: only unset/\"\"/0/1; a typo throws instead of turning the requirement off", async () => {
+  const { hostRequiresObjectStore } = await import("./host");
+  assert.equal(hostRequiresObjectStore(undefined), false);
+  assert.equal(hostRequiresObjectStore("0"), false);
+  assert.equal(hostRequiresObjectStore("1"), true);
+  for (const bad of ["true", "yes", "2"])
+    assert.throws(() => hostRequiresObjectStore(bad), /PEACESTOCKS_REQUIRE_OBJECT_STORE_INVALID/u, bad);
+});

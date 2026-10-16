@@ -166,6 +166,14 @@ function makeResult(
   });
 }
 
+/** PEACESTOCKS_REQUIRE_OBJECT_STORE: unset/""/"0" -> off, "1" -> on; anything else throws (a typo must not turn the requirement off). */
+export function hostRequiresObjectStore(value: string | undefined): boolean {
+  const s = value?.trim() ?? "";
+  if (s === "" || s === "0") return false;
+  if (s === "1") return true;
+  throw new Error(`PEACESTOCKS_REQUIRE_OBJECT_STORE_INVALID:${JSON.stringify(s.slice(0, 20))}`);
+}
+
 export async function runScannerHost(
   options: {
     readonly now?: Date;
@@ -192,7 +200,7 @@ export async function runScannerHost(
     throw new Error(MARKET_SCHEDULER_HOST_PATH_ERROR);
   const root = prepareSafeStoreDirectory(configuredRoot, MARKET_SCHEDULER_HOST_PATH_ERROR);
   if (
-    process.env.PEACESTOCKS_REQUIRE_OBJECT_STORE === "1" &&
+    hostRequiresObjectStore(process.env.PEACESTOCKS_REQUIRE_OBJECT_STORE) &&
     !process.env.PEACESTOCKS_R2_BUCKET?.trim()
   ) {
     throw new Error("OBJECT_STORE_REQUIRED");
