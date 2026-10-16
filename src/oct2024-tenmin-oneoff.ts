@@ -108,6 +108,7 @@ export function errorClass(e: unknown): string {
 
 /** Referenced setTimeout + own AbortController raced against the call: always settles at ms (box v3 wrapper). */
 export function timedFetch(ms: number, base: typeof fetch = fetch): typeof fetch {
+  if (!Number.isFinite(ms) || ms < 1) throw new Error("INVALID_TIMEOUT_MS");
   return async (u, i) => {
     const ac = new AbortController();
     let t: ReturnType<typeof setTimeout> | undefined;
