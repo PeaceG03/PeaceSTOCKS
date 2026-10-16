@@ -41,7 +41,9 @@ function assertNoReparseAncestors(path: string, errorCode: string): void {
   let current = resolve(path);
   const leaf = current;
   const filesystemRoot = parse(current).root;
-  while (true) {
+  // Bounded walk: an ancestor chain deeper than 512 is refused (fail closed) rather than walked.
+  let depth = 0;
+  while (depth < 512) {
     const existing = tryLstat(current, errorCode);
     if (existing?.isSymbolicLink()) throw new Error(errorCode);
     if (current !== leaf && existing && !existing.isDirectory()) throw new Error(errorCode);
@@ -49,7 +51,9 @@ function assertNoReparseAncestors(path: string, errorCode: string): void {
     const parent = dirname(current);
     if (parent === current) return;
     current = parent;
+    depth += 1;
   }
+  throw new Error(errorCode);
 }
 
 function tryLstat(path: string, errorCode: string) {
