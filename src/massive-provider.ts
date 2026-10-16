@@ -290,6 +290,7 @@ export function massiveTenMinuteBarsFromReply(input: {
 /** Grouped daily (whole US stock market, one session): the only params getDailyBars uses. */
 export const GROUPED_DAILY_PARAMS: Readonly<Record<string, string>> = { adjusted: "false", include_otc: "false" };
 export function groupedDailyPath(sessionDate: string): string {
+  if (sessionDate.length !== 10) throw new Error("INVALID_GROUPED_DAILY_DATE");
   return `/v2/aggs/grouped/locale/us/market/stocks/${sessionDate}`;
 }
 
