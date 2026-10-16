@@ -11,6 +11,7 @@
   "types": "./src/index.ts",
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:scanner": "tsc -p tsconfig.scanner.json --noEmit",
     "typecheck:lib": "tsc -p tsconfig.lib.json --noEmit",
     "typecheck:worker": "tsc -p tsconfig.worker.json --noEmit",
     "test": "tsx --test src/*.test.ts",
