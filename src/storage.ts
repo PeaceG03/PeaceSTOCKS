@@ -562,3 +562,8 @@ export class MarketStorage implements MarketStore {
   }
 
 }
+
+export function storageUtilizationPercent(mbPerDay: number): number {
+  const gbPerYear = (mbPerDay * 252) / 1024;
+  return gbPerYear * 10;
+}
