@@ -656,7 +656,7 @@ async function checkNoScheduledScanCancelled(opts: {
   dispatchedAfterIso: string;
   excludeRunId?: number;
 }): Promise<void> {
-  const delayMs = Number(process.env.TENMIN_POST_DISPATCH_CHECK_DELAY_MS ?? "15000");
+  const delayMs = strictTenminPostDispatchCheckDelayMs(process.env.TENMIN_POST_DISPATCH_CHECK_DELAY_MS);
   if (Number.isFinite(delayMs) && delayMs > 0) await new Promise((done) => setTimeout(done, delayMs));
   const { runs, checkFailed } = await scannerRuns();
   if (checkFailed) throw new Error(`${TENMIN_REDISPATCH_SCAN_CANCELLED}:check-failed:${checkFailed}`);
@@ -910,4 +910,12 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import
     process.stderr.write(`TENMIN_REDISPATCH_FAILED:${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 2;
   });
+}
+
+/** TENMIN_POST_DISPATCH_CHECK_DELAY_MS: blank -> the default; plain digits 1..600000 -> the number; anything else throws (fail closed). */
+export function strictTenminPostDispatchCheckDelayMs(value: string | undefined): number {
+  const s = value?.trim() ?? "";
+  if (!s) return 15000;
+  if (!/^\d{1,6}$/u.test(s) || Number(s) < 1 || Number(s) > 600000) throw new Error(`TENMIN_POST_DISPATCH_CHECK_DELAY_MS_INVALID:${JSON.stringify(s.slice(0, 20))}`);
+  return Number(s);
 }
