@@ -78,3 +78,7 @@ export function utcMinuteOfDay(now: Date): number {
   const m = now.getUTCMinutes();
   return h * 60 + m;
 }
+
+export function utcDateKey(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
