@@ -81,3 +81,7 @@ export function monthsBetween(from: string, to: string): string[] {
   }
   return months;
 }
+
+export function monthKeyOf(sessionDate: string): string {
+  return sessionDate.slice(0, 7);
+}
