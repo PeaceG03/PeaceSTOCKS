@@ -141,3 +141,8 @@ export function daysBackToSlotDay(todayUtcDay: number, slotDays: readonly number
   }
   return -1;
 }
+
+export function isUtcWeekend(d: Date): boolean {
+  const day = d.getUTCDay();
+  return day === 0 || day === 6;
+}
