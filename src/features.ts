@@ -67,3 +67,17 @@ export function featureRecipe(featureId: string): FeatureRecipe | undefined {
   if (featureId.length === 0) throw new Error("INVALID_FEATURE_ID");
   return FEATURE_RECIPES.find((recipe) => recipe.featureId === featureId);
 }
+
+export function sampleVariance(values: readonly number[]): number {
+  if (values.length < 2) return 0;
+  let sum = 0;
+  for (const v of values) {
+  sum += v;
+  }
+  const mean = sum / values.length;
+  let sq = 0;
+  for (const v of values) {
+  sq += (v - mean) * (v - mean);
+  }
+  return sq / (values.length - 1);
+}
