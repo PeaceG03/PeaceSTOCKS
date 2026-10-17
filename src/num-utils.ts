@@ -22,3 +22,11 @@ export function countWholeHours(ms: number): number {
   }
   return t;
 }
+
+export function sumOf(values: readonly number[]): number {
+  let total = 0;
+  for (const v of values) {
+  total += v;
+  }
+  return total;
+}
