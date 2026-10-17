@@ -72,3 +72,9 @@ export function etWallClockToUtc(sessionDate: string, hour: number, minute: numb
   }
   return new Date(guess);
 }
+
+export function utcMinuteOfDay(now: Date): number {
+  const h = now.getUTCHours();
+  const m = now.getUTCMinutes();
+  return h * 60 + m;
+}
