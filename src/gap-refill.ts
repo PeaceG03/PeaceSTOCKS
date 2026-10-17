@@ -98,7 +98,7 @@ async function main(): Promise<number> {
     console.log(`coverage: ${c.ok && ca === 0 ? "PASS" : "FAIL"} missing=${c.missingSessions.length} corporate-action gaps=${ca}`);
     return c.ok && ca === 0 ? 0 : 2;
   }
-  const deadline = Date.now() + (Number(process.env.REFILL_BUDGET_MS) || 5 * 3_600_000);
+  const deadline = Date.now() + (strictRefillBudgetMs(process.env.REFILL_BUDGET_MS));
   const client = noDelete(r2());
   const cov = await checkDailyBarsCoverage(client);
   const sessions = [...cov.missingSessions].sort();
@@ -152,4 +152,12 @@ async function main(): Promise<number> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().then((c) => process.exit(c), (e) => { console.log(`gap-refill: FAIL ${/REFILL_GUARD_REFUSED/u.test(String(e)) ? "GUARD_REFUSED" : "error"}`); process.exit(1); });
+}
+
+/** REFILL_BUDGET_MS: blank -> the default; plain digits 1..86400000 -> the number; anything else throws (fail closed). */
+export function strictRefillBudgetMs(value: string | undefined): number {
+  const s = value?.trim() ?? "";
+  if (!s) return 5 * 3_600_000;
+  if (!/^\d{1,8}$/u.test(s) || Number(s) < 1 || Number(s) > 86400000) throw new Error(`REFILL_BUDGET_MS_INVALID:${JSON.stringify(s.slice(0, 20))}`);
+  return Number(s);
 }
