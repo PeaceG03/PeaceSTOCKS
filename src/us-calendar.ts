@@ -144,3 +144,8 @@ export function usEquityCalendarRulesTable(fromYear = 2020, toYear = 2035): {
 export function usEquityCalendarSha256(fromYear = 2020, toYear = 2035): string {
   return sha256(stableJson(usEquityCalendarRulesTable(fromYear, toYear)));
 }
+
+export function utcDaysBetween(from: Date, to: Date): number {
+  const ms = to.getTime() - from.getTime();
+  return Math.round(ms / 86400000);
+}
