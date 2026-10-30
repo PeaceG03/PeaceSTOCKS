@@ -2,6 +2,7 @@ import { createHash, createHmac } from "node:crypto";
 import { isRetryableR2Status } from "./r2-retry-status";
 import { r2RetryAllowed } from "./r2-retry-allowed";
 import { r2RetryDelayMs } from "./r2-retry-delay";
+import { r2RequestFailure } from "./r2-request-failure";
 
 /** Custom object metadata: lowercase names, printable-ASCII values (S3 x-amz-meta-*). */
 export type ObjectMetadata = Record<string, string>;
@@ -266,7 +267,15 @@ export class R2ObjectClient implements ObjectClient {
       try {
         response = await this.fetchImpl(url, { ...init, signal: AbortSignal.timeout(30000) });
       } catch (error) {
-        if (!r2RetryAllowed(attempt + 1)) throw error;
+        if (!r2RetryAllowed(attempt + 1)) {
+          throw new Error(
+            r2RequestFailure(
+              method,
+              error instanceof Error ? (error.message === "fetch failed" || error.name === "TimeoutError" || error.name === "AbortError" ? error.message : error.name) : "Error"
+            ),
+            { cause: error }
+          );
+        }
         await this.sleep(r2RetryDelayMs(attempt, 500));
         continue;
       }
