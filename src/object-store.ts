@@ -1,4 +1,7 @@
 import { createHash, createHmac } from "node:crypto";
+import { isRetryableR2Status } from "./r2-retry-status";
+import { r2RetryAllowed } from "./r2-retry-allowed";
+import { r2RetryDelayMs } from "./r2-retry-delay";
 
 /** Custom object metadata: lowercase names, printable-ASCII values (S3 x-amz-meta-*). */
 export type ObjectMetadata = Record<string, string>;
@@ -132,6 +135,7 @@ export interface R2Config {
   secretAccessKey: string;
   fetchImpl?: typeof fetch;
   now?: () => Date;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 function sha256Hex(value: string | Uint8Array): string {
@@ -207,12 +211,14 @@ export function authorizationHeader(input: {
 export class R2ObjectClient implements ObjectClient {
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => Date;
+  private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(private readonly config: R2Config) {
     if (!config.accountId || !config.bucket || !config.accessKeyId || !config.secretAccessKey)
       throw new Error("R2_CONFIG_REQUIRED");
     this.fetchImpl = config.fetchImpl ?? fetch;
     this.now = config.now ?? (() => new Date());
+    this.sleep = config.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
   }
 
   static fromEnv(env: NodeJS.ProcessEnv = process.env): R2ObjectClient {
@@ -236,26 +242,37 @@ export class R2ObjectClient implements ObjectClient {
     body: Uint8Array = new Uint8Array(),
     amzHeaders: Record<string, string> = {},
   ): Promise<Response> {
-    const signed = authorizationHeader({
-      method,
-      url,
-      body,
-      accessKeyId: this.config.accessKeyId,
-      secretAccessKey: this.config.secretAccessKey,
-      now: this.now(),
-      amzHeaders,
-    });
-    const init: RequestInit = {
-      method,
-      headers: {
-        ...amzHeaders,
-        authorization: signed.authorization,
-        "x-amz-date": signed.amzDate,
-        "x-amz-content-sha256": signed.payloadHash,
-      },
-    };
-    if (method !== "GET" && method !== "DELETE" && method !== "HEAD") init.body = body;
-    return this.fetchImpl(url, init);
+    for (let attempt = 0; ; attempt += 1) {
+      const signed = authorizationHeader({
+        method,
+        url,
+        body,
+        accessKeyId: this.config.accessKeyId,
+        secretAccessKey: this.config.secretAccessKey,
+        now: this.now(),
+        amzHeaders,
+      });
+      const init: RequestInit = {
+        method,
+        headers: {
+          ...amzHeaders,
+          authorization: signed.authorization,
+          "x-amz-date": signed.amzDate,
+          "x-amz-content-sha256": signed.payloadHash,
+        },
+      };
+      if (method !== "GET" && method !== "DELETE" && method !== "HEAD") init.body = body;
+      let response;
+      try {
+        response = await this.fetchImpl(url, { ...init, signal: AbortSignal.timeout(30000) });
+      } catch (error) {
+        if (!r2RetryAllowed(attempt + 1)) throw error;
+        await this.sleep(r2RetryDelayMs(attempt, 500));
+        continue;
+      }
+      if (!isRetryableR2Status(response.status) || !r2RetryAllowed(attempt + 1)) return response;
+      await this.sleep(r2RetryDelayMs(attempt, 500));
+    }
   }
 
   async get(key: string): Promise<Uint8Array | undefined> {
