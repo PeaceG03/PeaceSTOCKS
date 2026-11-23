@@ -27,14 +27,16 @@ test("check-in: written once per run under its part and day, read back by size a
 });
 
 test("check-in: no key, token, signature, or query string ever reaches a stored message", async () => {
-  const raw = "MASSIVE_HTTP_403 https://api.massive.com/v2/aggs/ticker/AAA?apiKey=abcd1234 Bearer sk_live_x token=hunter2 AKIAABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+  // Plainly fake values (no real credential format), one per kind the redactor removes.
+  const opaque = `FAKEOPAQUE${"0".repeat(30)}`;
+  const raw = `MASSIVE_HTTP_403 https://api.example.invalid/v2/aggs/ticker/AAA?apiKey=FAKE-QUERY-KEY Bearer FAKE-BEARER token=FAKE-TOKEN ${opaque}`;
   const safe = redactHealthMessage(raw)!;
-  for (const secret of ["abcd1234", "sk_live_x", "hunter2", "AKIAABCDEFGHIJKLMNOPQRSTUVWXYZ012345"]) assert.ok(!safe.includes(secret), secret);
+  for (const secret of ["FAKE-QUERY-KEY", "FAKE-BEARER", "FAKE-TOKEN", opaque]) assert.ok(!safe.includes(secret), secret);
   assert.match(safe, /^MASSIVE_HTTP_403 /u);
   assert.ok(redactHealthMessage("x".repeat(500))!.length <= 200);
   const store = new MemoryObjectClient();
   const { key } = await writeHealthCheckin(store, { part: "gap-refill", state: "ERROR", at: "2026-10-27T15:00:00.000Z", message: raw });
-  assert.ok(!new TextDecoder().decode((await store.get(key))!).includes("hunter2"));
+  assert.ok(!new TextDecoder().decode((await store.get(key))!).includes("FAKE-TOKEN"));
 });
 
 test("reportPart: writes on Actions (R2 set), skips locally, and never throws", async () => {
