@@ -164,6 +164,16 @@ export async function latestHealthCheckin(
   return key ? parseCheckin(key, await store.get(key), part) : undefined;
 }
 
+/** Write one JSON report with the same read-back check as a check-in (size + checksum metadata). */
+export async function writeVerifiedHealthJson(store: HealthCheckinStore, key: string, value: unknown): Promise<void> {
+  const bytes = new TextEncoder().encode(`${JSON.stringify(value, null, 2)}\n`);
+  const checksum = sha256Hex(bytes);
+  await store.put(key, bytes, { [CHECKSUM_META]: checksum });
+  const head = await store.head(key);
+  if (!head || head.size !== bytes.length || head.metadata[CHECKSUM_META] !== checksum)
+    throw new Error(`HEALTH_REPORT_READBACK_MISMATCH:${key}`);
+}
+
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }

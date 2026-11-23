@@ -6,7 +6,17 @@
 // - 3 or more silent parts at once: the health check's own likely fault is flagged, and the silent
 //   parts are still listed by name.
 // - No parts reporting: "no parts reporting", never "Healthy".
+import { pathToFileURL } from "node:url";
+import { dayStuck } from "./day-stuck";
 import { countErrorParts } from "./health-error-count";
+import {
+  HEALTH_PARTS,
+  type HealthCheckinStore,
+  errorMessage,
+  latestHealthCheckin,
+  redactHealthMessage,
+  writeVerifiedHealthJson,
+} from "./health-checkins";
 import { likelyCheckFault } from "./health-check-fault";
 import { countMissingParts } from "./health-missing-count";
 import { noResponseLine } from "./health-no-response-line";
@@ -14,6 +24,10 @@ import { partOkLine } from "./health-part-ok-line";
 import { type HealthPartStatus, isRecognizedStateWord, partStatus } from "./health-part-state";
 import { isCheckinSilent } from "./health-silent";
 import { silentParts } from "./health-silent-parts";
+import { R2ObjectClient } from "./object-store";
+import { expectedTenMinBars } from "./tenmin-day-done";
+import { TENMIN_DAILY_CATCHUP_SESSIONS, readTenMinDailyIndex, tenMinDailyCatchupSessions } from "./tenmin-daily-liquid";
+import { lastCompletedSessionDate } from "./tenmin-history";
 
 export const HEALTHY = "Healthy" as const;
 export const NO_PARTS_REPORTING = "no parts reporting" as const;
@@ -131,4 +145,68 @@ export function evaluateHealth(input: {
   if (fault) lines.push(`health check likely at fault: ${silent.length} parts silent at once (${silent.join(", ")})`);
   lines.push(...results.map((r) => r.line), ...stuckDays.map(stuckDayLine));
   return { headline, parts: results, errors, missing, silentParts: silent, likelyCheckFault: fault, stuckDays, lines, requests };
+}
+
+export const HEALTH_CHECK_SCHEMA = "health-check-v1" as const;
+export const HEALTH_CHECK_LATEST_KEY = "permanent/health/check/latest.json" as const;
+export const HEALTH_CHECK_STATE_KEY = "permanent/health/check/state.json" as const;
+
+/** Days in the daily step's catch-up window it keeps re-running without finishing (dayStuck). */
+export async function readStuckDays(
+  store: Pick<HealthCheckinStore, "get">,
+  now: Date,
+  catchupSessions: number = TENMIN_DAILY_CATCHUP_SESSIONS,
+): Promise<HealthStuckDay[]> {
+  const output: HealthStuckDay[] = [];
+  for (const sessionDate of tenMinDailyCatchupSessions(lastCompletedSessionDate(now), catchupSessions)) {
+    const index = await readTenMinDailyIndex(store, sessionDate).catch(() => undefined);
+    if (!index || index.done || !dayStuck(index.notDoneRuns ?? 0)) continue;
+    output.push({
+      sessionDate,
+      expectedBars: expectedTenMinBars(sessionDate),
+      shortNames: index.shortNames ?? 0,
+      missingDailyBars: index.missingDailyBars ?? 0,
+      reRuns: index.notDoneRuns ?? 0,
+    });
+  }
+  return output;
+}
+
+/** One health check: latest check-in per declared part, stuck days, carried no-response counts. Writes latest.json. */
+export async function runHealthCheck(store: HealthCheckinStore, now: Date = new Date()): Promise<HealthCheckResult> {
+  const latest = new Map<string, HealthCheckinFacts | undefined>();
+  for (const part of HEALTH_PARTS) latest.set(part.name, await latestHealthCheckin(store, part.id));
+  let priorRequests: Record<string, number> = {};
+  const stateBytes = await store.get(HEALTH_CHECK_STATE_KEY);
+  if (stateBytes) {
+    try {
+      const parsed = JSON.parse(new TextDecoder().decode(stateBytes)) as { requests?: Record<string, number> };
+      if (parsed.requests && typeof parsed.requests === "object") priorRequests = parsed.requests;
+    } catch {
+      // An unreadable state starts the counts again; it never stops the check.
+    }
+  }
+  const result = evaluateHealth({
+    parts: HEALTH_PARTS.map((p) => ({ name: p.name, ...(p.allowedSilenceMinutes === undefined ? {} : { allowedSilenceMinutes: p.allowedSilenceMinutes }) })),
+    latest,
+    priorRequests,
+    now,
+    stuckDays: await readStuckDays(store, now),
+  });
+  const at = now.toISOString();
+  await writeVerifiedHealthJson(store, HEALTH_CHECK_STATE_KEY, { schemaVersion: HEALTH_CHECK_SCHEMA, requests: result.requests, updatedAt: at });
+  await writeVerifiedHealthJson(store, HEALTH_CHECK_LATEST_KEY, { schemaVersion: HEALTH_CHECK_SCHEMA, at, ...result });
+  return result;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  runHealthCheck(R2ObjectClient.fromEnv(process.env))
+    .then((result) => {
+      for (const line of result.lines) process.stdout.write(`${line}\n`);
+      if (result.headline !== HEALTHY) process.stdout.write(`::warning title=PeaceSTOCKS health::${result.headline}\n`);
+    })
+    .catch((error: unknown) => {
+      process.stdout.write(`HEALTH_CHECK_FAILED:${redactHealthMessage(errorMessage(error))?.slice(0, 120) ?? ""}\n`);
+      process.exitCode = 1;
+    });
 }

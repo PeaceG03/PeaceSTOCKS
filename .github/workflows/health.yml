@@ -1,0 +1,37 @@
+name: Health check
+# PeaceSTOCKS health check (src/health-check.ts). Reads the check-ins the real parts write to R2
+# (permanent/health/checkins/), the daily 10-minute step's catch-up indexes (stuck days), and the
+# carried no-response counts; writes permanent/health/check/latest.json. No Massive request, no
+# secrets in logs (counts, part names and redacted messages only). Every 6 h, outside both scan
+# guard windows (05:12-06:15 / 09:12-10:15 UTC).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "40 1,7,13,19 * * *"
+permissions:
+  contents: read
+concurrency:
+  group: peacestocks-health
+  cancel-in-progress: false
+jobs:
+  check:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+      PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+      PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+      PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Health check
+        run: pnpm -s exec tsx src/health-check.ts
