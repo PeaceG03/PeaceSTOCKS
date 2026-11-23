@@ -437,6 +437,8 @@ jobs:
       PEACESTOCKS_SOURCE_COMMIT: ${{ github.sha }}
       PEACESTOCKS_REQUIRE_OBJECT_STORE: "1"
       PEACESTOCKS_TENMIN_HISTORY: "1"
+      # Done-day hold: with the daily 10-minute step on, a failed day in its 10-session window holds the chain.
+      TENMIN_DAILY_ENABLED: ${{ vars.TENMIN_DAILY_ENABLED }}
       # Dated ticker reference index phase (off unless exactly "true"). Probe unless FULL=true.
       TICKER_INDEX_DATED: ${{ vars.TICKER_INDEX_DATED }}
       TICKER_INDEX_DATED_FULL: ${{ vars.TICKER_INDEX_DATED_FULL }}

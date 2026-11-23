@@ -14,6 +14,7 @@ import { resolveRedispatchGate } from "./tenmin-gate";
 import { lastOutcomeFromRecord, modeFromChainState } from "./tenmin-mode";
 import {
   SCAN_GUARD_WINDOWS_UTC,
+  TENMIN_DAILY_RUN_NAME,
   TENMIN_RESTARTER_RUN_NAME,
   isIdleScannerRun,
   isScanCheckFailure,
@@ -94,6 +95,11 @@ export const TENMIN_REFUSAL_CODES = [
 /** scanner.yml cron that runs only the restarter job (never a scan). Must match scanner.yml. */
 export const TENMIN_RESTARTER_CRON = "47 * * * *" as const;
 /** Chain wait reasons that send a heal dispatch (restart right after the guard window ends). */
+/** Outcome/decision reason prefix: a failed day in the daily step's catch-up window holds the chain. */
+export const TENMIN_WAIT_DAILY_STEP = "WAIT_DAILY_STEP" as const;
+/** Decision reason prefix: the fallback restarts a held chain because a daily step ran since. */
+export const TENMIN_CONTINUE_DAILY_STEP_RAN = "CONTINUE_DAILY_STEP_RAN" as const;
+
 export const TENMIN_HEAL_REASONS: ReadonlySet<string> = new Set(["WAIT_GUARD_WINDOW", "WAIT_NEAR_GUARD_WINDOW"]);
 /** Heal decides this long after the window ends (clock skew, late window edges). */
 export const TENMIN_HEAL_MARGIN_MINUTES = 2;
@@ -197,6 +203,9 @@ export function tenMinRunOutcome(report: TenMinHistoryRunReport): TenMinRunOutco
     const refusal = TENMIN_REFUSAL_CODES.find((code) => message.includes(code));
     return out("stop", refusal ? `STOP_REFUSAL:${refusal}` : `STOP_ERROR:${message.slice(0, 160)}`);
   }
+  // Not "continue": a held run would be re-dispatched at once and spend the chain doing nothing.
+  // The decision turns it into a wait; the fallback restarts it after the next daily step.
+  if (report.dailyStepHold) return out("stop", `${TENMIN_WAIT_DAILY_STEP}:${report.dailyStepHold}`);
   if (report.outageStop) return out("stop", `STOP_OUTAGE:${report.outageStop.slice(0, 160)}`);
   if (report.reopen) return out("stop", "STOP_BOUNDED_MANUAL_RUN:reopen");
   if (report.maxRanges !== undefined) return out("stop", `STOP_BOUNDED_MANUAL_RUN:maxRanges=${report.maxRanges}`);
@@ -309,6 +318,8 @@ export interface TenMinRedispatchInput {
    */
   scanCheckStops?: number;
   finishedAt?: string;
+  /** fallback: a completed "Scanner tenmin daily" run created after the held run finished (its id). */
+  dailyStepRanSince?: string;
 }
 
 /** Decision reason prefix: a finished chain restarts because a new two-month range closed. */
@@ -365,6 +376,14 @@ export function maxChainOf(value: string | number | undefined): number {
   return Math.min(n, TENMIN_REDISPATCH_HARD_MAX_CHAIN);
 }
 
+/** Pure: a completed daily 10-minute run ("Scanner tenmin daily") created after `sinceIso`, if any. */
+export function tenMinDailyRunSince<T extends { status: string; created_at: string; display_title?: string | null }>(
+  runs: readonly T[],
+  sinceIso: string,
+): T | undefined {
+  return runs.find((r) => r.display_title === TENMIN_DAILY_RUN_NAME && r.status === "completed" && r.created_at > sinceIso);
+}
+
 /** Pure decision: dispatch the next tenmin_history run now, wait, or stop the chain. */
 export function decideTenMinRedispatch(input: TenMinRedispatchInput): TenMinRedispatchDecision {
   const nextChain = input.chain + 1;
@@ -382,6 +401,14 @@ export function decideTenMinRedispatch(input: TenMinRedispatchInput): TenMinRedi
   if (!input.outcome) return stop("STOP_NO_OUTCOME");
   const scanRetry = scanCheckRetry(input);
   if (scanRetry) return scanRetry;
+  if (input.outcome.reason.startsWith(`${TENMIN_WAIT_DAILY_STEP}:`)) {
+    // Chain intact. The held run re-checks the hold itself, so at most one run per daily step.
+    if (input.trigger !== "fallback" || !input.dailyStepRanSince) return wait(input.outcome.reason);
+    if (nextChain > maxChainOf(input.maxChain)) return stop(`STOP_CHAIN_CAP:${maxChainOf(input.maxChain)}`);
+    const gate = queueAndGuard(input);
+    if (gate) return wait(gate);
+    return { dispatch: true, nextAction: "continue", reason: `${TENMIN_CONTINUE_DAILY_STEP_RAN}:${input.dailyStepRanSince}`, nextChain };
+  }
   const capRaised = rangeEndCapRaised(input);
   const newRange = newRangeClosed(input);
   const restart = capRaised ?? newRange;
@@ -846,6 +873,8 @@ async function main(mode: string | undefined): Promise<void> {
             FAILED.has(r.conclusion),
         )
       : undefined;
+    const heldSince = record?.outcome?.reason.startsWith(`${TENMIN_WAIT_DAILY_STEP}:`) ? record.finishedAt : undefined;
+    const dailyRun = heldSince ? tenMinDailyRunSince(runs, heldSince) : undefined;
     const newRangeClosedSinceRecord =
       record?.outcome?.reason.startsWith("STOP_DONE:no-range-left") && record.finishedAt
         ? tenMinNewRangeClosedSince(record.finishedAt, now)
@@ -867,6 +896,7 @@ async function main(mode: string | undefined): Promise<void> {
       ...(newRangeClosedSinceRecord ? { newRangeClosed: newRangeClosedSinceRecord } : {}),
       ...(record?.scanCheckStops !== undefined ? { scanCheckStops: record.scanCheckStops } : {}),
       ...(record?.finishedAt ? { finishedAt: record.finishedAt } : {}),
+      ...(dailyRun ? { dailyStepRanSince: String(dailyRun.id) } : {}),
     });
     output("next_action", decision.nextAction);
     output("reason", decision.reason);

@@ -720,6 +720,18 @@ export async function tenMinDailyHistoryHold(
   return historyBlockingDay(days, sessions);
 }
 
+/**
+ * History-run override (host): when the daily step is on and R2 is configured, the chain checks the
+ * done-day hold before any Massive request. Off otherwise (no daily step, nothing to wait for).
+ */
+export function tenMinHistoryDailyStepHold(
+  env: NodeJS.ProcessEnv,
+  openStore: (env: NodeJS.ProcessEnv) => Pick<ReplyDustStore, "get" | "head"> = (e) => R2ObjectClient.fromEnv(e),
+): { dailyStepHold?: () => Promise<string | undefined> } {
+  if (!tenMinDailyEnabled(env) || !env.PEACESTOCKS_R2_BUCKET?.trim()) return {};
+  return { dailyStepHold: () => tenMinDailyHistoryHold(openStore(env)) };
+}
+
 export interface TenMinSecurityDayRead {
   /** range: sealed two-month manifest (authoritative); daily: the daily index; none: neither has it. */
   source: "range" | "daily" | "none";

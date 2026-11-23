@@ -718,6 +718,11 @@ export interface TenMinHistoryRunReport {
   rangeEndCap?: TenMinHistoryPlan["rangeEndCap"];
   yieldedForScan?: string;
   /**
+   * Set when a failed day in the daily 10-minute step's catch-up window holds the chain (done-day
+   * rule): the session date. The run made no Massive request.
+   */
+  dailyStepHold?: string;
+  /**
    * Set when the run yielded before the range phase (dated ticker-index phase): no range was
    * attempted, so "no range left" must not be inferred from this report.
    */
@@ -798,6 +803,11 @@ export async function runTenMinHistory(options: {
   /** One session's raw grouped-daily reply. Defaults to the shared provider (same pace). */
   fetchGroupedDaily?: (sessionDate: string) => Promise<ProviderRawReply>;
   writeReport?: boolean;
+  /**
+   * Done-day hold: the failed session in the daily step's catch-up window that holds the chain, or
+   * undefined (see tenMinDailyHistoryHold). Checked before any Massive request.
+   */
+  dailyStepHold?: () => Promise<string | undefined>;
 }): Promise<TenMinHistoryRunResult> {
   const env = options.env ?? process.env;
   // Validate the range-end cap first: an invalid value fails before any store or Massive call.
@@ -845,6 +855,40 @@ export async function runTenMinHistory(options: {
         });
 
   const lastCompleted = options.lastCompletedSession ?? lastCompletedSessionDate(now);
+  const held = options.dailyStepHold ? await options.dailyStepHold() : undefined;
+  if (held) {
+    const configured = options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START;
+    const heldPlan = planTenMinHistoryRanges({
+      windowStart: configured,
+      lastCompletedSession: lastCompleted,
+      ...(maxRangeEnd ? { maxRangeEnd } : {}),
+    });
+    return {
+      report: {
+        groupedDailyRequests: 0,
+        groupedDailyStored: 0,
+        groupedDailyResumed: 0,
+        schemaVersion: TENMIN_HISTORY_RUN_SCHEMA,
+        runId: `tenmin-history-${stamp().replaceAll(/[^0-9]/gu, "").slice(0, 17)}`,
+        provider: providerName,
+        configuredWindowStart: configured,
+        windowStart: heldPlan.windowStart,
+        lastCompletedSession: lastCompleted,
+        skippedBefore: heldPlan.skippedBefore,
+        reopen: options.reopen === true,
+        securityLink: TENMIN_SECURITY_LINK,
+        ranges: [],
+        rangesPlanned: heldPlan.ranges.length,
+        dailyStepHold: held,
+        stoppedOnError: false,
+        warnings: [],
+        zstdVersion,
+        massiveRequests: 0,
+        completedAt: stamp(),
+      },
+      rangeResults: [],
+    };
+  }
   // Optional phase: dated ticker reference indexes (off unless TICKER_INDEX_DATED === "true").
   // Runs before range history so loadTickerReferenceIndexAsOf can see asOf ≤ D. Probe by default.
   let datedTickerIndex: DatedTickerRunReport | undefined;

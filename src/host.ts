@@ -28,6 +28,7 @@ import { openMarketStore } from "./object-storage";
 import { R2ObjectClient } from "./object-store";
 import { FileReplyDustStore, type ReplyDustStore } from "./intraday-reply-dust";
 import { scanGroupedReplyDustEnabled } from "./scan-grouped-reply-dust";
+import { tenMinHistoryDailyStepHold } from "./tenmin-daily-liquid";
 import {
   runTenMinHistoryFromEnv,
   tenMinHistorySummary,
@@ -401,7 +402,7 @@ async function main(): Promise<void> {
   // (keep-all-Massive-fields Reply Dust ranges). Optional: PEACESTOCKS_TENMIN_HISTORY_REOPEN=1,
   // PEACESTOCKS_TENMIN_HISTORY_MAX_RANGES, PEACESTOCKS_TENMIN_HISTORY_BUDGET_MS. Refuses without
   // pinned zstd 1.5.7 and without a store when PEACESTOCKS_REQUIRE_OBJECT_STORE=1.
-  const history = await runTenMinHistoryFromEnv(process.env);
+  const history = await runTenMinHistoryFromEnv(process.env, tenMinHistoryDailyStepHold(process.env));
   if (history) {
     // Concise dated ticker-index section (also on R2 history report + tenMinHistorySummary).
     if (history.report.datedTickerIndex)
