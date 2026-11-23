@@ -8,6 +8,7 @@
 //   permanent/daily-bars-sidecar/YYYY-MM-DD/manifest.json sha256 of file, payload and lines; seals the day
 // The decoder is a separate module (daily-bars-pack-decode.ts) that shares no code with this file.
 import { createHash } from "node:crypto";
+import { decodeDailyBarsPack } from "./daily-bars-pack-decode";
 import type { CanonicalDailyBar, SecurityMasterRecord } from "./contracts";
 import { stableJson } from "./identity";
 import type { ReplyDustStore } from "./intraday-reply-dust";
@@ -22,6 +23,8 @@ export const DAILY_BARS_SIDECAR_WARNING = "DAILY_BARS_SIDECAR_WARNING" as const;
 /** Run-failing codes (the scan FAILS and exits non-zero). Format: <CODE>:<sessionDate>[:<ERROR_CODE>]. */
 export const DAILY_BARS_PACK_EXISTS_DIFFERENT = "DAILY_BARS_PACK_EXISTS_DIFFERENT" as const;
 export const DAILY_BARS_PACK_WRITE_FAILED = "DAILY_BARS_PACK_WRITE_FAILED" as const;
+/** Warning only: the stored pack holds the same market rows; only ingestion stamps (SIDECAR_META) differ. */
+export const DAILY_BARS_PACK_EXISTS_EQUIVALENT = "DAILY_BARS_PACK_EXISTS_EQUIVALENT" as const;
 /** Leading upper-case code of an error message only (never values). */
 export function errorCode(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
@@ -305,7 +308,33 @@ function dayPrefix(sessionDate: string): string {
 export const dailyBarsSidecarFileKey = (sessionDate: string) => `${dayPrefix(sessionDate)}/sidecar.dbs`;
 export const dailyBarsSidecarManifestKey = (sessionDate: string) => `${dayPrefix(sessionDate)}/manifest.json`;
 
-export type DailyBarsSidecarWriteStatus = "stored" | "exists-same" | "exists-different" | "no-rows";
+export type DailyBarsSidecarWriteStatus =
+  | "stored"
+  | "exists-same"
+  | "exists-equivalent"
+  | "exists-different"
+  | "no-rows";
+
+/** A row without its ingestion stamps (SIDECAR_META), as canonical JSON. */
+function marketContent(line: string): string {
+  const row = JSON.parse(line) as Record<string, unknown>;
+  for (const path of SIDECAR_META) {
+    const [head, leaf] = path.split(".") as [string, string | undefined];
+    if (leaf === undefined) delete row[head];
+    else if (row[head] && typeof row[head] === "object") {
+      const inner = { ...(row[head] as Record<string, unknown>) };
+      delete inner[leaf];
+      row[head] = inner;
+    }
+  }
+  return stableJson(row);
+}
+function sameMarketContent(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const left = a.map(marketContent).sort();
+  const right = b.map(marketContent).sort();
+  return left.every((line, i) => line === right[i]);
+}
 export interface DailyBarsSidecarWriteResult {
   status: DailyBarsSidecarWriteStatus;
   sessionDate: string;
@@ -316,14 +345,18 @@ export interface DailyBarsSidecarWriteResult {
 /**
  * Store one session's sidecar: new keys only. The file goes first (put, read back, compare), then the
  * manifest (put, read back, compare), which seals the day. An existing manifest is never replaced:
- * same lines => exists-same, otherwise exists-different (caller reports a warning). A file without a
- * manifest is never overwritten either (exists-different).
+ * same lines or same file bytes => exists-same; the stored pack decodes to the same market rows with
+ * only ingestion stamps differing => exists-equivalent (no-op, caller warns); otherwise exists-different
+ * (caller fails the run). A file without a manifest is never overwritten: byte-identical => the manifest
+ * is written to seal it (stored); otherwise exists-different.
  */
 export async function writeDailyBarsSidecar(options: {
   store: ReplyDustStore;
   sessionDate: string;
   rows: readonly CanonicalDailyBar[];
   dust: null | { replySha256: string; replyByteLength: number; results: GroupedResult[] };
+  /** The raw grouped-daily reply behind `dust`; lets an existing Dust-bound pack be decoded and compared. */
+  dustReply?: Uint8Array | null;
   symbolsFor?: (securityId: string) => readonly string[];
   backend?: ReplyDustBackend;
 }): Promise<DailyBarsSidecarWriteResult> {
@@ -352,9 +385,17 @@ export async function writeDailyBarsSidecar(options: {
   const existing = await options.store.get(manifestKey);
   if (existing) {
     const prior = JSON.parse(new TextDecoder().decode(existing)) as DailyBarsSidecarManifest;
-    return { status: prior.linesSha256 === manifest.linesSha256 ? "exists-same" : "exists-different", sessionDate, manifest: prior, bytesWritten: 0 };
+    const done = (status: DailyBarsSidecarWriteStatus): DailyBarsSidecarWriteResult => ({ status, sessionDate, manifest: prior, bytesWritten: 0 });
+    if (prior.linesSha256 === manifest.linesSha256 || prior.fileSha256 === manifest.fileSha256) return done("exists-same");
+    const storedLines = await decodeStoredLines(options.store, fileKey, existing, prior, options, backend);
+    return done(storedLines && sameMarketContent(storedLines, lines) ? "exists-equivalent" : "exists-different");
   }
-  if (await options.store.head(fileKey)) return { status: "exists-different", sessionDate, bytesWritten: 0 };
+  const orphan = await options.store.head(fileKey);
+  if (orphan) {
+    const storedFile = orphan.size === file.length ? await options.store.get(fileKey) : undefined;
+    if (!storedFile || !sameBytes(storedFile, file)) return { status: "exists-different", sessionDate, bytesWritten: 0 };
+    return { status: "stored", sessionDate, manifest, bytesWritten: await sealManifest(options.store, manifestKey, manifest, sessionDate) };
+  }
   await options.store.put(fileKey, file, {
     "dbs-schema": DAILY_BARS_SIDECAR_SCHEMA,
     "dbs-session-date": sessionDate,
@@ -362,12 +403,51 @@ export async function writeDailyBarsSidecar(options: {
   });
   const storedFile = await options.store.get(fileKey);
   if (!storedFile || !sameBytes(storedFile, file)) throw new Error(`DAILY_BARS_SIDECAR_READBACK_MISMATCH:${sessionDate}`);
+  const manifestBytes = await sealManifest(options.store, manifestKey, manifest, sessionDate);
+  return { status: "stored", sessionDate, manifest, bytesWritten: file.length + manifestBytes };
+}
+
+/** Put the manifest, read it back, compare. Returns the bytes written. */
+async function sealManifest(
+  store: ReplyDustStore,
+  manifestKey: string,
+  manifest: DailyBarsSidecarManifest,
+  sessionDate: string,
+): Promise<number> {
   const manifestBytes = new TextEncoder().encode(`${JSON.stringify(manifest, null, 2)}\n`);
-  await options.store.put(manifestKey, manifestBytes);
-  const storedManifest = await options.store.get(manifestKey);
+  await store.put(manifestKey, manifestBytes);
+  const storedManifest = await store.get(manifestKey);
   if (!storedManifest || !sameBytes(storedManifest, manifestBytes))
     throw new Error(`DAILY_BARS_SIDECAR_MANIFEST_READBACK_MISMATCH:${sessionDate}`);
-  return { status: "stored", sessionDate, manifest, bytesWritten: file.length + manifestBytes.length };
+  return manifestBytes.length;
+}
+
+/** The stored pack's lines, or undefined when it cannot be decoded here (then it counts as different). */
+async function decodeStoredLines(
+  store: ReplyDustStore,
+  fileKey: string,
+  manifestBytes: Uint8Array,
+  prior: DailyBarsSidecarManifest,
+  options: { dust: null | { replySha256: string }; dustReply?: Uint8Array | null },
+  backend: ReplyDustBackend,
+): Promise<string[] | undefined> {
+  try {
+    const storedFile = await store.get(fileKey);
+    if (!storedFile) return undefined;
+    let dustReply: Uint8Array | null = null;
+    if (prior.dustReplySha256) {
+      if (prior.dustReplySha256 !== options.dust?.replySha256 || !options.dustReply) return undefined;
+      dustReply = options.dustReply;
+    }
+    return decodeDailyBarsPack({
+      file: storedFile,
+      manifest: manifestBytes,
+      dustReply,
+      decompress: (frame) => backend.decompress(frame, null),
+    }).lines;
+  } catch {
+    return undefined;
+  }
 }
 
 export interface ScanDailyBarsSidecarReport {
@@ -378,7 +458,7 @@ export interface ScanDailyBarsSidecarReport {
   rows?: number;
   bytesWritten: number;
   warnings: string[];
-  /** Set when the run must fail: exists-different or any write error (exists-same/no-rows are fine). */
+  /** Set when the run must fail: exists-different or any write error (exists-same/-equivalent/no-rows are fine). */
   failure?: string;
 }
 
@@ -410,9 +490,11 @@ export async function maybeWriteScanDailyBarsSidecar(options: {
     assertPinnedZstdForWriting(options.zstdVersionProbe);
     const backend = options.backend ?? nodeReplyDustBackend;
     let dust: { replySha256: string; replyByteLength: number; results: GroupedResult[] } | null = null;
+    let dustReply: Uint8Array | null = null;
     const dustManifest = await readDailyReplyDustManifest(options.store, options.sessionDate);
     if (dustManifest) {
       const reply = await readDailyReplyDustReply(options.store, dustManifest, backend);
+      dustReply = reply;
       const parsed = JSON.parse(new TextDecoder().decode(reply)) as { results?: unknown };
       dust = {
         replySha256: dustManifest.replySha256,
@@ -425,17 +507,20 @@ export async function maybeWriteScanDailyBarsSidecar(options: {
       sessionDate: options.sessionDate,
       rows: options.bars,
       dust,
+      dustReply,
       symbolsFor: securitySymbols(options.securities),
       backend,
     });
     const failure =
       result.status === "exists-different" ? `${DAILY_BARS_PACK_EXISTS_DIFFERENT}:${options.sessionDate}` : undefined;
+    const equivalent =
+      result.status === "exists-equivalent" ? `${DAILY_BARS_PACK_EXISTS_EQUIVALENT}:${options.sessionDate}` : undefined;
     return {
       ...base,
       status: result.status,
       ...(result.manifest ? { source: result.manifest.source, rows: result.manifest.rows } : {}),
       bytesWritten: result.bytesWritten,
-      warnings: failure ? [failure] : [],
+      warnings: failure ? [failure] : equivalent ? [equivalent] : [],
       ...(failure ? { failure } : {}),
     };
   } catch (error) {

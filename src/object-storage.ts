@@ -44,6 +44,11 @@ function lines<T>(body: string): T[] {
     .map((line) => JSON.parse(line) as T);
 }
 
+/** A record as it reads back from storage (undefined fields dropped), as canonical JSON. */
+function storedJson(record: unknown): string {
+  return stableJson(JSON.parse(JSON.stringify(record)));
+}
+
 function lineText(records: StoredRecord[]): string {
   return records.map((record) => stableJson(record)).join("\n") + (records.length ? "\n" : "");
 }
@@ -420,12 +425,18 @@ export class ObjectMarketStorage implements MarketStore {
   ): Promise<void> {
     const existing = lines<T>(await this.readText(keyName));
     const byKey = new Map(existing.map((record) => [key(record), record]));
+    let changed = false;
     for (const record of incoming) {
       const prior = byKey.get(key(record));
-      if (prior && stableJson(prior) !== stableJson(record))
-        throw new Error(`IMMUTABLE_RECORD_CONFLICT:${key(record)}`);
+      if (prior) {
+        // Compare as stored: JSON drops undefined fields. Same content => no-op; any difference throws.
+        if (storedJson(prior) !== storedJson(record)) throw new Error(`IMMUTABLE_RECORD_CONFLICT:${key(record)}`);
+        continue;
+      }
       byKey.set(key(record), record);
+      changed = true;
     }
+    if (!changed) return;
     await this.writeText(keyName, lineText([...byKey.values()].sort((a, b) => key(a).localeCompare(key(b))) as StoredRecord[]));
   }
 }
