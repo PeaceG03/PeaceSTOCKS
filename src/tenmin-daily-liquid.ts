@@ -32,6 +32,7 @@ import { type ZstdVersionProbe, assertPinnedZstdForWriting } from "./reply-dust-
 import { type ScanRunPick, checkScannerRuns, createScanYieldCheck, inScanGuardWindow, isScanCheckFailure } from "./scan-yield";
 import type { SessionCalendar } from "./scanner";
 import { TENMIN_DAILY_CLOSE_ORIGIN } from "./tenmin-range-entries";
+import { type HistoryHoldDay, historyBlockingDay } from "./history-blocked";
 import { expectedTenMinBars, presentTenMinBars, tenMinSessionDone } from "./tenmin-day-done";
 import { lastCompletedSessionDate, pairRangeForDate } from "./tenmin-history";
 import {
@@ -693,6 +694,30 @@ export async function runTenMinDailyLiquid(options: {
   }
   report.estimatedKeyMinutes = Math.round(((report.massiveRequests * TENMIN_DAILY_SECONDS_PER_REQUEST) / 60) * 10) / 10;
   return report;
+}
+
+/**
+ * The session (inside the 10-session catch-up window) that holds the history chain, or undefined.
+ * Reads only the daily indexes and range manifests (no Massive request). A sealed range counts as done.
+ */
+export async function tenMinDailyHistoryHold(
+  store: Pick<ReplyDustStore, "get" | "head">,
+  options: { now?: Date; lastCompletedSession?: string; catchupSessions?: number; calendar?: SessionCalendar } = {},
+): Promise<string | undefined> {
+  const calendar = options.calendar ?? US_EQUITY_MARKET_CALENDAR;
+  const lastCompleted = options.lastCompletedSession ?? lastCompletedSessionDate(options.now ?? new Date(), calendar);
+  const sessions = tenMinDailyCatchupSessions(lastCompleted, options.catchupSessions ?? TENMIN_DAILY_CATCHUP_SESSIONS, calendar);
+  const days: HistoryHoldDay[] = [];
+  for (const sessionDate of sessions) {
+    if (await tenMinRangeSealedFor(store, sessionDate)) {
+      days.push({ sessionDate, done: true, failed: false });
+      continue;
+    }
+    const index = await readTenMinDailyIndex(store, sessionDate);
+    const done = !!index?.done;
+    days.push({ sessionDate, done, failed: !done && (index?.notDoneRuns ?? 0) >= 1 });
+  }
+  return historyBlockingDay(days, sessions);
 }
 
 export interface TenMinSecurityDayRead {

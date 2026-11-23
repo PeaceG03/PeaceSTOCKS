@@ -18,6 +18,7 @@ import {
   runTenMinDailyLiquid,
   selectTenMinDailyLiquidNames,
   tenMinDailyCatchupSessions,
+  tenMinDailyHistoryHold,
   tenMinDailyIndexKey,
   tenMinDailyYieldReason,
   tradingSessionsBefore,
@@ -758,4 +759,23 @@ test("done-day: a half day is done at 21 bars", async () => {
   assert.equal(run.sessions[0]!.sessionDate, "2026-11-27");
   assert.equal(run.sessions[0]!.expectedBars, 21);
   assert.equal(run.sessions[0]!.status, "COMPLETE");
+});
+
+test("history hold: a failed day in the catch-up window holds the chain until a later session is done", async () => {
+  const store = new MemoryObjectClient();
+  const calls: string[] = [];
+  const short = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+    calls.push(`${sec.symbol}:${from}`);
+    return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, from === "2026-10-08" ? 12 : 39));
+  };
+  assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-08", catchupSessions: 2 }), undefined, "nothing tried yet");
+  await baseRun(store, calls, { lastCompletedSession: "2026-10-08", catchupSessions: 1, fetchPages: short });
+  assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-08", catchupSessions: 2 }), "2026-10-08");
+  // 10-09 is a later session and gets done: the chain is unblocked even though 10-08 is still short.
+  await baseRun(store, calls, { lastCompletedSession: "2026-10-09", catchupSessions: 2, fetchPages: short });
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.done, undefined);
+  assert.ok((await readTenMinDailyIndex(store, "2026-10-09"))!.done);
+  assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-09", catchupSessions: 2 }), undefined);
+  // Outside the window it never blocks.
+  assert.equal(await tenMinDailyHistoryHold(new MemoryObjectClient(), { lastCompletedSession: "2026-10-09", catchupSessions: 2 }), undefined);
 });
