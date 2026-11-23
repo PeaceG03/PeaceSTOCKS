@@ -34,6 +34,7 @@ import {
 } from "./tenmin-history";
 import { tenMinRunOutcome, tenMinScanCheckFailure } from "./tenmin-redispatch";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
+import { defaultStageSink, hostFailureLine, stageTimed, type StageSink, type StageTracker } from "./scan-stages";
 
 export const DEFAULT_MARKETS_ROOT = "C:\\ProgramData\\PeaceAI\\Markets";
 export const MARKET_SCHEDULER_HOST_PATH_ERROR = "MARKET_SCHEDULER_HOST_PATH_INVALID";
@@ -191,6 +192,8 @@ export async function runScannerHost(
       readonly to: string;
       readonly maxSessions?: number;
     };
+    /** SCAN_STAGE line sink (tests); defaults to stderr outside the test runner. */
+    readonly stageSink?: StageSink;
   } = {},
 ): Promise<SchedulerHostResult> {
   const now = options.now ?? new Date();
@@ -212,7 +215,9 @@ export async function runScannerHost(
   }
 
   const calendar = options.calendar ?? US_EQUITY_MARKET_CALENDAR;
-  const storage = openMarketStore(root);
+  const stageSink = options.stageSink ?? defaultStageSink();
+  const tracker: StageTracker = { session: "host" };
+  const storage = stageTimed(openMarketStore(root), "storage", tracker, stageSink);
   await storage.initialize();
   const reports = await storage.loadRunReports();
   // ALREADY_FROZEN counts as completed. NOT_DUE / FAILED / PROVIDER_NOT_READY do not
@@ -269,8 +274,12 @@ export async function runScannerHost(
 
   const env = options.env ?? process.env;
   const groupedDustOn = scanGroupedReplyDustEnabled(env);
-  const provider =
-    options.provider ?? new MassiveMarketProvider(groupedDustOn ? { keepRawReplies: true } : {});
+  const provider = stageTimed(
+    options.provider ?? new MassiveMarketProvider(groupedDustOn ? { keepRawReplies: true } : {}),
+    "provider",
+    tracker,
+    stageSink,
+  );
   let groupedReplyDustStore: ReplyDustStore | undefined;
   if (groupedDustOn) {
     groupedReplyDustStore =
@@ -299,6 +308,7 @@ export async function runScannerHost(
   const credentialRejected = (report: ScannerRunReport) =>
     report.unresolvedFailures.some((failure) => failure.includes("MASSIVE_CREDENTIAL_REJECTED"));
   for (const missedSession of missed) {
+    tracker.session = missedSession;
     const report = await scanner.run(missedSession, "EVIDENCE_ONLY");
     collected.push(report);
     collectedSessions.add(report.session.sessionDate);
@@ -314,6 +324,7 @@ export async function runScannerHost(
     const mode = forwardFreezeAllowed(due.session.sessionDate, now, calendar)
       ? "FORWARD"
       : "EVIDENCE_ONLY";
+    tracker.session = due.session.sessionDate;
     const report = await scanner.run(due.session.sessionDate, mode);
     collected.push(report);
     collectedSessions.add(report.session.sessionDate);
@@ -335,6 +346,7 @@ export async function runScannerHost(
   const nextObserved = unresolved[0]
     ? addDays(unresolved[0], -1)
     : due.session.sessionDate;
+  tracker.session = "host";
   const nextState = {
     ...state,
     lastObservedSessionDate: nextObserved,
@@ -450,9 +462,7 @@ async function main(): Promise<void> {
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
   main().catch((error: unknown) => {
-    process.stderr.write(
-      `MARKETS_SCHEDULER_HOST_FAILED:${error instanceof Error ? error.message : "UNKNOWN"}\n`,
-    );
+    process.stderr.write(`${hostFailureLine(error)}\n`);
     process.exitCode = 2;
   });
 }
