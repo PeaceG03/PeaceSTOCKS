@@ -48,7 +48,10 @@ export function refillPauseReason(
 ): string | undefined {
   if (!afterScan && inRefillGuard(now)) return "GUARD_WINDOW";
   if ("error" in runs) return "RUNS_CHECK_FAILED";
-  return runs.some((r) => r.status !== "completed" && !isIdleScannerRun(r) && !(afterScan && r.id === afterScan.ownRunId)) ? "ACTIVE_SCANNER_RUN" : undefined;
+  // After a scan only runs actually in progress count: runs queued behind this scan's own job (the
+  // peacestocks-r2-writer concurrency group) cannot start until it ends, so waiting on them never ends.
+  const active = (r: { status: string }) => (afterScan ? r.status === "in_progress" : r.status !== "completed");
+  return runs.some((r) => active(r) && !isIdleScannerRun(r) && !(afterScan && r.id === afterScan.ownRunId)) ? "ACTIVE_SCANNER_RUN" : undefined;
 }
 
 /** --after-scan needs the scan's own run id (GITHUB_RUN_ID); anything else fails closed. */

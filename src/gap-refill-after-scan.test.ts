@@ -9,16 +9,24 @@ test("after a scan, the refill does not wait on its own scan run or the guard wi
   const own = { id: 45000000001, status: "in_progress", display_title: "Scanner" };
   assert.equal(refillPauseReason(t(5, 40), [own], { ownRunId: own.id }), undefined);
   assert.equal(refillPauseReason(t(12, 0), [own], { ownRunId: own.id }), undefined);
-  // Another active scanner run still pauses it, and a failed runs check still fails closed.
+  // Another scanner run in progress still pauses it; runs queued (or waiting/pending) behind this scan's
+  // own job do not, since they cannot start until it ends. A failed runs check still fails closed.
   assert.equal(
-    refillPauseReason(t(12, 0), [own, { id: 45000000002, status: "queued", display_title: "Scanner" }], { ownRunId: own.id }),
+    refillPauseReason(t(12, 0), [own, { id: 45000000002, status: "in_progress", display_title: "Scanner" }], { ownRunId: own.id }),
     "ACTIVE_SCANNER_RUN",
   );
+  for (const status of ["queued", "waiting", "pending", "requested"])
+    assert.equal(
+      refillPauseReason(t(12, 0), [own, { id: 45000000003, status, display_title: "Scanner" }], { ownRunId: own.id }),
+      undefined,
+      status,
+    );
   assert.equal(refillPauseReason(t(12, 0), { error: "http-403" }, { ownRunId: own.id }), "RUNS_CHECK_FAILED");
   // A run listed without an id is never mistaken for the scan's own run.
   assert.equal(refillPauseReason(t(12, 0), [{ status: "in_progress", display_title: "Scanner" }], { ownRunId: own.id }), "ACTIVE_SCANNER_RUN");
   // Without --after-scan nothing changes: the weekly refill still yields to every scan and guard window.
   assert.equal(refillPauseReason(t(12, 0), [own]), "ACTIVE_SCANNER_RUN");
+  assert.equal(refillPauseReason(t(12, 0), [{ status: "queued", display_title: "Scanner" }]), "ACTIVE_SCANNER_RUN");
   assert.equal(refillPauseReason(t(5, 40), []), "GUARD_WINDOW");
 });
 
