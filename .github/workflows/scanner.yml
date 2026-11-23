@@ -93,6 +93,12 @@ jobs:
     # Pinned so the runner image cannot change mid-rollout; move to 26.04 deliberately later.
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    # Was the repo default (read). issues: write is for the inline refill's failure alert; actions: read
+    # lets the refill see other scanner runs.
+    permissions:
+      contents: read
+      actions: read
+      issues: write
     env:
       MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
       PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
@@ -175,6 +181,13 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REFILL_BUDGET_MS: "1800000"
         run: pnpm -s exec tsx src/gap-refill.ts --after-scan
+      # Same pre-images artifact and failure alert as gap-refill.yml (shared composite action).
+      - name: Keep refill pre-images and alert on FAIL
+        if: ${{ always() && (steps.post_scan_refill.outcome == 'success' || steps.post_scan_refill.outcome == 'failure') }}
+        uses: ./.github/actions/refill-backup-and-alert
+        with:
+          artifact-name: refill-backup-after-scan-${{ github.run_id }}
+          outcome: ${{ steps.post_scan_refill.outcome }}
       # Daily Massive plan probe (1 request, key already held by this job; logs booleans only, never the URL).
       # Detection only for now: the plan file feeds the auto-backfill decision (src/tenmin-backfill.ts).
       - name: Ten-minute stored floor (R2 HEADs only)
