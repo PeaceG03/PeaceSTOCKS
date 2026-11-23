@@ -1,13 +1,29 @@
 name: Health check
-# PeaceSTOCKS health check (src/health-check.ts). Reads the check-ins the real parts write to R2
-# (permanent/health/checkins/), the daily 10-minute step's catch-up indexes (stuck days), and the
-# carried no-response counts; writes permanent/health/check/latest.json. No Massive request, no
-# secrets in logs (counts, part names and redacted messages only). Every 6 h, outside both scan
-# guard windows (05:12-06:15 / 09:12-10:15 UTC).
+# PeaceSTOCKS health check (src/health-check.ts) and weekly health review (src/health-weekly-review.ts).
+# Both read the check-ins the real parts write to R2 (permanent/health/checkins/) and write only under
+# permanent/health/. No Massive request, no secrets in logs (counts, part names and redacted messages).
+# - check: every 6 h, outside both scan guard windows (05:12-06:15 / 09:12-10:15 UTC); also reads the
+#   daily 10-minute step's catch-up indexes for stuck days and carries the no-response counts.
+# - weekly: Sunday after the gap refill. Triggered when the scheduled gap-refill.yml run completes;
+#   the 21:30 UTC Sunday cron is a backstop (the gap refill can run until about 20:10 UTC) and does
+#   nothing when that day's review is already stored.
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "check (health check now) or weekly (weekly health review now)"
+        required: true
+        default: check
+        type: choice
+        options:
+          - check
+          - weekly
   schedule:
     - cron: "40 1,7,13,19 * * *"
+    - cron: "30 21 * * 0"
+  workflow_run:
+    workflows: ["Daily-bars gap refill"]
+    types: [completed]
 permissions:
   contents: read
 concurrency:
@@ -15,7 +31,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   check:
-    if: ${{ github.ref == 'refs/heads/main' }}
+    if: ${{ github.ref == 'refs/heads/main' && ((github.event_name == 'schedule' && github.event.schedule == '40 1,7,13,19 * * *') || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'check')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
@@ -35,3 +51,24 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Health check
         run: pnpm -s exec tsx src/health-check.ts
+  weekly:
+    if: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'schedule' && github.event.workflow_run.head_branch == 'main') || (github.ref == 'refs/heads/main' && ((github.event_name == 'schedule' && github.event.schedule == '30 21 * * 0') || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'weekly'))) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+      PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+      PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+      PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Weekly health review
+        run: pnpm -s exec tsx src/health-weekly-review.ts
