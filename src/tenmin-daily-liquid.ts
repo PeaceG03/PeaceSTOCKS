@@ -32,6 +32,7 @@ import { type ZstdVersionProbe, assertPinnedZstdForWriting } from "./reply-dust-
 import { type ScanRunPick, checkScannerRuns, createScanYieldCheck, inScanGuardWindow, isScanCheckFailure } from "./scan-yield";
 import type { SessionCalendar } from "./scanner";
 import { TENMIN_DAILY_CLOSE_ORIGIN } from "./tenmin-range-entries";
+import { errorMessage, reportPart } from "./health-checkins";
 import { type HistoryHoldDay, historyBlockingDay } from "./history-blocked";
 import { expectedTenMinBars, presentTenMinBars, tenMinSessionDone } from "./tenmin-day-done";
 import { lastCompletedSessionDate, pairRangeForDate } from "./tenmin-history";
@@ -911,9 +912,11 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import
         process.stdout.write(`::error title=Daily 10-minute step stopped: active-run check failed::${yielded}\n`);
         process.exitCode = 2;
       }
+      await reportPart(process.env, "tenmin-daily", isScanCheckFailure(yielded) ? "ERROR" : "OK", isScanCheckFailure(yielded) ? yielded : String(summary.status ?? ""));
     })
-    .catch((error: unknown) => {
+    .catch(async (error: unknown) => {
       process.stderr.write(`TENMIN_DAILY_FAILED:${error instanceof Error ? error.message : String(error)}\n`);
       process.exitCode = 2;
+      await reportPart(process.env, "tenmin-daily", "ERROR", errorMessage(error));
     });
 }

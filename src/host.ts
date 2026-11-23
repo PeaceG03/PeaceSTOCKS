@@ -29,6 +29,7 @@ import { R2ObjectClient } from "./object-store";
 import { FileReplyDustStore, type ReplyDustStore } from "./intraday-reply-dust";
 import { scanGroupedReplyDustEnabled } from "./scan-grouped-reply-dust";
 import { tenMinHistoryDailyStepHold } from "./tenmin-daily-liquid";
+import { errorMessage, reportPart } from "./health-checkins";
 import {
   runTenMinHistoryFromEnv,
   tenMinHistorySummary,
@@ -402,7 +403,10 @@ async function main(): Promise<void> {
   // (keep-all-Massive-fields Reply Dust ranges). Optional: PEACESTOCKS_TENMIN_HISTORY_REOPEN=1,
   // PEACESTOCKS_TENMIN_HISTORY_MAX_RANGES, PEACESTOCKS_TENMIN_HISTORY_BUDGET_MS. Refuses without
   // pinned zstd 1.5.7 and without a store when PEACESTOCKS_REQUIRE_OBJECT_STORE=1.
-  const history = await runTenMinHistoryFromEnv(process.env, tenMinHistoryDailyStepHold(process.env));
+  const history = await runTenMinHistoryFromEnv(process.env, tenMinHistoryDailyStepHold(process.env)).catch(async (error: unknown) => {
+    await reportPart(process.env, "history-chain", "ERROR", errorMessage(error));
+    throw error;
+  });
   if (history) {
     // Concise dated ticker-index section (also on R2 history report + tenMinHistorySummary).
     if (history.report.datedTickerIndex)
@@ -432,13 +436,23 @@ async function main(): Promise<void> {
       );
     }
     process.exitCode = history.report.stoppedOnError || checkFailure ? 2 : 0;
+    const historyFailed = history.report.stoppedOnError || !!checkFailure;
+    await reportPart(
+      process.env,
+      "history-chain",
+      historyFailed ? "ERROR" : "OK",
+      historyFailed ? (history.report.error ?? checkFailure ?? "STOPPED_ON_ERROR") : outcome.reason,
+    );
     return;
   }
   const intradayFrom = process.env.PEACEAI_MARKETS_INTRADAY_FROM;
   const intradayTo = process.env.PEACEAI_MARKETS_INTRADAY_TO;
   const output = await runScannerHost(
     intradayFrom && intradayTo ? { intraday: { from: intradayFrom, to: intradayTo } } : {},
-  );
+  ).catch(async (error: unknown) => {
+    await reportPart(process.env, "scan", "ERROR", errorMessage(error));
+    throw error;
+  });
   // Pack failures are codes + session dates only (no values).
   const packFailures = (output.reports ?? [])
     .map((report) => report.dailyBarsSidecar?.failure)
@@ -447,6 +461,12 @@ async function main(): Promise<void> {
     `${JSON.stringify({ status: output.status, reason: output.reason, sessions: output.sessions, ...(packFailures.length ? { packFailures } : {}) })}\n`,
   );
   process.exitCode = output.status === "FAILED" || output.status === "NOT_READY" ? 2 : 0;
+  await reportPart(
+    process.env,
+    "scan",
+    output.status === "FAILED" || output.status === "NOT_READY" ? "ERROR" : "OK",
+    `${output.status}:${output.reason}`,
+  );
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {

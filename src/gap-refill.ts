@@ -13,6 +13,7 @@ import { isIdleScannerRun } from "./scan-yield";
 import { refill, verifySessions } from "./gap-refill-lib";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import { timedFetch } from "./oct2024-tenmin-oneoff";
+import { reportPart } from "./health-checkins";
 
 export type NetFreeze = { ok: true; commit: string } | { ok: false; reason: string };
 
@@ -151,7 +152,20 @@ async function main(): Promise<number> {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().then((c) => process.exit(c), (e) => { console.log(`gap-refill: FAIL ${/REFILL_GUARD_REFUSED/u.test(String(e)) ? "GUARD_REFUSED" : "error"}`); process.exit(1); });
+  // Only the refill itself checks in (--check / --check-asof are read-only probes for other jobs).
+  const refillRun = !process.argv[2];
+  main().then(
+    async (c) => {
+      if (refillRun) await reportPart(process.env, "gap-refill", c === 0 ? "OK" : "ERROR", c === 0 ? undefined : `GAP_REFILL_EXIT_${c}`);
+      process.exit(c);
+    },
+    async (e) => {
+      const why = /REFILL_GUARD_REFUSED/u.test(String(e)) ? "GUARD_REFUSED" : "error";
+      console.log(`gap-refill: FAIL ${why}`);
+      if (refillRun) await reportPart(process.env, "gap-refill", "ERROR", `GAP_REFILL_FAIL_${why}`);
+      process.exit(1);
+    },
+  );
 }
 
 /** REFILL_BUDGET_MS: blank -> the default; plain digits 1..86400000 -> the number; anything else throws (fail closed). */
