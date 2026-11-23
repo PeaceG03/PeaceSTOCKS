@@ -166,11 +166,14 @@ jobs:
         id: post_scan_refill
         if: ${{ success() && github.ref == 'refs/heads/main' }}
         continue-on-error: true
-        timeout-minutes: 45
+        # Fits the 120 min job: setup ~5 + scan host budget 65 (PEACESTOCKS_SCAN_BUDGET_MS default; the
+        # host starts no new session after it) + one session in flight + this 40 (budget 30 + the
+        # refill's own 10 min fatal margin) + the probe and coverage steps.
+        timeout-minutes: 40
         env:
           NET_READ_TOKEN: ${{ secrets.NET_RERUN_DISPATCH_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
-          REFILL_BUDGET_MS: "2400000"
+          REFILL_BUDGET_MS: "1800000"
         run: pnpm -s exec tsx src/gap-refill.ts --after-scan
       # Daily Massive plan probe (1 request, key already held by this job; logs booleans only, never the URL).
       # Detection only for now: the plan file feeds the auto-backfill decision (src/tenmin-backfill.ts).
