@@ -154,6 +154,21 @@ jobs:
         env:
           PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
         run: pnpm scheduler
+      # Fill daily-bars coverage right after a successful scan (same src/gap-refill.ts the weekly
+      # gap-refill.yml runs: coverage check first, a no-op in seconds when nothing is missing; never
+      # replaces or deletes a stored object). --after-scan: this run is not "another active scanner
+      # run" and the guard windows (this scan's own slot) do not apply. Main only, like gap-refill.yml.
+      # continue-on-error: the coverage check below stays the job's verdict.
+      - name: Fill daily-bars coverage after the scan
+        id: post_scan_refill
+        if: ${{ success() && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        timeout-minutes: 45
+        env:
+          NET_READ_TOKEN: ${{ secrets.NET_RERUN_DISPATCH_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REFILL_BUDGET_MS: "2400000"
+        run: pnpm -s exec tsx src/gap-refill.ts --after-scan
       # Daily Massive plan probe (1 request, key already held by this job; logs booleans only, never the URL).
       # Detection only for now: the plan file feeds the auto-backfill decision (src/tenmin-backfill.ts).
       - name: Ten-minute stored floor (R2 HEADs only)
