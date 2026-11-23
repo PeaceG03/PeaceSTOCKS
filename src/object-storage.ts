@@ -20,7 +20,7 @@ import {
   type TickerReferenceIndexManifest,
   writeTickerReferenceIndex,
 } from "./ticker-reference-index";
-import type { ObjectClient } from "./object-store";
+import type { ObjectClient, ObjectListing } from "./object-store";
 import { R2ObjectClient } from "./object-store";
 import { MarketStorage, type MarketStore } from "./storage";
 
@@ -248,15 +248,38 @@ export class ObjectMarketStorage implements MarketStore {
     return reports.sort((left, right) => left.session.sessionDate.localeCompare(right.session.sessionDate));
   }
 
+  private storageSizes: Promise<Record<string, number>> | undefined;
+
+  /**
+   * Bytes per top-level category, measured once per storage instance (one host run) from the
+   * listing's sizes. It used to GET every object in the bucket on every run report, which grew with
+   * the ten-minute history and timed out the scheduled scan; the bodies were only used for length.
+   */
+  private measureCategoryBytes(): Promise<Record<string, number>> {
+    this.storageSizes ??= (async () => {
+      const categoryBytes: Record<string, number> = { permanent: 0, cache: 0, transient: 0 };
+      let entries: ObjectListing[];
+      if (this.client.listSizes) entries = await this.client.listSizes("");
+      else {
+        // Clients without sized listings: one HEAD per key (still no bodies).
+        entries = [];
+        for (const key of await this.client.list("")) entries.push({ key, size: (await this.client.head(key))?.size ?? 0 });
+      }
+      for (const { key, size } of entries) {
+        if (key.startsWith("permanent/")) categoryBytes.permanent = (categoryBytes.permanent ?? 0) + size;
+        else if (key.startsWith("cache/")) categoryBytes.cache = (categoryBytes.cache ?? 0) + size;
+        else if (key.startsWith("transient/")) categoryBytes.transient = (categoryBytes.transient ?? 0) + size;
+      }
+      return categoryBytes;
+    })();
+    this.storageSizes.catch(() => {
+      this.storageSizes = undefined;
+    });
+    return this.storageSizes;
+  }
+
   async measureStorage(): Promise<StorageReport> {
-    const keys = await this.client.list("");
-    const categoryBytes: Record<string, number> = { permanent: 0, cache: 0, transient: 0 };
-    for (const key of keys) {
-      const size = (await this.client.get(key))?.byteLength ?? 0;
-      if (key.startsWith("permanent/")) categoryBytes.permanent = (categoryBytes.permanent ?? 0) + size;
-      else if (key.startsWith("cache/")) categoryBytes.cache = (categoryBytes.cache ?? 0) + size;
-      else if (key.startsWith("transient/")) categoryBytes.transient = (categoryBytes.transient ?? 0) + size;
-    }
+    const categoryBytes = { ...(await this.measureCategoryBytes()) };
     const permanentBytesToday = categoryBytes.permanent ?? 0;
     const rollingMbPerDay = permanentBytesToday / 1024 / 1024;
     return {

@@ -20,6 +20,13 @@ export interface ObjectClient {
   delete(key: string): Promise<void>;
   /** Every key under the prefix (all pages), sorted. */
   list(prefix: string): Promise<string[]>;
+  /** Every key under the prefix with its size, from the listing alone (no GET or HEAD per key). */
+  listSizes?(prefix: string): Promise<ObjectListing[]>;
+}
+
+export interface ObjectListing {
+  readonly key: string;
+  readonly size: number;
 }
 
 /** Kept at S3's 2 KB user-metadata limit (R2 allows more) so objects stay portable. */
@@ -126,6 +133,10 @@ export class MemoryObjectClient implements ObjectClient {
 
   async list(prefix: string): Promise<string[]> {
     return [...this.objects.keys()].filter((key) => key.startsWith(prefix)).sort();
+  }
+
+  async listSizes(prefix: string): Promise<ObjectListing[]> {
+    return (await this.list(prefix)).map((key) => ({ key, size: this.objects.get(key)?.length ?? 0 }));
   }
 }
 
@@ -371,6 +382,33 @@ export class R2ObjectClient implements ObjectClient {
       const truncated = /<IsTruncated>true<\/IsTruncated>/u.test(xml);
       token = /<NextContinuationToken>([^<]+)<\/NextContinuationToken>/u.exec(xml)?.[1];
       if (!truncated) return keys.sort();
+      if (!token) throw new Error("R2_LIST_TRUNCATED_WITHOUT_TOKEN");
+      token = xmlText(token);
+    }
+    throw new Error("R2_LIST_TOO_MANY_PAGES");
+  }
+
+  async listSizes(prefix: string): Promise<ObjectListing[]> {
+    // ListObjectsV2 returns at most 1000 keys per page, each with its Size; follow continuation
+    // tokens to the end.
+    const entries: ObjectListing[] = [];
+    let token: string | undefined;
+    for (let page = 0; page < 100_000; page += 1) {
+      const query: Record<string, string> = { "list-type": "2", prefix };
+      if (token) query["continuation-token"] = token;
+      const response = await this.request("GET", this.endpoint("", query));
+      if (!response.ok) throw new Error(`R2_LIST_${response.status}`);
+      const xml = await response.text();
+      for (const match of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/gu)) {
+        const body = match[1] ?? "";
+        const key = xmlText(/<Key>([^<]+)<\/Key>/u.exec(body)?.[1] ?? "");
+        if (!key) continue;
+        const size = Number(/<Size>(\d+)<\/Size>/u.exec(body)?.[1] ?? "0");
+        entries.push({ key, size: Number.isFinite(size) ? size : 0 });
+      }
+      const truncated = /<IsTruncated>true<\/IsTruncated>/u.test(xml);
+      token = /<NextContinuationToken>([^<]+)<\/NextContinuationToken>/u.exec(xml)?.[1];
+      if (!truncated) return entries.sort((left, right) => (left.key < right.key ? -1 : left.key > right.key ? 1 : 0));
       if (!token) throw new Error("R2_LIST_TRUNCATED_WITHOUT_TOKEN");
       token = xmlText(token);
     }
