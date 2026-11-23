@@ -78,11 +78,14 @@ function barsFor(sessions: readonly string[], dv: Record<string, number> = DV): 
 /** One 10-minute Massive bar JSON for a UTC ISO time. */
 const aggBar = (iso: string, price: number) =>
   `{"v":100,"vw":${price},"o":${price},"c":${price + 0.01},"h":${price + 0.02},"l":${price - 0.01},"t":${Date.parse(iso)},"n":3}`;
-/** Two regular-hours bars on session D (EDT: 13:30Z and 13:40Z). */
-const dayBars = (symbol: string, d: string) => {
+/** The first `count` regular-hours ten-minute bars on session D (EDT: from 13:30Z). Synthetic prices. */
+const barsOnDay = (symbol: string, d: string, count: number) => {
   const base = symbol.charCodeAt(0);
-  return [aggBar(`${d}T13:30:00Z`, base), aggBar(`${d}T13:40:00Z`, base + 0.5)];
+  const open = Date.parse(`${d}T13:30:00Z`);
+  return Array.from({ length: count }, (_, i) => aggBar(new Date(open + i * 600_000).toISOString(), base + i / 100));
 };
+/** All 39 regular-hours bars on a normal session D (the done-day rule needs every one). */
+const dayBars = (symbol: string, d: string) => barsOnDay(symbol, d, 39);
 
 function replyPages(symbol: string, securityId: string, from: string, to: string, bars: string[], fetchedAt = "2026-10-10T06:31:00.000Z"): TenMinuteRangeReply[] {
   const body = `{"ticker":"${symbol}","adjusted":false,"results":[${bars.join(",")}],"status":"OK","request_id":"SYN-${symbol}-${from}-${to}","count":${bars.length}}`;
@@ -392,7 +395,8 @@ test("outage: 5 network/5xx failures in a row stop the run; a 404-style failure 
     },
   });
   assert.equal(gapRun.sessions[0]!.gaps, 1);
-  assert.equal(gapRun.sessions[0]!.status, "COMPLETE");
+  // Done-day rule: a gap is not a saved stock, so the day is not done and catch-up re-runs it.
+  assert.equal(gapRun.sessions[0]!.status, "PARTIAL");
 });
 
 test("yield reason: guard windows, deadline, waiting scheduled scan only (history, restarter and the daily run itself do not preempt)", async () => {
@@ -677,4 +681,81 @@ test("liquidRequiresObjectStore: only unset/\"\"/0/1; a typo throws instead of t
   assert.equal(liquidRequiresObjectStore("1"), true);
   for (const bad of ["true", "yes", "2"])
     assert.throws(() => liquidRequiresObjectStore(bad), /PEACESTOCKS_REQUIRE_OBJECT_STORE_INVALID/u, bad);
+});
+
+test("done-day: a stock short of 39 bars keeps the day open; catch-up re-runs it until its bars are saved", async () => {
+  const store = new MemoryObjectClient();
+  const calls: string[] = [];
+  let bbbBars = 30;
+  const fetchPages = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+    calls.push(`${sec.symbol}:${from}:${to}`);
+    return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, sec.symbol === "BBB" ? bbbBars : 39));
+  };
+  const first = await baseRun(store, calls, { catchupSessions: 1, fetchPages });
+  assert.equal(first.sessions[0]!.status, "PARTIAL", "BBB has 30 of 39 bars");
+  assert.equal(first.sessions[0]!.shortNames, 1);
+  assert.equal(first.sessions[0]!.expectedBars, 39);
+  let index = await readTenMinDailyIndex(store, "2026-10-09");
+  assert.equal(index!.done, undefined);
+  assert.equal(index!.notDoneRuns, 1);
+  assert.equal(index!.stored.find((e) => e.securityId === "sec_bbb")?.bars, 30);
+
+  // Re-run: only the short stock is fetched again; a reply with no more bars is not written.
+  calls.length = 0;
+  const bbbKey = tenMinRangeFileKey(RANGE_FROM, RANGE_TO, "sec_bbb", "BBB", "2026-10-09", "2026-10-09", 1);
+  const shortBytes = await store.get(bbbKey);
+  const second = await baseRun(store, calls, { catchupSessions: 1, fetchPages });
+  assert.deepEqual(calls, ["BBB:2026-10-09:2026-10-09"]);
+  assert.equal(second.sessions[0]!.status, "PARTIAL");
+  assert.deepEqual(await store.get(bbbKey), shortBytes, "same-size reply does not replace the stored one");
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-09"))!.notDoneRuns, 2);
+
+  // The provider now has every bar: the day is done.
+  bbbBars = 39;
+  calls.length = 0;
+  const third = await baseRun(store, calls, { catchupSessions: 1, fetchPages });
+  assert.deepEqual(calls, ["BBB:2026-10-09:2026-10-09"]);
+  assert.equal(third.sessions[0]!.status, "COMPLETE");
+  assert.equal(third.sessions[0]!.refetchedThisRun, 1);
+  index = await readTenMinDailyIndex(store, "2026-10-09");
+  assert.equal(index!.done?.expectedBars, 39);
+  assert.equal(index!.stored.find((e) => e.securityId === "sec_bbb")?.bars, 39);
+
+  // Done days are not re-run.
+  calls.length = 0;
+  const fourth = await baseRun(store, calls, { catchupSessions: 1, fetchPages });
+  assert.deepEqual(calls, []);
+  assert.equal(fourth.sessions[0]!.status, "COMPLETE");
+});
+
+test("done-day: all ten-minute bars without the daily bars saved is not done; it finishes once the daily bars land", async () => {
+  const store = new MemoryObjectClient();
+  const calls: string[] = [];
+  // Ranking bars exist for earlier sessions, but the session's own daily bars are not saved yet.
+  const noDailyForD = async (sessions: readonly string[]) => barsFor(sessions.filter((s) => s !== "2026-10-09"));
+  const first = await baseRun(store, calls, { catchupSessions: 1, loadBars: noDailyForD });
+  assert.equal(first.sessions[0]!.status, "WAITING_DAILY_BARS");
+  assert.equal(first.sessions[0]!.missingDailyBars, 3);
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-09"))!.done, undefined);
+  calls.length = 0;
+  const second = await baseRun(store, calls, { catchupSessions: 1 });
+  assert.deepEqual(calls, [], "no Massive request: only the daily bars were missing");
+  assert.equal(second.sessions[0]!.status, "COMPLETE");
+  assert.ok((await readTenMinDailyIndex(store, "2026-10-09"))!.done);
+});
+
+test("done-day: a half day is done at 21 bars", async () => {
+  const store = new MemoryObjectClient();
+  const calls: string[] = [];
+  // 2026-11-27 is the NYSE half day after Thanksgiving (EST: open 14:30Z).
+  const fetchPages = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+    calls.push(`${sec.symbol}:${from}`);
+    const open = Date.parse(`${from}T14:30:00Z`);
+    const bars = Array.from({ length: 21 }, (_, i) => aggBar(new Date(open + i * 600_000).toISOString(), 50 + i / 100));
+    return replyPages(sec.symbol, sec.securityId, from, to, bars);
+  };
+  const run = await baseRun(store, calls, { lastCompletedSession: "2026-11-27", catchupSessions: 1, fetchPages });
+  assert.equal(run.sessions[0]!.sessionDate, "2026-11-27");
+  assert.equal(run.sessions[0]!.expectedBars, 21);
+  assert.equal(run.sessions[0]!.status, "COMPLETE");
 });

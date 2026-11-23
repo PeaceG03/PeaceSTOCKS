@@ -32,6 +32,7 @@ import { type ZstdVersionProbe, assertPinnedZstdForWriting } from "./reply-dust-
 import { type ScanRunPick, checkScannerRuns, createScanYieldCheck, inScanGuardWindow, isScanCheckFailure } from "./scan-yield";
 import type { SessionCalendar } from "./scanner";
 import { TENMIN_DAILY_CLOSE_ORIGIN } from "./tenmin-range-entries";
+import { expectedTenMinBars, presentTenMinBars, tenMinSessionDone } from "./tenmin-day-done";
 import { lastCompletedSessionDate, pairRangeForDate } from "./tenmin-history";
 import {
   TENMIN_RANGE_OUTAGE_STREAK,
@@ -265,6 +266,8 @@ export interface TenMinDailyStoredEntry {
   fetch: TenMinRangeTickerFetch;
   /** true when the object already existed and was verified instead of fetched. */
   adopted?: boolean;
+  /** Ten-minute bars the stored reply holds for the session (absent on indexes written before the done-day rule). */
+  bars?: number;
 }
 
 export interface TenMinDailyGapEntry {
@@ -285,6 +288,13 @@ export interface TenMinDailyIndex {
   selected: TenMinDailySelected[];
   stored: TenMinDailyStoredEntry[];
   gaps: TenMinDailyGapEntry[];
+  /** Set once the day is done (done-day rule: every stock has all its bars AND its daily bars are saved). */
+  done?: { at: string; expectedBars: number };
+  /** Full catch-up passes that ended with the day still not done (the health check flags a stuck day). */
+  notDoneRuns?: number;
+  /** Stocks still short of the expected bars / without a saved daily bar after the last pass. */
+  shortNames?: number;
+  missingDailyBars?: number;
   updatedAt: string;
   checksum: string;
 }
@@ -367,7 +377,11 @@ async function verifyExistingDaily(
   return verified ?? "INVALID";
 }
 
-export type TenMinDailySessionStatus = "COMPLETE" | "PARTIAL" | "SKIPPED_RANGE_SEALED" | "NO_SELECTION";
+/**
+ * COMPLETE only when the day is done by the done-day rule. WAITING_DAILY_BARS: every stock has all its
+ * ten-minute bars but some daily bars are not saved yet (catch-up keeps re-running the day).
+ */
+export type TenMinDailySessionStatus = "COMPLETE" | "PARTIAL" | "WAITING_DAILY_BARS" | "SKIPPED_RANGE_SEALED" | "NO_SELECTION";
 
 export interface TenMinDailySessionReport {
   sessionDate: string;
@@ -379,6 +393,13 @@ export interface TenMinDailySessionReport {
   adoptedThisRun: number;
   gaps: number;
   requests: number;
+  /** Bars each stock needs for this session (39, or 21 on a half day). */
+  expectedBars?: number;
+  /** Stocks still short of expectedBars / without a saved daily bar at the end of this run. */
+  shortNames?: number;
+  missingDailyBars?: number;
+  /** Stored names whose short reply was fetched again this run. */
+  refetchedThisRun?: number;
 }
 
 export interface TenMinDailyRunReport {
@@ -465,7 +486,18 @@ export async function runTenMinDailyLiquid(options: {
       report.sessions.push(sessionReport);
       continue;
     }
+    const expectedBars = expectedTenMinBars(sessionDate, calendar);
+    sessionReport.expectedBars = expectedBars;
     let index = await readTenMinDailyIndex(store, sessionDate);
+    if (index?.done) {
+      sessionReport.status = "COMPLETE";
+      sessionReport.selected = index.selected.length;
+      sessionReport.stored = index.stored.length;
+      sessionReport.shortNames = 0;
+      sessionReport.missingDailyBars = 0;
+      report.sessions.push(sessionReport);
+      continue;
+    }
     let dirty = false;
     if (!index) {
       const trailingSessions = tradingSessionsBefore(sessionDate, TENMIN_DAILY_LOOKBACK_SESSIONS, calendar);
@@ -512,32 +544,61 @@ export async function runTenMinDailyLiquid(options: {
       sinceSave = 0;
     };
     if (index.gaps.length) dirty = true;
+    let sessionStopped = false;
+    let refetched = 0;
+    // Bars held by a stored object (counted once, then kept in the index). Undefined = unreadable.
+    const storedBars = async (securityId: string, fetch: TenMinRangeTickerFetch): Promise<number | undefined> => {
+      try {
+        return presentTenMinBars(await decodeDailyObjectBars(store, provider, securityId, sessionDate, fetch, backend));
+      } catch {
+        return undefined;
+      }
+    };
 
     try {
       for (const name of index.selected) {
-        if (stored.has(name.securityId)) continue;
+        let prior = stored.get(name.securityId);
+        if (prior && prior.bars === undefined) {
+          const counted = await storedBars(name.securityId, prior.fetch);
+          if (counted === undefined) {
+            gaps.set(name.securityId, { securityId: name.securityId, symbol: name.symbol, reason: "TENMIN_DAILY_OBJECT_UNVERIFIED", at: stamp() });
+            dirty = true;
+            continue;
+          }
+          prior = { ...prior, bars: counted };
+          stored.set(name.securityId, prior);
+          dirty = true;
+        }
+        // Done-day rule: a stored name is finished only with all its bars; a short one is re-run.
+        if (prior && (prior.bars ?? 0) >= expectedBars) continue;
         const yieldReason = options.shouldYield ? await options.shouldYield() : undefined;
         if (yieldReason) {
           report.yielded = yieldReason;
           stop = true;
+          sessionStopped = true;
           break;
         }
-        const existing = await verifyExistingDaily(store, provider, name.securityId, name.symbol, sessionDate, backend);
-        if (existing === "INVALID") {
-          gaps.set(name.securityId, { securityId: name.securityId, symbol: name.symbol, reason: "TENMIN_DAILY_OBJECT_UNVERIFIED", at: stamp() });
-          dirty = true;
-          continue;
-        }
-        if (existing) {
-          stored.set(name.securityId, { securityId: name.securityId, fetch: existing, adopted: true });
-          sessionReport.adoptedThisRun += 1;
-          dirty = true;
-          if (++sinceSave >= INDEX_SAVE_EVERY) await save();
-          continue;
+        if (!prior) {
+          const existing = await verifyExistingDaily(store, provider, name.securityId, name.symbol, sessionDate, backend);
+          if (existing === "INVALID") {
+            gaps.set(name.securityId, { securityId: name.securityId, symbol: name.symbol, reason: "TENMIN_DAILY_OBJECT_UNVERIFIED", at: stamp() });
+            dirty = true;
+            continue;
+          }
+          if (existing) {
+            const counted = await storedBars(name.securityId, existing);
+            prior = { securityId: name.securityId, fetch: existing, adopted: true, bars: counted ?? 0 };
+            stored.set(name.securityId, prior);
+            sessionReport.adoptedThisRun += 1;
+            dirty = true;
+            if (++sinceSave >= INDEX_SAVE_EVERY) await save();
+            if ((prior.bars ?? 0) >= expectedBars) continue;
+          }
         }
         if (report.massiveRequests >= options.maxRequests) {
           report.budgetStop = true;
           stop = true;
+          sessionStopped = true;
           break;
         }
         report.massiveRequests += 1;
@@ -546,6 +607,12 @@ export async function runTenMinDailyLiquid(options: {
           const pages = await options.fetchPages({ securityId: name.securityId, symbol: name.symbol }, sessionDate, sessionDate);
           report.massiveRequests += Math.max(0, pages.length - 1);
           sessionReport.requests += Math.max(0, pages.length - 1);
+          const bars = presentTenMinBars(barsFromPages(provider, sessionDate, name.securityId, pages));
+          // A re-run only replaces a short stored reply with one that holds more bars.
+          if (prior && bars <= (prior.bars ?? 0)) {
+            outageStreak = 0;
+            continue;
+          }
           const { fetch } = await writeTenMinRangeFetch(store, pages, {
             provider,
             calendarFrom,
@@ -555,8 +622,10 @@ export async function runTenMinDailyLiquid(options: {
             backend,
             origin: TENMIN_DAILY_CLOSE_ORIGIN,
           });
-          stored.set(name.securityId, { securityId: name.securityId, fetch });
-          sessionReport.fetchedThisRun += 1;
+          stored.set(name.securityId, { securityId: name.securityId, fetch, bars });
+          gaps.delete(name.securityId);
+          if (prior) refetched += 1;
+          else sessionReport.fetchedThisRun += 1;
           outageStreak = 0;
           dirty = true;
           if (++sinceSave >= INDEX_SAVE_EVERY) await save();
@@ -575,6 +644,7 @@ export async function runTenMinDailyLiquid(options: {
             if (outageStreak >= TENMIN_RANGE_OUTAGE_STREAK) {
               report.outageStop = `MASSIVE_OUTAGE:${message}`;
               stop = true;
+              sessionStopped = true;
               break;
             }
             continue;
@@ -588,10 +658,37 @@ export async function runTenMinDailyLiquid(options: {
       // Keep what was stored even when the run aborts.
       await save();
     }
+    // Done-day rule: all ten-minute bars for every stock AND its daily bars saved.
+    const dailySaved = new Set(
+      (await loadBars([sessionDate])).filter((bar) => bar.sessionDate === sessionDate).map((bar) => bar.securityId),
+    );
+    const verdict = tenMinSessionDone({
+      sessionDate,
+      selected: index.selected.map((name) => name.securityId),
+      savedBars: new Map([...stored.values()].map((entry) => [entry.securityId, entry.bars ?? 0])),
+      dailyBarsSaved: dailySaved,
+      calendar,
+    });
+    const notDoneRuns = (index.notDoneRuns ?? 0) + (!verdict.done && !sessionStopped ? 1 : 0);
+    const { done: _done, notDoneRuns: _runs, shortNames: _short, missingDailyBars: _missing, ...indexBody } = index;
+    index = finalizeIndex({
+      ...indexBody,
+      stored: [...stored.values()],
+      gaps: [...gaps.values()],
+      ...(verdict.done ? { done: { at: stamp(), expectedBars: verdict.expectedBars } } : {}),
+      ...(notDoneRuns ? { notDoneRuns } : {}),
+      shortNames: verdict.shortNames.length,
+      missingDailyBars: verdict.missingDailyBars.length,
+      updatedAt: stamp(),
+    });
+    await writeTenMinDailyIndex(store, index);
     sessionReport.selected = index.selected.length;
     sessionReport.stored = stored.size;
     sessionReport.gaps = gaps.size;
-    sessionReport.status = stored.size + gaps.size >= index.selected.length ? "COMPLETE" : "PARTIAL";
+    sessionReport.shortNames = verdict.shortNames.length;
+    sessionReport.missingDailyBars = verdict.missingDailyBars.length;
+    if (refetched) sessionReport.refetchedThisRun = refetched;
+    sessionReport.status = verdict.done ? "COMPLETE" : !verdict.shortNames.length ? "WAITING_DAILY_BARS" : "PARTIAL";
     report.sessions.push(sessionReport);
   }
   report.estimatedKeyMinutes = Math.round(((report.massiveRequests * TENMIN_DAILY_SECONDS_PER_REQUEST) / 60) * 10) / 10;
@@ -626,7 +723,41 @@ export async function readTenMinSecurityDay(
   const entry = index?.stored.find((item) => item.securityId === securityId);
   if (!index || !entry) return { source: "none", bars: [] };
   const provider = options.provider ?? index.provider;
-  const verified = await verifyExistingDaily(store, provider, securityId, entry.fetch.symbol, sessionDate, backend, entry.fetch);
+  return { source: "daily", bars: await decodeDailyObjectBars(store, provider, securityId, sessionDate, entry.fetch, backend) };
+}
+
+/** Pure: canonical ten-minute bars for one session from freshly fetched reply pages. */
+function barsFromPages(provider: string, sessionDate: string, securityId: string, pages: readonly TenMinuteRangeReply[]): CanonicalTenMinuteBar[] {
+  const results: Array<Record<string, unknown>> = [];
+  let requestId: unknown;
+  for (const page of pages) {
+    const parsed = JSON.parse(new TextDecoder().decode(page.body)) as Record<string, unknown>;
+    if (requestId === undefined) requestId = parsed.request_id;
+    if (Array.isArray(parsed.results))
+      for (const raw of parsed.results) if (raw && typeof raw === "object") results.push(raw as Record<string, unknown>);
+  }
+  const first = pages[0];
+  return massiveTenMinuteBarsFromReply({
+    provider,
+    sessionDate,
+    securityId,
+    symbol: first?.symbol ?? "",
+    reply: { results, ...(requestId === undefined ? {} : { request_id: requestId }) },
+    observedAt: first?.fetchedAt ?? "",
+  });
+}
+
+/** Verify and decode one stored daily object into canonical bars (throws when it does not verify). */
+async function decodeDailyObjectBars(
+  store: ReplyDustStore,
+  provider: string,
+  securityId: string,
+  sessionDate: string,
+  fetch: TenMinRangeTickerFetch,
+  backend: ReplyDustBackend,
+): Promise<CanonicalTenMinuteBar[]> {
+  const { calendarFrom, calendarTo } = pairRangeForDate(sessionDate);
+  const verified = await verifyExistingDaily(store, provider, securityId, fetch.symbol, sessionDate, backend, fetch);
   if (!verified || verified === "INVALID") throw new Error(`TENMIN_DAILY_OBJECT_UNVERIFIED:${securityId}:${sessionDate}`);
   const results: Array<Record<string, unknown>> = [];
   let requestId: unknown;
@@ -643,17 +774,14 @@ export async function readTenMinSecurityDay(
     if (Array.isArray(parsed.results))
       for (const raw of parsed.results) if (raw && typeof raw === "object") results.push(raw as Record<string, unknown>);
   }
-  return {
-    source: "daily",
-    bars: massiveTenMinuteBarsFromReply({
-      provider,
-      sessionDate,
-      securityId,
-      symbol: verified.symbol,
-      reply: { results, ...(requestId === undefined ? {} : { request_id: requestId }) },
-      observedAt: verified.observedAt,
-    }),
-  };
+  return massiveTenMinuteBarsFromReply({
+    provider,
+    sessionDate,
+    securityId,
+    symbol: verified.symbol,
+    reply: { results, ...(requestId === undefined ? {} : { request_id: requestId }) },
+    observedAt: verified.observedAt,
+  });
 }
 
 const ACTIVE_RUN_STATES = new Set(["queued", "in_progress", "waiting", "pending", "requested"]);
