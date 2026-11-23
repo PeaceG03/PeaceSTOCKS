@@ -22,7 +22,7 @@ import {
 } from "./ticker-reference-index";
 import type { ObjectClient, ObjectListing } from "./object-store";
 import { R2ObjectClient } from "./object-store";
-import { MarketStorage, type MarketStore } from "./storage";
+import { MarketStorage, monthsBetween, type MarketStore } from "./storage";
 
 type StoredRecord =
   | SecurityMasterRecord
@@ -119,6 +119,22 @@ export class ObjectMarketStorage implements MarketStore {
     return groups.flat();
   }
 
+  async loadBarsBetween(from: string, to: string): Promise<CanonicalDailyBar[]> {
+    const output: CanonicalDailyBar[] = [];
+    // One month file at a time; a line is parsed only when its sessionDate is inside the window.
+    for (const month of monthsBetween(from, to)) {
+      const body = await this.readText(`permanent/daily-bars/${month}.jsonl`);
+      for (const line of body.split("\n")) {
+        if (!line) continue;
+        const date = /"sessionDate":"(\d{4}-\d{2}-\d{2})"/u.exec(line)?.[1];
+        if (date !== undefined && (date < from || date > to)) continue;
+        const bar = JSON.parse(line) as CanonicalDailyBar;
+        if (bar.sessionDate >= from && bar.sessionDate <= to) output.push(bar);
+      }
+    }
+    return output;
+  }
+
   async loadDailyBarSessions(month: string): Promise<DailyBarSessionIndex> {
     requireMonth(month);
     const body = await this.client.get(`permanent/daily-bars/${month}.jsonl`);
@@ -158,11 +174,13 @@ export class ObjectMarketStorage implements MarketStore {
             provenance: record.provenance,
           });
       }
+      this.barCountsByKey.delete(`permanent/daily-bars/${month}.jsonl`);
       await this.appendUnique(
         `permanent/daily-bars/${month}.jsonl`,
         monthRecords,
         (record) => `${record.securityId}|${record.sessionDate}|${record.revision}`,
       );
+      this.barCountsByKey.delete(`permanent/daily-bars/${month}.jsonl`);
     }
     await this.appendCorrections(corrections);
   }
@@ -317,15 +335,29 @@ export class ObjectMarketStorage implements MarketStore {
     await this.writeText("backfill-state.json", JSON.stringify(state, null, 2) + "\n");
   }
 
+  /** Per month file: securityId -> stored bar lines. Kept for this storage instance (one host run). */
+  private readonly barCountsByKey = new Map<string, Map<string, number>>();
+
+  /**
+   * Stored bar lines per security across every month file. Each month is read once per storage
+   * instance, one at a time; appendBars drops the cached count of each month it rewrites, so only
+   * those months are read again. (It used to re-read every month on every session.)
+   */
   async tallyBarCounts(): Promise<Map<string, number>> {
     const counts = new Map<string, number>();
     for (const key of await this.client.list("permanent/daily-bars/")) {
-      const body = await this.readText(key);
-      for (const line of body.split("\n")) {
-        if (!line) continue;
-        const securityId = /"securityId":"([^"]+)"/u.exec(line)?.[1];
-        if (securityId) counts.set(securityId, (counts.get(securityId) ?? 0) + 1);
+      let monthCounts = this.barCountsByKey.get(key);
+      if (!monthCounts) {
+        monthCounts = new Map<string, number>();
+        const body = await this.readText(key);
+        for (const line of body.split("\n")) {
+          if (!line) continue;
+          const securityId = /"securityId":"([^"]+)"/u.exec(line)?.[1];
+          if (securityId) monthCounts.set(securityId, (monthCounts.get(securityId) ?? 0) + 1);
+        }
+        this.barCountsByKey.set(key, monthCounts);
       }
+      for (const [securityId, count] of monthCounts) counts.set(securityId, (counts.get(securityId) ?? 0) + count);
     }
     return counts;
   }

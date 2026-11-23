@@ -48,6 +48,11 @@ export interface MarketStore {
   appendMembership(records: UniverseMembershipEvidence[]): Promise<void>;
   loadBars(sessionDate?: string): Promise<CanonicalDailyBar[]>;
   /**
+   * Bars with from <= sessionDate <= to, reading only the month files in that range, one at a time.
+   * The scan uses this for its lookback window instead of loading every stored month.
+   */
+  loadBarsBetween(from: string, to: string): Promise<CanonicalDailyBar[]>;
+  /**
    * securityId -> sessionDates with a stored daily bar, for one YYYY-MM file only. Streams the
    * month's lines and keeps just those two fields (monthly files are ~100 MB).
    */
@@ -89,6 +94,26 @@ async function readJson<T>(path: string): Promise<T | undefined> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
   }
+}
+
+/** Every YYYY-MM from from's month through to's month (inclusive); empty when to < from. */
+export function monthsBetween(from: string, to: string): string[] {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(from) || !/^\d{4}-\d{2}-\d{2}$/u.test(to)) throw new Error("INVALID_SESSION_DATE");
+  const months: string[] = [];
+  let year = Number(from.slice(0, 4));
+  let month = Number(from.slice(5, 7));
+  const last = to.slice(0, 7);
+  for (let guard = 0; guard < 1200; guard += 1) {
+    const current = `${year}-${String(month).padStart(2, "0")}`;
+    if (current > last) break;
+    months.push(current);
+    month += 1;
+    if (month > 12) {
+      month = 1;
+      year += 1;
+    }
+  }
+  return months;
 }
 
 async function readJsonLines<T>(path: string): Promise<T[]> {
@@ -226,6 +251,14 @@ export class MarketStorage implements MarketStore {
         this.path(`daily-bars/${sessionDate.slice(0, 7)}.jsonl`),
       ).then((bars) => bars.filter((bar) => bar.sessionDate === sessionDate));
     return this.readTree("daily-bars", async (file) => readJsonLines<CanonicalDailyBar>(file));
+  }
+
+  async loadBarsBetween(from: string, to: string): Promise<CanonicalDailyBar[]> {
+    const output: CanonicalDailyBar[] = [];
+    for (const month of monthsBetween(from, to))
+      for (const bar of await readJsonLines<CanonicalDailyBar>(this.path(`daily-bars/${month}.jsonl`)))
+        if (bar.sessionDate >= from && bar.sessionDate <= to) output.push(bar);
+    return output;
   }
 
   async loadDailyBarSessions(month: string): Promise<DailyBarSessionIndex> {

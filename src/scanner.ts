@@ -51,6 +51,30 @@ export const US_EQUITY_CALENDAR: SessionCalendar = {
 
 const SPY_BENCHMARK_TICKER = "SPY";
 const SPY_HISTORY_SESSIONS_REQUIRED = 21;
+/**
+ * Trading sessions of daily bars the scan loads, ending at the scanned session. The longest feature
+ * (MOMENTUM_60D / DRAWDOWN_60D, src/features.ts) needs 61 closes and SPY needs 21; 70 leaves margin.
+ */
+export const SCAN_BAR_LOOKBACK_SESSIONS = 70;
+
+/** First date of the window that holds `sessions` eligible sessions ending at sessionDate. */
+export function scanBarWindowStart(
+  sessionDate: string,
+  calendar: SessionCalendar,
+  sessions: number = SCAN_BAR_LOOKBACK_SESSIONS,
+): string {
+  const date = new Date(`${sessionDate}T00:00:00.000Z`);
+  if (Number.isNaN(date.getTime())) throw new Error("INVALID_SESSION_DATE");
+  let found = 0;
+  for (let guard = 0; guard < 3660; guard += 1) {
+    const day = date.toISOString().slice(0, 10);
+    const kind = calendar.getSession(day).kind;
+    if (kind === "NORMAL" || kind === "HALF_DAY") found += 1;
+    if (found >= sessions) return day;
+    date.setUTCDate(date.getUTCDate() - 1);
+  }
+  return date.toISOString().slice(0, 10);
+}
 
 export function resolveSpyBenchmarkId(
   securities: readonly SecurityMasterRecord[],
@@ -293,7 +317,11 @@ export class MarketsScanner {
     const incomplete = ids.filter((id) => !received.has(id)).length;
     if (incomplete) failures.push(`MISSING_SECURITY_EVIDENCE:${incomplete}`);
     const securities = await refreshEligibility(this.storage);
-    const allBars = await this.storage.loadBars();
+    // Only the lookback window (was every stored month, ~5.6M rows: the scan ran out of heap).
+    const allBars = await this.storage.loadBarsBetween(
+      scanBarWindowStart(sessionDate, this.calendar),
+      sessionDate,
+    );
     // Daily-bars pack alongside the JSONL write (which is unchanged): not gated on grouped Reply Dust;
     // bound to the day's grouped Dust when sealed, otherwise a pure pack. A different existing pack or
     // any write error FAILS the run (non-zero exit) with a code and the session date only.
