@@ -44,6 +44,11 @@ on:
         description: "backfill only: trading sessions per chunk (each chunk has its own checkpoint and ticker refresh)"
         required: false
         default: "150"
+      backfill_reopen_inactive_tails:
+        description: "backfill only: opt-in reopen stored sessions for INACTIVE names and corporate actions (default false)"
+        required: false
+        default: false
+        type: boolean
       tenmin_history_reopen:
         description: "tenmin_history only: reopen sealed ranges to retry gaps + new securities (default off)"
         required: false
@@ -501,7 +506,8 @@ jobs:
           BACKFILL_MAX_SESSIONS: ${{ github.event.inputs.max_sessions }}
           BACKFILL_REQUEST_SPACING_MS: ${{ github.event.inputs.backfill_request_spacing_ms }}
           BACKFILL_CHUNK_SESSIONS: ${{ github.event.inputs.backfill_chunk_sessions }}
-        run: pnpm backfill --from "$MARKETS_BACKFILL_FROM" --to "$MARKETS_BACKFILL_TO" --max-sessions "$BACKFILL_MAX_SESSIONS" --request-spacing-ms "$BACKFILL_REQUEST_SPACING_MS" --chunk-sessions "$BACKFILL_CHUNK_SESSIONS" --budget-ms 6600000
+          BACKFILL_REOPEN_INACTIVE_TAILS: ${{ github.event.inputs.backfill_reopen_inactive_tails }}
+        run: pnpm backfill --from "$MARKETS_BACKFILL_FROM" --to "$MARKETS_BACKFILL_TO" --max-sessions "$BACKFILL_MAX_SESSIONS" --request-spacing-ms "$BACKFILL_REQUEST_SPACING_MS" --chunk-sessions "$BACKFILL_CHUNK_SESSIONS" --reopen-inactive-tails "$BACKFILL_REOPEN_INACTIVE_TAILS" --budget-ms 6600000
 
   # Dispatch only: never on this workflow's schedule. Shares peacestocks-r2-writer concurrency with
   # scan/backfill so it queues behind (or ahead of) them; the host also yields via scanYieldReason.

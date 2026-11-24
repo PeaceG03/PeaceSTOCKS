@@ -146,6 +146,14 @@ session's bars are stored before it is marked complete.
   (it skips sessions that already have a pack). The month JSONL file is still rewritten per
   session; that's unchanged.
 
+## Reopening stored sessions for INACTIVE tails (`--reopen-inactive-tails`)
+
+- **Opt-in only (default `false`):** `scanner.yml` input `backfill_reopen_inactive_tails` (CLI `--reopen-inactive-tails`) revisits already-stored sessions without changing default `mode=backfill` behavior.
+- **Checkpointing and safety guards:** Reopen progress is stored separately in `backfill-reopen-state.json` (corrupt state refuses rather than resetting); finished chunks are skipped before `refreshUniverse`; `checkSealedDailyBarsPack` runs pre-write before fetching or appending bars; month JSONL writes are additive, byte-for-byte line- and order-preserving, no-op on zero new keys, and SHA/ETag-checked (`putIfAbsent`/`putIfMatch`).
+- **INACTIVE-only and symbol-collision guard:** Reopen mode appends bars **only** for `INACTIVE` members and skips any candidate whose ticker on that session already matches any stored bar on that date (re-FIGI collision guard), while refreshing point-in-time corporate actions (`getCorporateActions(sessionDate, memberIds)`).
+- **Final sealed test:** The final held-out sealed test runs on post-backfill data. `HeldOutSeal` (`src/research-folds.ts`) hashes window dates only, so appending `INACTIVE` bars in `>= 2026-08-27` does not invalidate or alter the seal.
+- **Known limitation:** `INACTIVE` records in `security-master.json` currently carry `inactiveAt` without `listingDate` or `delistedAt` (open-ended membership bounded by `inactiveAt` and the grouped-daily reply), and `INACTIVE` names whose ticker an `ACTIVE` name now holds still receive no bars during reopen.
+
 ## How to verify after each chunk
 
 1. The run is green, and its backfill summary shows completed = chunk sessions and `failedSessions` empty.

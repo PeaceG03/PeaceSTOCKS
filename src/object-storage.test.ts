@@ -129,3 +129,85 @@ test("appendBars only touches the months being written", async () => {
   assert.equal((await storage.loadBars("2026-02-03")).length, 1);
   assert.equal((await storage.loadBars("2026-01-22")).length, 1);
 });
+
+test("appendBars is a no-op when 0 new bar keys exist, preserves existing lines byte-for-byte, and refuses SHA/ETag drift", async () => {
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
+  const idA = securityId("fixture-provider", "issuer-1", "STOCK");
+  const idB = securityId("fixture-provider", "issuer-2", "STOCK");
+  const key = "permanent/daily-bars/2026-01.jsonl";
+  // Seed an existing line with custom key spacing to prove existing lines stay byte-for-byte untouched.
+  const rawExisting = JSON.stringify(bar(idA, "2026-01-22", 100)).replace(":", ": ");
+  await client.put(key, new TextEncoder().encode(rawExisting + "\n"));
+  const beforeNoop = await client.getWithEtag(key);
+  let putCount = 0;
+  let putIfMatchCount = 0;
+  const origPut = client.put.bind(client);
+  const origPutIfMatch = client.putIfMatch.bind(client);
+  client.put = async (k, b, m) => { putCount += 1; return origPut(k, b, m); };
+  client.putIfMatch = async (k, b, e) => { putIfMatchCount += 1; return origPutIfMatch(k, b, e); };
+  // Duplicate key: 0 new bar keys => 0 writes and unchanged ETag.
+  await storage.appendBars([bar(idA, "2026-01-22", 999)]);
+  assert.equal(putCount, 0);
+  assert.equal(putIfMatchCount, 0);
+  assert.equal((await client.getWithEtag(key))?.etag, beforeNoop?.etag);
+  // Adding a new key uses putIfMatch (1 write) and preserves the existing raw line verbatim.
+  await storage.appendBars([bar(idB, "2026-01-22", 50)]);
+  assert.equal(putIfMatchCount, 1);
+  assert.equal(putCount, 1); // MemoryObjectClient.putIfMatch delegates to this.put
+  const afterAdd = new TextDecoder().decode((await client.get(key))!).split("\n").filter(Boolean);
+  assert.equal(afterAdd.length, 2);
+  assert.ok(afterAdd.includes(rawExisting), "existing raw line preserved byte-for-byte");
+  // Simulate concurrent SHA/ETag drift between read and write (putIfMatch path).
+  const idC = securityId("fixture-provider", "issuer-3", "STOCK");
+  const origGetWithEtag = client.getWithEtag.bind(client);
+  client.getWithEtag = async (k) => {
+    const res = await origGetWithEtag(k);
+    if (k === key && res) {
+      await origPut(key, new TextEncoder().encode(new TextDecoder().decode(res.body) + "{\"securityId\":\"concurrent\",\"sessionDate\":\"2026-01-22\",\"revision\":1}\n"));
+    }
+    return res;
+  };
+  await assert.rejects(() => storage.appendBars([bar(idC, "2026-01-22", 60)]), /DAILY_BARS_MONTH_SHA_DRIFT/);
+  // Fallback client without getWithEtag/putIfMatch still checks SHA before put.
+  const noEtagClient = new MemoryObjectClient();
+  await noEtagClient.put(key, new TextEncoder().encode(rawExisting + "\n"));
+  const origNoEtagGet = noEtagClient.get.bind(noEtagClient);
+  const origNoEtagPut = noEtagClient.put.bind(noEtagClient);
+  let reads = 0;
+  const fallbackClient = {
+    get: async (k: string) => {
+      const res = await origNoEtagGet(k);
+      reads += 1;
+      if (k === key && res && reads === 1) {
+        await origNoEtagPut(key, new TextEncoder().encode(new TextDecoder().decode(res) + "{\"securityId\":\"drift\",\"sessionDate\":\"2026-01-22\",\"revision\":1}\n"));
+      }
+      return res;
+    },
+    put: origNoEtagPut,
+    head: noEtagClient.head.bind(noEtagClient),
+    delete: noEtagClient.delete.bind(noEtagClient),
+    list: noEtagClient.list.bind(noEtagClient),
+  };
+  await assert.rejects(() => new ObjectMarketStorage(fallbackClient).appendBars([bar(idC, "2026-01-22", 60)]), /DAILY_BARS_MONTH_SHA_DRIFT/);
+});
+
+test("appendBars preserves relative order of existing lines and refuses unsorted existing order drift", async () => {
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
+  const idA = securityId("fixture-provider", "issuer-a", "STOCK");
+  const idB = securityId("fixture-provider", "issuer-b", "STOCK");
+  const idC = securityId("fixture-provider", "issuer-c", "STOCK");
+  const key = "permanent/daily-bars/2026-01.jsonl";
+  const lA = JSON.stringify(bar(idA, "2026-01-22", 10));
+  const lC = JSON.stringify(bar(idC, "2026-01-22", 30));
+  // Sorted existing lines [A, C] + inserting B preserves A before C.
+  await client.put(key, new TextEncoder().encode(`${lA}\n${lC}\n`));
+  await storage.appendBars([bar(idB, "2026-01-22", 20)]);
+  const after = new TextDecoder().decode((await client.get(key))!).split("\n").filter(Boolean);
+  assert.ok(after.indexOf(lA) < after.indexOf(lC));
+  // Unsorted existing lines [C, A] + inserting another key refuses order drift.
+  const idD = securityId("fixture-provider", "issuer-d", "STOCK");
+  await client.put(key, new TextEncoder().encode(`${lC}\n${lA}\n`));
+  await assert.rejects(() => storage.appendBars([bar(idD, "2026-01-22", 40)]), /DAILY_BARS_MONTH_ORDER_DRIFT/);
+});

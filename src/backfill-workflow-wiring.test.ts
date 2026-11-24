@@ -10,6 +10,9 @@ import test from "node:test";
 import { backfillChunks, backfillJobMain, parseBackfillJobArgs, type BackfillJobCliDeps } from "./backfill-job-cli";
 import { FAKE_MASSIVE_BASE_URL, fakeMassive, syntheticMarket } from "./fake-massive";
 import { dailyBarsSidecarFileKey } from "./daily-bars-sidecar";
+import { writeDailyReplyDust } from "./daily-reply-dust";
+import { MassiveMarketProvider } from "./massive-provider";
+import { refreshUniverse } from "./universe";
 import { MemoryObjectClient } from "./object-store";
 import { ObjectMarketStorage } from "./object-storage";
 
@@ -174,4 +177,80 @@ test("main only: on Actions the job refuses any ref but main (even with a key); 
   // Past the guard on main (stops at the next refusal: no key).
   await assert.rejects(backfillJobMain(args, { GITHUB_ACTIONS: "true", GITHUB_REF: "refs/heads/main" }, {}), /MASSIVE_API_KEY_REQUIRED/u);
   await assert.rejects(backfillJobMain(args, {}, {}), /MASSIVE_API_KEY_REQUIRED/u);
+});
+
+test("workflow wires backfill_reopen_inactive_tails (default false) to --reopen-inactive-tails", () => {
+  assert.match(runStep, /BACKFILL_REOPEN_INACTIVE_TAILS: \$\{\{ github\.event\.inputs\.backfill_reopen_inactive_tails \}\}/u);
+  assert.ok(runLine.includes("--reopen-inactive-tails "), "runLine passes --reopen-inactive-tails");
+  assert.match(
+    yml,
+    /backfill_reopen_inactive_tails:\n {8}description: [^\n]+\n {8}required: false\n {8}default: false\n {8}type: boolean\n/u,
+  );
+  assert.equal(parseBackfillJobArgs(["--from", "2026-01-20", "--to", "2026-01-21", "--reopen-inactive-tails", "false"]).reopenInactiveTails, undefined);
+  assert.equal(parseBackfillJobArgs(["--from", "2026-01-20", "--to", "2026-01-21", "--reopen-inactive-tails", "true"]).reopenInactiveTails, true);
+  assert.equal(parseBackfillJobArgs(["--from", "2026-01-20", "--to", "2026-01-21", "--reopen-inactive-tails"]).reopenInactiveTails, true);
+  assert.throws(() => parseBackfillJobArgs(["--from", "2026-01-20", "--to", "2026-01-21", "--reopen-inactive-tails", "maybe"]), /BACKFILL_ARG_INVALID:reopen-inactive-tails/u);
+});
+
+test("CLI --reopen-inactive-tails counts Dust-cached reopened sessions toward --max-sessions across chunks", async () => {
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
+  const market = syntheticMarket(4);
+  const tickers = [...market.tickers, { ticker: "GONE", figi: "FIGI0000GONE", type: "CS" as const, active: false, delistedDate: "2026-01-27" }];
+  const grouped = (day: string) => [...market.grouped(day), { T: "GONE", o: 5, h: 5.5, l: 4.5, c: 4.8, v: 500 }];
+  const seedFake = fakeMassive({ tickers, grouped });
+  const seedProvider = new MassiveMarketProvider({
+    apiKey: "fake-key-not-real",
+    baseUrl: FAKE_MASSIVE_BASE_URL,
+    fetchImpl: seedFake.fetchImpl,
+    minRequestIntervalMs: 0,
+    retryBackoffMs: 0,
+    keepRawReplies: true,
+    now: () => "2026-01-28T00:00:00.000Z",
+  });
+  await refreshUniverse(seedProvider, storage, "2026-01-26");
+  const activeIds = (await storage.loadSecurities()).filter((s) => s.status === "ACTIVE").map((s) => s.securityId);
+  for (const d of ["2026-01-20", "2026-01-21", "2026-01-22", "2026-01-23", "2026-01-26"]) {
+    const bars = await seedProvider.getDailyBars(d, activeIds);
+    const raw = seedProvider.takeRawReplies()[0]!;
+    await writeDailyReplyDust(client, raw, { provider: seedProvider.providerName, observedAt: bars[0]!.observedAt });
+    await storage.appendBars(bars);
+  }
+  const fake = fakeMassive({ tickers, grouped });
+  let now = Date.parse("2026-11-24T12:00:00Z");
+  const lines: string[] = [];
+  const deps: BackfillJobCliDeps = {
+    storage,
+    store: client,
+    fetchImpl: fake.fetchImpl,
+    baseUrl: FAKE_MASSIVE_BASE_URL,
+    clock: () => now,
+    sleep: async (ms) => { await new Promise((r) => setImmediate(r)); now += ms; },
+    now: () => new Date(now).toISOString(),
+    zstdVersionProbe: () => "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***",
+    scanYield: async () => undefined,
+    log: (l) => lines.push(l),
+    report: async () => "SKIPPED",
+  };
+  const runArgs = workflowArgs({
+    MARKETS_BACKFILL_FROM: "2026-01-20",
+    MARKETS_BACKFILL_TO: "2026-01-26",
+    BACKFILL_MAX_SESSIONS: "3",
+    BACKFILL_REQUEST_SPACING_MS: "0",
+    BACKFILL_CHUNK_SESSIONS: "2",
+    BACKFILL_REOPEN_INACTIVE_TAILS: "true",
+  });
+  const first = await backfillJobMain(runArgs, env, deps);
+  assert.equal(first.exitCode, 0);
+  assert.equal(fake.calls.grouped.length, 0, "0 grouped calls with Reply Dust");
+  assert.equal(first.chunks.length, 2);
+  assert.equal(first.chunks[0]!.completedThisRun, 2);
+  assert.equal(first.chunks[1]!.completedThisRun, 1);
+  assert.equal(first.chunks[1]!.stopReason, "MAX_SESSIONS");
+  const second = await backfillJobMain(runArgs, env, deps);
+  assert.equal(second.exitCode, 0);
+  assert.equal(second.chunks[0]!.requests, 0, "chunk 1 skipped before refreshUniverse");
+  assert.equal(second.chunks[1]!.completedThisRun, 1);
+  assert.equal(second.chunks[2]!.completedThisRun, 1);
+  assert.equal(second.chunks[2]!.status, "COMPLETE");
 });

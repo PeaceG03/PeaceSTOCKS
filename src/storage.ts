@@ -79,6 +79,8 @@ export interface MarketStore {
   saveSchedulerState(state: unknown): Promise<void>;
   loadBackfillProgress(): Promise<unknown>;
   saveBackfillProgress(state: unknown): Promise<void>;
+  loadBackfillReopenProgress?(): Promise<unknown>;
+  saveBackfillReopenProgress?(state: unknown): Promise<void>;
   tallyBarCounts(): Promise<Map<string, number>>;
 }
 
@@ -616,6 +618,17 @@ export class MarketStorage implements MarketStore {
   async saveBackfillProgress(state: unknown): Promise<void> {
     await this.atomicWrite(
       join(this.root, "backfill-state.json"),
+      JSON.stringify(state, null, 2) + "\n",
+    );
+  }
+
+  async loadBackfillReopenProgress(): Promise<unknown> {
+    return readJson(join(this.root, "backfill-reopen-state.json"));
+  }
+
+  async saveBackfillReopenProgress(state: unknown): Promise<void> {
+    await this.atomicWrite(
+      join(this.root, "backfill-reopen-state.json"),
       JSON.stringify(state, null, 2) + "\n",
     );
   }

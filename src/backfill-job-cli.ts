@@ -38,6 +38,7 @@ export interface BackfillJobCliOptions {
   maxSessions?: number;
   requestSpacingMs: number;
   budgetMs: number;
+  reopenInactiveTails?: boolean;
 }
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/u;
@@ -59,12 +60,29 @@ function integer(text: string | undefined, name: string, fallback: number | unde
   return n;
 }
 
+function booleanFlag(args: readonly string[], name: string, envValue?: string): boolean {
+  const i = args.indexOf(`--${name}`);
+  if (i >= 0) {
+    const next = args[i + 1];
+    if (next === undefined || next.startsWith("--")) return true;
+    const v = next.trim().toLowerCase();
+    if (v === "" || v === "false" || v === "0") return false;
+    if (v === "true" || v === "1") return true;
+    throw new Error(`BACKFILL_ARG_INVALID:${name}`);
+  }
+  const e = envValue?.trim().toLowerCase() ?? "";
+  if (e === "" || e === "false" || e === "0") return false;
+  if (e === "true" || e === "1") return true;
+  throw new Error(`BACKFILL_ARG_INVALID:${name}`);
+}
+
 export function parseBackfillJobArgs(args: readonly string[], env: NodeJS.ProcessEnv = {}): BackfillJobCliOptions {
   const from = value(args, "from") ?? env.MARKETS_BACKFILL_FROM;
   const to = value(args, "to") ?? env.MARKETS_BACKFILL_TO;
   if (!from || !to) throw new Error("BACKFILL_RANGE_REQUIRED");
   if (!DATE.test(from) || !DATE.test(to) || from > to) throw new Error("BACKFILL_RANGE_INVALID");
   const maxSessions = integer(value(args, "max-sessions"), "max-sessions", undefined, 1, 100_000);
+  const reopenInactiveTails = booleanFlag(args, "reopen-inactive-tails", env.BACKFILL_REOPEN_INACTIVE_TAILS);
   return {
     from,
     to,
@@ -72,6 +90,7 @@ export function parseBackfillJobArgs(args: readonly string[], env: NodeJS.Proces
     ...(maxSessions !== undefined ? { maxSessions } : {}),
     requestSpacingMs: integer(value(args, "request-spacing-ms"), "request-spacing-ms", DEFAULT_REQUEST_SPACING_MS, 0, 600_000)!,
     budgetMs: integer(value(args, "budget-ms"), "budget-ms", DEFAULT_BUDGET_MS, 1, 86_400_000)!,
+    ...(reopenInactiveTails ? { reopenInactiveTails: true } : {}),
   };
 }
 
@@ -134,7 +153,9 @@ export async function backfillJobMain(args: readonly string[], env: NodeJS.Proce
   const started = clock();
   const scanYield = deps.scanYield ?? (env.GITHUB_ACTIONS === "true" ? createScanYieldCheck({ env }) : async () => undefined);
   // Sessions fetched = grouped-daily requests sent (one per fetched session; a stored session sends none).
+  // When reopenInactiveTails is enabled, Dust-cached reopened sessions also count toward --max-sessions.
   let fetched = 0;
+  let reopened = 0;
   const baseFetch = deps.fetchImpl ?? fetch;
   let lastRequestAt: number | undefined;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -152,7 +173,8 @@ export async function backfillJobMain(args: readonly string[], env: NodeJS.Proce
   // The backfill asks this at the start, at ticker-page boundaries and before every session it would
   // fetch: the caps stop at the next boundary, never mid-session.
   const shouldYield = async (): Promise<string | undefined> => {
-    if (options.maxSessions !== undefined && fetched >= options.maxSessions) return JOB_YIELD_MAX_SESSIONS;
+    const used = options.reopenInactiveTails ? reopened : fetched;
+    if (options.maxSessions !== undefined && used >= options.maxSessions) return JOB_YIELD_MAX_SESSIONS;
     if (clock() - started >= options.budgetMs) return JOB_YIELD_BUDGET;
     return scanYield();
   };
@@ -177,6 +199,8 @@ export async function backfillJobMain(args: readonly string[], env: NodeJS.Proce
         shouldYield,
         env,
         ...(deps.zstdVersionProbe ? { zstdVersionProbe: deps.zstdVersionProbe } : {}),
+        ...(options.reopenInactiveTails ? { reopenInactiveTails: true, onSessionAttempt: () => { reopened += 1; } } : {}),
+        ...(options.reopenInactiveTails && options.maxSessions !== undefined ? { maxSessions: Math.max(0, options.maxSessions - reopened) } : {}),
       });
       reports.push(r);
       log(JSON.stringify({
@@ -186,6 +210,11 @@ export async function backfillJobMain(args: readonly string[], env: NodeJS.Proce
         shaMismatches: r.shaMismatches, packConflicts: r.packConflicts, packCheckFailures: r.packCheckFailures,
         failedSessions: Object.fromEntries(Object.entries(r.failedSessions).map(([d, m]) => [d, classifyStop(m)])),
         requests: r.requests, minRequestGapMs: r.minRequestGapMs, survivorship: r.backfill.survivorship,
+        ...(r.backfill.reopenAddedByStatus ? {
+          reopenAddedByStatus: r.backfill.reopenAddedByStatus,
+          reopenSkippedCollisionByStatus: r.backfill.reopenSkippedCollisionByStatus,
+          reopenSkippedNonInactiveByStatus: r.backfill.reopenSkippedNonInactiveByStatus,
+        } : {}),
       }));
       if (r.status === "REFUSED_SHA_MISMATCH" || r.status === "REFUSED_PACK_CONFLICT") {
         exitCode = 3;
