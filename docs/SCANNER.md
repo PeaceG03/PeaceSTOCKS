@@ -81,7 +81,10 @@ The pick lists are stock lists: only security-master records with `assetType` ST
 before split adjustment, the floor and features. They stay in the security master and the stored
 bars, so SPY (`resolveSpyBenchmarkId`, assetType ETF) is still the market benchmark for relative
 strength and the held-out eval. Funds other than ETFs never reach the master: ingestion keeps only
-the provider's common-stock (CS) and ETF types. The scan reports `NON_STOCK_EXCLUDED:<n>` in its
+the provider's common-stock (CS) and ETF types, so ETN, FUND, ETV/ETS, ADR, preferred, warrant, right
+and unit records are dropped (src/fund-types-ingestion.test.ts). Limit: the security master keeps no
+issuer name, and the local data has no second type field, so an ETN or closed-end fund that the
+provider itself types as CS would enter the stock lists; there is no name-based check. The scan reports `NON_STOCK_EXCLUDED:<n>` in its
 skips, and production lists' configFingerprint names the rule (`listAssetType: STOCK`).
 
 ## Eligibility floor
