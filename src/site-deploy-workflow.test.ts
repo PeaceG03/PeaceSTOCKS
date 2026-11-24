@@ -45,7 +45,6 @@ test("site deploy workflow: Access is set up and read back before the deploy, wh
   assert.match(deployStep, /ACCESS_AUD: \$\{\{ steps\.access\.outputs\.aud \}\}/u);
   assert.match(deployStep, /ACCESS_TEAM_DOMAIN: \$\{\{ steps\.access\.outputs\.team_domain \}\}/u);
   assert.match(deployStep, /--var "ACCESS_AUD:\$\{ACCESS_AUD\}" --var "ACCESS_TEAM_DOMAIN:\$\{ACCESS_TEAM_DOMAIN\}"/u);
-  assert.match(deployStep, /CLOUDFLARE_API_TOKEN: \$\{\{ secrets\.CLOUDFLARE_API_TOKEN \}\}/u);
 });
 
 test("site deploy workflow: only read-only R2 keys reach the Worker; nothing secret is echoed", () => {
@@ -320,5 +319,73 @@ test("site deploy post-check: passing on 401/403 warns that Access may be off (o
     const ok = runPostCheck(`echo "${code} - 0"`);
     assert.equal(ok.status, 0, ok.out);
     assert.match(ok.out, new RegExp(`::warning::https://stocks\\.example\\.test/ answered ${code}, not a redirect to the Access login: Access may be off, and only the Worker's own JWT check is refusing`, "u"));
+  }
+});
+
+/** Runs the trim step's `node -e` script and returns what it wrote to GITHUB_ENV. */
+function runTrimScript(env: Record<string, string>): { status: number; out: string; githubEnv: string } {
+  const step = block("Trim Cloudflare API token and account id");
+  const line = step.split("\n").find((l) => l.trim().startsWith("node -e "));
+  assert.ok(line, "the step trims with node -e");
+  const dir = mkdtempSync(join(tmpdir(), "cftrim-"));
+  try {
+    const githubEnv = join(dir, "github.env");
+    writeFileSync(githubEnv, "");
+    const result = spawnSync("bash", ["-e", "-c", line!.trim()], {
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", GITHUB_ENV: githubEnv, ...env },
+      encoding: "utf8",
+    });
+    return { status: result.status ?? -1, out: `${result.stdout}${result.stderr}`, githubEnv: readFileSync(githubEnv, "utf8") };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("site deploy workflow: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are trimmed into GITHUB_ENV before Access and wrangler", () => {
+  const trimAt = workflow.indexOf("- name: Trim Cloudflare API token and account id");
+  const access = workflow.indexOf("- name: Cloudflare Access app");
+  const deploy = workflow.indexOf("- name: Deploy Worker");
+  const secrets = workflow.indexOf("- name: Worker secrets");
+  assert.ok(trimAt > 0 && trimAt < access && access < deploy && deploy < secrets, "trim runs before Access, deploy, and Worker secrets");
+
+  const trim = block("Trim Cloudflare API token and account id");
+  assert.match(trim, /CLOUDFLARE_API_TOKEN: \$\{\{ secrets\.CLOUDFLARE_API_TOKEN \}\}/u);
+  assert.match(trim, /CLOUDFLARE_ACCOUNT_ID: \$\{\{ secrets\.PEACESTOCKS_R2_ACCOUNT_ID \}\}/u);
+  assert.match(trim, /GITHUB_ENV/u);
+  assert.doesNotMatch(trim, /\bset -x\b/u);
+  assert.doesNotMatch(trim, /echo[^\n]*\$CLOUDFLARE_(API_TOKEN|ACCOUNT_ID)/u);
+  assert.doesNotMatch(trim, /cat[^\n]*GITHUB_ENV/u);
+
+  // Later steps must not re-assign these from secrets: that would put the untrimmed value back.
+  for (const name of ["Cloudflare Access app", "Deploy Worker", "Worker secrets"]) {
+    const step = block(name);
+    assert.doesNotMatch(step, /CLOUDFLARE_API_TOKEN: \$\{\{ secrets\./u, name);
+    assert.doesNotMatch(step, /CLOUDFLARE_ACCOUNT_ID: \$\{\{ secrets\./u, name);
+  }
+
+  const result = runTrimScript({
+    CLOUDFLARE_API_TOKEN: "  tok_abc\n",
+    CLOUDFLARE_ACCOUNT_ID: "\tacct123\r\n",
+  });
+  assert.equal(result.status, 0, result.out);
+  assert.match(result.githubEnv, /CLOUDFLARE_API_TOKEN<<EOF_CLOUDFLARE_API_TOKEN\ntok_abc\nEOF_CLOUDFLARE_API_TOKEN/u);
+  assert.match(result.githubEnv, /CLOUDFLARE_ACCOUNT_ID<<EOF_CLOUDFLARE_ACCOUNT_ID\nacct123\nEOF_CLOUDFLARE_ACCOUNT_ID/u);
+  assert.doesNotMatch(result.out, /tok_abc/u);
+  assert.doesNotMatch(result.out, /acct123/u);
+});
+
+test("site deploy workflow: a Cloudflare credential that is empty after trimming stops the step, naming it only", () => {
+  for (const name of ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"] as const) {
+    for (const value of [" \n", undefined]) {
+      const env: Record<string, string> = { CLOUDFLARE_API_TOKEN: "tok_abc", CLOUDFLARE_ACCOUNT_ID: "acct123" };
+      if (value === undefined) delete env[name];
+      else env[name] = value;
+      const result = runTrimScript(env);
+      assert.notEqual(result.status, 0, `${name}=${JSON.stringify(value)}`);
+      assert.equal(result.githubEnv, "", "nothing written to GITHUB_ENV");
+      assert.match(result.out, new RegExp(`::error::${name} is missing or empty after trimming`, "u"));
+      assert.doesNotMatch(result.out, /tok_abc/u);
+      assert.doesNotMatch(result.out, /acct123/u);
+    }
   }
 });
