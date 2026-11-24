@@ -259,3 +259,14 @@ test("access setup: two apps on the hostname is an error, and nothing is changed
   assert.deepEqual(writes(cf.calls), [], "no PUT/POST before the error");
   assert.deepEqual({ apps: [...cf.apps], policies: [...cf.policies] }, before);
 });
+
+test("access setup: two policies with our name is an error, and nothing is changed", async () => {
+  const cf = fakeCloudflare();
+  cf.policies.set("pol-a", { id: "pol-a", name: SITE_ACCESS_POLICY_NAME, decision: "allow", include: [{ email: { email: "old@example.test" } }], exclude: [], require: [] });
+  cf.policies.set("pol-b", { id: "pol-b", name: SITE_ACCESS_POLICY_NAME, decision: "allow", include: [{ everyone: {} }], exclude: [], require: [] });
+  cf.apps.set("app-ours", { id: "app-ours", name: SITE_ACCESS_APP_NAME, type: "self_hosted", domain: HOST, aud: "aud-ours", policies: [{ id: "pol-b" }] });
+  const before = structuredClone({ apps: [...cf.apps], policies: [...cf.policies] });
+  await assert.rejects(setupSiteAccess(input(cf.fetchImpl)), /more than one Access policy named "PeaceSTOCKS site owner"/u);
+  assert.deepEqual(writes(cf.calls), [], "no PUT/POST before the error");
+  assert.deepEqual({ apps: [...cf.apps], policies: [...cf.policies] }, before);
+});
