@@ -89,6 +89,7 @@ const REASON_WORDS: Record<string, string> = {
   FLOOR_PRICE: "price under $5",
   FLOOR_DOLLAR_VOLUME: "dollar volume under $5M",
   FLOOR_HISTORY: "under 60 sessions of history",
+  FLOOR_NO_BAR_ON_SESSION: "no bar on the session",
   SPLIT_UNRECONCILED: "split records disagree",
   PRICE_GAP_UNEXPLAINED: "unexplained price gap",
   SPLIT_LIKE_MOVE_UNRECORDED: "split-like move with no record",

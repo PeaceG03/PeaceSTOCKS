@@ -81,17 +81,22 @@ The pick lists are stock lists: only security-master records with `assetType` ST
 before split adjustment, the floor and features. They stay in the security master and the stored
 bars, so SPY (`resolveSpyBenchmarkId`, assetType ETF) is still the market benchmark for relative
 strength and the held-out eval. Funds other than ETFs never reach the master: ingestion keeps only
-the provider's common-stock (CS) and ETF types. The scan reports `NON_STOCK_EXCLUDED:<n>` in its
+the provider's common-stock (CS) and ETF types, so ETN, FUND, ETV/ETS, ADR, preferred, warrant, right
+and unit records are dropped (src/fund-types-ingestion.test.ts). Limit: the security master keeps no
+issuer name, and the local data has no second type field, so an ETN or closed-end fund that the
+provider itself types as CS would enter the stock lists; there is no name-based check. The scan reports `NON_STOCK_EXCLUDED:<n>` in its
 skips, and production lists' configFingerprint names the rule (`listAssetType: STOCK`).
 
 ## Eligibility floor
 
-Every stock list is drawn only from names that pass a fixed floor (`config/eligibility-floor-v1.json`,
-`src/eligibility-floor.ts`). It was set before looking at the held-out window and is not tuned on it:
+Every stock list is drawn only from names that pass a fixed floor (`config/eligibility-floor-v2.json`,
+`src/eligibility-floor.ts`). Its thresholds are v1's, set before looking at the held-out window and not
+tuned on it; v2 adds only the bar-on-session rule:
 
 | Rule | Value |
 | --- | --- |
-| Price | split-adjusted last close on or before the scanned session >= $5 (`minLastCloseUsd`) |
+| Bar on the session | the name has a stored bar on the scanned session (`requireBarOnSession`, v2): a halted or missing name is not passed on an earlier close (`FLOOR_NO_BAR_ON_SESSION`) |
+| Price | split-adjusted last close (on the scanned session) >= $5 (`minLastCloseUsd`) |
 | Liquidity | median dollar volume (close x volume) of the last 20 bars >= $5,000,000 (`minMedianDollarVolumeUsd`, `dollarVolumeSessions`) |
 | History | >= 60 sessions with a stored bar in the scan's 100-session bar window (`minHistorySessions`) |
 
@@ -99,7 +104,9 @@ The floor is applied after split adjustment (dollar volume is unchanged by it) a
 and ranking, so a name below it is in no list. The scan reports the count as
 `ELIGIBILITY_FLOOR_EXCLUDED:<n>` in its skips. The floor's version is part of the lists'
 configFingerprint, so lists frozen with it have different predictionIds from lists frozen without it.
-A change to the floor is a new file and version (`eligibility-floor-v2`), never an edit.
+A change to the floor is a new file and version, never an edit: v1 (`eligibility-floor-v1.json`, no
+bar-on-session rule) is kept unchanged; production lists use v2 from 2026-11-24, so their predictionIds
+differ from v1 lists.
 
 ## Current daily feature set
 
@@ -272,23 +279,33 @@ the open, names expected and covered, and the names the eligibility floor and th
 out, by reason. A failed write never fails the scan (the run report says `scanHealth: FAILED:...`).
 The site's Health card shows the newest record under "Nightly scan".
 
+The freeze time (`predictedAt`) is the scanner clock read right before the picks are written, and
+the freeze gate and the on-time figures use that same time. The host's scanner clock is live
+(`hostWallClock`, src/host-write-clock.test.ts): a run that starts before the open and writes
+after it is `UNAVAILABLE / FREEZE_AFTER_OPEN`, not frozen and not on-time. Records written before
+this fix carry the host start time instead (Nov 23: 06:20:10 UTC start, picks written 06:42:58 UTC).
+
 A session misses the freeze when the next session opens without picks frozen before that open
 (frozen late, unavailable, or no decision stored at all, e.g. the scan never ran).
 src/freeze-watch.ts checks the newest 3 judged sessions from their prediction-status records and
 raises the existing alert: the one "PeaceSTOCKS health needs attention" issue (label
 `scanner-alert`, src/health-alert.ts), opened or commented on. A marker under
-`permanent/health/scan/missed-freeze-alerts/<D>.json`, written only after the alert went out, keeps
-it to once per session. It runs as the last step of every scan job and on the hourly :47 tick
+`permanent/health/scan/missed-freeze-alerts/<D>.json` keeps it to once per session: each run claims
+it with one conditional put (`If-None-Match: *`) before alerting, and a 412 means another run
+already alerted, so the scan job's last step and the :47 tick cannot both comment. A failed alert
+deletes its claim so the next run retries; a run killed between the claim and the alert leaves a
+`CLAIMED` marker and no alert for that session (src/freeze-watch-claim.test.ts). It runs as the last step of every scan job and on the hourly :47 tick
 (`freeze_watch` job), so a session whose scan never ran is still reported within the hour after the
 open. No Massive request and no tickers in the alert.
 
 ### Freeze reliability: Oct 13 - Nov 20, 2026 (root cause)
 
 No session from Oct 13 to Nov 20 had picks frozen before the next open. From the scanner.yml run
-history (gh run list/view, scan job logs, codes only): 100 scan-job attempts from Oct 13 to Nov 24;
-every session had 1 to 4 attempts that started after its close and before the next open, so the
-late-firing crons (scheduled runs created hours after 05:30/09:30 UTC) were not the cause. Every
-attempt died in the scan host:
+history (gh run list/view, scan job logs, codes only): 100 scan-job attempts from Oct 13 to Nov 24,
+94 of which died and 6 succeeded (3 on Oct 13, all before that session's close, and 3 on or after the
+Nov 24 catch-up). Every session had 1 to 4 attempts that started after its close and before the next open,
+so the late-firing crons (scheduled runs created hours after 05:30/09:30 UTC) were not the cause.
+The 94 deaths, all in the scan host:
 
 - Oct 14 - Oct 30, 38 attempts: `MARKETS_SCHEDULER_HOST_FAILED:fetch failed` after about 50 min.
   The R2 client had no timeout and no retry, and the scan read the whole stored history, so one
@@ -301,12 +318,16 @@ attempt died in the scan host:
 - Oct 14: one attempt cancelled at the 120 min job limit. Nov 24 02:08 UTC: one attempt failed
   on `DAILY_BARS_PACK_EXISTS_DIFFERENT` while re-collecting sealed sessions.
 
+(38 + 47 + 7 + 1 + 1 = 94.)
+
 Fixed on main on Nov 23 (#114 batch): the body is read inside the retry loop with a size-aware
 timeout (d0b7e3e, src/object-store-body-retry.test.ts), the scan loads only its bar window
-(45ec0e9), a sealed pack is checked before any session write (922e085), the security list is
+(45ea0e9, widened to 100 sessions in 7ce489e), a sealed pack is checked before any session write (922e085), the security list is
 fetched once per run (efb9fb5), and the backlog per run is capped (5b07f04). Run history since:
-the Nov 24 06:19 UTC run caught up the 29 missed sessions as evidence and froze the Nov 23 picks
-at 06:42:58 UTC, 7 h 47 min before the 14:30 UTC open; the two later runs that day found the
+the Nov 24 06:19 UTC run caught up the 29 missed sessions as evidence and wrote the Nov 23 picks
+at 06:42:58 UTC (its `writePredictions` log line), 7 h 47 min before the 14:30 UTC open. That
+record's stored `predictedAt` is 06:20:10 UTC, the host start (the clock was frozen at start until
+the write-time fix above); both are before the open, so Nov 23 is on time either way; the two later runs that day found the
 session complete. The missed sessions stay UNAVAILABLE (evidence only): forward picks cannot be
 made honestly after the fact.
 

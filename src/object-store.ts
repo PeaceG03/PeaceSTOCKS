@@ -15,6 +15,11 @@ export interface ObjectHead {
 export interface ObjectClient {
   get(key: string): Promise<Uint8Array | undefined>;
   put(key: string, body: Uint8Array, metadata?: ObjectMetadata): Promise<void>;
+  /**
+   * Create only (S3/R2 conditional write, If-None-Match: *): true when written, false when the key
+   * already exists. Never overwrites. Optional: only the paper ledger needs it.
+   */
+  putIfAbsent?(key: string, body: Uint8Array): Promise<boolean>;
   /** Size and custom metadata without the body, or undefined if the key does not exist. */
   head(key: string): Promise<ObjectHead | undefined>;
   delete(key: string): Promise<void>;
@@ -121,6 +126,12 @@ export class MemoryObjectClient implements ObjectClient {
     assertObjectMetadata(metadata);
     this.objects.set(key, new Uint8Array(body));
     this.metadata.set(key, { ...metadata });
+  }
+
+  async putIfAbsent(key: string, body: Uint8Array): Promise<boolean> {
+    if (this.objects.has(key)) return false;
+    await this.put(key, body);
+    return true;
   }
 
   async head(key: string): Promise<ObjectHead | undefined> {
@@ -347,6 +358,17 @@ export class R2ObjectClient implements ObjectClient {
     );
     const response = await this.request("PUT", this.endpoint(key), body, amzHeaders);
     if (!response.ok) throw new Error(`R2_PUT_${response.status}`);
+  }
+
+  /**
+   * Create only: PUT with If-None-Match: * (signed). R2 answers 412 when the key exists, so an existing
+   * object is never overwritten, even by a writer outside the workflow's concurrency group.
+   */
+  async putIfAbsent(key: string, body: Uint8Array): Promise<boolean> {
+    const response = await this.request("PUT", this.endpoint(key), body, { "if-none-match": "*" });
+    if (response.status === 412) return false;
+    if (!response.ok) throw new Error(`R2_PUT_${response.status}`);
+    return true;
   }
 
   async head(key: string): Promise<ObjectHead | undefined> {

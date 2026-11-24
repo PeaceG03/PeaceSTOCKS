@@ -133,7 +133,7 @@ export function rankSecurities(
       excluded.push({ securityId: security.securityId, reason: adjusted.excluded });
       continue;
     }
-    const below = floor ? floorExclusion(adjusted.bars, floor) : undefined;
+    const below = floor ? floorExclusion(adjusted.bars, floor, sessionDate) : undefined;
     if (below) floorExcluded.push({ securityId: security.securityId, reason: below });
     else adjustedById.set(security.securityId, adjusted.bars);
   }

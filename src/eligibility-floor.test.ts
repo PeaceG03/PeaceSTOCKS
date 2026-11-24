@@ -6,6 +6,8 @@ import { ELIGIBILITY_FLOOR, ELIGIBILITY_FLOOR_FILE, floorExclusion, parseEligibi
 import { DEFAULT_SCANNER_CONFIG, rankSecurities } from "./ranking";
 
 const floor = ELIGIBILITY_FLOOR;
+/** The scanned session: the last day of every series below. */
+const LAST = "2026-11-20";
 function days(n: number, last = "2026-11-20"): string[] {
   const out: string[] = [];
   for (const d = new Date(`${last}T00:00:00Z`); out.length < n; d.setUTCDate(d.getUTCDate() - 1))
@@ -20,11 +22,12 @@ const series = (n: number, close: (k: number) => number, volume: (k: number) => 
 
 test("floor config: exactly the fixed rule, strictly parsed", () => {
   assert.deepEqual({ ...floor }, {
-    version: "eligibility-floor-v1",
+    version: "eligibility-floor-v2",
     minLastCloseUsd: 5,
     minMedianDollarVolumeUsd: 5_000_000,
     dollarVolumeSessions: 20,
     minHistorySessions: 60,
+    requireBarOnSession: true,
   });
   const base = JSON.parse(readFileSync(ELIGIBILITY_FLOOR_FILE, "utf8")) as Record<string, unknown>;
   const bad = (patch: Record<string, unknown>, drop?: string) => {
@@ -44,22 +47,22 @@ test("floor config: exactly the fixed rule, strictly parsed", () => {
 
 test("floor thresholds: price >= $5, median 20-session dollar volume >= $5M, >= 60 sessions (boundaries inclusive)", () => {
   const ok = (n = 60, price = 5, vol = 1_000_000) => series(n, () => price, () => vol);
-  assert.equal(floorExclusion(ok(), floor), undefined); // exactly $5 x 1M = $5M, exactly 60 sessions
-  assert.equal(floorExclusion(ok(59), floor), "FLOOR_HISTORY");
-  assert.equal(floorExclusion(ok(60, 4.99), floor), "FLOOR_PRICE");
-  assert.equal(floorExclusion(ok(60, 5, 999_999), floor), "FLOOR_DOLLAR_VOLUME");
+  assert.equal(floorExclusion(ok(), floor, LAST), undefined); // exactly $5 x 1M = $5M, exactly 60 sessions
+  assert.equal(floorExclusion(ok(59), floor, LAST), "FLOOR_HISTORY");
+  assert.equal(floorExclusion(ok(60, 4.99), floor, LAST), "FLOOR_PRICE");
+  assert.equal(floorExclusion(ok(60, 5, 999_999), floor, LAST), "FLOOR_DOLLAR_VOLUME");
   // Price is the LAST close: an expensive past does not save a name that is now under $5.
-  assert.equal(floorExclusion(series(60, (k) => (k < 59 ? 50 : 4.5), () => 10_000_000), floor), "FLOOR_PRICE");
-  assert.equal(floorExclusion(series(60, (k) => (k < 59 ? 1 : 6), () => 10_000_000), floor), undefined);
+  assert.equal(floorExclusion(series(60, (k) => (k < 59 ? 50 : 4.5), () => 10_000_000), floor, LAST), "FLOOR_PRICE");
+  assert.equal(floorExclusion(series(60, (k) => (k < 59 ? 1 : 6), () => 10_000_000), floor, LAST), undefined);
   // Dollar volume is the MEDIAN of the LAST 20 bars: one spike does not pass, old liquidity does not count.
-  assert.equal(floorExclusion(series(60, () => 10, (k) => (k === 59 ? 1e12 : 100_000)), floor), "FLOOR_DOLLAR_VOLUME");
-  assert.equal(floorExclusion(series(60, () => 10, (k) => (k < 40 ? 1e9 : 100_000)), floor), "FLOOR_DOLLAR_VOLUME");
-  assert.equal(floorExclusion(series(60, () => 10, (k) => (k >= 40 && k % 2 === 0 ? 100_000 : 600_000)), floor), "FLOOR_DOLLAR_VOLUME"); // median of 20 = (100k+600k)/2 x $10 = $3.5M
-  assert.equal(floorExclusion(series(60, () => 10, (k) => (k >= 40 && k < 49 ? 100_000 : 600_000)), floor), undefined); // 11 of 20 at $6M
+  assert.equal(floorExclusion(series(60, () => 10, (k) => (k === 59 ? 1e12 : 100_000)), floor, LAST), "FLOOR_DOLLAR_VOLUME");
+  assert.equal(floorExclusion(series(60, () => 10, (k) => (k < 40 ? 1e9 : 100_000)), floor, LAST), "FLOOR_DOLLAR_VOLUME");
+  assert.equal(floorExclusion(series(60, () => 10, (k) => (k >= 40 && k % 2 === 0 ? 100_000 : 600_000)), floor, LAST), "FLOOR_DOLLAR_VOLUME"); // median of 20 = (100k+600k)/2 x $10 = $3.5M
+  assert.equal(floorExclusion(series(60, () => 10, (k) => (k >= 40 && k < 49 ? 100_000 : 600_000)), floor, LAST), undefined); // 11 of 20 at $6M
   // The thresholds come from the floor passed in.
   const loose: EligibilityFloor = { ...floor, minLastCloseUsd: 1, minMedianDollarVolumeUsd: 1, minHistorySessions: 10 };
-  assert.equal(floorExclusion(series(10, () => 2, () => 1), loose), undefined);
-  assert.equal(floorExclusion(series(9, () => 2, () => 1), loose), "FLOOR_HISTORY");
+  assert.equal(floorExclusion(series(10, () => 2, () => 1), loose, LAST), undefined);
+  assert.equal(floorExclusion(series(9, () => 2, () => 1), loose, LAST), "FLOOR_HISTORY");
 });
 
 function security(id: string): SecurityMasterRecord {
@@ -120,4 +123,65 @@ test("scan: the floor applies to the frozen lists and the report counts the name
   assert.ok(lists.length > 0);
   for (const list of lists) assert.equal(list.securityIds.includes(ids.thin), false, list.setType);
   assert.ok(lists.find((l) => l.setType === "TOP_15_OVERALL")!.securityIds.includes(ids.a));
+});
+
+test("floor uses the last CLOSE, not the open: fixtures with open != close", () => {
+  // Opens on the wrong side of each threshold: the close decides.
+  const withOpen = (closeAt: number, openAt: number, volume = 1_000_000) =>
+    days(60).map((d) => ({ ...bar("o", d, closeAt, volume), open: openAt, high: Math.max(openAt, closeAt), low: Math.min(openAt, closeAt) }) as CanonicalDailyBar);
+  assert.equal(floorExclusion(withOpen(4.99, 6), floor, LAST), "FLOOR_PRICE"); // opened above $5, closed under
+  assert.equal(floorExclusion(withOpen(5, 4), floor, LAST), undefined); // opened under $5, closed at $5
+  // Dollar volume is close x volume: $4 open x 1.5M = $6M would pass, $3 close x 1.5M = $4.5M does not.
+  assert.equal(floorExclusion(withOpen(3, 4, 1_500_000), { ...floor, minLastCloseUsd: 1 }, LAST), "FLOOR_DOLLAR_VOLUME");
+  assert.equal(floorExclusion(withOpen(4, 3, 1_500_000), { ...floor, minLastCloseUsd: 1 }, LAST), undefined);
+});
+
+test("floor uses split-adjusted bars: a split that crosses $5 (ranking end to end)", () => {
+  const n = 80;
+  const dates = days(n);
+  const D = dates.at(-1)!;
+  const splitDay = dates[n - 10]!;
+  const liquid = Array.from({ length: 5 }, (_, i) => `liq_${i}`);
+  // fwd: $12 before a 4-for-1 split, $3 after (now under $5). rev: $2 before a 1-for-4 reverse split, $8 after.
+  const fwd = dates.map((d, k) => bar("fwd", d, k < n - 10 ? 12 : 3, k < n - 10 ? 1_000_000 : 4_000_000));
+  const rev = dates.map((d, k) => bar("rev", d, k < n - 10 ? 2 : 8, k < n - 10 ? 4_000_000 : 1_000_000));
+  const bars = [...liquid.flatMap((id, i) => series(n, (k) => 20 * (1 + 0.001 * i) ** k, () => 1_000_000, id)), ...fwd, ...rev];
+  const split = (securityId: string, from: number, to: number) =>
+    ({ corporateActionId: `s-${securityId}`, securityId, actionType: from < to ? "SPLIT" : "REVERSE_SPLIT", effectiveDate: splitDay, details: { split_from: from, split_to: to }, observedAt: "t" }) as unknown as CorporateAction;
+  const result = rankSecurities([...liquid, "fwd", "rev"].map(security), bars, [], D, DEFAULT_SCANNER_CONFIG, [split("fwd", 1, 4), split("rev", 4, 1)]);
+  assert.equal(result.excluded, undefined, JSON.stringify(result.excluded)); // both splits reconcile
+  const reasons = Object.fromEntries((result.floorExcluded ?? []).map((e) => [e.securityId, e.reason]));
+  assert.deepEqual(reasons, { fwd: "FLOOR_PRICE" });
+  assert.ok(result.ranked.some((r) => r.securityId === "rev"), "the reverse-split name is $8 now and liquid");
+});
+
+test("floor: a name with no bar on the scanned session fails (not passed on an earlier close)", () => {
+  const liquid = (n: number, last: string) => days(n, last).map((d) => bar("h", d, 20, 1_000_000));
+  assert.equal(floorExclusion(liquid(60, "2026-11-19"), floor, LAST), "FLOOR_NO_BAR_ON_SESSION");
+  assert.equal(floorExclusion(liquid(60, LAST), floor, LAST), undefined);
+  // Too little history is still reported as history first.
+  assert.equal(floorExclusion(liquid(30, "2026-11-19"), floor, LAST), "FLOOR_HISTORY");
+  // End to end: the halted name has the best momentum but is in no list.
+  const n = 80;
+  const D = days(n).at(-1)!;
+  const names = Array.from({ length: 10 }, (_, i) => `liq_${i}`);
+  const bars = [
+    ...names.flatMap((id, i) => series(n, (k) => 20 * (1 + 0.001 * i) ** k, () => 1_000_000, id)),
+    ...series(n, (k) => 20 * 1.02 ** k, () => 1_000_000, "halted").filter((b) => b.sessionDate !== D),
+  ];
+  const r = rankSecurities([...names, "halted"].map(security), bars, [], D);
+  assert.deepEqual(r.floorExcluded, [{ securityId: "halted", reason: "FLOOR_NO_BAR_ON_SESSION" }]);
+  for (const p of r.predictions) assert.equal(p.securityIds.includes("halted"), false, p.setType);
+});
+
+test("floor v2 is a new file and version; v1 is unchanged and still parses (no bar-on-session rule)", () => {
+  const v1 = parseEligibilityFloor(readFileSync(new URL("../config/eligibility-floor-v1.json", import.meta.url), "utf8"));
+  assert.deepEqual({ ...v1 }, { version: "eligibility-floor-v1", minLastCloseUsd: 5, minMedianDollarVolumeUsd: 5_000_000, dollarVolumeSessions: 20, minHistorySessions: 60 });
+  const halted = days(60, "2026-11-19").map((d) => bar("h", d, 20, 1_000_000));
+  assert.equal(floorExclusion(halted, v1, LAST), undefined);
+  const { version: _v, ...thresholds } = v1;
+  const { version: _w, requireBarOnSession, ...thresholds2 } = floor;
+  assert.deepEqual(thresholds2, thresholds, "same thresholds");
+  assert.equal(requireBarOnSession, true);
+  assert.throws(() => parseEligibilityFloor(JSON.stringify({ ...v1, requireBarOnSession: "yes" })), /requireBarOnSession/u);
 });
