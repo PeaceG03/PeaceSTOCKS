@@ -322,6 +322,8 @@ export interface TenMinDailyIndex {
 }
 
 export const TENMIN_DAILY_DONE_RULE = "done-day-v1" as const;
+/** Run-log marker: a tracked, not-done day under a sealed range was skipped (no fetch, no write). */
+export const TENMIN_DAILY_SKIPPED_RANGE_SEALED = "TENMIN_DAILY_SKIPPED_RANGE_SEALED" as const;
 /** The daily step's first session (Sep 29, 2026) is in this two-month range; no daily index is older. */
 export const TENMIN_DAILY_FIRST_RANGE_FROM = "2026-09-01" as const;
 
@@ -633,10 +635,24 @@ export async function runTenMinDailyLiquid(options: {
       requests: 0,
     };
     let index = await readTenMinDailyIndex(store, sessionDate);
-    // A sealed range owns a day the daily step never tracked. A day it tracks counts as done only by
-    // its own bars (seal guard): one still short keeps being worked even under a sealed range.
-    if ((!index || index.done) && (await tenMinRangeSealedFor(store, sessionDate))) {
+    // A sealed range owns its sessions: nothing is fetched or written under it (Auditor B3; a re-fetch
+    // would overwrite an object the seal reused). A tracked day keeps its index, status and counts
+    // unchanged; it is still not done by its own bars (seal guard), and is reported as skipped.
+    if (await tenMinRangeSealedFor(store, sessionDate)) {
       sessionReport.status = "SKIPPED_RANGE_SEALED";
+      if (index) {
+        sessionReport.selected = index.selected.length;
+        sessionReport.stored = index.stored.length;
+        if (!isPreRuleIndex(index) || index.done) {
+          const counts = tenMinDailyIndexCounts(index, expectedTenMinBars(sessionDate, calendar));
+          sessionReport.bars = counts.dayBars;
+          sessionReport.dailyBars = counts.dailyBars;
+        }
+        if (!index.done)
+          report.warnings.push(
+            `${TENMIN_DAILY_SKIPPED_RANGE_SEALED}:${sessionDate}:${index.stuckShort ? TENMIN_DAILY_STUCK_SHORT : "not-done"}:${sessionReport.bars ?? "pre-rule"}`,
+          );
+      }
       report.sessions.push(sessionReport);
       continue;
     }
@@ -914,9 +930,10 @@ export async function tenMinDailyHistoryHold(
   const days: HistoryHoldDay[] = [];
   for (const sessionDate of sessions) {
     const index = await readTenMinDailyIndex(store, sessionDate);
-    // A sealed range counts as done only for a day the daily step never tracked (seal guard).
-    if (!index && (await tenMinRangeSealedFor(store, sessionDate))) {
-      days.push({ sessionDate, done: true, failed: false });
+    // A sealed range counts as done only for a day the daily step never tracked (seal guard). A tracked
+    // day under it is not done, but the daily step no longer works it (B3), so it cannot hold the chain.
+    if (await tenMinRangeSealedFor(store, sessionDate)) {
+      days.push({ sessionDate, done: !index || !!index.done, failed: false });
       continue;
     }
     const done = !!index?.done;

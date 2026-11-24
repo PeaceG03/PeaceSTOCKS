@@ -926,7 +926,7 @@ test("STUCK_SHORT: after 6 failed full passes a short day is STUCK_SHORT with it
   assert.equal(index.stuckShort, undefined);
 });
 
-test("seal guard: a day the daily step tracks is not done just because its range sealed; it keeps being worked and holds", async () => {
+test("B3: a tracked unfinished day and a STUCK_SHORT day under a sealed range: no fetch, no write, status and counts kept", async () => {
   const root = await mkdtemp(join(tmpdir(), "peacestocks-seal-old-"));
   try {
     const store = new MemoryObjectClient();
@@ -936,8 +936,12 @@ test("seal guard: a day the daily step tracks is not done just because its range
       calls.push(`${sec.symbol}:${from}`);
       return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, sec.symbol === "BBB" ? bbbBars : 39));
     };
+    // 10-08 short 6 times -> STUCK_SHORT; 10-09 short once (still retrying).
+    for (let i = 0; i < 6; i += 1) await baseRun(store, calls, { lastCompletedSession: "2026-10-08", catchupSessions: 1, fetchPages: pages });
     await baseRun(store, calls, { catchupSessions: 1, fetchPages: pages });
-    // A range sealed over the retrying day (as an older seal without the guard could).
+    assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.stuckShort?.status, "STUCK_SHORT");
+    assert.equal((await readTenMinDailyIndex(store, "2026-10-09"))!.notDoneRuns, 1);
+    // A range sealed over both days (as an older seal without the guard could).
     await writeTenMinRangeReplyDust({
       store,
       root,
@@ -950,14 +954,75 @@ test("seal guard: a day the daily step tracks is not done just because its range
       fetchPages: async (sec, from, to) => replyPages(sec.symbol, sec.securityId, from, to, dayBars(sec.symbol, "2026-09-01")),
     });
     assert.ok(await readTenMinRangeManifest(store, RANGE_FROM, RANGE_TO));
-    assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-09", catchupSessions: 1 }), "2026-10-09", "sealed does not make it done");
+    const snapshot = async () => new Map(await Promise.all((await store.list("permanent/")).map(async (k) => [k, await store.get(k)] as const)));
+    const before = await snapshot();
+    let puts = 0;
+    const watched = Object.assign(Object.create(store) as MemoryObjectClient, {
+      put: async (...args: Parameters<MemoryObjectClient["put"]>) => {
+        puts += 1;
+        return store.put(...args);
+      },
+    });
     calls.length = 0;
     bbbBars = 39;
-    const run = await baseRun(store, calls, { catchupSessions: 1, fetchPages: pages });
-    assert.notEqual(run.sessions[0]!.status, "SKIPPED_RANGE_SEALED");
-    assert.deepEqual(calls, ["BBB:2026-10-09"]);
-    assert.equal(run.sessions[0]!.status, "COMPLETE");
+    const run = await baseRun(watched, calls, { catchupSessions: 2, fetchPages: pages });
+    assert.deepEqual(calls, [], "no fetch under a sealed range");
+    assert.equal(puts, 0, "no write under a sealed range");
+    assert.deepEqual(await snapshot(), before);
+    assert.deepEqual(run.sessions.map((x) => [x.sessionDate, x.status, x.bars]), [
+      ["2026-10-09", "SKIPPED_RANGE_SEALED", "108/117"],
+      ["2026-10-08", "SKIPPED_RANGE_SEALED", "108/117"],
+    ]);
+    assert.deepEqual(run.warnings.filter((w) => w.startsWith("TENMIN_DAILY_SKIPPED_RANGE_SEALED")).sort(), [
+      "TENMIN_DAILY_SKIPPED_RANGE_SEALED:2026-10-08:STUCK_SHORT:108/117",
+      "TENMIN_DAILY_SKIPPED_RANGE_SEALED:2026-10-09:not-done:108/117",
+    ]);
+    assert.equal((await readTenMinDailyIndex(store, "2026-10-09"))!.done, undefined, "still not done (never treated as full)");
+    // The daily step no longer works it, so it does not hold the chain.
     assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-09", catchupSessions: 1 }), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("B3: the reused one-day object under a sealed range is never overwritten; the sealed read still passes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peacestocks-seal-reuse-"));
+  try {
+    const store = new MemoryObjectClient();
+    let bbbBars = 30;
+    const pages = async (sec: { securityId: string; symbol: string }, from: string, to: string) =>
+      replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, sec.symbol === "BBB" ? bbbBars : 39));
+    // Daily step stores 10-09 for AAA (full) and BBB (short: tracked, not done).
+    await baseRun(store, [], { n: 2, catchupSessions: 1, fetchPages: pages });
+    // The chain seals the range and reuses BBB's one-day object 10-09_10-09.
+    const chainCalls: string[] = [];
+    const result = await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: RANGE_FROM,
+      to: RANGE_TO,
+      fetches: [{ securityId: "sec_bbb", symbol: "BBB", fetchFrom: "2026-10-09", fetchTo: "2026-10-09" }],
+      zstdVersionProbe: pinnedZstd,
+      now: ISO,
+      fetchPages: async (sec, from, to) => {
+        chainCalls.push(`${sec.symbol}:${from}:${to}`);
+        return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, 30));
+      },
+    });
+    assert.equal(result.sealed, true);
+    assert.deepEqual(chainCalls, [], "BBB reused the daily object");
+    const sealedRead = await readTenMinSecurityDay(store, "sec_bbb", "2026-10-09");
+    assert.equal(sealedRead.source, "range");
+    const key = tenMinRangeFileKey(RANGE_FROM, RANGE_TO, "sec_bbb", "BBB", "2026-10-09", "2026-10-09", 1);
+    const bytes = await store.get(key);
+    // The daily step now could get every BBB bar: it must not re-fetch into the sealed range.
+    bbbBars = 39;
+    await baseRun(store, [], { n: 2, catchupSessions: 1, fetchPages: pages });
+    assert.deepEqual(await store.get(key), bytes, "the reused object is byte-identical");
+    const after = await readTenMinSecurityDay(store, "sec_bbb", "2026-10-09");
+    assert.equal(after.source, "range");
+    assert.deepEqual(ohlcv(after.bars), ohlcv(sealedRead.bars));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
