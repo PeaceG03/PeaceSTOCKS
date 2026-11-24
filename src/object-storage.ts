@@ -395,6 +395,15 @@ export class ObjectMarketStorage implements MarketStore {
     await this.writeText("backfill-state.json", JSON.stringify(state, null, 2) + "\n");
   }
 
+  async loadBackfillReopenProgress(): Promise<unknown> {
+    const body = await this.readText("backfill-reopen-state.json");
+    return body ? (JSON.parse(body) as unknown) : undefined;
+  }
+
+  async saveBackfillReopenProgress(state: unknown): Promise<void> {
+    await this.writeText("backfill-reopen-state.json", JSON.stringify(state, null, 2) + "\n");
+  }
+
   /** Per month file: securityId -> stored bar lines. Kept for this storage instance (one host run). */
   private readonly barCountsByKey = new Map<string, Map<string, number>>();
 

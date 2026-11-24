@@ -6,6 +6,7 @@ import type {
   ProviderSecurityRecord,
   SecurityMasterRecord,
 } from "./contracts";
+import { checkSealedDailyBarsPack } from "./daily-bars-sidecar";
 import {
   dailyBarsFromReply,
   readDailyReplyDustBars,
@@ -34,6 +35,7 @@ import { pointInTimeUniverse } from "./pit-universe";
 import { ScanYieldError, createScanYieldCheck } from "./scan-yield";
 
 const STATE_VERSION = "markets-scanner-backfill-v1" as const;
+const REOPEN_STATE_VERSION = "markets-scanner-backfill-reopen-v1" as const;
 export const MARKET_BACKFILL_PATH_ERROR = "MARKET_BACKFILL_PATH_INVALID";
 
 export interface BackfillState {
@@ -41,6 +43,14 @@ export interface BackfillState {
   provider: string;
   from: string;
   to: string;
+  completedSessions: string[];
+  failedSessions: Record<string, string>;
+  updatedAt: string;
+}
+
+export interface BackfillReopenState {
+  schemaVersion: typeof REOPEN_STATE_VERSION;
+  provider: string;
   completedSessions: string[];
   failedSessions: Record<string, string>;
   updatedAt: string;
@@ -204,6 +214,38 @@ async function writeProgress(storage: MarketStore, state: BackfillState): Promis
   await storage.saveBackfillProgress({ ...state, updatedAt: new Date().toISOString() });
 }
 
+function emptyReopenState(provider: string): BackfillReopenState {
+  return {
+    schemaVersion: REOPEN_STATE_VERSION,
+    provider,
+    completedSessions: [],
+    failedSessions: {},
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function readReopenProgress(storage: MarketStore, provider: string): Promise<BackfillReopenState> {
+  try {
+    const raw = (await storage.loadBackfillReopenProgress?.()) as BackfillReopenState | undefined;
+    if (
+      raw &&
+      raw.schemaVersion === REOPEN_STATE_VERSION &&
+      raw.provider === provider &&
+      Array.isArray(raw.completedSessions) &&
+      raw.failedSessions &&
+      typeof raw.failedSessions === "object"
+    )
+      return raw;
+  } catch {
+    // Treat corrupt or missing reopen progress as fresh.
+  }
+  return emptyReopenState(provider);
+}
+
+async function writeReopenProgress(storage: MarketStore, state: BackfillReopenState): Promise<void> {
+  await storage.saveBackfillReopenProgress?.({ ...state, updatedAt: new Date().toISOString() });
+}
+
 /** PEACESTOCKS_REQUIRE_OBJECT_STORE: unset/""/"0" -> off, "1" -> on; anything else throws (a typo must not turn the requirement off). */
 export function backfillRequiresObjectStore(value: string | undefined): boolean {
   const s = value?.trim() ?? "";
@@ -239,6 +281,10 @@ export async function backfillHistoricalEvidence(options: {
   replyDustBackend?: ReplyDustBackend;
   /** Tests inject this; production asks the zstd program. */
   zstdVersionProbe?: ZstdVersionProbe;
+  /** Opt-in: revisit already-stored sessions using point-in-time ACTIVE+INACTIVE universe. */
+  reopenInactiveTails?: boolean;
+  /** Called immediately when a session is attempted (including Dust-cached reopen sessions). */
+  onSessionAttempt?: () => void;
 }): Promise<BackfillResult> {
   const env = options.env ?? process.env;
   requireObjectStore(env);
@@ -259,6 +305,25 @@ export async function backfillHistoricalEvidence(options: {
   let replyDustFilesWritten = 0;
   let replyDustFallbackFiles = 0;
   await storage.initialize();
+  const reopenInactiveTails = options.reopenInactiveTails === true;
+  const allSessions = dates(options.from, options.to);
+  const reopenState = reopenInactiveTails ? await readReopenProgress(storage, provider.providerName) : undefined;
+  const reopenCompleted = new Set(reopenState?.completedSessions ?? []);
+  if (reopenInactiveTails && allSessions.length > 0 && allSessions.every((d) => reopenCompleted.has(d))) {
+    return {
+      provider: provider.providerName,
+      requestedFrom: options.from,
+      requestedTo: options.to,
+      attemptedSessions: [],
+      completedSessions: [],
+      skippedExistingSessions: allSessions,
+      failedSessions: {},
+      barsStored: 0,
+      actionsStored: 0,
+      stoppedOnError: false,
+      eligibility: {},
+    };
+  }
   // On Actions the scan always wins the Massive budget; local/test runs opt in via shouldYield.
   const shouldYield =
     options.shouldYield ??
@@ -295,15 +360,14 @@ export async function backfillHistoricalEvidence(options: {
   ).bindUniverse;
   if (bind) bind.call(provider, providerRecords(securities, provider.providerName));
 
-  const state = await readProgress(storage, provider.providerName, options.from, options.to);
-  const sessions = dates(options.from, options.to).slice(
-    0,
-    options.maxSessions ?? Number.MAX_SAFE_INTEGER,
-  );
+  const state = reopenInactiveTails ? undefined : await readProgress(storage, provider.providerName, options.from, options.to);
+  const sessions = reopenInactiveTails
+    ? allSessions
+    : allSessions.slice(0, options.maxSessions ?? Number.MAX_SAFE_INTEGER);
   const attemptedSessions: string[] = [],
     completedSessions: string[] = [],
     skippedExistingSessions: string[] = [];
-  const failedSessions: Record<string, string> = { ...state.failedSessions };
+  const failedSessions: Record<string, string> = { ...(reopenInactiveTails ? reopenState!.failedSessions : state!.failedSessions) };
   let barsStored = 0,
     actionsStored = 0,
     stoppedOnError = false,
@@ -367,19 +431,45 @@ export async function backfillHistoricalEvidence(options: {
   };
 
   for (const sessionDate of sessions) {
-    if (state.completedSessions.includes(sessionDate)) {
-      skippedExistingSessions.push(sessionDate);
-      continue;
+    if (reopenInactiveTails) {
+      if (reopenCompleted.has(sessionDate)) {
+        skippedExistingSessions.push(sessionDate);
+        continue;
+      }
+      if (options.maxSessions !== undefined && attemptedSessions.length >= options.maxSessions) {
+        yieldedForScan = "JOB_MAX_SESSIONS_REACHED";
+        break;
+      }
+    } else {
+      if (state!.completedSessions.includes(sessionDate)) {
+        skippedExistingSessions.push(sessionDate);
+        continue;
+      }
     }
     const existing = await storage.loadBars(sessionDate);
-    if (existing.length > 0) {
-      state.completedSessions = [...new Set([...state.completedSessions, sessionDate])].sort();
+    if (!reopenInactiveTails && existing.length > 0) {
+      state!.completedSessions = [...new Set([...state!.completedSessions, sessionDate])].sort();
       skippedExistingSessions.push(sessionDate);
-      await writeProgress(storage, state);
+      await writeProgress(storage, state!);
       continue;
     }
     yieldedForScan = await shouldYield();
     if (yieldedForScan) break;
+    if (reopenInactiveTails && replyStore) {
+      const sealed = await checkSealedDailyBarsPack({
+        store: replyStore,
+        sessionDate,
+        storedRows: existing,
+        ...(options.replyDustBackend ? { backend: options.replyDustBackend } : {}),
+      });
+      if (sealed.state === "conflict") {
+        failedSessions[sessionDate] = `REOPEN_PACK_CONFLICT:${sealed.reason}`;
+        stoppedOnError = true;
+        await writeReopenProgress(storage, { ...reopenState!, failedSessions });
+        break;
+      }
+    }
+    options.onSessionAttempt?.();
     attemptedSessions.push(sessionDate);
     try {
       const members = membersOn(sessionDate);
@@ -387,8 +477,19 @@ export async function backfillHistoricalEvidence(options: {
       const bars = replyDust
         ? await dailyBarsWithReplyDust(sessionDate, memberIds, members.records)
         : await provider.getDailyBars(sessionDate, memberIds);
-      await storage.appendBars(bars);
-      barsStored += bars.length;
+      let rowsWritten = bars.length;
+      if (reopenInactiveTails) {
+        const existingKeys = new Set(existing.map((b) => `${b.securityId}|${b.sessionDate}|${b.revision}`));
+        const newBars = bars.filter((b) => !existingKeys.has(`${b.securityId}|${b.sessionDate}|${b.revision}`));
+        rowsWritten = newBars.length;
+        if (newBars.length > 0) {
+          await storage.appendBars(newBars);
+          barsStored += newBars.length;
+        }
+      } else {
+        await storage.appendBars(bars);
+        barsStored += bars.length;
+      }
       try {
         const actions = await provider.getCorporateActions(sessionDate, memberIds);
         await storage.appendActions(actions);
@@ -412,17 +513,24 @@ export async function backfillHistoricalEvidence(options: {
         storage,
         sessionDate,
         provider.providerName,
-        bars.length ? "GOOD" : "PARTIAL_RUN",
+        existing.length + rowsWritten ? "GOOD" : "PARTIAL_RUN",
       );
-      state.completedSessions = [...new Set([...state.completedSessions, sessionDate])].sort();
       delete failedSessions[sessionDate];
       completedSessions.push(sessionDate);
-      await writeProgress(storage, { ...state, failedSessions });
+      if (reopenInactiveTails) {
+        reopenState!.completedSessions = [...new Set([...reopenState!.completedSessions, sessionDate])].sort();
+        reopenCompleted.add(sessionDate);
+        await writeReopenProgress(storage, { ...reopenState!, failedSessions });
+      } else {
+        state!.completedSessions = [...new Set([...state!.completedSessions, sessionDate])].sort();
+        await writeProgress(storage, { ...state!, failedSessions });
+      }
     } catch (error) {
       const message = String(error);
       failedSessions[sessionDate] = message;
       stoppedOnError = true;
-      await writeProgress(storage, { ...state, failedSessions });
+      if (reopenInactiveTails) await writeReopenProgress(storage, { ...reopenState!, failedSessions });
+      else await writeProgress(storage, { ...state!, failedSessions });
       break;
     }
   }

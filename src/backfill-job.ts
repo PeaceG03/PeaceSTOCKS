@@ -19,7 +19,7 @@
  * a fake Massive; the workflow's backfill mode reaches it through src/backfill-job-cli.ts.
  */
 import type { CanonicalDailyBar, SecurityMasterRecord } from "./contracts";
-import { backfillHistoricalEvidence, type BackfillResult, type BackfillState } from "./backfill";
+import { backfillHistoricalEvidence, type BackfillReopenState, type BackfillResult, type BackfillState } from "./backfill";
 import { readDailyReplyDustManifest, readDailyReplyDustReply } from "./daily-reply-dust";
 import { checkSealedDailyBarsPack, maybeWriteScanDailyBarsSidecar } from "./daily-bars-sidecar";
 import type { ReplyDustStore } from "./intraday-reply-dust";
@@ -89,6 +89,8 @@ export interface BackfillJobOptions {
   env?: NodeJS.ProcessEnv;
   backend?: ReplyDustBackend;
   zstdVersionProbe?: ZstdVersionProbe;
+  reopenInactiveTails?: boolean;
+  onSessionAttempt?: () => void;
 }
 
 export function classifyStop(message: string): BackfillStopReason {
@@ -130,8 +132,12 @@ export async function runBackfillJob(options: BackfillJobOptions): Promise<Backf
     ...(options.backend ? { replyDustBackend: options.backend } : {}),
     ...(options.zstdVersionProbe ? { zstdVersionProbe: options.zstdVersionProbe } : {}),
     ...(options.maxSessions !== undefined ? { maxSessions: options.maxSessions } : {}),
+    ...(options.reopenInactiveTails !== undefined ? { reopenInactiveTails: options.reopenInactiveTails } : {}),
+    ...(options.onSessionAttempt ? { onSessionAttempt: options.onSessionAttempt } : {}),
   });
-  const progress = (await options.storage.loadBackfillProgress()) as BackfillState | undefined;
+  const progress = options.reopenInactiveTails
+    ? ((await options.storage.loadBackfillReopenProgress?.()) as BackfillReopenState | undefined)
+    : ((await options.storage.loadBackfillProgress()) as BackfillState | undefined);
   const completed = (progress?.completedSessions ?? []).filter((d) => d >= options.from && d <= options.to);
   const securities: SecurityMasterRecord[] = await options.storage.loadSecurities();
   let packsWritten = 0;
@@ -141,6 +147,12 @@ export async function runBackfillJob(options: BackfillJobOptions): Promise<Backf
   const packConflicts: string[] = [];
   const rowsOutsidePack: Record<string, number> = {};
   const packCheckFailures: Record<string, string> = {};
+  for (const [sessionDate, msg] of Object.entries(result.failedSessions)) {
+    const conflictReason = /^REOPEN_PACK_CONFLICT:(.+)$/u.exec(msg)?.[1];
+    if (!conflictReason) continue;
+    (conflictReason === "PACKED_ROW_NOT_STORED" ? packConflicts : shaMismatches).push(sessionDate);
+    packCheckFailures[sessionDate] = conflictReason;
+  }
   let barRows = 0;
   const keys = new Set<string>();
   // Each month file is read once (not once per session), and only one month is held at a time.
