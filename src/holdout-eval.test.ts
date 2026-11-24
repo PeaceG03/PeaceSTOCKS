@@ -136,3 +136,26 @@ test("summarize: excess is the list mean minus the same session's universe mean"
   assert.ok(Math.abs(t.meanExcess - 0.015) < 1e-12); // a raw-mean "excess" would be 0.01
   assert.ok(Math.abs(t.excessTStat - 0.015 / (Math.sqrt(0.00005) / Math.sqrt(2))) < 1e-9);
 });
+
+test("as-known split knowledge: only split records observed before the next open are used", () => {
+  const days = weekdays(130);
+  const { bars, ids } = world(30, days, 8, false);
+  const jumped = bars.map((b) => (b.securityId === "s001" && b.sessionDate >= days[100]! ? { ...b, open: b.open * 10, close: b.close * 10 } : b));
+  const history = new EvalHistory(jumped);
+  const action = (observedAt: string) =>
+    ({ actionId: "x", securityId: "s001", actionType: "REVERSE_SPLIT", effectiveDate: days[100]!, observedAt, details: { split_from: 10, split_to: 1 } }) as never;
+  const late = action(`${days[103]}T18:00:00.000Z`); // recorded three sessions after the split, after that day's open
+  const base = { horizon: 1, randomDraws: 1, seed: 1 };
+  // Effective-date replay (the default) uses the record from its effective date on.
+  assert.equal(evaluateSession(master(ids), history, 100, { ...base, splitActions: [late] })!.excluded, 0);
+  // As-known: on the split day and until the record arrives, the scan could not have had it.
+  for (const i of [100, 101, 102])
+    assert.equal(evaluateSession(master(ids), history, i, { ...base, splitActions: [late], splitKnowledge: "as-known" } as never)!.excluded, 1, `i ${i}`);
+  // Session 103's scan (before session 104's open) runs after the record arrived.
+  assert.equal(evaluateSession(master(ids), history, 103, { ...base, splitActions: [late], splitKnowledge: "as-known" } as never)!.excluded, 0);
+  // A record observed the evening of the split day is known before the next open.
+  const prompt = action(`${days[100]}T22:00:00.000Z`);
+  assert.equal(evaluateSession(master(ids), history, 100, { ...base, splitActions: [prompt], splitKnowledge: "as-known" } as never)!.excluded, 0);
+  // No usable observedAt: not known.
+  assert.equal(evaluateSession(master(ids), history, 105, { ...base, splitActions: [action("")], splitKnowledge: "as-known" } as never)!.excluded, 1);
+});

@@ -12,6 +12,7 @@
 import type { CanonicalDailyBar, CorporateAction, PredictionSet, SecurityMasterRecord } from "./contracts";
 import { DEFAULT_SCANNER_CONFIG, rankSecurities } from "./ranking";
 import { resolveSpyBenchmarkId, scanBarWindowStart, type SessionCalendar } from "./scanner";
+import { nextSessionOpen } from "./session-open";
 import { eligibilityForBarCount } from "./universe";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 
@@ -128,6 +129,26 @@ export interface EvalOptions {
   calendar?: SessionCalendar;
   /** Stored split records, passed to rankSecurities as the scan does (only those effective <= D are used). */
   splitActions?: readonly CorporateAction[];
+  /**
+   * "effective-date" (default): every split record is used from its effective date on, even if it was
+   * recorded later (look-ahead on knowledge time). "as-known": only records whose observedAt is before
+   * the next session's 09:30 ET open, i.e. what a forward scan of D could have read.
+   */
+  splitKnowledge?: "effective-date" | "as-known";
+}
+
+/** Split records a forward scan of D could have read: observed before the next session's open. */
+export function splitActionsKnownAt(
+  actions: readonly CorporateAction[],
+  sessionDate: string,
+  calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
+): CorporateAction[] {
+  const open = nextSessionOpen(sessionDate, calendar)?.nextSessionOpen.getTime();
+  if (open === undefined) return [];
+  return actions.filter((a) => {
+    const seen = Date.parse(a.observedAt ?? "");
+    return Number.isFinite(seen) && seen < open;
+  });
 }
 
 export function rng(seed: number): () => number {
@@ -183,7 +204,11 @@ export function evaluateSession(
   const bars = scanInputBars(history, i, options.calendar);
   const spyId = resolveSpyBenchmarkId(securities);
   const benchmark = spyId ? bars.filter((bar) => bar.securityId === spyId) : [];
-  const result = rankSecurities(securities, bars, benchmark, D, DEFAULT_SCANNER_CONFIG, options.splitActions ?? []);
+  const splitActions =
+    options.splitKnowledge === "as-known"
+      ? splitActionsKnownAt(options.splitActions ?? [], D, options.calendar)
+      : (options.splitActions ?? []);
+  const result = rankSecurities(securities, bars, benchmark, D, DEFAULT_SCANNER_CONFIG, splitActions);
   const h = options.horizon;
   const raw = new Map<string, number>();
   for (const item of result.ranked) {

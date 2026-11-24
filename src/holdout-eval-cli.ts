@@ -3,7 +3,10 @@
  * network and writes only the --out file. It prints aggregate metrics only (no symbols or ids).
  *
  *   tsx src/holdout-eval-cli.ts --data <dir> --from YYYY-MM-DD --to YYYY-MM-DD --horizon 1 \
- *     [--draws 1000] [--step 1] [--winsorize 0.01] [--out result.json]
+ *     [--draws 1000] [--step 1] [--winsorize 0.01] [--splits effective-date|as-known] [--out result.json]
+ *
+ * --splits as-known uses only split records observed before the next session's open (what a forward
+ * scan could have read); effective-date (default) uses every record from its effective date on.
  *
  * <dir> holds permanent/daily-bars/<YYYY-MM>.jsonl, permanent/security-master.json and
  * (optional) permanent/corporate-actions.jsonl, laid out as in the bucket.
@@ -45,8 +48,10 @@ async function main(): Promise<void> {
   const step = Number(arg("step", "1"));
   const winsorize = Number(arg("winsorize", "0"));
   const out = arg("out", "");
+  const splitKnowledge = arg("splits", "effective-date");
+  if (splitKnowledge !== "effective-date" && splitKnowledge !== "as-known") throw new Error(`BAD_ARG:splits:${splitKnowledge}`);
   const log = (line: string) => console.log(`[${new Date().toISOString()}] ${line}`);
-  log(`held-out eval from=${from} to=${to} horizon=${horizon} draws=${draws} step=${step} winsorize=${winsorize}`);
+  log(`held-out eval from=${from} to=${to} horizon=${horizon} draws=${draws} step=${step} winsorize=${winsorize} splits=${splitKnowledge}`);
 
   // Bars: enough before `from` for the scan window and feature lookbacks, and after `to` for outcomes.
   const loadFrom = shiftDays(from, -170);
@@ -104,7 +109,7 @@ async function main(): Promise<void> {
   for (const [k, [D, i]] of indexes.entries()) {
     if (k % step !== 0) continue;
     const started = Date.now();
-    const got = evaluateSession(master, history, i, { horizon, randomDraws: draws, seed: 20261124, excluded, splitActions, ...(winsorize ? { winsorize } : {}) });
+    const got = evaluateSession(master, history, i, { horizon, randomDraws: draws, seed: 20261124, excluded, splitActions, splitKnowledge, ...(winsorize ? { winsorize } : {}) });
     if (!got) {
       log(`${D}: no outcome window (needs ${horizon} later sessions)`);
       continue;
@@ -124,7 +129,7 @@ async function main(): Promise<void> {
   for (const [type, s] of Object.entries(summary.lists))
     log(`SUMMARY ${type}: sessions ${s.sessions} mean ${(s.meanReturn * 100).toFixed(3)}% universe ${(s.universeMean * 100).toFixed(3)}% random ${(s.randomMean * 100).toFixed(3)}% spy ${s.spyMean === undefined ? "n/a" : (s.spyMean * 100).toFixed(3) + "%"} excess ${(s.meanExcess * 100).toFixed(3)}% t ${s.excessTStat.toFixed(2)} hit ${(s.hitRate * 100).toFixed(1)}% randomP ${s.randomP.toFixed(3)}`);
   if (out)
-    writeFileSync(out, JSON.stringify({ from, to, horizon, draws, step, winsorize, sessionsEvaluated: outcomes.map((o) => o.sessionDate), droppedForSplit, splitExcluded, summary }, null, 2) + "\n");
+    writeFileSync(out, JSON.stringify({ from, to, horizon, draws, step, winsorize, splitKnowledge, sessionsEvaluated: outcomes.map((o) => o.sessionDate), droppedForSplit, splitExcluded, summary }, null, 2) + "\n");
 }
 
 await main();
