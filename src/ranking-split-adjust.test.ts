@@ -256,12 +256,12 @@ test("two split dates with no bar between them are excluded, not combined", asyn
 test("a recent split-sized move with no split record yet (late record) excludes the name", async () => {
   const { splitAdjustedBars } = await import("./split-adjust");
   const asOf = sessions(40).at(-1)!;
-  // Moves into the last 10 sessions: 1.8x and more either way are excluded.
+  // Moves into the last 20 sessions: 1.8x and more either way are excluded.
   for (const ratio of [2, 1.8, 0.5, 1 / 1.8])
     assert.deepEqual(splitAdjustedBars(flatBars(40, 35, ratio), [], asOf), { excluded: "SPLIT_LIKE_MOVE_UNRECORDED" }, `ratio ${ratio}`);
-  assert.deepEqual(splitAdjustedBars(flatBars(40, 30, 2), [], asOf), { excluded: "SPLIT_LIKE_MOVE_UNRECORDED" }, "10th-last move");
-  // Smaller moves, or the same move more than 10 sessions back, are kept.
-  for (const [at, ratio] of [[35, 1.7], [35, 1 / 1.7], [29, 2], [29, 0.5]] as const)
+  assert.deepEqual(splitAdjustedBars(flatBars(40, 20, 2), [], asOf), { excluded: "SPLIT_LIKE_MOVE_UNRECORDED" }, "20th-last move");
+  // Smaller moves, or the same move more than 20 sessions back, are kept.
+  for (const [at, ratio] of [[35, 1.7], [35, 1 / 1.7], [19, 2], [19, 0.5]] as const)
     assert.ok("bars" in splitAdjustedBars(flatBars(40, at, ratio), [], asOf), `at ${at} ratio ${ratio}`);
   // Once the split is recorded, the adjusted series has no jump and the name is kept.
   const ds = sessions(40);

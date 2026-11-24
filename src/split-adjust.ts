@@ -10,7 +10,7 @@
  * that session (SPLIT_UNRECONCILED). After adjusting, any
  * session-to-session close move of 3x or more either way (no recorded split explains it, or the
  * split data is missing) also drops the name (PRICE_GAP_UNEXPLAINED), and so does a move of 1.8x or
- * more either way into any of the last 10 sessions (SPLIT_LIKE_MOVE_UNRECORDED: a split whose record
+ * more either way into any of the last 20 sessions (SPLIT_LIKE_MOVE_UNRECORDED: a split whose record
  * has not arrived yet). Nothing is guessed.
  * Only splits effective on or before the scanned session are used.
  */
@@ -22,11 +22,12 @@ export const UNEXPLAINED_GAP_RATIO = 3;
 /**
  * Split records can arrive days after the split (1-9 days seen). Until then a 2-for-1 or 1-for-2 looks
  * like a +100% / -50% day, under the 3x rule. So a move of 1.8x or more either way into any of the
- * last 10 sessions that no recorded split explains also drops the name. 1.8 / 10 were chosen from the
- * held-out period's data (see the build log): same late splits caught as 1.6 or 1.7, fewest exclusions.
+ * last 20 sessions that no recorded split explains also drops the name. Both chosen from the held-out
+ * period's data (see the build log): 1.8 catches as many late splits as 1.6 or 1.7 with the fewest
+ * exclusions; 20 sessions (not 10) because records also arrive 10-30 days late.
  */
 export const RECENT_SPLIT_LIKE_RATIO = 1.8;
-export const RECENT_SPLIT_LIKE_SESSIONS = 10;
+export const RECENT_SPLIT_LIKE_SESSIONS = 20;
 
 export type SplitExclusion = "SPLIT_UNRECONCILED" | "PRICE_GAP_UNEXPLAINED" | "SPLIT_LIKE_MOVE_UNRECORDED";
 
