@@ -27,6 +27,8 @@ export interface ObjectClient {
 export interface ObjectListing {
   readonly key: string;
   readonly size: number;
+  /** ISO time from the listing's <LastModified>, when the store reports it. */
+  readonly lastModified?: string;
 }
 
 /** Kept at S3's 2 KB user-metadata limit (R2 allows more) so objects stay portable. */
@@ -404,7 +406,9 @@ export class R2ObjectClient implements ObjectClient {
         const key = xmlText(/<Key>([^<]+)<\/Key>/u.exec(body)?.[1] ?? "");
         if (!key) continue;
         const size = Number(/<Size>(\d+)<\/Size>/u.exec(body)?.[1] ?? "0");
-        entries.push({ key, size: Number.isFinite(size) ? size : 0 });
+        const modified = /<LastModified>([^<]+)<\/LastModified>/u.exec(body)?.[1];
+        const lastModified = modified && !Number.isNaN(Date.parse(modified)) ? new Date(modified).toISOString() : undefined;
+        entries.push({ key, size: Number.isFinite(size) ? size : 0, ...(lastModified ? { lastModified } : {}) });
       }
       const truncated = /<IsTruncated>true<\/IsTruncated>/u.test(xml);
       token = /<NextContinuationToken>([^<]+)<\/NextContinuationToken>/u.exec(xml)?.[1];
