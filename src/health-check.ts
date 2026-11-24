@@ -44,6 +44,8 @@ import { lastCompletedSessionDate } from "./tenmin-history";
 
 export const HEALTHY = "Healthy" as const;
 export const NO_PARTS_REPORTING = "no parts reporting" as const;
+export const NO_PARTS_REPORTING_NOTE =
+  "no check-ins yet: expected once, before the first scheduled runs (scan Tue-Sat 05:30/09:30 UTC); still here after the next scan means runs are not checking in" as const;
 
 /** One part as the health check sees it. */
 export interface HealthCheckPart {
@@ -287,6 +289,8 @@ export function evaluateHealth(input: {
         ? `behind: ${behind.join(", ")}`
         : HEALTHY;
   const lines = [headline, `errors: ${errors}, missing: ${missing}`];
+  // Before the first check-ins this is expected once (Auditor, final review): say so in the issue body.
+  if (headline === NO_PARTS_REPORTING) lines.push(NO_PARTS_REPORTING_NOTE);
   if (fault) lines.push(`health check likely at fault: ${silent.length} parts silent at once (${silent.join(", ")})`);
   lines.push(...results.map((r) => r.line), ...stuckDays.map(stuckDayLine));
   const needsPerson = headline === NO_PARTS_REPORTING || attention.length > 0;
