@@ -123,7 +123,28 @@ test("a valid but different pack already in the store is refused, never overwrit
   const report = await runBackfillJob(base(fake(), "2026-01-20", "2026-01-21"));
   assert.equal(report.status, "REFUSED_PACK_CONFLICT");
   assert.deepEqual(report.packConflicts, ["2026-01-21"]);
+  assert.equal(report.packCheckFailures["2026-01-21"], "PACKED_ROW_NOT_STORED");
   assert.equal(Buffer.from((await client.get(packKey))!).toString("base64"), theirs);
+});
+
+test("rows stored after a pack was sealed (late-arriving, other identities) are reported, never a conflict, and the pack is kept", async () => {
+  // Live 2026-11-24 02:09 UTC: re-collecting a sealed session with a newer universe appended 3-17 rows
+  // per session under other identities after the seal; the pack writer then saw a different line set.
+  const { client, storage, base, fake } = rig();
+  await runBackfillJob(base(fake(), "2026-01-20", "2026-01-21"));
+  const packKey = dailyBarsSidecarFileKey("2026-01-21");
+  const sealedPack = Buffer.from((await client.get(packKey))!).toString("base64");
+  const [row] = await storage.loadBars("2026-01-21");
+  await storage.appendBars([{ ...row!, securityId: `${row!.securityId}-late`, ingestedAt: "2026-11-24T02:09:00.000Z" }]);
+  const again = fake();
+  const report = await runBackfillJob(base(again, "2026-01-20", "2026-01-21"));
+  assert.equal(report.status, "COMPLETE");
+  assert.deepEqual(report.packConflicts, []);
+  assert.equal(report.packsAlreadySealed, 2);
+  assert.equal(report.sessionsVerified, 2);
+  assert.deepEqual(report.rowsOutsidePack, { "2026-01-21": 1 });
+  assert.deepEqual(again.calls.grouped, []);
+  assert.equal(Buffer.from((await client.get(packKey))!).toString("base64"), sealedPack);
 });
 
 test("a tampered Reply Dust file is refused even for a session with no rows (no pack to cross-check)", async () => {

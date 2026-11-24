@@ -5,8 +5,10 @@
  * progress in backfill-state.json, one session at a time) with grouped-daily Reply Dust on, through
  * the production Massive adapter (its own request spacing), then for every session of the range that
  * the checkpoint marks complete:
- *   1. the session's daily-bars pack is written with the scanner's own writer (new keys only; an
- *      existing pack is never replaced, a different one is refused), bound to the day's Reply Dust;
+ *   1. an existing sealed pack is checked first (checkSealedDailyBarsPack): if every packed line is a
+ *      stored row it is authoritative (rows stored later are reported, never removed); if it does not
+ *      verify the run is refused. Otherwise the pack is written with the scanner's own writer (new keys
+ *      only; never replaced), bound to the day's Reply Dust;
  *   2. the pack is re-read and checked (checkSealedDailyBarsPack: file sha, manifest, every packed line
  *      is a stored row) and the Reply Dust file is re-read against its manifest sha.
  * Any sha mismatch refuses the run (status REFUSED_SHA_MISMATCH). A provider 403 (plan window or
@@ -44,6 +46,10 @@ export interface BackfillJobReport {
   sessionsVerified: number;
   shaMismatches: string[];
   packConflicts: string[];
+  /** Sessions whose sealed pack verified but which hold stored rows outside it (late-arriving): count per session. */
+  rowsOutsidePack: Record<string, number>;
+  /** Why an existing pack did not verify (code only), per session. */
+  packCheckFailures: Record<string, string>;
   /** Stored bar rows and distinct (security, session, revision) keys in the range: equal = no duplicates. */
   barRows: number;
   distinctBarKeys: number;
@@ -122,6 +128,8 @@ export async function runBackfillJob(options: BackfillJobOptions): Promise<Backf
   let sessionsVerified = 0;
   const shaMismatches: string[] = [];
   const packConflicts: string[] = [];
+  const rowsOutsidePack: Record<string, number> = {};
+  const packCheckFailures: Record<string, string> = {};
   let barRows = 0;
   const keys = new Set<string>();
   for (const sessionDate of completed) {
@@ -134,6 +142,24 @@ export async function runBackfillJob(options: BackfillJobOptions): Promise<Backf
       await readDailyReplyDustReply(options.store, dust, options.backend);
     } catch {
       shaMismatches.push(sessionDate);
+      continue;
+    }
+    // Sealed pack FIRST (the scanner's rule since 922e085): a pack whose every line is a stored row of
+    // the session is authoritative. Rows stored after the seal (late-arriving, other identities) are
+    // counted in rowsOutsidePack and never removed; the pack is never rewritten. Without this the
+    // writer compared the pack against the grown row set and refused it (EXISTS_DIFFERENT).
+    const sealed = await checkSealedDailyBarsPack({ store: options.store, sessionDate, storedRows: rows, ...(options.backend ? { backend: options.backend } : {}) });
+    if (sealed.state === "verified") {
+      packsAlreadySealed += 1;
+      sessionsVerified += 1;
+      if (sealed.outsidePack) rowsOutsidePack[sessionDate] = sealed.outsidePack;
+      continue;
+    }
+    if (sealed.state === "conflict") {
+      // A well-formed pack holding a row that is not stored is a real conflict; anything else
+      // (sha, decode, manifest without file, Dust binding) is an integrity failure.
+      (sealed.reason === "PACKED_ROW_NOT_STORED" ? packConflicts : shaMismatches).push(sessionDate);
+      packCheckFailures[sessionDate] = sealed.reason;
       continue;
     }
     const pack = await maybeWriteScanDailyBarsSidecar({
@@ -188,6 +214,8 @@ export async function runBackfillJob(options: BackfillJobOptions): Promise<Backf
     sessionsVerified,
     shaMismatches,
     packConflicts,
+    rowsOutsidePack,
+    packCheckFailures,
     barRows,
     distinctBarKeys: keys.size,
     requests: requestTimes.length,
