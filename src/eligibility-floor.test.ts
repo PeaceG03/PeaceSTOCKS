@@ -121,3 +121,33 @@ test("scan: the floor applies to the frozen lists and the report counts the name
   for (const list of lists) assert.equal(list.securityIds.includes(ids.thin), false, list.setType);
   assert.ok(lists.find((l) => l.setType === "TOP_15_OVERALL")!.securityIds.includes(ids.a));
 });
+
+test("floor uses the last CLOSE, not the open: fixtures with open != close", () => {
+  // Opens on the wrong side of each threshold: the close decides.
+  const withOpen = (closeAt: number, openAt: number, volume = 1_000_000) =>
+    days(60).map((d) => ({ ...bar("o", d, closeAt, volume), open: openAt, high: Math.max(openAt, closeAt), low: Math.min(openAt, closeAt) }) as CanonicalDailyBar);
+  assert.equal(floorExclusion(withOpen(4.99, 6), floor), "FLOOR_PRICE"); // opened above $5, closed under
+  assert.equal(floorExclusion(withOpen(5, 4), floor), undefined); // opened under $5, closed at $5
+  // Dollar volume is close x volume: $4 open x 1.5M = $6M would pass, $3 close x 1.5M = $4.5M does not.
+  assert.equal(floorExclusion(withOpen(3, 4, 1_500_000), { ...floor, minLastCloseUsd: 1 }), "FLOOR_DOLLAR_VOLUME");
+  assert.equal(floorExclusion(withOpen(4, 3, 1_500_000), { ...floor, minLastCloseUsd: 1 }), undefined);
+});
+
+test("floor uses split-adjusted bars: a split that crosses $5 (ranking end to end)", () => {
+  const n = 80;
+  const dates = days(n);
+  const D = dates.at(-1)!;
+  const splitDay = dates[n - 10]!;
+  const liquid = Array.from({ length: 5 }, (_, i) => `liq_${i}`);
+  // fwd: $12 before a 4-for-1 split, $3 after (now under $5). rev: $2 before a 1-for-4 reverse split, $8 after.
+  const fwd = dates.map((d, k) => bar("fwd", d, k < n - 10 ? 12 : 3, k < n - 10 ? 1_000_000 : 4_000_000));
+  const rev = dates.map((d, k) => bar("rev", d, k < n - 10 ? 2 : 8, k < n - 10 ? 4_000_000 : 1_000_000));
+  const bars = [...liquid.flatMap((id, i) => series(n, (k) => 20 * (1 + 0.001 * i) ** k, () => 1_000_000, id)), ...fwd, ...rev];
+  const split = (securityId: string, from: number, to: number) =>
+    ({ corporateActionId: `s-${securityId}`, securityId, actionType: from < to ? "SPLIT" : "REVERSE_SPLIT", effectiveDate: splitDay, details: { split_from: from, split_to: to }, observedAt: "t" }) as unknown as CorporateAction;
+  const result = rankSecurities([...liquid, "fwd", "rev"].map(security), bars, [], D, DEFAULT_SCANNER_CONFIG, [split("fwd", 1, 4), split("rev", 4, 1)]);
+  assert.equal(result.excluded, undefined, JSON.stringify(result.excluded)); // both splits reconcile
+  const reasons = Object.fromEntries((result.floorExcluded ?? []).map((e) => [e.securityId, e.reason]));
+  assert.deepEqual(reasons, { fwd: "FLOOR_PRICE" });
+  assert.ok(result.ranked.some((r) => r.securityId === "rev"), "the reverse-split name is $8 now and liquid");
+});
