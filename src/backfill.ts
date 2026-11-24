@@ -83,6 +83,12 @@ export interface BackfillResult {
    * name-sessions bound for names INACTIVE in today's master, and tickers dropped as ambiguous.
    */
   survivorship?: { inactiveNameSessions: number; ambiguousSymbolSessions: number };
+  /** Present only with reopenInactiveTails: bars appended, counted by security status. */
+  reopenAddedByStatus?: Record<string, number>;
+  /** Present only with reopenInactiveTails: candidate bars skipped for a same-ticker stored row, counted by status. */
+  reopenSkippedCollisionByStatus?: Record<string, number>;
+  /** Present only with reopenInactiveTails: candidate bars skipped because the member is not INACTIVE, counted by status. */
+  reopenSkippedNonInactiveByStatus?: Record<string, number>;
 }
 
 function parseDate(value: string): Date {
