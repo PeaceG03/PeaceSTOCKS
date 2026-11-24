@@ -52,10 +52,13 @@ export const US_EQUITY_CALENDAR: SessionCalendar = {
 const SPY_BENCHMARK_TICKER = "SPY";
 const SPY_HISTORY_SESSIONS_REQUIRED = 21;
 /**
- * Trading sessions of daily bars the scan loads, ending at the scanned session. The longest feature
- * (MOMENTUM_60D / DRAWDOWN_60D, src/features.ts) needs 61 closes and SPY needs 21; 70 leaves margin.
+ * Trading sessions of daily bars the scan loads, ending at the scanned session. The longest features
+ * (MOMENTUM_60D / DRAWDOWN_60D, src/features.ts) need 61 of a security's OWN closes and SPY needs 21.
+ * Thin names skip sessions in grouped daily, so 100 keeps those features for a security missing up to
+ * 39 sessions of the window (70 lost them after 9). Peak heap at ~10.7k securities stays far below the
+ * runner's ~2 GB default (NODE_OPTIONS 12 GB on the host step is the safety net).
  */
-export const SCAN_BAR_LOOKBACK_SESSIONS = 70;
+export const SCAN_BAR_LOOKBACK_SESSIONS = 100;
 
 /** First date of the window that holds `sessions` eligible sessions ending at sessionDate. */
 export function scanBarWindowStart(

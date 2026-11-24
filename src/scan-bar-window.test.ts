@@ -106,7 +106,7 @@ test("scan reads only the lookback window's months, one at a time, and counts ba
   const secondSession = client.monthReads - firstSession;
   t.diagnostic(`month reads: first=${firstSession} second=${secondSession} maxInFlight=${client.maxInFlight}`);
 
-  // Window: 70 sessions back from D spans 5 calendar months (2026-06..2026-10).
+  // Window: SCAN_BAR_LOOKBACK_SESSIONS (100) back from D spans 6 calendar months.
   // Session 1: every stored month once for the bar counts, the window months, appendBars' month rewrite.
   assert.ok(firstSession <= months + 12, `first session read ${firstSession} month files (history ${months})`);
   // Session 2 reuses the counts: only the window and the rewritten month, never the whole history again.
@@ -122,7 +122,9 @@ test("loadBarsBetween returns only bars inside the window", async () => {
   const bars = await storage.loadBarsBetween(from, D);
   assert.ok(bars.length > 0);
   assert.ok(bars.every((b) => b.sessionDate >= from && b.sessionDate <= D));
-  assert.equal(client.monthReads, 5);
+  // One read per calendar month the window touches (6 for 100 sessions ending 2026-10-05).
+  const windowMonths = (Number(D.slice(0, 4)) - Number(from.slice(0, 4))) * 12 + Number(D.slice(5, 7)) - Number(from.slice(5, 7)) + 1;
+  assert.equal(client.monthReads, windowMonths);
 });
 
 test("scanBarWindowStart holds exactly the lookback's trading sessions", () => {
