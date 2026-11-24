@@ -36,6 +36,12 @@ export interface PaperRules {
    * actual amount. Fills and earlier ledger entries are never rewritten.
    */
   readonly stuckPositionRule: "MARK_ZERO_THEN_CORRECT";
+  /**
+   * Coverage hole: a session whose stored bars cover fewer names than this fraction of the median name
+   * count of the 20 stored sessions before it (or that has no bars at all) is a hole in our data, not
+   * a halt. A name with no open on a hole session does not count as a missed exit (paper or universe).
+   */
+  readonly coverageHoleFraction: number;
 }
 
 export interface LoadedPaperRules {
@@ -47,11 +53,13 @@ export interface LoadedPaperRules {
 /**
  * v2 (Nov 24, before any run): dropped v1's unapproved 1.8x "fill flat" gap rule (Auditor FAIL on #127:
  * it booked real crashes at 0% and biased P&L upward) and added a write-off at the last close.
- * v3 (Nov 24, before any run): replaces that write-off with Peace's $0-then-correct rule
- * (markZeroAfterMissedExits, stuckPositionRule). Neither v1 nor v2 ever ran; no ledger row was ever
- * written under them, so their files were removed.
+ * v3 (Nov 24, before any run): replaced that write-off with Peace's $0-then-correct rule
+ * (markZeroAfterMissedExits, stuckPositionRule).
+ * v4 (Nov 24, before any run): adds coverageHoleFraction (a session with far fewer names than normal
+ * is a hole in our data and is not a missed exit). v1-v3 never ran; no ledger row was ever written
+ * under them, so their files were removed.
  */
-export const PAPER_RULES_CURRENT_VERSION = "paper-rules-v3";
+export const PAPER_RULES_CURRENT_VERSION = "paper-rules-v4";
 
 const KEYS = [
   "rulesVersion",
@@ -69,6 +77,7 @@ const KEYS = [
   "wholeShares",
   "markZeroAfterMissedExits",
   "stuckPositionRule",
+  "coverageHoleFraction",
 ] as const;
 
 function fail(why: string): never {
@@ -110,6 +119,7 @@ export function parsePaperRules(text: string): PaperRules {
   finiteIn(record.markZeroAfterMissedExits, "markZeroAfterMissedExits", 1, 60);
   if (!Number.isInteger(record.markZeroAfterMissedExits)) fail("markZeroAfterMissedExits_NOT_AN_INTEGER");
   if (record.stuckPositionRule !== "MARK_ZERO_THEN_CORRECT") fail("stuckPositionRule");
+  finiteIn(record.coverageHoleFraction, "coverageHoleFraction", 0, 1, true);
   return Object.freeze({ ...record }) as unknown as PaperRules;
 }
 

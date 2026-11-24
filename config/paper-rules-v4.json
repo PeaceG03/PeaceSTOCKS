@@ -1,5 +1,5 @@
 {
-  "rulesVersion": "paper-rules-v3",
+  "rulesVersion": "paper-rules-v4",
   "mode": "SIMULATED_ONLY",
   "list": "TOP_15_OVERALL",
   "weighting": "EQUAL",
@@ -13,5 +13,6 @@
   "slippageBpsPerSide": 10,
   "wholeShares": true,
   "markZeroAfterMissedExits": 5,
-  "stuckPositionRule": "MARK_ZERO_THEN_CORRECT"
+  "stuckPositionRule": "MARK_ZERO_THEN_CORRECT",
+  "coverageHoleFraction": 0.5
 }

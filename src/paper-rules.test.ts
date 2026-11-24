@@ -3,13 +3,13 @@ import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 import { loadPaperRules, parsePaperRules, PAPER_RULES_CURRENT_VERSION } from "./paper-rules";
 
-const file = () => readFileSync(new URL("../config/paper-rules-v3.json", import.meta.url), "utf8");
+const file = () => readFileSync(new URL("../config/paper-rules-v4.json", import.meta.url), "utf8");
 
-test("paper rules v3: exactly the pre-registered values", () => {
+test("paper rules v4: exactly the pre-registered values", () => {
   const { rules, rulesSha256 } = loadPaperRules();
-  assert.equal(PAPER_RULES_CURRENT_VERSION, "paper-rules-v3");
+  assert.equal(PAPER_RULES_CURRENT_VERSION, "paper-rules-v4");
   assert.deepEqual({ ...rules }, {
-    rulesVersion: "paper-rules-v3",
+    rulesVersion: "paper-rules-v4",
     mode: "SIMULATED_ONLY",
     list: "TOP_15_OVERALL",
     weighting: "EQUAL",
@@ -24,6 +24,7 @@ test("paper rules v3: exactly the pre-registered values", () => {
     wholeShares: true,
     markZeroAfterMissedExits: 5,
     stuckPositionRule: "MARK_ZERO_THEN_CORRECT",
+    coverageHoleFraction: 0.5,
   });
   assert.match(rulesSha256, /^[0-9a-f]{64}$/u);
 });
@@ -40,11 +41,13 @@ test("paper rules: the doc states the same rules as the file", () => {
     "lost 3% or more",
     "$0 per order",
     "10 bps per side",
-    "rulesVersion `paper-rules-v3`",
+    "rulesVersion `paper-rules-v4`",
     "5 exit attempts in a row",
     "valued at $0",
     "`MARK_ZERO_THEN_CORRECT`",
     "appended correction",
+    "coverage hole",
+    "fewer than 50% of the median",
     "at the actual open",
     "simulated, no real money",
   ])
@@ -79,6 +82,10 @@ test("paper rules: strict parsing rejects unknown keys, missing keys, wrong enum
   bad({}, "markZeroAfterMissedExits");
   bad({ stuckPositionRule: "WRITE_OFF_LAST_CLOSE" });
   bad({}, "stuckPositionRule");
+  bad({ coverageHoleFraction: 0 });
+  bad({ coverageHoleFraction: 1.5 });
+  bad({ coverageHoleFraction: "0.5" });
+  bad({}, "coverageHoleFraction");
   bad({ rulesVersion: "v1" });
   assert.throws(() => parsePaperRules("not json"), /PAPER_RULES_INVALID:NOT_JSON/u);
   assert.throws(() => loadPaperRules("../x"), /PAPER_RULES_INVALID/u);

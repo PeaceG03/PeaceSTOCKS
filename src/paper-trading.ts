@@ -1,6 +1,6 @@
 /**
  * Simulated paper trading of the frozen TOP_15_OVERALL picks under the pre-registered rules
- * (config/paper-rules-v3.json, docs/PAPER_TRADING.md). No broker: every order is a ledger row filled from
+ * (config/paper-rules-v4.json, docs/PAPER_TRADING.md). No broker: every order is a ledger row filled from
  * the stored daily bars. Nothing here sends an order anywhere.
  *
  * One run: (1) gates (enabled, kill switches) before anything is read or written; (1b) corrections for
@@ -33,6 +33,8 @@ import {
   type PaperOrderIntent,
   type PaperPosition,
   type PaperStuckResolution,
+  type PaperUniverseResolution,
+  type PaperUniverseStuck,
 } from "./paper-ledger";
 import type { LoadedPaperRules, PaperRules } from "./paper-rules";
 import { resolveSessionPredictionStatus } from "./prediction-status";
@@ -146,21 +148,58 @@ export function appliedSplitFactor(events: readonly SplitEvent[] | undefined, af
   return Number.isFinite(factor) && factor > 0 ? { factor, unreconciled: false } : { factor: 1, unreconciled: true };
 }
 
+/** Stored sessions before a session whose median name count defines "normal" coverage. */
+export const COVERAGE_TRAILING_SESSIONS = 20;
+
 /** One bar per security and session (highest revision), with lookups. */
 export class PaperBars {
   private readonly byId = new Map<string, Map<string, CanonicalDailyBar>>();
   private readonly dates = new Set<string>();
+  private readonly names = new Map<string, number>();
+  private sorted: string[] | undefined;
+  private readonly coveredCache = new Map<string, boolean>();
   constructor(bars: Iterable<CanonicalDailyBar>) {
     for (const bar of bars) {
       let own = this.byId.get(bar.securityId);
       if (!own) this.byId.set(bar.securityId, (own = new Map()));
       const prior = own.get(bar.sessionDate);
+      if (!prior) this.names.set(bar.sessionDate, (this.names.get(bar.sessionDate) ?? 0) + 1);
       if (!prior || bar.revision >= prior.revision) own.set(bar.sessionDate, bar);
       this.dates.add(bar.sessionDate);
     }
   }
   hasSession(date: string): boolean {
     return this.dates.has(date);
+  }
+  /** Oldest stored session, or undefined when there are no bars. */
+  firstSession(): string | undefined {
+    return (this.sorted ??= [...this.dates].sort())[0];
+  }
+  /** Names with a stored bar on this session (0 when none). */
+  nameCount(date: string): number {
+    return this.names.get(date) ?? 0;
+  }
+  /**
+   * Is this session covered by our data? False for a coverage hole: no bars at all, or fewer names than
+   * `fraction` x the median name count of the COVERAGE_TRAILING_SESSIONS stored sessions before it
+   * (as loaded). With no stored session before it, a session with bars counts as covered.
+   */
+  covered(date: string, fraction: number): boolean {
+    if (!this.dates.has(date)) return false;
+    const key = `${date}|${fraction}`;
+    const cached = this.coveredCache.get(key);
+    if (cached !== undefined) return cached;
+    const sorted = (this.sorted ??= [...this.dates].sort());
+    const at = sorted.indexOf(date);
+    const trailing = sorted.slice(Math.max(0, at - COVERAGE_TRAILING_SESSIONS), at).map((d) => this.nameCount(d)).sort((a, b) => a - b);
+    let result = true;
+    if (trailing.length) {
+      const mid = trailing.length >> 1;
+      const median = trailing.length % 2 ? trailing[mid]! : (trailing[mid - 1]! + trailing[mid]!) / 2;
+      result = this.nameCount(date) >= fraction * median;
+    }
+    this.coveredCache.set(key, result);
+    return result;
   }
   open(id: string, date: string): number | undefined {
     const value = this.byId.get(id)?.get(date)?.open;
@@ -175,6 +214,15 @@ export class PaperBars {
       if (!best || bar.sessionDate > best.sessionDate) best = bar;
     }
     return best?.close;
+  }
+  /** Session of the newest positive close strictly before `date`, with that close. */
+  lastCloseBefore(id: string, date: string): { sessionDate: string; close: number } | undefined {
+    let best: CanonicalDailyBar | undefined;
+    for (const bar of this.byId.get(id)?.values() ?? []) {
+      if (bar.sessionDate >= date || !(bar.close > 0) || !Number.isFinite(bar.close)) continue;
+      if (!best || bar.sessionDate > best.sessionDate) best = bar;
+    }
+    return best ? { sessionDate: best.sessionDate, close: best.close } : undefined;
   }
   /** Sessions with a usable open for this security, oldest first. */
   openSessions(id: string): string[] {
@@ -243,6 +291,11 @@ export function computeFills(input: {
       continue;
     }
     const rawOpen = bars.open(order.securityId, S);
+    if (rawOpen === undefined && !bars.covered(S, rules.coverageHoleFraction)) {
+      // Coverage hole in our data (far fewer names than normal): not a missed exit; stays held.
+      fills.push({ ...base(order), status: "NO_PRICE", ...none, flags: ["COVERAGE_HOLE"] });
+      continue;
+    }
     if (rawOpen === undefined) {
       const missed = (position.missedExits ?? 0) + 1;
       if (missed < rules.markZeroAfterMissedExits) {
@@ -474,17 +527,29 @@ export function windowReturn(
 }
 
 /**
- * The universe benchmark's side of the $0 rule: true when `to` is exactly the N-th stored session in a
- * row with no open for this name, after a session that had one. That window counts it at -100% once;
- * windows before and after leave it out (no price), as before. A later price is not fed back.
+ * Missed sessions for one name up to `to`: walking back over eligible sessions until one with an open,
+ * the number of covered sessions (PaperBars.covered) with no open. Coverage holes are skipped, not
+ * counted, as for paper exits. `lastOpen` is the session with that open; undefined when the walk leaves
+ * the loaded bars first (unknown, so never treated as missed).
  */
-export function stuckAt(bars: PaperBars, id: string, to: string, n: number, calendar = US_EQUITY_MARKET_CALENDAR): boolean {
-  let date: string | undefined = to;
-  for (let i = 0; i < n; i += 1) {
-    if (!date || !bars.hasSession(date) || bars.open(id, date) !== undefined) return false;
-    date = previousEligibleSession(date, calendar);
+export function missedSessions(bars: PaperBars, id: string, to: string, fraction: number, calendar = US_EQUITY_MARKET_CALENDAR): { misses: number; lastOpen?: string } {
+  const first = bars.firstSession();
+  let misses = 0;
+  for (let date: string | undefined = to; date && first && date >= first; date = previousEligibleSession(date, calendar)) {
+    if (bars.open(id, date) !== undefined) return { misses, lastOpen: date };
+    if (bars.covered(date, fraction)) misses += 1;
   }
-  return date !== undefined && bars.open(id, date) !== undefined;
+  return { misses };
+}
+
+/**
+ * The universe's side of the $0 rule, the same trigger as paper: `to` is covered, has no open for the
+ * name, and is exactly its N-th covered session in a row without one, after a session with an open.
+ */
+export function universeStuckAt(bars: PaperBars, id: string, to: string, rules: Pick<PaperRules, "markZeroAfterMissedExits" | "coverageHoleFraction">, calendar = US_EQUITY_MARKET_CALENDAR): boolean {
+  if (bars.open(id, to) !== undefined || !bars.covered(to, rules.coverageHoleFraction)) return false;
+  const run = missedSessions(bars, id, to, rules.coverageHoleFraction, calendar);
+  return run.lastOpen !== undefined && run.misses === rules.markZeroAfterMissedExits;
 }
 
 const compound = (cumulative: number, r: number | null) => (r === null ? cumulative : (1 + cumulative) * (1 + r) - 1);
@@ -499,26 +564,81 @@ export function computeDay(input: {
   securities: readonly SecurityMasterRecord[];
   loaded: LoadedPaperRules;
   calendar?: typeof US_EQUITY_MARKET_CALENDAR;
+  /** Stored cash settlement records (loadSettlementActions), for universe resolutions. */
+  settlements?: readonly CorporateAction[];
+  now?: Date;
 }): PaperDay {
   const { from, to, bars, splits } = input;
   const calendar = input.calendar ?? US_EQUITY_MARKET_CALENDAR;
   const { rules, rulesSha256 } = input.loaded;
   const spyId = resolveSpyBenchmarkId(input.securities);
   const spy = spyId ? windowReturn(bars, splits, spyId, from.sessionDate, to.sessionDate) ?? null : null;
+  const prev = input.previousDay;
+  // Equal-weight universe under the same MARK_ZERO_THEN_CORRECT rule as paper. Index level at the
+  // window's opening open (1 at the start); a name newly at $0 loses its 1/n slice of it.
+  const levelFrom = 1 + (prev?.cumulativeUniverseReturn ?? 0);
   const universe: number[] = [];
+  const newlyStuck: { securityId: string; basis: { sessionDate: string; close: number } }[] = [];
   for (const security of input.securities) {
     if (security.status !== "ACTIVE" || (security.eligibility !== "LEVEL_2" && security.eligibility !== "LEVEL_3")) continue;
-    const r = windowReturn(bars, splits, security.securityId, from.sessionDate, to.sessionDate) ??
-      (stuckAt(bars, security.securityId, to.sessionDate, input.loaded.rules.markZeroAfterMissedExits, calendar) ? -1 : undefined);
-    if (r !== undefined) universe.push(r);
+    const id = security.securityId;
+    const r = windowReturn(bars, splits, id, from.sessionDate, to.sessionDate);
+    if (r !== undefined) {
+      universe.push(r);
+      continue;
+    }
+    if (!universeStuckAt(bars, id, to.sessionDate, rules, calendar)) continue;
+    const basis = bars.lastCloseBefore(id, to.sessionDate);
+    if (!basis) continue;
+    universe.push(-1);
+    newlyStuck.push({ securityId: id, basis });
   }
-  const universeReturn = universe.length ? universe.reduce((sum, r) => sum + r, 0) / universe.length : null;
+  // Resolve earlier universe $0 marks with the same data and the same function as paper
+  // (stuckResolutionFor), with no costs: the recovered slice enters this window's return.
+  const noCosts: LoadedPaperRules = { ...input.loaded, rules: { ...rules, slippageBpsPerSide: 0, commissionPerOrderUsd: 0 } };
+  const stillStuck: PaperUniverseStuck[] = [];
+  const resolved: PaperUniverseResolution[] = [];
+  let recoveredUnits = 0;
+  for (const entry of prev?.universeStuck ?? []) {
+    const resolution = stuckResolutionFor({
+      position: { securityId: entry.securityId, qty: 1, entryOpen: entry.basisClose, entryFillPrice: entry.basisClose, entrySessionDate: entry.basisSessionDate, stuckSince: entry.stuckSince },
+      clientOrderId: "universe",
+      n: 1,
+      bars,
+      splits,
+      settlements: input.settlements ?? [],
+      through: to.sessionDate,
+      loaded: noCosts,
+      now: input.now ?? new Date(0),
+    });
+    if (!resolution) {
+      stillStuck.push(entry);
+      continue;
+    }
+    const units = (entry.units * resolution.perShareUsd) / entry.basisClose;
+    recoveredUnits += units;
+    resolved.push({
+      securityId: entry.securityId,
+      stuckSince: entry.stuckSince,
+      source: resolution.source,
+      ...(resolution.sourceSessionDate ? { sourceSessionDate: resolution.sourceSessionDate } : {}),
+      ...(resolution.actionId ? { actionId: resolution.actionId } : {}),
+      perShareUsd: resolution.perShareUsd,
+      basisClose: entry.basisClose,
+      units: entry.units,
+      recoveredUnits: units,
+    });
+  }
+  const n = universe.length;
+  for (const stuck of newlyStuck)
+    stillStuck.push({ securityId: stuck.securityId, stuckSince: to.sessionDate, basisSessionDate: stuck.basis.sessionDate, basisClose: stuck.basis.close, units: levelFrom / n });
+  const correctionReturn = recoveredUnits / levelFrom;
+  const universeReturn = n ? universe.reduce((sum, r) => sum + r, 0) / n + correctionReturn : resolved.length ? correctionReturn : null;
   const paperReturn = to.equityAtOpen / from.equityAtOpen - 1;
   const cost = (fill: PaperFill) => fill.slippageUsd + fill.commissionUsd;
   const costsUsd =
     from.fills.filter((f) => f.side === "BUY").reduce((sum, f) => sum + cost(f), 0) +
     to.fills.filter((f) => f.side === "SELL").reduce((sum, f) => sum + cost(f), 0);
-  const prev = input.previousDay;
   return {
     schemaVersion: "paper-day-v1",
     rulesVersion: rules.rulesVersion,
@@ -531,6 +651,8 @@ export function computeDay(input: {
     spyReturn: spy,
     universeReturn,
     universeSize: universe.length,
+    ...(stillStuck.length ? { universeStuck: stillStuck.sort((a, b) => a.securityId.localeCompare(b.securityId)) } : {}),
+    ...(resolved.length ? { universeResolved: resolved.sort((a, b) => a.securityId.localeCompare(b.securityId)), universeCorrectionReturn: correctionReturn } : {}),
     cumulativePaperReturn: compound(prev?.cumulativePaperReturn ?? 0, paperReturn),
     cumulativeSpyReturn: compound(prev?.cumulativeSpyReturn ?? 0, spy),
     cumulativeUniverseReturn: compound(prev?.cumulativeUniverseReturn ?? 0, universeReturn),
@@ -556,9 +678,12 @@ export function nextOpenSession(now: Date, calendar = US_EQUITY_MARKET_CALENDAR)
   return next;
 }
 
-/** Calendar days of bars loaded before the earliest session a run reads: last closes and N missed sessions. */
+/**
+ * Calendar days of bars loaded before the earliest session a run reads: last closes, N missed sessions,
+ * and the COVERAGE_TRAILING_SESSIONS stored sessions before them that define a coverage hole.
+ */
 export function paperBarsLookbackDays(rules: Pick<PaperRules, "markZeroAfterMissedExits">): number {
-  return Math.max(21, Math.ceil((rules.markZeroAfterMissedExits * 7) / 5) + 10);
+  return Math.max(21, Math.ceil(((rules.markZeroAfterMissedExits + COVERAGE_TRAILING_SESSIONS) * 7) / 5) + 10);
 }
 
 function addDays(date: string, days: number): string {
@@ -660,12 +785,14 @@ export async function runPaperTrading(options: {
   const bars = new PaperBars(await market.loadBarsBetween(addDays(dates[0]!, -paperBarsLookbackDays(rules)), dates.at(-1)!));
   let securities: SecurityMasterRecord[] | undefined;
   const loadSecurities = async () => (securities ??= await market.loadSecurities());
+  let settlementActions: CorporateAction[] | undefined;
+  const loadSettlements = async () => (settlementActions ??= (await market.loadSettlementActions?.()) ?? []);
 
   // (1c) STUCK holdings (marked $0): append the resolution once a later price or a cash settlement is
   // stored. The MARKED_ZERO fill is never rewritten; the cash enters at the next open that is filled.
   const stuck = lastFilled ? (await readFills(lastFilled)).positionsAfter.filter((p) => p.stuckSince) : [];
   if (stuck.length) {
-    const settlements = (await market.loadSettlementActions?.()) ?? [];
+    const settlements = await loadSettlements();
     for (const position of stuck) {
       const own = correctionKeys.map(parsePaperCorrectionKey).filter((k) => k && k.sessionDate === position.stuckSince && k.securityId === position.securityId);
       let resolvedAlready = false;
@@ -744,6 +871,8 @@ export async function runPaperTrading(options: {
       securities: await loadSecurities(),
       loaded,
       calendar,
+      settlements: await loadSettlements(),
+      now,
     });
     await ledger.putOnce(paperLedgerKey("days", S), day);
     previousDay = (await ledger.read<PaperDay>(paperLedgerKey("days", S)))!;

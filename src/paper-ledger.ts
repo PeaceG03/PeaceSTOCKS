@@ -230,6 +230,32 @@ export interface PaperStuckResolution extends RulesStamp {
   recordedAt: string;
 }
 
+/** A universe name marked $0: its lost slice of the equal-weight index and the close it was worth. */
+export interface PaperUniverseStuck {
+  securityId: string;
+  /** Session of the window it was marked $0 in. */
+  stuckSince: string;
+  /** Last stored close before that session (what the slice was worth per share), and its session. */
+  basisSessionDate: string;
+  basisClose: number;
+  /** Index units lost: index level at that window's opening open / universe size of that window. */
+  units: number;
+}
+
+export interface PaperUniverseResolution {
+  securityId: string;
+  stuckSince: string;
+  source: "PRICE" | "CASH_SETTLEMENT";
+  sourceSessionDate?: string;
+  actionId?: string;
+  /** Per share, split-adjusted, no costs (stuckResolutionFor with zero costs). */
+  perShareUsd: number;
+  basisClose: number;
+  units: number;
+  /** units x perShareUsd / basisClose. */
+  recoveredUnits: number;
+}
+
 /** One open-to-open window, from the previous filled session's open to this session's open. */
 export interface PaperDay extends RulesStamp {
   schemaVersion: "paper-day-v1";
@@ -249,6 +275,15 @@ export interface PaperDay extends RulesStamp {
   costsUsd: number;
   /** Corrections of earlier exit fills that entered equity at this window's closing open. */
   correctionsUsd?: number;
+  /**
+   * Universe names at $0 (MARK_ZERO_THEN_CORRECT) still waiting for a later open or cash record after
+   * this window, carried to the next day row.
+   */
+  universeStuck?: PaperUniverseStuck[];
+  /** Universe $0 marks resolved in this window, by the same data and function as paper. */
+  universeResolved?: PaperUniverseResolution[];
+  /** The recovered slices as a return on the index at this window's opening open (in universeReturn). */
+  universeCorrectionReturn?: number;
   entriesRefused?: PaperEntryRefusal;
 }
 
