@@ -1,9 +1,15 @@
+# Private PeaceSTOCKS site (src/read-worker.ts). Deployed only by .github/workflows/site-deploy.yml.
+# Only https://stocks.jjpeace.com serves it, behind a Cloudflare Access app for one email; the Worker
+# also checks the Access JWT itself. No workers.dev or preview URLs (they would sit outside Access).
+# No R2 binding: the Worker reads R2 through the S3 API with a read-only key pair (Worker secrets
+# R2_READ_ACCESS_KEY_ID / R2_READ_SECRET_ACCESS_KEY), so it cannot write to the bucket.
 name = "peacestocks-read"
 main = "src/read-worker.ts"
 compatibility_date = "2026-10-04"
 compatibility_flags = ["nodejs_compat"]
-workers_dev = true
+workers_dev = false
+preview_urls = false
 
-[[r2_buckets]]
-binding = "PEACESTOCKS"
-bucket_name = "peacestocks"
+[[routes]]
+pattern = "stocks.jjpeace.com"
+custom_domain = true
