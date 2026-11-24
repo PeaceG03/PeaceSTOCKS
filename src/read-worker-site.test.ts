@@ -3,7 +3,8 @@ import { createSign, generateKeyPairSync } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { clearAccessCertCache } from "./access-jwt";
-import worker, { createSiteWorker } from "./read-worker";
+import worker, { createSiteWorker, siteReadClient } from "./read-worker";
+import { authorizationHeader } from "./object-store";
 import { MemoryObjectClient } from "./object-store";
 
 const TEAM = "https://example-team.cloudflareaccess.com";
@@ -172,4 +173,43 @@ test("site worker: any host but stocks.jjpeace.com (e.g. a *.workers.dev URL) ge
     assert.equal(response.status, 200);
     assert.ok(r2Calls(calls).length > 0);
   });
+});
+
+test("site worker: siteReadClient trims every R2 setting, so a pasted trailing newline cannot break SigV4", async () => {
+  const seen: Array<{ url: string; headers: Headers }> = [];
+  const stub = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    seen.push({ url: String(input), headers: new Headers(init?.headers) });
+    return new Response("<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>", { status: 200 });
+  }) as typeof fetch;
+  const client = siteReadClient(
+    { ...ENV, R2_ACCOUNT_ID: " acct\n", R2_BUCKET: "bucket\r\n", R2_READ_ACCESS_KEY_ID: "\tREADKEYID \n", R2_READ_SECRET_ACCESS_KEY: "read-secret\n" },
+    stub,
+  );
+  assert.ok(client);
+  await client.list("runs/");
+  assert.equal(seen.length, 1);
+  const url = new URL(seen[0]!.url);
+  assert.equal(url.host, "acct.r2.cloudflarestorage.com");
+  assert.equal(url.pathname, "/bucket/");
+  // The signature must be the one the clean values give.
+  const amzDate = seen[0]!.headers.get("x-amz-date")!;
+  const now = new Date(`${amzDate.slice(0, 4)}-${amzDate.slice(4, 6)}-${amzDate.slice(6, 8)}T${amzDate.slice(9, 11)}:${amzDate.slice(11, 13)}:${amzDate.slice(13, 15)}Z`);
+  const expected = authorizationHeader({ method: "GET", url, body: new Uint8Array(), accessKeyId: "READKEYID", secretAccessKey: "read-secret", now });
+  assert.equal(seen[0]!.headers.get("authorization"), expected.authorization);
+});
+
+test("site worker: an R2 setting that is missing or blank after trimming gives a clear 503 naming it, with no reads", async () => {
+  clearAccessCertCache();
+  for (const name of ["R2_ACCOUNT_ID", "R2_BUCKET", "R2_READ_ACCESS_KEY_ID", "R2_READ_SECRET_ACCESS_KEY"] as const) {
+    for (const value of [" \n", "", undefined]) {
+      assert.equal(siteReadClient({ ...ENV, [name]: value }), undefined, `${name}=${JSON.stringify(value)}`);
+      await withFetch(async (calls) => {
+        const response = await worker.fetch(new Request(`https://${HOST}/`, { headers: { "cf-access-jwt-assertion": token() } }), { ...ENV, [name]: value });
+        assert.equal(response.status, 503);
+        const text = await response.text();
+        assert.equal(text, `Storage not configured: ${name} is missing or empty.`);
+        assert.deepEqual(r2Calls(calls), []);
+      });
+    }
+  }
 });

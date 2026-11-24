@@ -86,7 +86,8 @@ jobs:
           umask 077
           file="$RUNNER_TEMP/site-secrets.json"
           trap 'rm -f "$file"' EXIT
-          node -e 'const e=process.env; require("fs").writeFileSync(process.argv[1], JSON.stringify({ALLOWED_EMAIL:e.ALLOWED_EMAIL.trim(),R2_ACCOUNT_ID:e.CLOUDFLARE_ACCOUNT_ID,R2_BUCKET:e.R2_BUCKET,R2_READ_ACCESS_KEY_ID:e.R2_READ_ACCESS_KEY_ID,R2_READ_SECRET_ACCESS_KEY:e.R2_READ_SECRET_ACCESS_KEY}))' "$file"
+          # Every value trimmed: a value pasted into the GitHub UI often ends in a newline, which breaks SigV4.
+          node -e 'const e=process.env; const v={ALLOWED_EMAIL:e.ALLOWED_EMAIL,R2_ACCOUNT_ID:e.CLOUDFLARE_ACCOUNT_ID,R2_BUCKET:e.R2_BUCKET,R2_READ_ACCESS_KEY_ID:e.R2_READ_ACCESS_KEY_ID,R2_READ_SECRET_ACCESS_KEY:e.R2_READ_SECRET_ACCESS_KEY}; for (const k of Object.keys(v)) { v[k]=String(v[k] ?? "").trim(); if (!v[k]) { console.error("::error::"+k+" is missing or empty after trimming"); process.exit(1); } } require("fs").writeFileSync(process.argv[1], JSON.stringify(v))' "$file"
           npx --yes "wrangler@${WRANGLER_VERSION}" secret bulk "$file"
       - name: Confirm the site is not public
         # A brand-new custom domain can take minutes to get DNS and a certificate, so keep trying for

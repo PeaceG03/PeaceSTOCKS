@@ -106,6 +106,8 @@ function plain(status: number, text: string): Response {
 export function createSiteWorker(deps: {
   verify: (request: Request) => Promise<AccessJwtResult>;
   client: (ObjectClient & { listSizes: NonNullable<ObjectClient["listSizes"]> }) | undefined;
+  /** Why there is no client (setting names only, never values). */
+  storageProblem?: string;
 }): { fetch(request: Request): Promise<Response> } {
   return {
     async fetch(request: Request): Promise<Response> {
@@ -118,7 +120,7 @@ export function createSiteWorker(deps: {
       if (!verdict.ok)
         return verdict.reason === "ACCESS_NOT_CONFIGURED" ? plain(503, "Not configured.") : plain(403, "Forbidden.");
       if (request.method !== "GET" && request.method !== "HEAD") return plain(405, "Read only.");
-      if (!deps.client) return plain(503, "Storage not configured.");
+      if (!deps.client) return plain(503, deps.storageProblem ? `Storage not configured: ${deps.storageProblem}.` : "Storage not configured.");
       const path = new URL(request.url).pathname;
       if (path === "/") {
         const html = renderSitePage(await loadSiteData(deps.client));
@@ -133,13 +135,25 @@ export function createSiteWorker(deps: {
   };
 }
 
+const SITE_READ_SETTINGS = ["R2_ACCOUNT_ID", "R2_BUCKET", "R2_READ_ACCESS_KEY_ID", "R2_READ_SECRET_ACCESS_KEY"] as const;
+
+/** Trimmed R2 settings (a pasted secret often ends in a newline, which breaks SigV4) and the names missing. */
+function siteReadSettings(env: SiteEnv): { values: Record<(typeof SITE_READ_SETTINGS)[number], string>; missing: string[] } {
+  const values = Object.fromEntries(SITE_READ_SETTINGS.map((name) => [name, (env[name] ?? "").trim()])) as Record<
+    (typeof SITE_READ_SETTINGS)[number],
+    string
+  >;
+  return { values, missing: SITE_READ_SETTINGS.filter((name) => !values[name]) };
+}
+
 export function siteReadClient(env: SiteEnv, fetchImpl?: typeof fetch): ReadOnlyR2Client | undefined {
-  if (!env.R2_ACCOUNT_ID || !env.R2_BUCKET || !env.R2_READ_ACCESS_KEY_ID || !env.R2_READ_SECRET_ACCESS_KEY) return undefined;
+  const { values, missing } = siteReadSettings(env);
+  if (missing.length) return undefined;
   return new ReadOnlyR2Client({
-    accountId: env.R2_ACCOUNT_ID,
-    bucket: env.R2_BUCKET,
-    accessKeyId: env.R2_READ_ACCESS_KEY_ID,
-    secretAccessKey: env.R2_READ_SECRET_ACCESS_KEY,
+    accountId: values.R2_ACCOUNT_ID,
+    bucket: values.R2_BUCKET,
+    accessKeyId: values.R2_READ_ACCESS_KEY_ID,
+    secretAccessKey: values.R2_READ_SECRET_ACCESS_KEY,
     ...(fetchImpl ? { fetchImpl } : {}),
   });
 }
@@ -162,6 +176,7 @@ export default {
           allowedEmail: env.ALLOWED_EMAIL,
         }),
       client: siteReadClient(env),
+      storageProblem: siteReadSettings(env).missing.map((name) => `${name} is missing or empty`).join(", "),
     }).fetch(request);
   },
 };

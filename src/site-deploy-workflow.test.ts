@@ -215,3 +215,68 @@ test("site deploy post-check: only an Access login redirect or 401/403 passes; a
     assert.match(bad.out, /::error::could not confirm the Access login/u, answer);
   }
 });
+
+/** Runs the Worker-secrets step's `node -e` script (not wrangler) and returns the JSON it writes. */
+function runSecretsScript(env: Record<string, string>): { status: number; out: string; json?: Record<string, string> } {
+  const step = block("Worker secrets");
+  const line = step.split("\n").find((l) => l.trim().startsWith("node -e "));
+  assert.ok(line, "the step builds the secrets file with node -e");
+  const dir = mkdtempSync(join(tmpdir(), "secrets-"));
+  try {
+    const file = join(dir, "site-secrets.json");
+    const result = spawnSync("bash", ["-e", "-c", line!.trim()], {
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", file, ...env },
+      encoding: "utf8",
+    });
+    let json: Record<string, string> | undefined;
+    try {
+      json = JSON.parse(readFileSync(file, "utf8")) as Record<string, string>;
+    } catch {
+      json = undefined;
+    }
+    return { status: result.status ?? -1, out: `${result.stdout}${result.stderr}`, ...(json ? { json } : {}) };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const SECRET_ENV = {
+  ALLOWED_EMAIL: " owner@example.test\n",
+  CLOUDFLARE_ACCOUNT_ID: "acct123\n",
+  R2_BUCKET: "\tbucket-aaa \n",
+  R2_READ_ACCESS_KEY_ID: "READKEYIDAAA\r\n",
+  R2_READ_SECRET_ACCESS_KEY: "  read-secret-bbb\n",
+};
+
+test("site deploy workflow: every Worker secret is trimmed (pasted values often end in a newline)", () => {
+  const result = runSecretsScript(SECRET_ENV);
+  assert.equal(result.status, 0, result.out);
+  assert.deepEqual(result.json, {
+    ALLOWED_EMAIL: "owner@example.test",
+    R2_ACCOUNT_ID: "acct123",
+    R2_BUCKET: "bucket-aaa",
+    R2_READ_ACCESS_KEY_ID: "READKEYIDAAA",
+    R2_READ_SECRET_ACCESS_KEY: "read-secret-bbb",
+  });
+});
+
+test("site deploy workflow: a secret that is missing or empty after trimming stops the step, naming it only", () => {
+  for (const [name, written] of [
+    ["R2_READ_SECRET_ACCESS_KEY", "R2_READ_SECRET_ACCESS_KEY"],
+    ["R2_READ_ACCESS_KEY_ID", "R2_READ_ACCESS_KEY_ID"],
+    ["CLOUDFLARE_ACCOUNT_ID", "R2_ACCOUNT_ID"],
+    ["R2_BUCKET", "R2_BUCKET"],
+    ["ALLOWED_EMAIL", "ALLOWED_EMAIL"],
+  ] as const) {
+    for (const value of [" \n", undefined]) {
+      const env: Record<string, string> = { ...SECRET_ENV };
+      if (value === undefined) delete env[name];
+      else env[name] = value;
+      const result = runSecretsScript(env);
+      assert.notEqual(result.status, 0, `${name}=${JSON.stringify(value)}`);
+      assert.equal(result.json, undefined, "no secrets file written");
+      assert.match(result.out, new RegExp(`::error::${written} is missing or empty after trimming`, "u"));
+      for (const secret of Object.values(SECRET_ENV)) assert.ok(!result.out.includes(secret.trim()), "no value in the output");
+    }
+  }
+});
