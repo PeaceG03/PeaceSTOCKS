@@ -8,7 +8,9 @@
  * and test metrics, the pooled test metrics and the pooled p-value. Every result reports how many
  * distinct variants the log holds and the Holm-adjusted pooled p-value over all of them.
  */
-import { AppendOnlyLog, configHash } from "./append-only-log";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { AppendOnlyLog, configHash, gitCommittedHead } from "./append-only-log";
 import { simulateList, type CostConfig, type DailyResult, type HarnessSession } from "./research-costs";
 import type { Fold, FoldConfig } from "./research-folds";
 import { holmAdjusted, mean, seriesMetrics, type SeriesMetrics } from "./research-stats";
@@ -74,12 +76,41 @@ export const foldPositive = (m: SeriesMetrics): boolean => m.excessUniverse.mean
  * candidate variants ever tried, family size max(variants, strategies) and each strategy's
  * adjusted p. Used by evaluateStrategy and by the research CLI (one definition, one set of tests).
  */
-export function holmFamily(all: readonly VariantRecord[]): { strategies: VariantRecord[]; variantsTried: number; familySize: number; adjustedP: (strategyHash: string) => number } {
+export interface PreregistrationLedgerEntry {
+  type: "PEEK_DISCLOSURE" | "PREREGISTER";
+  version?: string;
+  baselineVariantsCount?: number;
+  candidateIds?: string[];
+  candidateCount?: number;
+}
+
+/**
+ * Total hypothesis pool implied by preregistration.jsonl in `ledgerDir` (baseline variants present
+ * when registered + distinct pre-registered candidate IDs). Returns 0 when no preregistration log exists.
+ */
+export function preregisteredPoolSize(ledgerDir: string): number {
+  const path = join(ledgerDir, "preregistration.jsonl");
+  if (!existsSync(path)) return 0;
+  const entries = new AppendOnlyLog<PreregistrationLedgerEntry>(path, undefined, { anchor: () => gitCommittedHead(path) }).entries();
+  let baseline = 0;
+  const ids = new Set<string>();
+  for (const e of entries) {
+    if (e.type !== "PREREGISTER") continue;
+    if (typeof e.baselineVariantsCount === "number" && e.baselineVariantsCount > baseline) baseline = e.baselineVariantsCount;
+    for (const id of e.candidateIds ?? []) ids.add(id);
+  }
+  return baseline + ids.size;
+}
+
+export function holmFamily(
+  all: readonly VariantRecord[],
+  preregisteredCount = 0,
+): { strategies: VariantRecord[]; variantsTried: number; familySize: number; adjustedP: (strategyHash: string) => number } {
   const latest = new Map<string, VariantRecord>();
   for (const entry of all) latest.set(entry.strategyHash, entry);
   const strategies = [...latest.values()];
   const variantsTried = new Set(all.flatMap((e) => e.candidateHashes)).size;
-  const familySize = Math.max(variantsTried, strategies.length);
+  const familySize = Math.max(variantsTried, strategies.length, preregisteredCount);
   const adjusted = holmAdjusted(strategies.map((x) => x.pooledP), familySize);
   return { strategies, variantsTried, familySize, adjustedP: (hash) => adjusted[strategies.findIndex((x) => x.strategyHash === hash)]! };
 }
@@ -89,6 +120,7 @@ export function evaluateStrategy(
   folds: readonly Fold[],
   strategy: StrategyConfig,
   log: AppendOnlyLog<VariantRecord>,
+  preregisteredCount = 0,
 ): StrategyEvaluation {
   if (!strategy.candidates.length) throw new Error("STRATEGY_HAS_NO_CANDIDATES");
   const candidateHashes = strategy.candidates.map((c) => configHash(c));
@@ -127,7 +159,7 @@ export function evaluateStrategy(
     pooledP: Math.max(pooled.excessUniverse.p, pooled.excessSpy.p),
   };
   log.append(record);
-  const family = holmFamily(log.entries());
+  const family = holmFamily(log.entries(), preregisteredCount);
   const { variantsTried, familySize } = family;
   const adjustedP = family.adjustedP(record.strategyHash);
   return { record, daily, variantsTried, familySize, adjustedP, foldsPositive: results.filter((r) => r.positive).length, costBpsPerSide: strategy.costs.slippageBpsPerSide };

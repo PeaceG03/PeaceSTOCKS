@@ -75,3 +75,30 @@ test("pre-registration file lists <= 20 well-formed, unrun candidate scoring ide
   const ledger = new AppendOnlyLog<VariantRecord>(`${RESEARCH_LEDGER_DIR}/variants.jsonl`).entries();
   assert.equal(ledger.length, 10);
 });
+
+test("research-ledger/preregistration.jsonl anchors prereg config, doc, and Aug 27-Nov 19 peek disclosure", async () => {
+  const { createHash } = await import("node:crypto");
+  const { gitCommittedHead } = await import("./append-only-log");
+  const { holmFamily } = await import("./research-variants");
+  const { preregisteredPoolSize } = await import("./research-variants");
+  const preregLogPath = `${RESEARCH_LEDGER_DIR}/preregistration.jsonl`;
+  const log = new AppendOnlyLog<Record<string, unknown>>(preregLogPath, undefined, { anchor: () => gitCommittedHead(preregLogPath) });
+  const entries = log.entries();
+  const peek = entries.find((e) => e.type === "PEEK_DISCLOSURE");
+  assert.ok(peek, "PEEK_DISCLOSURE missing in research-ledger/preregistration.jsonl");
+  assert.match(JSON.stringify(peek), /2026-08-27.*2026-11-19/u);
+  assert.match(JSON.stringify(peek), /-0\.558%/u);
+
+  const reg = entries.find((e) => e.type === "PREREGISTER" && e.version === "research-preregistration-v1") as Record<string, unknown> | undefined;
+  assert.ok(reg, "PREREGISTER missing in research-ledger/preregistration.jsonl");
+  const sha = (rel: string) => createHash("sha256").update(readFileSync(new URL(`../${rel}`, import.meta.url))).digest("hex");
+  assert.equal(reg.configSha256, sha("config/research-preregistration-v1.json"));
+  assert.equal(reg.docSha256, sha("docs/RESEARCH_PREREGISTRATION.md"));
+  assert.equal(reg.candidateCount, 13);
+
+  const variants = new AppendOnlyLog<VariantRecord>(`${RESEARCH_LEDGER_DIR}/variants.jsonl`).entries();
+  const poolSize = preregisteredPoolSize(RESEARCH_LEDGER_DIR);
+  assert.equal(poolSize, 23); // 10 baseline variants + 13 unrun pre-registered ideas
+  const fam = holmFamily(variants, poolSize);
+  assert.equal(fam.familySize, 23);
+});

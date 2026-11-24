@@ -129,3 +129,20 @@ test("maxDrawdown and seriesMetrics compute compounded peak-to-trough drawdown f
   // spy: 1 -> 1.05 -> 1.008 -> 1.02816 => dd = 0.04
   close(m.maxDrawdownSpy!, 0.04, 1e-12);
 });
+
+test("holmFamily counts pre-registered unrun ideas via m = max(run variants, strategies, preregisteredCount)", async () => {
+  const { holmFamily } = await import("./research-variants");
+  const dir = mkdtempSync(join(tmpdir(), "holm-prereg-"));
+  try {
+    const log = new AppendOnlyLog<VariantRecord>(join(dir, "variants.jsonl"));
+    const folds = walkForwardFolds(40, strategy("x", ["GOOD"]).folds);
+    const ev = evaluateStrategy(sessions, folds, strategy("good", ["GOOD"]), log);
+    const fam = holmFamily(log.entries(), 16);
+    assert.equal(fam.variantsTried, 1);
+    assert.equal(fam.familySize, 16);
+    const expectedP = Math.min(1, ev.record.pooledP * 16);
+    close(fam.adjustedP(ev.record.strategyHash), expectedP, 1e-12);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
