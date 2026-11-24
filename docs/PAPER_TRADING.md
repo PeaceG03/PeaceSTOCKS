@@ -83,12 +83,13 @@ Stored in the same R2 bucket the scanner uses, under `paper/v1/`, written by the
 | `paper/v1/intents/<T>.json` | before T's open | the orders for T's open: SELL every held name, BUY each picked name, or why entries were refused |
 | `paper/v1/fills/<T>.json` | once T's bars are stored | each order's fill (price, shares, slippage, commission) or why it did not fill; cash and positions after |
 | `paper/v1/days/<T>.json` | with the fills | the window from the previous open to T's open: paper return vs SPY and vs the equal-weight universe, plus cumulative |
+| `paper/v1/corrections/<S>/<securityId>_<n>.json` | when a late split record changes an exit's price | the n-th correction of the exit fill of that name at S's open: old and new split factor and price, and the cash difference |
 
 - **Append-only**: every object is written once and never overwritten or deleted. Each write is a
   single conditional put (`If-None-Match: *`): R2 itself refuses to overwrite an existing key (412),
   so even a writer racing outside the workflow's concurrency group cannot replace a stored object; the
   run keeps the stored object. The ledger writer can only write keys of exactly these
-  three shapes; it has no delete.
+  four shapes; it has no delete.
 - **Idempotent orders**: each order's id is `<rulesVersion>_<session>_<securityId>_<side>` (the
   client order id), unique per session, name and side. A retried run finds the object already stored
   and does not write or fill it again.
@@ -108,6 +109,16 @@ Stored in the same R2 bucket the scanner uses, under `paper/v1/`, written by the
   the same way, with no slippage or commission.
 - Then entries: per-name notional = min(equity at the open / number of names, 10% of equity);
   never more than the cash left. A name still held (its exit had no price) is not bought again.
+
+### Late split records: corrections, never rewrites
+Split records often arrive days after the split. A fill is never rewritten. Each run re-checks the
+exit fills of the last 30 filled sessions against the split records stored now. When the factor
+differs from the one the fill (or its latest correction) used, a correction is appended with the
+corrected price and `cashAdjustmentUsd = shares x (new price - old price)`. That cash enters the
+book at the next open that is filled (`correctionsUsd` and the cumulative `correctionsApplied` on the
+fills, `correctionsUsd` on that day row), exactly once. So the window in which a correction lands
+includes it in its return; earlier day rows are not changed. Benchmarks are not corrected after the
+fact; they used the records known when their day row was written, the same as the paper fill.
 
 ### Benchmarks (same window, open to open)
 - **SPY**: the security-master SPY ETF, no costs.

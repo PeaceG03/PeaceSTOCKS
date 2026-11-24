@@ -53,7 +53,7 @@ test("cli: end to end over the scanner's real storage layout, writing only paper
   await store.writePredictionStatus(fake.statuses[0]!);
   const before = new Map([...(await client.list(""))].map((key) => [key, true]));
   const line = await paperMain({ env: ON, now: new Date("2026-12-08T11:15:00.000Z"), repoRoot: emptyRoot(), makeClient: () => client });
-  assert.equal(line, "paper-trading: ON filled=0 pending=0 days=0 intents=2026-12-08:WRITTEN entries=1 exits=0 refused=-");
+  assert.equal(line, "paper-trading: ON filled=0 pending=0 days=0 corrections=0 intents=2026-12-08:WRITTEN entries=1 exits=0 refused=-");
   assert.ok(!line.includes("ZZTOP") && !line.includes("sec_aaa"));
   const added = (await client.list("")).filter((key) => !before.has(key));
   assert.deepEqual(added, [`${PAPER_LEDGER_PREFIX}intents/2026-12-08.json`]);

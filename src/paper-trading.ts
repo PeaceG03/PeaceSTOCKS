@@ -18,7 +18,10 @@ import type {
 import { etCalendarDate, etWallClockToUtc } from "./et-time";
 import {
   paperClientOrderId,
+  paperCorrectionKey,
   paperLedgerKey,
+  parsePaperCorrectionKey,
+  type PaperCorrection,
   type PaperDay,
   type PaperEntryRefusal,
   type PaperFill,
@@ -174,6 +177,8 @@ export function computeFills(input: {
   bars: PaperBars;
   splits: ReadonlyMap<string, SplitEvent[]>;
   loaded: LoadedPaperRules;
+  /** Corrections to add to cash at this open: their total, and every key applied so far (this open's included). */
+  corrections?: { usd: number; applied: string[] };
 }): PaperFills {
   const { intents, bars, splits } = input;
   const { rules, rulesSha256 } = input.loaded;
@@ -181,7 +186,8 @@ export function computeFills(input: {
   const S = intents.sessionDate;
   const bps = rules.slippageBpsPerSide;
   const commission = rules.commissionPerOrderUsd;
-  let cash = input.prior.cash;
+  const cashBefore = input.prior.cash + (input.corrections?.usd ?? 0);
+  let cash = cashBefore;
   const held = new Map(input.prior.positions.map((position) => [position.securityId, position]));
   const fills: PaperFill[] = [];
   const base = (order: PaperOrderIntent) => ({
@@ -278,14 +284,65 @@ export function computeFills(input: {
     schemaVersion: "paper-fills-v1",
     ...stamp,
     sessionDate: S,
-    cashBefore: input.prior.cash,
+    cashBefore,
     cashAfterExits,
     equityAtOpen,
     cashAfter: cash,
     positionsAfter: [...held.values()].sort((a, b) => a.securityId.localeCompare(b.securityId)),
     fills,
+    ...(input.corrections && input.corrections.applied.length
+      ? { correctionsUsd: input.corrections.usd, correctionsApplied: [...input.corrections.applied].sort() }
+      : {}),
   };
 }
+
+/**
+ * Corrections owed on stored exit fills: for each FILLED / WRITTEN_OFF exit whose split factor (by the
+ * records known now, appliedSplitFactor) differs from the factor its latest price used, the next
+ * correction. The fill itself is never rewritten. Pure.
+ */
+export function correctionsFor(input: {
+  fills: PaperFills;
+  latest: ReadonlyMap<string, PaperCorrection>;
+  splits: ReadonlyMap<string, SplitEvent[]>;
+  loaded: LoadedPaperRules;
+  now: Date;
+}): PaperCorrection[] {
+  const { rules, rulesSha256 } = input.loaded;
+  const out: PaperCorrection[] = [];
+  for (const fill of input.fills.fills) {
+    if (fill.side !== "SELL" || (fill.status !== "FILLED" && fill.status !== "WRITTEN_OFF")) continue;
+    if (fill.rawPrice === undefined || fill.splitFactorApplied === undefined || !fill.entrySessionDate || fill.fillPrice === undefined) continue;
+    const previous = input.latest.get(fill.securityId);
+    const previousFactor = previous?.correctedFactor ?? fill.splitFactorApplied;
+    const previousFillPrice = previous?.correctedFillPrice ?? fill.fillPrice;
+    const now = appliedSplitFactor(input.splits.get(fill.securityId), fill.entrySessionDate, input.fills.sessionDate).factor;
+    if (Math.abs(now / previousFactor - 1) <= 1e-9) continue;
+    const price = fill.rawPrice / now;
+    const correctedFillPrice = fill.status === "WRITTEN_OFF" ? price : sellFillPrice(price, rules.slippageBpsPerSide);
+    out.push({
+      schemaVersion: "paper-correction-v1",
+      rulesVersion: rules.rulesVersion,
+      rulesSha256,
+      sessionDate: input.fills.sessionDate,
+      securityId: fill.securityId,
+      clientOrderId: fill.clientOrderId,
+      n: (previous?.n ?? 0) + 1,
+      qty: fill.qty,
+      rawPrice: fill.rawPrice,
+      previousFactor,
+      previousFillPrice,
+      correctedFactor: now,
+      correctedFillPrice,
+      cashAdjustmentUsd: fill.qty * (correctedFillPrice - previousFillPrice),
+      recordedAt: input.now.toISOString(),
+    });
+  }
+  return out;
+}
+
+/** How many recent fill sessions are re-checked for late split records each run. */
+export const PAPER_CORRECTION_LOOKBACK_SESSIONS = 30;
 
 /**
  * Open-to-open return at the actual opens, split-adjusted exactly as paper exits are
@@ -350,6 +407,7 @@ export function computeDay(input: {
     cumulativeUniverseReturn: compound(prev?.cumulativeUniverseReturn ?? 0, universeReturn),
     positions: from.positionsAfter.length,
     costsUsd,
+    ...(to.correctionsUsd ? { correctionsUsd: to.correctionsUsd } : {}),
     ...(input.fromIntents?.entriesRefused ? { entriesRefused: input.fromIntents.entriesRefused } : {}),
   };
 }
@@ -376,6 +434,8 @@ export interface PaperRunResult {
   filled: string[];
   /** Pending intents left unfilled because their session's bars are not stored yet. */
   pendingFills: number;
+  /** Correction keys appended this run. */
+  corrections?: string[];
   days: string[];
   intents?: {
     sessionDate: string;
@@ -416,19 +476,7 @@ export async function runPaperTrading(options: {
   const needIntents = !intentSessions.includes(T);
 
   const result: PaperRunResult = { gate: "ON", filled: [], pendingFills: 0, days: [] };
-  if (!pending.length && !missingDays.length && !needIntents) {
-    result.intents = { sessionDate: T, outcome: "KEPT_EXISTING", entries: 0, exits: 0 };
-    return result;
-  }
-
-  // Bars for every session this run reads, plus 21 days before for last-close marks.
-  const predecessors = missingDays.map((s) => fillSessions[fillSessions.indexOf(s) - 1]!);
-  const dates = [...pending, ...missingDays, ...predecessors, D, ...(lastFilled ? [lastFilled] : [])].sort();
-  const bars = new PaperBars(await market.loadBarsBetween(addDays(dates[0]!, -21), dates.at(-1)!));
   const splits = splitEventsBySecurity(await market.loadSplitActions());
-  let securities: SecurityMasterRecord[] | undefined;
-  const loadSecurities = async () => (securities ??= await market.loadSecurities());
-
   const fillsCache = new Map<string, PaperFills>();
   const readFills = async (s: string) => {
     let found = fillsCache.get(s);
@@ -440,6 +488,37 @@ export async function runPaperTrading(options: {
     return found;
   };
 
+  // (1b) Late split records: append corrections for recent exit fills (fills are never rewritten).
+  const correctionKeys = await ledger.correctionKeys();
+  for (const F of fillSessions.slice(-PAPER_CORRECTION_LOOKBACK_SESSIONS)) {
+    const latest = new Map<string, PaperCorrection>();
+    for (const key of correctionKeys) {
+      const parsed = parsePaperCorrectionKey(key);
+      if (!parsed || parsed.sessionDate !== F) continue;
+      if ((latest.get(parsed.securityId)?.n ?? 0) > parsed.n) continue;
+      const stored = await ledger.read<PaperCorrection>(key);
+      if (stored) latest.set(parsed.securityId, stored);
+    }
+    for (const correction of correctionsFor({ fills: await readFills(F), latest, splits, loaded, now })) {
+      const key = paperCorrectionKey(F, correction.securityId, correction.n);
+      await ledger.putOnce(key, correction);
+      correctionKeys.push(key);
+      (result.corrections ??= []).push(key);
+    }
+  }
+
+  if (!pending.length && !missingDays.length && !needIntents) {
+    result.intents = { sessionDate: T, outcome: "KEPT_EXISTING", entries: 0, exits: 0 };
+    return result;
+  }
+
+  // Bars for every session this run reads, plus 21 days before for last-close marks.
+  const predecessors = missingDays.map((s) => fillSessions[fillSessions.indexOf(s) - 1]!);
+  const dates = [...pending, ...missingDays, ...predecessors, D, ...(lastFilled ? [lastFilled] : [])].sort();
+  const bars = new PaperBars(await market.loadBarsBetween(addDays(dates[0]!, -21), dates.at(-1)!));
+  let securities: SecurityMasterRecord[] | undefined;
+  const loadSecurities = async () => (securities ??= await market.loadSecurities());
+
   // (2) Fill pending intents, oldest first; stop at the first session whose bars are not stored yet.
   let state: BookState = lastFilled
     ? { cash: (await readFills(lastFilled)).cashAfter, positions: (await readFills(lastFilled)).positionsAfter }
@@ -449,7 +528,14 @@ export async function runPaperTrading(options: {
     if (!bars.hasSession(S)) break;
     const intents = await ledger.read<PaperIntents>(paperLedgerKey("intents", S));
     if (!intents) throw new Error("PAPER_LEDGER_INTENTS_MISSING");
-    const fills = computeFills({ intents, prior: state, bars, splits, loaded });
+    // Corrections not yet in cash enter it at this open.
+    const applied = new Set((allFilled.length ? (await readFills(allFilled.at(-1)!)).correctionsApplied : undefined) ?? []);
+    let usd = 0;
+    for (const key of correctionKeys.filter((k) => !applied.has(k)).sort()) {
+      usd += (await ledger.read<PaperCorrection>(key))!.cashAdjustmentUsd;
+      applied.add(key);
+    }
+    const fills = computeFills({ intents, prior: state, bars, splits, loaded, corrections: { usd, applied: [...applied] } });
     if ((await ledger.putOnce(paperLedgerKey("fills", S), fills)) === "KEPT_EXISTING") {
       // A concurrent or earlier write won: continue from what is stored.
       fillsCache.delete(S);

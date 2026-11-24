@@ -75,6 +75,18 @@ export class FakeMarket implements PaperMarketReader {
     } as unknown as SecurityMasterRecord);
   }
 
+  /** A split record: split_from/split_to (2-for-1 is 1/2). */
+  split(securityId: string, effectiveDate: string, from: number, to: number) {
+    this.splits.push({
+      actionId: `split_${securityId}_${effectiveDate}_${this.splits.length}`,
+      securityId,
+      actionType: from < to ? "SPLIT" : "REVERSE_SPLIT",
+      effectiveDate,
+      details: { split_from: from, split_to: to },
+      observedAt: `${effectiveDate}T00:00:00.000Z`,
+    } as unknown as CorporateAction);
+  }
+
   bar(securityId: string, sessionDate: string, open: number, close = open, revision = 1) {
     this.bars.push({ securityId, sessionDate, open, high: Math.max(open, close), low: Math.min(open, close), close, volume: 1000, revision } as unknown as CanonicalDailyBar);
   }

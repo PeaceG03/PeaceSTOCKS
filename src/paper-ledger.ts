@@ -2,7 +2,8 @@
  * Simulated paper-trading ledger (docs/PAPER_TRADING.md). No node: imports, so the site Worker can read it.
  *
  * Append-only: every object is written once under paper/v1/ and never overwritten or deleted. Keys have
- * exactly three shapes (intents, fills, days, one per trading session). A write to a key that already
+ * exactly these shapes: intents, fills, days (one per trading session) and corrections (one per
+ * correction of an exit fill). A write to a key that already
  * exists keeps the stored object (a retried step is a no-op), so an order can never be duplicated.
  * Writes are conditional puts (If-None-Match: *): the store refuses an overwrite.
  */
@@ -11,11 +12,15 @@ export const PAPER_LEDGER_PREFIX = "paper/v1/";
 export const PAPER_INTENTS_PREFIX = "paper/v1/intents/";
 export const PAPER_FILLS_PREFIX = "paper/v1/fills/";
 export const PAPER_DAYS_PREFIX = "paper/v1/days/";
+export const PAPER_CORRECTIONS_PREFIX = "paper/v1/corrections/";
 /** An object at this key stops all new orders and ledger writes (kill switch). */
 export const PAPER_KILL_KEY = "paper/KILL";
 
 const SESSION = /^\d{4}-\d{2}-\d{2}$/u;
 const LEDGER_KEY = /^paper\/v1\/(intents|fills|days)\/(\d{4}-\d{2}-\d{2})\.json$/u;
+/** paper/v1/corrections/<fill session>/<securityId>_<n>.json: the n-th correction of that exit fill. */
+const CORRECTION_KEY = /^paper\/v1\/corrections\/(\d{4}-\d{2}-\d{2})\/([A-Za-z0-9._-]{1,64})_([1-9][0-9]?)\.json$/u;
+const SECURITY = /^[A-Za-z0-9._-]{1,64}$/u;
 
 export type PaperLedgerKind = "intents" | "fills" | "days";
 export type PaperSide = "BUY" | "SELL";
@@ -31,10 +36,22 @@ export function paperLedgerSession(key: string, kind: PaperLedgerKind): string |
   return match && match[1] === kind ? match[2] : undefined;
 }
 
+export function paperCorrectionKey(sessionDate: string, securityId: string, n: number): string {
+  if (!SESSION.test(sessionDate)) throw new Error("PAPER_LEDGER_SESSION_INVALID");
+  if (!SECURITY.test(securityId)) throw new Error("PAPER_LEDGER_SECURITY_INVALID");
+  if (!Number.isInteger(n) || n < 1 || n > 99) throw new Error("PAPER_LEDGER_CORRECTION_INVALID");
+  return `${PAPER_CORRECTIONS_PREFIX}${sessionDate}/${securityId}_${n}.json`;
+}
+
+export function parsePaperCorrectionKey(key: string): { sessionDate: string; securityId: string; n: number } | undefined {
+  const match = CORRECTION_KEY.exec(key);
+  return match ? { sessionDate: match[1]!, securityId: match[2]!, n: Number(match[3]) } : undefined;
+}
+
 /** The client order id: one per (rules version, session, security, side). */
 export function paperClientOrderId(rulesVersion: string, sessionDate: string, securityId: string, side: PaperSide): string {
   if (!SESSION.test(sessionDate)) throw new Error("PAPER_LEDGER_SESSION_INVALID");
-  if (!/^[A-Za-z0-9._-]{1,64}$/u.test(securityId)) throw new Error("PAPER_LEDGER_SECURITY_INVALID");
+  if (!SECURITY.test(securityId)) throw new Error("PAPER_LEDGER_SECURITY_INVALID");
   return `${rulesVersion}_${sessionDate}_${securityId}_${side}`;
 }
 
@@ -130,6 +147,35 @@ export interface PaperFills extends RulesStamp {
   cashAfter: number;
   positionsAfter: PaperPosition[];
   fills: PaperFill[];
+  /** Corrections added to cash at this open (sum of their cashAdjustmentUsd); absent means 0. */
+  correctionsUsd?: number;
+  /** Every correction key applied so far, this open's included (cumulative, sorted). */
+  correctionsApplied?: string[];
+}
+
+/**
+ * An exit fill is never rewritten. When a split record that changes the factor an exit used turns up
+ * later, a correction is appended: the corrected price and the cash difference, which is added to cash
+ * at the next open that is filled.
+ */
+export interface PaperCorrection extends RulesStamp {
+  schemaVersion: "paper-correction-v1";
+  /** Session of the exit fill being corrected. */
+  sessionDate: string;
+  securityId: string;
+  clientOrderId: string;
+  /** 1 for the first correction of this fill, 2 for the next, ... */
+  n: number;
+  qty: number;
+  rawPrice: number;
+  /** Factor the previous price used (the fill's, or the previous correction's). */
+  previousFactor: number;
+  previousFillPrice: number;
+  correctedFactor: number;
+  correctedFillPrice: number;
+  /** qty x (correctedFillPrice - previousFillPrice). */
+  cashAdjustmentUsd: number;
+  recordedAt: string;
 }
 
 /** One open-to-open window, from the previous filled session's open to this session's open. */
@@ -149,6 +195,8 @@ export interface PaperDay extends RulesStamp {
   /** Names held through the window. */
   positions: number;
   costsUsd: number;
+  /** Corrections of earlier exit fills that entered equity at this window's closing open. */
+  correctionsUsd?: number;
   entriesRefused?: PaperEntryRefusal;
 }
 
@@ -172,8 +220,8 @@ export class PaperLedgerStore {
    * Write once, as one conditional put: the store itself refuses to overwrite an existing key, so the
    * stored object is kept (KEPT_EXISTING) even if two writers race.
    */
-  async putOnce(key: string, value: PaperIntents | PaperFills | PaperDay): Promise<"WRITTEN" | "KEPT_EXISTING"> {
-    if (!LEDGER_KEY.test(key)) throw new Error("PAPER_LEDGER_KEY_REFUSED");
+  async putOnce(key: string, value: PaperIntents | PaperFills | PaperDay | PaperCorrection): Promise<"WRITTEN" | "KEPT_EXISTING"> {
+    if (!LEDGER_KEY.test(key) && !CORRECTION_KEY.test(key)) throw new Error("PAPER_LEDGER_KEY_REFUSED");
     const written = await this.client.putIfAbsent(key, new TextEncoder().encode(`${JSON.stringify(value)}\n`));
     return written ? "WRITTEN" : "KEPT_EXISTING";
   }
@@ -190,6 +238,11 @@ export class PaperLedgerStore {
       .map((key) => paperLedgerSession(key, kind))
       .filter((session): session is string => session !== undefined)
       .sort();
+  }
+
+  /** Every correction key, sorted. */
+  async correctionKeys(): Promise<string[]> {
+    return (await this.client.list(PAPER_CORRECTIONS_PREFIX)).filter((key) => CORRECTION_KEY.test(key)).sort();
   }
 
   async killed(): Promise<boolean> {

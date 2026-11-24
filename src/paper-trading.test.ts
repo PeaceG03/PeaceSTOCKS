@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { FakeMarket, RecordingClient } from "./paper-fakes.test-helper";
-import { paperLedgerKey, PaperLedgerStore, PAPER_KILL_KEY, type PaperDay, type PaperFills, type PaperIntents } from "./paper-ledger";
+import { paperCorrectionKey, paperLedgerKey, PaperLedgerStore, PAPER_KILL_KEY, type PaperCorrection, type PaperDay, type PaperFills, type PaperIntents } from "./paper-ledger";
 import { loadPaperRules, type LoadedPaperRules } from "./paper-rules";
 import {
   buyFillPrice,
   checkFreezeProof,
   computeFills,
+  correctionsFor,
   dailyLossBreached,
   entryNotional,
   nextOpenSession,
@@ -407,4 +408,78 @@ test("entries never spend more cash than is left, even when held names inflate e
   near(fills.equityAtOpen, 10000);
   assert.deepEqual(fills.fills.map((f) => [f.securityId, f.status, f.qty]), [["x", "FILLED", Math.floor(1000 / 10.01)], ["y", "ZERO_QTY", 0]]);
   assert.ok(fills.cashAfter >= 0);
+});
+
+test("corrections: a later split record appends a correction (n, n+1), never re-corrects, never touches the fill", () => {
+  const loaded = loadPaperRules();
+  const fill = (status: "FILLED" | "WRITTEN_OFF" | "NO_PRICE", fillPrice = 51 * 0.999) => ({
+    rulesVersion: "paper-rules-v2", rulesSha256: "x", clientOrderId: "o", securityId: "a", side: "SELL" as const, purpose: "EXIT" as const,
+    status, qty: 100, rawPrice: 51, fillPrice, splitFactorApplied: 1, entrySessionDate: "2026-12-08", notionalUsd: 0, commissionUsd: 0, slippageUsd: 0, flags: [],
+  });
+  const fills = (f: ReturnType<typeof fill>) => ({ schemaVersion: "paper-fills-v1", rulesVersion: "paper-rules-v2", rulesSha256: "x", sessionDate: "2026-12-09", cashBefore: 0, cashAfterExits: 0, equityAtOpen: 0, cashAfter: 0, positionsAfter: [], fills: [f] }) as PaperFills;
+  const half = new Map([["a", [{ effectiveDate: "2026-12-09", factor: 0.5 }]]]);
+  const now = new Date("2026-12-11T11:15:00.000Z");
+  assert.deepEqual(correctionsFor({ fills: fills(fill("FILLED")), latest: new Map(), splits: new Map(), loaded, now }), []);
+  const [first] = correctionsFor({ fills: fills(fill("FILLED")), latest: new Map(), splits: half, loaded, now });
+  assert.deepEqual([first!.n, first!.previousFactor, first!.correctedFactor], [1, 1, 0.5]);
+  near(first!.correctedFillPrice, 102 * 0.999);
+  near(first!.cashAdjustmentUsd, 100 * (102 - 51) * 0.999);
+  // Already corrected to this factor: nothing more.
+  assert.deepEqual(correctionsFor({ fills: fills(fill("FILLED")), latest: new Map([["a", first!]]), splits: half, loaded, now }), []);
+  // A further record changes the factor again: correction 2, relative to correction 1.
+  const quarter = new Map([["a", [{ effectiveDate: "2026-12-09", factor: 0.5 }, { effectiveDate: "2026-12-09", factor: 0.5 }]]]);
+  const [second] = correctionsFor({ fills: fills(fill("FILLED")), latest: new Map([["a", first!]]), splits: quarter, loaded, now });
+  assert.deepEqual([second!.n, second!.previousFactor, second!.correctedFactor], [2, 0.5, 0.25]);
+  near(second!.cashAdjustmentUsd, 100 * (204 - 102) * 0.999);
+  // Write-offs are corrected without slippage; unfilled exits are not corrected.
+  const [wo] = correctionsFor({ fills: fills(fill("WRITTEN_OFF", 51)), latest: new Map(), splits: half, loaded, now });
+  near(wo!.correctedFillPrice, 102);
+  assert.deepEqual(correctionsFor({ fills: fills(fill("NO_PRICE")), latest: new Map(), splits: half, loaded, now }), []);
+  // A split outside (entry, exit] does not count.
+  assert.deepEqual(correctionsFor({ fills: fills(fill("FILLED")), latest: new Map(), splits: new Map([["a", [{ effectiveDate: "2026-12-08", factor: 0.5 }]]]), loaded, now }), []);
+});
+
+test("corrections end to end: the late split is appended, the fill stays byte-identical, cash picks it up once", async () => {
+  const client = new RecordingClient();
+  const m = world();
+  await run(client, m, at("2026-12-08"));
+  day2(m);
+  await run(client, m, at("2026-12-09"));
+  m.bar("spy", "2026-12-09", 500, 500);
+  m.bar("a", "2026-12-09", 55, 55); // a 2-for-1 split whose record is not stored yet
+  m.bar("b", "2026-12-09", 50, 50);
+  m.bar("c", "2026-12-09", 20, 20);
+  m.freeze("2026-12-09", "2026-12-10", ["c"]);
+  await run(client, m, at("2026-12-10"));
+  const fillsKey = paperLedgerKey("fills", "2026-12-09");
+  const before = new TextDecoder().decode(client.objects.get(fillsKey)!);
+  const f9 = JSON.parse(before) as PaperFills;
+  const sellA = f9.fills.find((f) => f.side === "SELL" && f.securityId === "a")!;
+  near(sellA.fillPrice!, 55 * 0.999, "booked at the actual open first");
+
+  m.split("a", "2026-12-09", 1, 2); // the record arrives late
+  for (const [id, px] of [["spy", 500], ["a", 55], ["b", 50], ["c", 20]] as const) m.bar(id, "2026-12-10", px, px);
+  m.freeze("2026-12-10", "2026-12-11", ["c"]);
+  const r = await run(client, m, at("2026-12-11"));
+  const key = paperCorrectionKey("2026-12-09", "a", 1);
+  assert.deepEqual(r.corrections, [key]);
+  assert.equal(new TextDecoder().decode(client.objects.get(fillsKey)!), before, "fill never rewritten");
+  const c = await read<PaperCorrection>(client, key);
+  near(c.cashAdjustmentUsd, sellA.qty * 55 * 0.999, "the split doubles the exit price");
+  const f10 = await read<PaperFills>(client, paperLedgerKey("fills", "2026-12-10"));
+  near(f10.cashBefore, f9.cashAfter + c.cashAdjustmentUsd, "applied at the next open");
+  assert.deepEqual([f10.correctionsUsd, f10.correctionsApplied], [c.cashAdjustmentUsd, [key]]);
+  near((await read<PaperDay>(client, paperLedgerKey("days", "2026-12-10"))).correctionsUsd!, c.cashAdjustmentUsd);
+
+  // A retry writes nothing; the next open does not apply it again.
+  const puts = client.puts.length;
+  await run(client, m, at("2026-12-11"));
+  assert.equal(client.puts.length, puts);
+  for (const [id, px] of [["spy", 500], ["a", 55], ["b", 50], ["c", 20]] as const) m.bar(id, "2026-12-11", px, px);
+  m.freeze("2026-12-11", "2026-12-14", ["c"]);
+  await run(client, m, at("2026-12-14"));
+  const f11 = await read<PaperFills>(client, paperLedgerKey("fills", "2026-12-11"));
+  near(f11.cashBefore, f10.cashAfter, "not applied twice");
+  assert.deepEqual([f11.correctionsUsd, f11.correctionsApplied], [0, [key]]);
+  assert.equal([...client.objects.keys()].filter((k) => k.includes("/corrections/")).length, 1);
 });

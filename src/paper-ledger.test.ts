@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   paperClientOrderId,
+  paperCorrectionKey,
+  parsePaperCorrectionKey,
   paperLedgerKey,
   paperLedgerSession,
   PaperLedgerStore,
@@ -49,6 +51,23 @@ test("append-only: a second write to the same key keeps the first object and doe
   assert.deepEqual(client.puts, [key]);
   assert.equal((await store.read<PaperDay>(key))!.equityTo, 101000);
   assert.deepEqual(await store.sessions("days"), ["2026-12-02"]);
+});
+
+test("correction keys: one shape, write-once like every ledger key", async () => {
+  assert.equal(paperCorrectionKey("2026-12-09", "sec_a", 1), "paper/v1/corrections/2026-12-09/sec_a_1.json");
+  assert.deepEqual(parsePaperCorrectionKey("paper/v1/corrections/2026-12-09/sec_a_12.json"), { sessionDate: "2026-12-09", securityId: "sec_a", n: 12 });
+  for (const bad of ["paper/v1/corrections/2026-12-09/sec_a_0.json", "paper/v1/corrections/2026-12-09/sec_a.json", "paper/v1/corrections/x/sec_a_1.json", "paper/v1/corrections/2026-12-09/a/b_1.json"])
+    assert.equal(parsePaperCorrectionKey(bad), undefined, bad);
+  assert.throws(() => paperCorrectionKey("2026-12-09", "a/b", 1), /PAPER_LEDGER_SECURITY_INVALID/u);
+  assert.throws(() => paperCorrectionKey("2026-12-09", "a", 0), /PAPER_LEDGER_CORRECTION_INVALID/u);
+  const client = new RecordingClient();
+  const store = new PaperLedgerStore(client);
+  const key = paperCorrectionKey("2026-12-09", "sec_a", 1);
+  assert.equal(await store.putOnce(key, day(1)), "WRITTEN");
+  assert.equal(await store.putOnce(key, day(2)), "KEPT_EXISTING");
+  await assert.rejects(store.putOnce("paper/v1/corrections/2026-12-09/sec_a_0.json", day(1)), /PAPER_LEDGER_KEY_REFUSED/u);
+  client.objects.set("paper/v1/corrections/junk", new Uint8Array());
+  assert.deepEqual(await store.correctionKeys(), [key]);
 });
 
 test("append-only: only ledger keys can be written (no kill key, scanner data, or other prefix)", async () => {

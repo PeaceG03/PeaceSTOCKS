@@ -51,7 +51,7 @@ export function paperRunLine(result: PaperRunResult): string {
   const parts = [`paper-trading: ${result.gate}`];
   if (result.killedBy) parts.push(`killed-by=${result.killedBy}`);
   if (result.gate === "ON") {
-    parts.push(`filled=${result.filled.length}`, `pending=${result.pendingFills}`, `days=${result.days.length}`);
+    parts.push(`filled=${result.filled.length}`, `pending=${result.pendingFills}`, `days=${result.days.length}`, `corrections=${result.corrections?.length ?? 0}`);
     if (result.intents)
       parts.push(
         `intents=${result.intents.sessionDate}:${result.intents.outcome}`,
