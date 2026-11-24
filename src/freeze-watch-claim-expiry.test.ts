@@ -176,3 +176,18 @@ test("state ALERTED is authoritative: even an old marker that says ALERTED with 
   const r = await runFreezeWatch({ store: client, env: {}, now: NOW, alert: c.alert as never });
   assert.deepEqual([r.alerted, c.calls()], [[], 0]);
 });
+
+test("an unreadable marker blocks (never treated as an expired claim)", async () => {
+  const client = new MemoryObjectClient();
+  await seed(client);
+  await client.put(MARKER, new TextEncoder().encode("not json"));
+  const c = counter();
+  const r = await runFreezeWatch({ store: client, env: {}, now: NOW, alert: c.alert as never });
+  assert.deepEqual([r.alerted, c.calls()], [[], 0]);
+  assert.equal(new TextDecoder().decode((await client.get(MARKER))!), "not json");
+});
+
+test("R2 getWithEtag: a GET without an ETag throws (a replace must name the version it read)", async () => {
+  const noEtag = new R2ObjectClient({ accountId: "a", bucket: "bucket", accessKeyId: "k", secretAccessKey: "s", sleep: async () => {}, fetchImpl: async () => new Response(new Uint8Array([1]), { status: 200 }) });
+  await assert.rejects(noEtag.getWithEtag("k.json"), /R2_GET_NO_ETAG/u);
+});
