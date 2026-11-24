@@ -25,6 +25,8 @@ export const DAILY_BARS_PACK_EXISTS_DIFFERENT = "DAILY_BARS_PACK_EXISTS_DIFFEREN
 export const DAILY_BARS_PACK_WRITE_FAILED = "DAILY_BARS_PACK_WRITE_FAILED" as const;
 /** Warning only: the stored pack holds the same market rows; only ingestion stamps (SIDECAR_META) differ. */
 export const DAILY_BARS_PACK_EXISTS_EQUIVALENT = "DAILY_BARS_PACK_EXISTS_EQUIVALENT" as const;
+/** Warning only: stored rows for a sealed session that its pack does not hold (appended after the seal). */
+export const DAILY_BARS_ROWS_OUTSIDE_PACK = "DAILY_BARS_ROWS_OUTSIDE_PACK" as const;
 /** Leading upper-case code of an error message only (never values). */
 export function errorCode(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
@@ -313,6 +315,7 @@ export type DailyBarsSidecarWriteStatus =
   | "exists-same"
   | "exists-equivalent"
   | "exists-different"
+  | "sealed-verified"
   | "no-rows";
 
 /** A row without its ingestion stamps (SIDECAR_META), as canonical JSON. */
@@ -526,5 +529,53 @@ export async function maybeWriteScanDailyBarsSidecar(options: {
   } catch (error) {
     const failure = `${DAILY_BARS_PACK_WRITE_FAILED}:${options.sessionDate}:${errorCode(error)}`;
     return { ...base, warnings: [failure], failure };
+  }
+}
+
+export type SealedDailyBarsPackCheck =
+  | { state: "none" }
+  | { state: "verified"; source: DailyBarsSidecarManifest["source"]; rows: number; outsidePack: number }
+  | { state: "conflict"; reason: string };
+
+/**
+ * Before any write for a session: is its daily-bars pack already sealed, and does it hold the stored rows?
+ * - no manifest and no file => "none" (collect and pack as usual);
+ * - a manifest whose pack decodes (with the day's canonical grouped-daily Dust when bound to it) and every
+ *   packed line is a stored row of the session, byte for byte => "verified": the stored evidence is
+ *   authoritative and the session is not collected again. Stored rows the pack lacks (appended after the
+ *   seal) are counted, never removed or packed;
+ * - anything else (file without manifest, unreadable pack, Dust mismatch, a packed line not stored) =>
+ *   "conflict": the caller fails the session before writing anything. Never overwrites.
+ */
+export async function checkSealedDailyBarsPack(options: {
+  store: ReplyDustStore;
+  sessionDate: string;
+  storedRows: readonly CanonicalDailyBar[];
+  backend?: ReplyDustBackend;
+}): Promise<SealedDailyBarsPackCheck> {
+  const backend = options.backend ?? nodeReplyDustBackend;
+  const manifestBytes = await options.store.get(dailyBarsSidecarManifestKey(options.sessionDate));
+  if (!manifestBytes) {
+    return (await options.store.head(dailyBarsSidecarFileKey(options.sessionDate)))
+      ? { state: "conflict", reason: "FILE_WITHOUT_MANIFEST" }
+      : { state: "none" };
+  }
+  try {
+    const manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as DailyBarsSidecarManifest;
+    const file = await options.store.get(dailyBarsSidecarFileKey(options.sessionDate));
+    if (!file) return { state: "conflict", reason: "MANIFEST_WITHOUT_FILE" };
+    let dustReply: Uint8Array | null = null;
+    if (manifest.dustReplySha256) {
+      const { readDailyReplyDustManifest, readDailyReplyDustReply } = await import("./daily-reply-dust");
+      const dust = await readDailyReplyDustManifest(options.store, options.sessionDate);
+      if (!dust || dust.replySha256 !== manifest.dustReplySha256) return { state: "conflict", reason: "DUST_MISMATCH" };
+      dustReply = await readDailyReplyDustReply(options.store, dust, backend);
+    }
+    const packed = decodeDailyBarsPack({ file, manifest: manifestBytes, dustReply, decompress: (frame) => backend.decompress(frame, null) }).lines;
+    const stored = new Set(options.storedRows.filter((row) => row.sessionDate === options.sessionDate).map((row) => stableJson(row)));
+    if (!packed.every((line) => stored.has(line))) return { state: "conflict", reason: "PACKED_ROW_NOT_STORED" };
+    return { state: "verified", source: manifest.source, rows: packed.length, outsidePack: stored.size - new Set(packed).size };
+  } catch (error) {
+    return { state: "conflict", reason: errorCode(error) };
   }
 }
