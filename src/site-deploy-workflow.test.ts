@@ -17,7 +17,18 @@ test("site deploy workflow: manual only, read-only repo permission", () => {
   assert.match(triggers, /workflow_dispatch:/u);
   assert.doesNotMatch(triggers, /\b(push|pull_request|schedule|workflow_run|repository_dispatch):/u);
   assert.match(workflow, /\npermissions:\n  contents: read\n/u);
-  assert.doesNotMatch(workflow, /environment:/u);
+});
+
+test("site deploy workflow: the Access team domain is passed explicitly (no Organizations lookup)", () => {
+  assert.match(workflow, /\n      team_domain:\n[^\n]*\n        required: true\n        default: "blue-leaf-13b3\.cloudflareaccess\.com"\n/u);
+  assert.match(block("Cloudflare Access app"), /ACCESS_TEAM_DOMAIN: \$\{\{ inputs\.team_domain \}\}/u);
+});
+
+test("site deploy workflow: the deploy job runs only from main, in the 'site' environment", () => {
+  const job = workflow.slice(workflow.indexOf("\n  deploy:\n"), workflow.indexOf("\n    steps:\n"));
+  assert.match(job, /\n    if: github\.ref == 'refs\/heads\/main'\n/u);
+  assert.match(job, /\n    environment: site\n/u);
+  assert.equal(workflow.match(/\n  [a-z-]+:\n    /gu)?.length, 1, "exactly one job");
 });
 
 test("site deploy workflow: Access is set up and read back before the deploy, which uses its AUD", () => {

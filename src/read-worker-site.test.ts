@@ -106,3 +106,35 @@ test("site worker: JSON scanner routes stay available behind the same gate", asy
   const denied = createSiteWorker({ verify: async () => { throw new Error("x"); }, client });
   assert.equal((await denied.fetch(new Request("https://stocks.example.test/scanner/health"))).status, 403);
 });
+
+test("site worker: HEAD and OPTIONS without a token are refused like GET, with no storage reads", async () => {
+  clearAccessCertCache();
+  await withFetch(async (calls) => {
+    for (const method of ["HEAD", "OPTIONS", "GET", "POST", "PUT", "DELETE"]) {
+      for (const path of ["/", "/scanner/health"]) {
+        const response = await worker.fetch(new Request(`https://stocks.example.test${path}`, { method }), ENV);
+        assert.equal(response.status, 403, `${method} ${path}`);
+      }
+    }
+    assert.equal(r2Calls(calls).length, 0);
+    // OPTIONS with a valid token is still not a read: 405.
+    const options = await worker.fetch(new Request("https://stocks.example.test/", { method: "OPTIONS", headers: { "cf-access-jwt-assertion": token() } }), ENV);
+    assert.equal(options.status, 405);
+  });
+});
+
+test("site worker: the page carries the CSP (incl. frame-ancestors 'none'), nosniff and no-frame headers", async () => {
+  clearAccessCertCache();
+  await withFetch(async () => {
+    const page = await worker.fetch(new Request("https://stocks.example.test/", { headers: { "cf-access-jwt-assertion": token() } }), ENV);
+    assert.equal(page.status, 200);
+    const csp = page.headers.get("content-security-policy") ?? "";
+    for (const directive of ["default-src 'none'", "style-src 'unsafe-inline'", "frame-ancestors 'none'", "base-uri 'none'", "form-action 'none'"])
+      assert.ok(csp.split(";").map((d) => d.trim()).includes(directive), directive);
+    assert.doesNotMatch(csp, /script-src/u);
+    assert.equal(page.headers.get("x-content-type-options"), "nosniff");
+    assert.equal(page.headers.get("x-frame-options"), "DENY");
+    assert.equal(page.headers.get("referrer-policy"), "no-referrer");
+    assert.equal(page.headers.get("x-robots-tag"), "noindex, nofollow");
+  });
+});

@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       team_domain:
-        description: "Cloudflare Access team domain, e.g. myteam.cloudflareaccess.com (blank = look it up)"
-        required: false
-        default: ""
+        description: "Cloudflare Access (Zero Trust) team domain. Not secret."
+        required: true
+        default: "blue-leaf-13b3.cloudflareaccess.com"
 permissions:
   contents: read
 concurrency:
@@ -21,6 +21,11 @@ env:
   WRANGLER_VERSION: 4.167.0
 jobs:
   deploy:
+    # Only from main: a dispatch on any other branch skips the job (no Access change, no deploy).
+    if: github.ref == 'refs/heads/main'
+    # GitHub environment "site": gives the deploy its own place for protection rules (e.g. required
+    # reviewer) and deployment history. Created on first use if it does not exist.
+    environment: site
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

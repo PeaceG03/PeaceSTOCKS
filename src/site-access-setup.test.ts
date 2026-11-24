@@ -6,7 +6,9 @@ const EMAIL = "owner@example.test";
 const HOST = "stocks.example.test";
 
 /** In-memory stand-in for the Cloudflare Access API (account-level apps, reusable policies, org). */
-function fakeCloudflare(options: { ignoreAppPolicies?: boolean; orgStatus?: number; failPolicyPost?: string } = {}) {
+function fakeCloudflare(
+  options: { extraAppPolicy?: boolean; policyReadBack?: (stored: Record<string, unknown>) => Record<string, unknown>; failPolicyPost?: string } = {},
+) {
   const apps = new Map<string, Record<string, unknown>>();
   const policies = new Map<string, Record<string, unknown>>();
   const calls: string[] = [];
@@ -19,10 +21,6 @@ function fakeCloudflare(options: { ignoreAppPolicies?: boolean; orgStatus?: numb
     const path = url.pathname.replace("/client/v4/accounts/acct/access", "");
     calls.push(`${method} ${path}`);
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
-    if (path === "/organizations") {
-      if (options.orgStatus) return Response.json({ success: false, errors: [{ code: 10000, message: "Authentication error" }] }, { status: options.orgStatus });
-      return ok({ auth_domain: "example-team.cloudflareaccess.com" });
-    }
     if (path === "/policies" && method === "GET") return ok([...policies.values()]);
     if (path === "/policies" && method === "POST") {
       if (options.failPolicyPost) return Response.json({ success: false, errors: [{ code: 12130, message: options.failPolicyPost }] }, { status: 400 });
@@ -34,18 +32,24 @@ function fakeCloudflare(options: { ignoreAppPolicies?: boolean; orgStatus?: numb
     if (policyMatch) {
       const id = policyMatch[1]!;
       if (method === "PUT") policies.set(id, { ...body, id });
+      if (method === "GET" && options.policyReadBack) return ok(options.policyReadBack(policies.get(id)!));
       return ok(policies.get(id));
     }
     if (path === "/apps" && method === "GET") return ok([...apps.values()]);
     if (path === "/apps" && method === "POST") {
       const id = `app-${next++}`;
-      apps.set(id, { ...body, id, aud: `aud-${id}`, ...(options.ignoreAppPolicies ? { policies: [] } : {}) });
+      // extraAppPolicy: the API keeps an older app-level policy next to ours (it did not replace the list).
+      const kept = options.extraAppPolicy ? { policies: [{ id: "legacy-app-policy" }, ...((body.policies as unknown[]) ?? [])] } : {};
+      apps.set(id, { ...body, id, aud: `aud-${id}`, ...kept });
       return ok(apps.get(id));
     }
     const appMatch = /^\/apps\/(.+)$/u.exec(path);
     if (appMatch) {
       const id = appMatch[1]!;
-      if (method === "PUT") apps.set(id, { ...apps.get(id), ...body, id, ...(options.ignoreAppPolicies ? { policies: apps.get(id)?.policies } : {}) });
+      if (method === "PUT") {
+        const kept = options.extraAppPolicy ? { policies: [{ id: "legacy-app-policy" }, ...((body.policies as unknown[]) ?? [])] } : {};
+        apps.set(id, { ...apps.get(id), ...body, id, ...kept });
+      }
       return ok(apps.get(id));
     }
     return Response.json({ success: false, errors: [{ code: 7003, message: "no route" }] }, { status: 404 });
@@ -58,6 +62,7 @@ const input = (fetchImpl: typeof fetch, over: Record<string, unknown> = {}) => (
   accountId: "acct",
   hostname: HOST,
   allowedEmail: EMAIL,
+  teamDomain: "example-team.cloudflareaccess.com",
   fetchImpl,
   ...over,
 });
@@ -81,12 +86,35 @@ test("access setup: creates one app with one single-email policy, then is idempo
   assert.equal(second.aud, first.aud);
   assert.equal(cf.apps.size, 1);
   assert.equal(cf.policies.size, 1);
+  assert.ok(!cf.calls.some((c) => c.includes("/organizations")), "team domain is never looked up");
   assert.ok(!cf.calls.slice(cf.calls.lastIndexOf("GET /policies")).includes("POST /apps"));
 });
 
-test("access setup: an existing app that kept extra policies is rejected on read-back (fail closed)", async () => {
-  const cf = fakeCloudflare({ ignoreAppPolicies: true });
-  await assert.rejects(setupSiteAccess(input(cf.fetchImpl)), /expected exactly 1 policy, found 0/u);
+test("access setup: an app that kept another policy next to ours is rejected on read-back (fail closed)", async () => {
+  const cf = fakeCloudflare({ extraAppPolicy: true });
+  await assert.rejects(setupSiteAccess(input(cf.fetchImpl)), /expected exactly 1 policy, found 2/u);
+  const app = [...cf.apps.values()][0]!;
+  assert.equal((app.policies as unknown[]).length, 2);
+});
+
+test("access setup: the policy read-back must be exactly one allow rule for the one email", async () => {
+  const drifts: Array<[string, (p: Record<string, unknown>) => Record<string, unknown>]> = [
+    ["extra include rule", (p) => ({ ...p, include: [...(p.include as unknown[]), { everyone: {} }] })],
+    ["include replaced by everyone", (p) => ({ ...p, include: [{ everyone: {} }] })],
+    ["email domain rule", (p) => ({ ...p, include: [{ email_domain: { domain: "example.test" } }] })],
+    ["lookalike email", (p) => ({ ...p, include: [{ email: { email: `x${EMAIL}` } }] })],
+    ["email plus a second key", (p) => ({ ...p, include: [{ email: { email: EMAIL }, everyone: {} }] })],
+    ["decision bypass", (p) => ({ ...p, decision: "bypass" })],
+    ["non-empty exclude", (p) => ({ ...p, exclude: [{ email: { email: "x@example.test" } }] })],
+    ["non-empty require", (p) => ({ ...p, require: [{ email: { email: EMAIL } }] })],
+    ["no include", (p) => ({ ...p, include: [] })],
+  ];
+  for (const [label, drift] of drifts) {
+    const cf = fakeCloudflare({ policyReadBack: drift });
+    await assert.rejects(setupSiteAccess(input(cf.fetchImpl)), /Access policy read-back: not exactly one allowed email/u, label);
+  }
+  const same = fakeCloudflare({ policyReadBack: (p) => ({ ...p }) });
+  assert.equal((await setupSiteAccess(input(same.fetchImpl))).created.policy, true);
 });
 
 test("access setup: refuses bad input before any API call, and never prints the email", async () => {
@@ -104,7 +132,9 @@ test("access setup: refuses bad input before any API call, and never prints the 
     assert.ok(!error.message.includes(EMAIL));
     return true;
   });
-  const noOrg = fakeCloudflare({ orgStatus: 403 });
-  await assert.rejects(setupSiteAccess(input(noOrg.fetchImpl)), /ACCESS_API_403:GET \/organizations/u);
-  assert.deepEqual(noOrg.calls, ["GET /organizations"]);
+  const quiet = fakeCloudflare();
+  for (const teamDomain of [undefined, "", "   "]) {
+    await assert.rejects(setupSiteAccess(input(quiet.fetchImpl, { teamDomain })), /team domain missing/u);
+  }
+  assert.deepEqual(quiet.calls, []);
 });

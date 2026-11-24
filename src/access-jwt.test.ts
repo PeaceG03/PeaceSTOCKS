@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync, createSign } from "node:crypto";
 import test from "node:test";
-import { clearAccessCertCache, normalizeTeamDomain, verifyAccessJwt, type AccessJwtConfig } from "./access-jwt";
+import { CERTS_REFETCH_MIN_MS, clearAccessCertCache, normalizeTeamDomain, verifyAccessJwt, type AccessJwtConfig } from "./access-jwt";
 
 const TEAM = "https://example-team.cloudflareaccess.com";
 const AUD = "aud-tag-123";
@@ -83,4 +83,58 @@ test("access jwt: missing config or unreachable certs fail closed", async () => 
   const down = config({ fetchImpl: (async () => new Response("no", { status: 500 })) as typeof fetch });
   assert.deepEqual(await verifyAccessJwt(token, down), { ok: false, reason: "CERTS_UNAVAILABLE" });
   assert.equal(normalizeTeamDomain("example-team.cloudflareaccess.com/"), TEAM);
+});
+
+test("access jwt: unknown-kid refetch of the certs is throttled to once a minute", async () => {
+  clearAccessCertCache();
+  let ms = 1_000_000;
+  const c = config({ nowMs: () => ms });
+  assert.equal((await verifyAccessJwt(sign(claims()), c)).ok, true);
+  assert.equal(c.calls.length, 1);
+  for (let i = 0; i < 5; i += 1) assert.deepEqual(await verifyAccessJwt(sign(claims(), { kid: `junk-${i}` }), c), { ok: false, reason: "UNKNOWN_KEY" });
+  assert.equal(c.calls.length, 1, "junk kids inside the window cause no refetch");
+  ms += CERTS_REFETCH_MIN_MS - 1;
+  await verifyAccessJwt(sign(claims(), { kid: "junk-x" }), c);
+  assert.equal(c.calls.length, 1);
+  ms += 1;
+  await verifyAccessJwt(sign(claims(), { kid: "junk-y" }), c);
+  assert.equal(c.calls.length, 2, "a rotated key is picked up once the minute has passed");
+  await verifyAccessJwt(sign(claims(), { kid: "junk-z" }), c);
+  assert.equal(c.calls.length, 2);
+  assert.equal((await verifyAccessJwt(sign(claims()), c)).ok, true);
+  assert.equal(c.calls.length, 2);
+});
+
+test("access jwt: substring and lookalike emails are refused", async () => {
+  clearAccessCertCache();
+  const c = config();
+  for (const email of [
+    "wner@example.test",
+    "owner@example.tes",
+    "owner@example.test.evil.test",
+    "xowner@example.test",
+    "owner@example.testx",
+    "owner+x@example.test",
+    "owner@example.test,other@example.test",
+    "owner@exampIe.test",
+    " ",
+  ]) {
+    assert.deepEqual(await verifyAccessJwt(sign(claims({ email })), c), { ok: false, reason: "EMAIL_NOT_ALLOWED" }, email);
+  }
+  // Allowed email configured with surrounding space/case still matches only itself.
+  assert.equal((await verifyAccessJwt(sign(claims()), config({ allowedEmail: "  OWNER@example.test " }))).ok, true);
+});
+
+test("access jwt: clock skew allowance is exactly 60 s on both sides", async () => {
+  clearAccessCertCache();
+  const c = config();
+  const verdict = async (over: Record<string, unknown>) => {
+    const result = await verifyAccessJwt(sign(claims(over)), c);
+    return result.ok ? "OK" : result.reason;
+  };
+  assert.equal(await verdict({ exp: NOW - 59 }), "OK");
+  assert.equal(await verdict({ exp: NOW - 60 }), "EXPIRED");
+  assert.equal(await verdict({ exp: NOW - 61 }), "EXPIRED");
+  assert.equal(await verdict({ nbf: NOW + 60 }), "OK");
+  assert.equal(await verdict({ nbf: NOW + 61 }), "NOT_YET_VALID");
 });
