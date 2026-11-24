@@ -467,6 +467,7 @@ export class MarketsScanner {
     }
     const result = rankSecurities(securities, allBars, benchmark, sessionDate, DEFAULT_SCANNER_CONFIG, splitActions);
     if (result.excluded?.length) skips.push(`SPLIT_ADJUST_EXCLUDED:${result.excluded.length}`);
+    if (result.floorExcluded?.length) skips.push(`ELIGIBILITY_FLOOR_EXCLUDED:${result.floorExcluded.length}`);
     const providerNotReady = failures.some((failure) => failure.startsWith("PROVIDER_NOT_READY"));
     const sourceCollectionFailed =
       providerNotReady ||

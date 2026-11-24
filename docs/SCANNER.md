@@ -74,6 +74,23 @@ Current levels:
 
 Current scanner ranking accepts LEVEL_2 and LEVEL_3 active securities.
 
+## Eligibility floor
+
+Every stock list is drawn only from names that pass a fixed floor (`config/eligibility-floor-v1.json`,
+`src/eligibility-floor.ts`). It was set before looking at the held-out window and is not tuned on it:
+
+| Rule | Value |
+| --- | --- |
+| Price | split-adjusted last close on or before the scanned session >= $5 (`minLastCloseUsd`) |
+| Liquidity | median dollar volume (close x volume) of the last 20 bars >= $5,000,000 (`minMedianDollarVolumeUsd`, `dollarVolumeSessions`) |
+| History | >= 60 sessions with a stored bar in the scan's 100-session bar window (`minHistorySessions`) |
+
+The floor is applied after split adjustment (dollar volume is unchanged by it) and before features
+and ranking, so a name below it is in no list. The scan reports the count as
+`ELIGIBILITY_FLOOR_EXCLUDED:<n>` in its skips. The floor's version is part of the lists'
+configFingerprint, so lists frozen with it have different predictionIds from lists frozen without it.
+A change to the floor is a new file and version (`eligibility-floor-v2`), never an edit.
+
 ## Current daily feature set
 
 Versioned recipes reconstruct:

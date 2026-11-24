@@ -10,6 +10,7 @@ import type {
 import { SCANNER_VERSION } from "./contracts";
 import { reconstructFeatures } from "./features";
 import { fingerprint, sha256 } from "./identity";
+import { ELIGIBILITY_FLOOR, floorExclusion, type EligibilityFloor, type FloorExclusion } from "./eligibility-floor";
 import { splitAdjustedBars, splitEventsBySecurity, type SplitExclusion } from "./split-adjust";
 
 export const DEFAULT_SCANNER_CONFIG: ScannerConfig = {
@@ -85,6 +86,8 @@ export interface RankingResult {
   predictions: PredictionSet[];
   /** Eligible names left out because their splits could not be adjusted honestly (absent when none). */
   excluded?: Array<{ securityId: string; reason: SplitExclusion }>;
+  /** Eligible names left out by the eligibility floor (price, dollar volume, history); absent when none or no floor. */
+  floorExcluded?: Array<{ securityId: string; reason: FloorExclusion }>;
 }
 
 export function rankSecurities(
@@ -94,6 +97,8 @@ export function rankSecurities(
   sessionDate: string,
   config: ScannerConfig = DEFAULT_SCANNER_CONFIG,
   splitActions: readonly CorporateAction[] = [],
+  /** The eligibility floor (src/eligibility-floor.ts); null turns it off (held-out eval comparison only). */
+  floor: EligibilityFloor | null = ELIGIBILITY_FLOOR,
 ): RankingResult {
   const eligible = securities.filter(
     (security) =>
@@ -112,9 +117,15 @@ export function rankSecurities(
   const splits = splitEventsBySecurity(splitActions);
   const adjustedById = new Map<string, CanonicalDailyBar[]>();
   const excluded: Array<{ securityId: string; reason: SplitExclusion }> = [];
+  const floorExcluded: Array<{ securityId: string; reason: FloorExclusion }> = [];
   for (const security of eligible) {
     const adjusted = splitAdjustedBars(latestFor(security.securityId), splits.get(security.securityId), sessionDate);
-    if ("excluded" in adjusted) excluded.push({ securityId: security.securityId, reason: adjusted.excluded });
+    if ("excluded" in adjusted) {
+      excluded.push({ securityId: security.securityId, reason: adjusted.excluded });
+      continue;
+    }
+    const below = floor ? floorExclusion(adjusted.bars, floor) : undefined;
+    if (below) floorExcluded.push({ securityId: security.securityId, reason: below });
     else adjustedById.set(security.securityId, adjusted.bars);
   }
   const featureById = new Map<string, DerivedFeatures>();
@@ -181,7 +192,8 @@ export function rankSecurities(
   const rankById = new Map(
     ranked.map((item, index) => [item.securityId, { item, rank: index + 1 }]),
   );
-  const configFingerprint = fingerprint(config);
+  // The floor changes the lists, so its version is part of the lists' fingerprint (and predictionId).
+  const configFingerprint = fingerprint(floor ? { ...config, eligibilityFloor: floor.version } : config);
   const beliefs: ScannerBelief[] = securities.map((security) => {
     const selected = rankById.get(security.securityId);
     const evidenceAsOfFingerprint = sha256(
@@ -257,5 +269,11 @@ export function rankSecurities(
         : {}),
     };
   });
-  return { beliefs, ranked, predictions, ...(excluded.length ? { excluded } : {}) };
+  return {
+    beliefs,
+    ranked,
+    predictions,
+    ...(excluded.length ? { excluded } : {}),
+    ...(floorExcluded.length ? { floorExcluded } : {}),
+  };
 }

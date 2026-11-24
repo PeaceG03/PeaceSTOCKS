@@ -569,18 +569,23 @@ test("scanner uses the SPY security id as the market benchmark", async () => {
       freezeNow(session),
     ).run(session);
     assert.equal(report.status, "COMPLETE");
-    assert.equal(report.skips, undefined);
+    // 21 sessions of history: under the eligibility floor's 60, so no name reaches the lists.
+    assert.deepEqual(report.skips, ["ELIGIBILITY_FLOOR_EXCLUDED:3"]);
     // Beliefs are retired (never persisted); check the benchmark wiring on the in-memory ranking
     // over the same stored securities and bars the scan used.
     assert.equal(existsSync(join(root, "permanent", "beliefs")), false);
     const securities = await storage.loadSecurities();
     const allBars = await storage.loadBars();
     assert.equal(securities.find((item) => item.currentSymbol === "SPY")?.securityId, spy);
+    // Floor off: 21 sessions of fixture history is about the benchmark wiring, not the floor.
     const ranking = rankSecurities(
       securities,
       allBars,
       allBars.filter((item) => item.securityId === spy),
       session,
+      DEFAULT_SCANNER_CONFIG,
+      [],
+      null,
     );
     const aaaScore = ranking.beliefs.find((item) => item.securityId === aaa)?.familyScores.relativeStrength;
     const bbbScore = ranking.beliefs.find((item) => item.securityId === bbb)?.familyScores.relativeStrength;
