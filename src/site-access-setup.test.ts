@@ -148,3 +148,49 @@ test("access setup: refuses bad input before any API call, and never prints the 
   }
   assert.deepEqual(quiet.calls, []);
 });
+
+test("access setup: a retry after a failed deploy reuses the app and policy the earlier run created", async () => {
+  const cf = fakeCloudflare();
+  // State left by a prior partial run (e.g. 45357759855: Access step succeeded, Worker deploy failed),
+  // plus drift since: the policy's rule changed and the app gained a second policy.
+  cf.policies.set("pol-prior", {
+    id: "pol-prior",
+    name: SITE_ACCESS_POLICY_NAME,
+    decision: "allow",
+    include: [{ email: { email: "old@example.test" } }, { everyone: {} }],
+    exclude: [],
+    require: [],
+  });
+  cf.policies.set("pol-unrelated", { id: "pol-unrelated", name: "Some other app", decision: "allow", include: [{ everyone: {} }] });
+  cf.apps.set("app-prior", {
+    id: "app-prior",
+    name: SITE_ACCESS_APP_NAME,
+    type: "self_hosted",
+    domain: HOST,
+    aud: "aud-prior",
+    policies: [{ id: "pol-prior" }, { id: "pol-unrelated" }],
+  });
+  cf.apps.set("app-other", { id: "app-other", name: "Other", type: "self_hosted", domain: "other.example.test", aud: "aud-other", policies: [] });
+
+  const result = await setupSiteAccess(input(cf.fetchImpl));
+  assert.deepEqual(result, {
+    appId: "app-prior",
+    policyId: "pol-prior",
+    aud: "aud-prior",
+    teamDomain: "https://example-team.cloudflareaccess.com",
+    created: { app: false, policy: false },
+  });
+  assert.ok(!cf.calls.some((c) => c.startsWith("POST ")), `no create calls: ${cf.calls.join(", ")}`);
+  assert.ok(cf.calls.includes("PUT /policies/pol-prior") && cf.calls.includes("PUT /apps/app-prior"));
+  assert.equal(cf.apps.size, 2);
+  assert.equal(cf.policies.size, 2);
+  assert.deepEqual(cf.policies.get("pol-prior")!.include, [{ email: { email: EMAIL } }], "policy updated to the single email");
+  assert.deepEqual(cf.apps.get("app-prior")!.policies, [{ id: "pol-prior", precedence: 1 }], "app back to exactly our policy");
+  assert.deepEqual(cf.apps.get("app-other")!.policies, [], "other apps untouched");
+  assert.deepEqual(cf.policies.get("pol-unrelated")!.include, [{ everyone: {} }], "other policies untouched");
+  // And a second retry is a no-op in shape: same ids, still nothing created.
+  const again = await setupSiteAccess(input(cf.fetchImpl));
+  assert.equal(again.appId, "app-prior");
+  assert.equal(again.aud, "aud-prior");
+  assert.ok(!cf.calls.some((c) => c.startsWith("POST ")));
+});
