@@ -149,7 +149,15 @@ export type FreezeWatchStore = HealthCheckinStore & {
  */
 export const MISSED_FREEZE_CLAIM_EXPIRY_MS = 2 * 60 * 60 * 1000;
 
-/** Pure: the marker is a claim (never ALERTED) older than the expiry. Unreadable markers are not. */
+/** Honest clock skew between runners: a claim's `at` this far ahead of now is treated as now. */
+export const MISSED_FREEZE_CLAIM_SKEW_MS = 5 * 60 * 1000;
+
+/**
+ * Pure: the marker is a claim (never ALERTED) older than the expiry. Unreadable JSON is not.
+ * Writers stamp `at` from the wall clock, so an `at` up to the skew ahead is clamped to now (a fresh
+ * claim); one further ahead, or missing or unparseable, is a corrupt claim that would otherwise block
+ * the session forever, so it counts as expired. Takeover is still one conditional replace (If-Match).
+ */
 export function claimExpired(body: Uint8Array, now: Date): boolean {
   let marker: { at?: unknown; alert?: unknown; state?: unknown };
   try {
@@ -159,7 +167,10 @@ export function claimExpired(body: Uint8Array, now: Date): boolean {
   }
   if (!marker || marker.state === "ALERTED" || marker.alert !== "CLAIMED") return false;
   const at = typeof marker.at === "string" ? Date.parse(marker.at) : Number.NaN;
-  return Number.isFinite(at) && now.getTime() - at > MISSED_FREEZE_CLAIM_EXPIRY_MS;
+  if (!Number.isFinite(at)) return true;
+  if (at - now.getTime() > MISSED_FREEZE_CLAIM_SKEW_MS) return true;
+  // Within the skew a future `at` acts as now: its age is <= 0, never past the expiry.
+  return now.getTime() - at > MISSED_FREEZE_CLAIM_EXPIRY_MS;
 }
 
 export interface FreezeWatchDeps {

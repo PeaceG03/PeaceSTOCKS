@@ -205,6 +205,32 @@ The adapter currently supports:
 
 Secrets are supplied externally and must not enter evidence or Git.
 
+### Where the data secrets live: the `scanner-data` environment
+
+`MASSIVE_API_KEY`, `NET_RERUN_DISPATCH_TOKEN` and `PEACESTOCKS_R2_{ACCESS_KEY_ID,SECRET_ACCESS_KEY,ACCOUNT_ID,BUCKET}`
+live in the GitHub environment `scanner-data`, whose deployment branch policy is `main` only. Every job
+that reads one (scanner.yml: scan, tenmin_daily, freeze_watch, backfill, tenmin_history; gap-refill.yml:
+refill; health.yml: check, weekly; net-rerun.yml: rerun; oct2024-tenmin.yml: run, post_seal) declares
+`environment: scanner-data`, so a workflow edited on a branch, or a run dispatched from a branch, gets
+none of them (src/workflow-secrets-environment.test.ts; no pull_request or push workflow may use the
+environment). site-deploy.yml keeps its own `site` environment; the Tests workflow has no environment
+and no secrets.
+
+All triggers of these jobs run on main: `schedule` and `workflow_run` run on the default branch, the
+chained `gh workflow run` calls and the scan backstop dispatch with `--ref main` / `ref: main`, the
+tenmin fallback dispatches to the default branch, the tenmin_history chain re-dispatches on the ref it
+runs on (main, since it can only run there now), and a manual
+`workflow_dispatch` must be started from main. A dispatch from another branch is now rejected by the
+environment (scan, tenmin_daily and tenmin_history had no ref guard of their own; the other jobs already
+skipped off main). Each environment job run also records a deployment to `scanner-data` (the hourly :47
+freeze watch included). The environment was created with a branch policy only; adding required
+reviewers or a wait timer to it would hold every scheduled scan.
+
+Rollout: the environment secrets take precedence over repository secrets of the same name. The
+repository-level copies are removed only after a scan has succeeded from the environment; until then
+they stay as the fallback. `PEACESTOCKS_R2_ACCOUNT_ID` / `PEACESTOCKS_R2_BUCKET` are also in the `site`
+environment (docs/SITE.md).
+
 ## Historical operational work already completed
 
 Earlier Scanner V0 work reached a healthy collection checkpoint using real Massive data.
@@ -295,7 +321,9 @@ it with one conditional put (`If-None-Match: *`) before alerting, and a 412 mean
 already alerted, so the scan job's last step and the :47 tick cannot both comment. A failed alert
 deletes its claim so the next run retries. A run killed between the claim and the alert leaves a
 `CLAIMED` marker; once that claim is more than 2 hours old and never reached `ALERTED`, the next run
-takes it over with one conditional replace (`If-Match: <etag>`), so exactly one run re-alerts
+takes it over with one conditional replace (`If-Match: <etag>`), so exactly one run re-alerts. A claim
+stamped up to 5 minutes in the future counts as stamped now; one further ahead, or with a missing or
+unparseable time, is corrupt and can be taken over at once (unreadable JSON never is)
 (src/freeze-watch-claim.test.ts, src/freeze-watch-claim-expiry.test.ts). It runs as the last step of every scan job and on the hourly :47 tick
 (`freeze_watch` job), so a session whose scan never ran is still reported within the hour after the
 open. No Massive request and no tickers in the alert.

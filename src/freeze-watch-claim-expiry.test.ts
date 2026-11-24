@@ -191,3 +191,35 @@ test("R2 getWithEtag: a GET without an ETag throws (a replace must name the vers
   const noEtag = new R2ObjectClient({ accountId: "a", bucket: "bucket", accessKeyId: "k", secretAccessKey: "s", sleep: async () => {}, fetchImpl: async () => new Response(new Uint8Array([1]), { status: 200 }) });
   await assert.rejects(noEtag.getWithEtag("k.json"), /R2_GET_NO_ETAG/u);
 });
+
+test("a CLAIMED marker with a far-future, unparseable or missing `at` can be taken over; modest skew is clamped to now", async () => {
+  const { claimExpired, MISSED_FREEZE_CLAIM_SKEW_MS } = await import("./freeze-watch");
+  assert.equal(MISSED_FREEZE_CLAIM_SKEW_MS, 5 * 60 * 1000);
+  const claim = (at: unknown) => enc({ ...(at === undefined ? {} : { at }), sessionDate: "2026-10-02", alert: "CLAIMED" });
+  const iso = (ms: number) => new Date(NOW.getTime() + ms).toISOString();
+  // A clock a few minutes ahead is clamped to now: a fresh claim, not taken over (age 0).
+  assert.equal(claimExpired(claim(iso(60_000)), NOW), false);
+  assert.equal(claimExpired(claim(iso(MISSED_FREEZE_CLAIM_SKEW_MS)), NOW), false);
+  // Further ahead than any honest skew: a corrupt timestamp, which used to block the session forever.
+  assert.equal(claimExpired(claim(iso(MISSED_FREEZE_CLAIM_SKEW_MS + 1)), NOW), true);
+  assert.equal(claimExpired(claim("2099-01-01T00:00:00.000Z"), NOW), true);
+  // Present but unparseable, missing or not a string: expired (the conditional replace still fences).
+  for (const at of ["not a date", "", 12345, null, undefined]) assert.equal(claimExpired(claim(at), NOW), true, String(at));
+  // Unchanged: ALERTED markers and unreadable JSON are never taken over; a past claim still needs > 2 h.
+  assert.equal(claimExpired(enc({ at: "garbage", alert: "CLAIMED", state: "ALERTED" }), NOW), false);
+  assert.equal(claimExpired(enc({ at: "garbage", alert: "commented #9" }), NOW), false);
+  assert.equal(claimExpired(new TextEncoder().encode("{not json"), NOW), false);
+  assert.equal(claimExpired(claim(iso(-MISSED_FREEZE_CLAIM_EXPIRY_MS)), NOW), false);
+  assert.equal(claimExpired(claim(iso(-MISSED_FREEZE_CLAIM_EXPIRY_MS - 1)), NOW), true);
+
+  // End to end: a far-future CLAIMED marker is taken over by one conditional replace and re-alerted once.
+  const client = new MemoryObjectClient();
+  await seed(client);
+  await client.put(MARKER, claim("2099-01-01T00:00:00.000Z"));
+  const sent: string[] = [];
+  const run = () => runFreezeWatch({ store: client, env: {}, now: NOW, alert: (async () => { sent.push("x"); return "commented #1"; }) as never });
+  await run();
+  await run();
+  assert.equal(sent.length, 1);
+  assert.equal(dec(await client.get(MARKER))?.state, "ALERTED");
+});

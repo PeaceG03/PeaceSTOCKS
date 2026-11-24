@@ -40,6 +40,7 @@ permissions:
 
 jobs:
   run:
+    environment: scanner-data
     if: ${{ github.ref == 'refs/heads/main' && inputs.mode == 'run' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 345
@@ -130,6 +131,7 @@ jobs:
           exit 1
 
   post_seal:
+    environment: scanner-data
     if: ${{ github.ref == 'refs/heads/main' && inputs.mode == 'post_seal' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150

@@ -12,9 +12,9 @@ import { RESEARCH_LEDGER_DIR, researchMain } from "./research-harness-cli";
 import type { VariantRecord } from "./research-variants";
 import { writeSyntheticStore } from "./research-fixture";
 
-const base = (root: string, out: string, scanner: string, heldOutTo = "2025-08-29") => [
+const base = (root: string, out: string, heldOutTo = "2025-08-29") => [
   "baseline", "--data", root, "--out", out, "--from", "2025-04-01", "--heldout-from", "2025-08-01", "--heldout-to", heldOutTo,
-  "--train", "20", "--test", "20", "--embargo", "1", "--scanner", scanner, "--min-bars", "1",
+  "--train", "20", "--test", "20", "--embargo", "1", "--min-bars", "1",
 ];
 const report = (out: string) => JSON.parse(readFileSync(join(out, "baseline.json"), "utf8")) as { variantsTried: number; results: Array<{ familySize: number }> };
 const lines = (path: string) => readFileSync(path, "utf8").trimEnd().split("\n").length;
@@ -24,20 +24,20 @@ test("a new --out folder neither resets the variant count / Holm family nor the 
   const ledgerDir = join(root, "ledger");
   try {
     writeSyntheticStore(root, { from: "2025-01-01", to: "2025-08-29" });
-    await researchMain(base(root, join(root, "out1"), "scanner-a"), { ledgerDir });
+    await researchMain(base(root, join(root, "out1")), { ledgerDir, scannerLabel: "scanner-a" });
     assert.equal(report(join(root, "out1")).variantsTried, 5);
     // Same experiment, brand-new output folder: same 5 variants, the log keeps growing in the ledger.
-    await researchMain(base(root, join(root, "out2"), "scanner-a"), { ledgerDir });
+    await researchMain(base(root, join(root, "out2")), { ledgerDir, scannerLabel: "scanner-a" });
     assert.equal(report(join(root, "out2")).variantsTried, 5);
     assert.equal(lines(join(ledgerDir, "variants.jsonl")), 10);
     // New scanner code, another fresh folder: 10 variants tried, every result corrected for 10.
-    await researchMain(base(root, join(root, "out3"), "scanner-b"), { ledgerDir });
+    await researchMain(base(root, join(root, "out3")), { ledgerDir, scannerLabel: "scanner-b" });
     assert.equal(report(join(root, "out3")).variantsTried, 10);
     assert.ok(report(join(root, "out3")).results.every((r) => r.familySize === 10));
     // The seal is the ledger's: 10 registrations (re-running scanner-a registers nothing new) ...
     assert.equal(lines(join(ledgerDir, "heldout.jsonl")), 10);
     // ... and moving the held-out window is refused even from a fresh folder.
-    await assert.rejects(researchMain(base(root, join(root, "out4"), "scanner-a", "2025-08-28"), { ledgerDir }), /HELD_OUT_WINDOW_CHANGED/u);
+    await assert.rejects(researchMain(base(root, join(root, "out4"), "2025-08-28"), { ledgerDir, scannerLabel: "scanner-a" }), /HELD_OUT_WINDOW_CHANGED/u);
     for (const out of ["out1", "out2", "out3"]) assert.deepEqual(readdirSync(join(root, out)).filter((f) => /jsonl|head|marker/u.test(f)), [], `${out} holds no log`);
     assert.ok(existsSync(join(ledgerDir, "variants.jsonl.head")) && existsSync(join(ledgerDir, "heldout.jsonl.head")));
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -71,7 +71,7 @@ test("the CLI's Holm family counts every candidate variant in the ledger, not ju
       pooled: { sessions: 0, meanGross: 0, meanNet: 0, meanCost: 0, meanTurnover: 0, meanUniverse: 0, meanSpy: 0, excessUniverse: none, excessSpy: none, sharpeNet: 0 },
       pooledP: 1,
     });
-    await researchMain(base(root, join(root, "out"), "scanner-a"), { ledgerDir });
+    await researchMain(base(root, join(root, "out")), { ledgerDir, scannerLabel: "scanner-a" });
     const r = report(join(root, "out"));
     assert.equal(r.variantsTried, 8); // 3 earlier + 5 now
     assert.ok(r.results.every((x) => x.familySize === 8), JSON.stringify(r.results.map((x) => x.familySize))); // 6 strategies, 8 variants
@@ -86,7 +86,7 @@ test("the CLI reads its ledger against the committed heads: rewriting a committe
     writeSyntheticStore(root, { from: "2025-01-01", to: "2025-08-29" });
     mkdirSync(ledgerDir, { recursive: true });
     git("init", "-q");
-    await researchMain(base(root, join(root, "out1"), "scanner-a"), { ledgerDir });
+    await researchMain(base(root, join(root, "out1")), { ledgerDir, scannerLabel: "scanner-a" });
     git("add", "research-ledger");
     git("commit", "-q", "-m", "ledger");
     // Drop the last variant record, re-chain, and write a matching head file (no git change).
@@ -101,6 +101,59 @@ test("the CLI reads its ledger against the committed heads: rewriting a committe
     }).join("");
     writeFileSync(path, text);
     writeFileSync(`${path}.head`, `${JSON.stringify({ seq: kept.length - 1, hash: prev })}\n`);
-    await assert.rejects(researchMain(base(root, join(root, "out2"), "scanner-a"), { ledgerDir }), /LOG_TAMPERED.*anchor/u);
+    await assert.rejects(researchMain(base(root, join(root, "out2")), { ledgerDir, scannerLabel: "scanner-a" }), /LOG_TAMPERED.*anchor/u);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("A9: with no injected ledger the CLI uses the repository ledger (research-ledger/), never --out", async () => {
+  // Same TOP_15_OVERALL config the committed seal registered, but a different held-out window: the
+  // committed seal must refuse it before any data is read. Were the ledger defaulted to --out (an
+  // empty folder), registration would succeed and the run would fail later on the missing data.
+  const out = mkdtempSync(join(tmpdir(), "a9-out-"));
+  const files = ["variants.jsonl", "variants.jsonl.head", "heldout.jsonl", "heldout.jsonl.head"];
+  const before = files.map((f) => readFileSync(join(RESEARCH_LEDGER_DIR, f), "utf8"));
+  try {
+    await assert.rejects(
+      researchMain([
+        "baseline", "--data", join(out, "no-data"), "--out", out,
+        "--from", "2025-03-03", "--heldout-from", "2026-08-27", "--heldout-to", "2026-11-19",
+        "--bps", "10", "--train", "63", "--test", "63", "--embargo", "2", "--mode", "rolling",
+      ], { scannerLabel: "main@f1605fe7 scanner-config-v0.1" }),
+      /HELD_OUT_WINDOW_CHANGED/u,
+    );
+    assert.deepEqual(files.map((f) => readFileSync(join(RESEARCH_LEDGER_DIR, f), "utf8")), before);
+    assert.deepEqual(readdirSync(out), []); // no ledger or results written to --out
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test("--scanner is refused: the label is derived from the commit and the scanner config hash", async () => {
+  const out = mkdtempSync(join(tmpdir(), "scanner-flag-"));
+  try {
+    await assert.rejects(
+      researchMain(["baseline", "--data", join(out, "no-data"), "--out", join(out, "out"), "--scanner", "anything"], { ledgerDir: join(out, "ledger") }),
+      /SCANNER_LABEL_IS_DERIVED/u,
+    );
+    assert.deepEqual(readdirSync(out), []); // refused before any folder or ledger is created
+  } finally { rmSync(out, { recursive: true, force: true }); }
+});
+
+test("the committed ledger carries the post-floor (v2) baseline under its own derived label: 10 variants, Holm family 10", async () => {
+  const { holmFamily } = await import("./research-variants");
+  const anchored = (path: string) => ({ anchor: () => gitCommittedHead(path) });
+  const variantsPath = join(RESEARCH_LEDGER_DIR, "variants.jsonl");
+  const sealPath = join(RESEARCH_LEDGER_DIR, "heldout.jsonl");
+  const family = holmFamily(new AppendOnlyLog<VariantRecord>(variantsPath, undefined, anchored(variantsPath)).entries());
+  assert.ok(family.variantsTried >= 10 && family.familySize >= 10, `tried ${family.variantsTried}, family ${family.familySize}`);
+  const seal = new AppendOnlyLog<Record<string, unknown>>(sealPath, undefined, anchored(sealPath)).read().map((l) => JSON.stringify(l.entry));
+  const labels = new Set(seal.flatMap((e) => [...e.matchAll(/"scanner":"([^"]*)"/gu)].map((m) => m[1]!)));
+  assert.ok(labels.has("main@f1605fe7 scanner-config-v0.1"));
+  const derived = [...labels].filter((l) => /^[0-9a-f]{12} scanner-v0\.1 config-[0-9a-f]{12}$/u.test(l));
+  assert.ok(derived.length >= 1, [...labels].join(","));
+  for (const label of derived) assert.equal(seal.filter((e) => e.includes(`"scanner":"${label}"`)).length, 5, label);
+  // Held-out stays sealed: registrations only, all on the reserved window.
+  assert.ok(seal.every((e) => /"window":\{"from":"2026-08-27","to":"2026-11-20"\}/u.test(e)), "window");
+  assert.ok(seal.every((e) => !/EVALUAT|UNSEAL/u.test(e)), "no evaluation or unseal");
+  assert.deepEqual(readdirSync(RESEARCH_LEDGER_DIR).filter((f) => f === "heldout-markers"), []);
 });

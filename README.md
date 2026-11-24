@@ -50,6 +50,8 @@ The package intentionally contains no brokerage or trading connector. MarketProv
 
 Massive Stocks Basic is suitable for the initial end-of-day clock because its current plan includes reference tickers, daily market summaries, splits, and dividends. The current Basic limits and data-retention/licensing terms remain provider obligations: the adapter uses a bounded five-calls-per-minute-compatible interval by default, requests unadjusted grouped daily bars, and does not claim historical coverage beyond the active provider plan. A full-universe run must be executed only after the operator has accepted the provider market-data terms and configured the secret through the deployment secret store.
 
+The scanner's data secrets (Massive key, R2 keys, net-rerun token) live in the main-only GitHub environment `scanner-data`; every job that reads them declares it. The repository-level copies are removed only after a scan has succeeded from the environment. See docs/SCANNER.md.
+
 The scanners scheduled entry is runDueCollection. It deliberately separates the due decision from hosting: a governed service, task scheduler, or existing PeaceAI scheduler invokes it, while durable run reports and idempotent storage provide missed-session recovery. This source package does not install an operating-system scheduler or call a live provider during tests.
 
 Storage is separated into permanent/ evidence, cache/ rebuildable derived material, and transient/ cleanup workspace. Daily bars are raw/unadjusted source evidence; adjustments and technical features are reconstructed from evidence plus versioned recipes.

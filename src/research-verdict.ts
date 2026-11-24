@@ -37,6 +37,22 @@ export function assertCostFloor(bps: number, floor = MIN_COST_BPS_PER_SIDE): num
   return bps;
 }
 
+/**
+ * Caller thresholds can only TIGHTEN the defaults: alpha no higher, the fold share, fold count and
+ * cost floor no lower. A value that is not a finite number falls back to the default. So a library
+ * caller cannot turn one zero-cost fold into an IMPROVEMENT by passing looser thresholds.
+ */
+export function clampThresholds(given: VerdictThresholds): VerdictThresholds {
+  const d = DEFAULT_VERDICT_THRESHOLDS;
+  const or = (v: number, fallback: number) => (Number.isFinite(v) ? v : fallback);
+  return {
+    alpha: Math.min(or(given.alpha, d.alpha), d.alpha),
+    minPositiveFoldShare: Math.max(or(given.minPositiveFoldShare, d.minPositiveFoldShare), d.minPositiveFoldShare),
+    minFolds: Math.max(or(given.minFolds, d.minFolds), d.minFolds),
+    minCostBpsPerSide: Math.max(or(given.minCostBpsPerSide, d.minCostBpsPerSide), d.minCostBpsPerSide),
+  };
+}
+
 export const LIVE_PAPER_RUN_NOTE =
   "A live paper run of this exact configuration is still required; no harness result alone can move it to real money, and real money needs Peace's own yes.";
 
@@ -62,8 +78,9 @@ export interface Verdict {
 export function verdictFor(
   evaluation: StrategyEvaluation,
   heldOut: SeriesMetrics | undefined,
-  thresholds: VerdictThresholds = DEFAULT_VERDICT_THRESHOLDS,
+  given: VerdictThresholds = DEFAULT_VERDICT_THRESHOLDS,
 ): Verdict {
+  const thresholds = clampThresholds(given);
   const pooled = evaluation.record.pooled;
   const folds = evaluation.record.folds.length;
   const beatsUniverseAfterCosts = pooled.excessUniverse.mean > 0;

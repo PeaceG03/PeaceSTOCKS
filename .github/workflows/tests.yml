@@ -11,6 +11,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
         with:
           version: 9.15.9
@@ -25,3 +27,7 @@ jobs:
         run: pnpm run typecheck:lib
       - name: Test suite
         run: pnpm test
+      # The research ledger must be append-only against main (src/research-ledger-check.ts): main's
+      # committed heads still in the chain, its held-out markers unchanged. Read-only git, no network.
+      - name: Research ledger is append-only against main
+        run: pnpm -s exec tsx src/research-ledger-check.ts origin/main
