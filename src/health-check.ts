@@ -12,6 +12,7 @@ import { dayStuck } from "./day-stuck";
 import { countErrorParts } from "./health-error-count";
 import {
   HEALTH_CHECKIN_PREFIX,
+  HEALTH_CRON_LATENESS_MINUTES,
   HEALTH_PARTS,
   type HealthCheckinStore,
   type HealthPruneStore,
@@ -51,15 +52,40 @@ export interface HealthCheckPart {
   allowedSilenceMinutes?: number;
   /** Finished-and-idle check-in messages (see HealthPartDeclaration.idle). */
   idle?: readonly { prefix: string; allowedSilenceMinutes?: number }[];
+  /** Declared cron slots: silent after the next slot following the last check-in + the lateness margin. */
+  cron?: { utcDays: readonly number[]; times: readonly string[] };
+}
+
+/** Pure: the first declared cron slot strictly after `afterIso` (UTC), or undefined when none is declared. */
+export function nextCronSlot(afterIso: string, cron: { utcDays: readonly number[]; times: readonly string[] }): Date | undefined {
+  const after = Date.parse(afterIso);
+  if (!Number.isFinite(after) || !cron.utcDays.length || !cron.times.length) return undefined;
+  const day0 = Date.parse(`${new Date(after).toISOString().slice(0, 10)}T00:00:00Z`);
+  for (let d = 0; d <= 8; d += 1) {
+    const day = new Date(day0 + d * 86_400_000);
+    if (!cron.utcDays.includes(day.getUTCDay())) continue;
+    for (const t of [...cron.times].sort()) {
+      const [h, m] = t.split(":").map(Number) as [number, number];
+      const slot = day.getTime() + (h * 60 + m) * 60_000;
+      if (slot > after) return new Date(slot);
+    }
+  }
+  return undefined;
 }
 
 /**
  * Pure: the silence allowance for a part given its latest check-in. An OK check-in whose message marks
  * the part finished and idle uses that idle entry's allowance (undefined = never silent).
  */
-export function silenceAllowance(part: HealthCheckPart, latest: HealthCheckinFacts | undefined): number | undefined {
+export function silenceAllowance(part: HealthCheckPart, latest: HealthCheckinFacts | undefined, sinceIso?: string): number | undefined {
   const idle = latest?.state === "OK" ? part.idle?.find((i) => latest.message?.startsWith(i.prefix)) : undefined;
-  return idle ? idle.allowedSilenceMinutes : part.allowedSilenceMinutes;
+  if (idle) return idle.allowedSilenceMinutes;
+  // Scheduled parts (Auditor, final review): next declared slot after the last check-in + 12 h, so a
+  // mid-week miss is flagged the same day, not after a flat 80 h.
+  const from = latest?.at ?? sinceIso;
+  const next = part.cron && from ? nextCronSlot(from, part.cron) : undefined;
+  if (next) return (next.getTime() - Date.parse(from!)) / 60_000 + HEALTH_CRON_LATENESS_MINUTES;
+  return part.allowedSilenceMinutes;
 }
 
 /** A check-in as written by a part. `state` is the part's own word. */
@@ -201,7 +227,7 @@ export function evaluateHealth(input: {
   const requests: Record<string, number> = {};
   for (const part of input.parts) {
     const latest = input.latest.get(part.name);
-    const allowance = silenceAllowance(part, latest);
+    const allowance = silenceAllowance(part, latest, input.monitoringSince);
     const silent =
       allowance !== undefined &&
       (latest
@@ -339,6 +365,7 @@ export async function runHealthCheck(
       name: p.name,
       ...(p.allowedSilenceMinutes === undefined ? {} : { allowedSilenceMinutes: p.allowedSilenceMinutes }),
       ...(p.idle ? { idle: p.idle } : {}),
+      ...(p.cronTimes ? { cron: { utcDays: p.schedule.utcDays, times: p.cronTimes } } : {}),
     })),
     ...(monitoringSince ? { monitoringSince } : {}),
     latest,

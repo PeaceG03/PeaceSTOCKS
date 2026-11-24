@@ -36,6 +36,11 @@ export interface HealthPartDeclaration {
    * entry's instead (undefined = never silent until it runs again).
    */
   idle?: readonly { prefix: string; allowedSilenceMinutes?: number }[];
+  /**
+   * The part's cron slots (UTC "HH:MM" on schedule.utcDays). When set, the part is silent once the next
+   * slot after its last check-in plus the lateness margin has passed (not a flat allowance).
+   */
+  cronTimes?: readonly string[];
 }
 
 const TUE_TO_SAT = [2, 3, 4, 5, 6] as const;
@@ -50,9 +55,9 @@ const SCAN_SILENCE_MINUTES = 68 * 60 + HEALTH_CRON_LATENESS_MINUTES;
 /** Each part's own schedule (from its workflow crons). */
 export const HEALTH_PARTS: readonly HealthPartDeclaration[] = [
   // scanner.yml crons 05:30 + 09:30 UTC Tue-Sat; Sat 09:30 -> Tue 05:30 is the longest normal gap (68 h).
-  { id: "scan", name: "scan", schedule: { utcDays: TUE_TO_SAT, perDay: 2 }, allowedSilenceMinutes: SCAN_SILENCE_MINUTES },
+  { id: "scan", name: "scan", schedule: { utcDays: TUE_TO_SAT, perDay: 2 }, allowedSilenceMinutes: SCAN_SILENCE_MINUTES, cronTimes: ["05:30", "09:30"] },
   // scanner.yml crons 06:20 + 10:20 UTC Tue-Sat (only while TENMIN_DAILY_ENABLED is true).
-  { id: "tenmin-daily", name: "daily 10-minute step", schedule: { utcDays: TUE_TO_SAT, perDay: 2 }, allowedSilenceMinutes: SCAN_SILENCE_MINUTES },
+  { id: "tenmin-daily", name: "daily 10-minute step", schedule: { utcDays: TUE_TO_SAT, perDay: 2 }, allowedSilenceMinutes: SCAN_SILENCE_MINUTES, cronTimes: ["06:20", "10:20"] },
   // Dispatched chain plus the hourly restarter: at least one run a day while the chain is working.
   // It has no cron of its own: after STOP_DONE (no range left) it is idle until the next range closes,
   // and while it waits on the daily step (WAIT_DAILY_STEP) it runs again only once that day resolves.
