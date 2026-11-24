@@ -35,7 +35,7 @@ export interface HealthPartDeclaration {
    * legitimately has nothing to run (it has no cron of its own), so the silence allowance is this
    * entry's instead (undefined = never silent until it runs again).
    */
-  idle?: readonly { prefix: string; allowedSilenceMinutes?: number }[];
+  idle?: readonly HealthIdleEntry[];
   /**
    * The part's cron slots (UTC "HH:MM" on schedule.utcDays). When set, the part is silent once the next
    * slot after its last check-in plus the lateness margin has passed (not a flat allowance).
@@ -52,8 +52,19 @@ const EVERY_DAY = [0, 1, 2, 3, 4, 5, 6] as const;
 export const HEALTH_CRON_LATENESS_MINUTES = 12 * 60;
 const SCAN_SILENCE_MINUTES = 68 * 60 + HEALTH_CRON_LATENESS_MINUTES;
 
-/** Longest silence for a finished (STOP_DONE) history chain before it is flagged: 8 days. */
-export const HISTORY_CHAIN_DONE_SILENCE_MINUTES = 8 * 24 * 60;
+/**
+ * A finished-and-idle check-in message. allowedSilenceMinutes: a flat limit (absent = never silent).
+ * afterNextRangeCloseDays: silent once the history chain's next 2-month range has closed (the end of
+ * the range holding the check-in, by pairRangeForDate) plus this many days.
+ */
+export interface HealthIdleEntry {
+  prefix: string;
+  allowedSilenceMinutes?: number;
+  afterNextRangeCloseDays?: number;
+}
+
+/** Days after the next range close a finished (STOP_DONE) history chain may stay silent. */
+export const HISTORY_CHAIN_DONE_AFTER_CLOSE_DAYS = 3;
 
 /** Each part's own schedule (from its workflow crons). */
 export const HEALTH_PARTS: readonly HealthPartDeclaration[] = [
@@ -69,9 +80,9 @@ export const HEALTH_PARTS: readonly HealthPartDeclaration[] = [
     name: "history chain",
     schedule: { utcDays: EVERY_DAY, perDay: 1 },
     allowedSilenceMinutes: 24 * 60 + HEALTH_CRON_LATENESS_MINUTES,
-    // STOP_DONE is bounded too (Auditor, final review): a finished chain that is silent for 8 days means
-    // ranges have kept closing without it being restarted.
-    idle: [{ prefix: "STOP_DONE:", allowedSilenceMinutes: HISTORY_CHAIN_DONE_SILENCE_MINUTES }, { prefix: "WAIT_DAILY_STEP:", allowedSilenceMinutes: SCAN_SILENCE_MINUTES }],
+    // STOP_DONE is bounded too (Auditor, rounds 4-5): silent past the next range close + 3 days means
+    // the newly closed range was not picked up (a flat limit would alert mid-cycle on a normal idle chain).
+    idle: [{ prefix: "STOP_DONE:", afterNextRangeCloseDays: HISTORY_CHAIN_DONE_AFTER_CLOSE_DAYS }, { prefix: "WAIT_DAILY_STEP:", allowedSilenceMinutes: SCAN_SILENCE_MINUTES }],
   },
   // Manual dispatch only: no expected check-ins, never silent.
   { id: "backfill", name: "backfill", schedule: { utcDays: [], perDay: 0 } },

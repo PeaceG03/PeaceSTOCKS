@@ -15,6 +15,7 @@ import {
   HEALTH_CRON_LATENESS_MINUTES,
   HEALTH_PARTS,
   type HealthCheckinStore,
+  type HealthIdleEntry,
   type HealthPruneStore,
   errorMessage,
   pruneHealthCheckins,
@@ -40,7 +41,7 @@ import {
   tenMinDailyCatchupSessions,
   tenMinDailyIndexCounts,
 } from "./tenmin-daily-liquid";
-import { lastCompletedSessionDate } from "./tenmin-history";
+import { lastCompletedSessionDate, pairRangeForDate } from "./tenmin-history";
 
 export const HEALTHY = "Healthy" as const;
 export const NO_PARTS_REPORTING = "no parts reporting" as const;
@@ -53,7 +54,7 @@ export interface HealthCheckPart {
   /** Minutes a part may go without a check-in before it counts as silent; undefined = never silent (runs only by hand). */
   allowedSilenceMinutes?: number;
   /** Finished-and-idle check-in messages (see HealthPartDeclaration.idle). */
-  idle?: readonly { prefix: string; allowedSilenceMinutes?: number }[];
+  idle?: readonly HealthIdleEntry[];
   /** Declared cron slots: silent after the next slot following the last check-in + the lateness margin. */
   cron?: { utcDays: readonly number[]; times: readonly string[] };
 }
@@ -81,6 +82,14 @@ export function nextCronSlot(afterIso: string, cron: { utcDays: readonly number[
  */
 export function silenceAllowance(part: HealthCheckPart, latest: HealthCheckinFacts | undefined, sinceIso?: string): number | undefined {
   const idle = latest?.state === "OK" ? part.idle?.find((i) => latest.message?.startsWith(i.prefix)) : undefined;
+  if (idle?.afterNextRangeCloseDays !== undefined && latest) {
+    const at = Date.parse(latest.at);
+    if (Number.isFinite(at)) {
+      const { calendarTo } = pairRangeForDate(new Date(at).toISOString().slice(0, 10));
+      const close = Date.parse(`${calendarTo}T00:00:00Z`) + 86_400_000; // the end of the range's last day
+      return (close + idle.afterNextRangeCloseDays * 86_400_000 - at) / 60_000;
+    }
+  }
   if (idle) return idle.allowedSilenceMinutes;
   // Scheduled parts (Auditor, final review): next declared slot after the last check-in + 12 h, so a
   // mid-week miss is flagged the same day, not after a flat 80 h.

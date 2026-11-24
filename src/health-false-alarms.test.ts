@@ -9,9 +9,9 @@ import { MemoryObjectClient } from "./object-store";
 const parts = HEALTH_PARTS.map((p) => ({ name: p.name, ...(p.allowedSilenceMinutes === undefined ? {} : { allowedSilenceMinutes: p.allowedSilenceMinutes }), ...(p.idle ? { idle: p.idle } : {}) }));
 const hours = (h: number, from: string) => new Date(Date.parse(from) + h * 3_600_000).toISOString();
 
-test("false alarm: the history chain that finished (STOP_DONE) is idle (up to its 8-day bound); a working chain is not", () => {
+test("false alarm: the history chain that finished (STOP_DONE) is idle until its next range close + 3 days; a working chain is not", () => {
   const at = "2026-11-01T12:00:00.000Z";
-  const now = new Date(hours(24 * 7, at)); // a week later (the 8-day bound: health-chain-done-bound.test.ts)
+  const now = new Date(hours(24 * 20, at)); // 20 days later: mid-cycle (Nov-Dec closes at the end of 12-31; health-chain-done-bound.test.ts)
   const done = evaluateHealth({ parts, now, latest: new Map([["history chain", { part: "history-chain", state: "OK", at, message: "STOP_DONE:no-range-left" }]]) });
   assert.equal(done.parts.find((p) => p.name === "history chain")!.status, "OK");
   const working = evaluateHealth({ parts, now: new Date(hours(37, at)), latest: new Map([["history chain", { part: "history-chain", state: "OK", at, message: "CONTINUE_TIME_BUDGET" }]]) });
@@ -48,7 +48,7 @@ test("false alarm: an idle part keeps its last check-in through pruning (still s
   assert.equal(await pruneHealthCheckins(store, now), 1);
   const run = await runHealthCheck(store, now);
   const chain = run.parts.find((p) => p.name === "history chain")!;
-  // Its last check-in survives pruning; a month of STOP_DONE silence is past the 8-day bound, so it is
+  // Its last check-in survives pruning; STOP_DONE on 10-02 is past Sep-Oct's close (end of 10-31) + 3 days, so it is
   // flagged as silent since 10-02, never as "no check-in at all".
   assert.equal(chain.lastCheckinAt, "2026-10-02T12:00:00.000Z");
   assert.equal(chain.status, "no response");
