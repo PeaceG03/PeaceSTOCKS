@@ -310,8 +310,49 @@ export interface TenMinDailyIndex {
    * longer holds the history chain, and it is never treated as a full day.
    */
   stuckShort?: TenMinDailyStuckShort;
+  /**
+   * Set on every index this code writes (the done-day rule, Nov 23). An index without it was written
+   * before the rule (main through Nov 23): it has no done field and no per-stock bars, so its counts
+   * are unknown, not short. Such a pre-rule index is never stamped STUCK_SHORT and, once out of the
+   * window, never holds a seal (the range's own seal checks apply, as before the rule).
+   */
+  doneRule?: typeof TENMIN_DAILY_DONE_RULE;
   updatedAt: string;
   checksum: string;
+}
+
+export const TENMIN_DAILY_DONE_RULE = "done-day-v1" as const;
+/** The daily step's first session (Sep 29, 2026) is in this two-month range; no daily index is older. */
+export const TENMIN_DAILY_FIRST_RANGE_FROM = "2026-09-01" as const;
+
+/** Pure: true for an index written before the done-day rule (no doneRule marker). */
+export function isPreRuleIndex(index: Pick<TenMinDailyIndex, "doneRule">): boolean {
+  return index.doneRule !== TENMIN_DAILY_DONE_RULE;
+}
+
+/**
+ * Every daily index key from the first daily range up to and including the range that holds
+ * `toSession`, sorted by session date (lists each range's daily/ folder; nothing else).
+ */
+export async function listTenMinDailyIndexDays(store: Pick<ReplyDustStore, "list">, toSession: string): Promise<string[]> {
+  requireDate(toSession);
+  const days: string[] = [];
+  let month = TENMIN_DAILY_FIRST_RANGE_FROM.slice(0, 7);
+  const seen = new Set<string>();
+  while (month <= toSession.slice(0, 7)) {
+    const { calendarFrom, calendarTo } = pairRangeForDate(`${month}-15`);
+    const prefix = `${tenMinRangePrefix(calendarFrom, calendarTo)}/daily/`;
+    if (!seen.has(prefix)) {
+      seen.add(prefix);
+      for (const key of await store.list(prefix)) {
+        const day = /^(\d{4}-\d{2}-\d{2})\.json$/u.exec(key.slice(prefix.length))?.[1];
+        if (day && day <= toSession) days.push(day);
+      }
+    }
+    const [y, m] = month.split("-").map(Number) as [number, number];
+    month = m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, "0")}`;
+  }
+  return [...new Set(days)].sort();
 }
 
 export const TENMIN_DAILY_STUCK_SHORT = "STUCK_SHORT" as const;
@@ -534,10 +575,14 @@ export async function runTenMinDailyLiquid(options: {
   let outageStreak = 0;
   let stop = false;
   // A day that left the window not done is no longer retried: record it STUCK_SHORT with its counts
-  // (it can then never hold a seal or the chain forever, and is never treated as full).
-  for (const sessionDate of tradingSessionsBefore(sessions[0] ?? lastCompleted, options.catchupSessions ?? TENMIN_DAILY_CATCHUP_SESSIONS, calendar)) {
+  // (it can then never hold a seal or the chain forever, and is never treated as full). Every tracked
+  // day older than the window is covered (Auditor B1), not only the sessions just before it. A
+  // pre-rule index (written before the done-day rule: no done field, no per-stock bars) is never
+  // stamped: its counts are unknown, not short.
+  const windowStart = sessions[0] ?? lastCompleted;
+  for (const sessionDate of (await listTenMinDailyIndexDays(store, windowStart)).filter((d) => d < windowStart)) {
     const old = await readTenMinDailyIndex(store, sessionDate);
-    if (!old || old.done || old.stuckShort) continue;
+    if (!old || old.done || old.stuckShort || isPreRuleIndex(old)) continue;
     const counts = tenMinDailyIndexCounts(old, expectedTenMinBars(sessionDate, calendar));
     await writeTenMinDailyIndex(
       store,
@@ -627,6 +672,7 @@ export async function runTenMinDailyLiquid(options: {
         selected,
         stored: [],
         gaps: [],
+        doneRule: TENMIN_DAILY_DONE_RULE,
         updatedAt: stamp(),
       });
       // Freeze the selection before the first request so a resumed run fetches the same names.
@@ -813,6 +859,7 @@ export async function runTenMinDailyLiquid(options: {
       shortStocks: verdict.shortStocks.map((stock) => ({ securityId: stock.securityId, bars: barCount(stock.bars, verdict.expectedBars) })),
       dailyBars,
       ...(stuckShort ? { stuckShort } : {}),
+      doneRule: TENMIN_DAILY_DONE_RULE,
       updatedAt: stamp(),
     });
     await writeTenMinDailyIndex(store, index);
@@ -869,10 +916,12 @@ export const TENMIN_SEAL_REFUSED_DAY_RETRYING = "TENMIN_SEAL_REFUSED_DAY_RETRYIN
 
 /**
  * Seal guard (Peace, Nov 23): a history range may seal (and so count as done) only if every day in
- * it is full or STUCK_SHORT. A day the daily step tracks (it has an index) must be done or
- * STUCK_SHORT; a day still inside the daily step's catch-up window that it has not tried yet must
- * wait for it. Days older than the window with no index are history-only (the range's own checks).
- * Returns the refusal for the first such day, or undefined. Reads only daily indexes.
+ * it is full or STUCK_SHORT. Inside the daily step's catch-up window a day it tracks (it has an index)
+ * must be done or STUCK_SHORT, and a day it has not tried yet must wait for it. Older than the window
+ * (Auditor B1): a pre-rule index (written before the rule) and a day with no index are history-only
+ * (the range's own seal checks); a day that left the window not done is STUCK_SHORT (LEFT_WINDOW, no
+ * longer retried), stamped by the daily step's sweep, so it never holds the seal forever even while
+ * the daily step is paused. Returns the refusal for the first day that must wait, or undefined.
  */
 export async function tenMinRangeSealRefusal(
   store: Pick<ReplyDustStore, "get">,
@@ -888,6 +937,9 @@ export async function tenMinRangeSealRefusal(
     const index = await readTenMinDailyIndex(store, sessionDate);
     if (index) {
       if (index.done || index.stuckShort) continue;
+      if (!window.has(sessionDate)) continue;
+      // A pre-rule index in the window is re-checked (and recounted) by the next daily step run.
+      if (isPreRuleIndex(index)) return `${TENMIN_SEAL_REFUSED_DAY_RETRYING}:${sessionDate}:pre-rule`;
       const counts = tenMinDailyIndexCounts(index, expectedTenMinBars(sessionDate, calendar));
       return `${TENMIN_SEAL_REFUSED_DAY_RETRYING}:${sessionDate}:${counts.dayBars}`;
     }

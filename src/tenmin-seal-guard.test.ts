@@ -35,6 +35,7 @@ async function putIndex(store: MemoryObjectClient, sessionDate: string, extra: R
     selected: [{ rank: 1, securityId: "sec_a", symbol: "A", dollarVolume: 1, sessions: 20 }],
     stored: [{ securityId: "sec_a", fetch: {}, bars: 38 }],
     gaps: [],
+    doneRule: "done-day-v1",
     ...extra,
     updatedAt: "t",
   };
@@ -168,4 +169,29 @@ test("seal guard: wired into the host override with the done-day hold", () => {
   const on = tenMinHistoryDailyStepHold({ TENMIN_DAILY_ENABLED: "true", PEACESTOCKS_R2_BUCKET: "b" }, () => new MemoryObjectClient());
   assert.equal(typeof on.sealGuard, "function");
   assert.deepEqual(tenMinHistoryDailyStepHold({}), {});
+});
+
+test("B1: a pre-rule index (main's shape: no done, no per-stock bars) is never stamped STUCK_SHORT and never holds a seal once out of the window", async () => {
+  const store = new MemoryObjectClient();
+  // Main wrote these: stored entries carry only { securityId, fetch }, no done / notDoneRuns / doneRule.
+  const preRule = { doneRule: undefined, stored: [{ securityId: "sec_a", fetch: {} }] };
+  await putIndex(store, "2026-10-13", preRule);
+  await putIndex(store, "2026-10-14", preRule);
+  // Window ends Nov 20 (10 sessions): Oct 13-14 are well outside it.
+  const opts = { lastCompletedSession: "2026-11-20", catchupSessions: 10 };
+  assert.equal(await tenMinRangeSealRefusal(store, "2026-09-01", "2026-10-31", opts), undefined, "the range's own seal checks apply");
+  // Inside the window a pre-rule index waits for the daily step to re-check it (it recounts the bars).
+  assert.equal(
+    await tenMinRangeSealRefusal(store, "2026-09-01", "2026-10-31", { lastCompletedSession: "2026-10-14", catchupSessions: 2 }),
+    `${TENMIN_SEAL_REFUSED_DAY_RETRYING}:2026-10-13:pre-rule`,
+  );
+});
+
+test("B1: a tracked day 25 sessions back that never finished does not block sealing forever", async () => {
+  const store = new MemoryObjectClient();
+  // Oct 2 left the window not done (2 passes) while the daily step was paused, so nothing stamped it.
+  await putIndex(store, "2026-10-02", { notDoneRuns: 2 });
+  // Window = Nov 2-6 (5 sessions); Oct 2 is 25 sessions back.
+  const opts = { lastCompletedSession: "2026-11-06", catchupSessions: 5 };
+  assert.equal(await tenMinRangeSealRefusal(store, "2026-09-01", "2026-10-31", opts), undefined);
 });

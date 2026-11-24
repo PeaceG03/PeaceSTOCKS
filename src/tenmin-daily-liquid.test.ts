@@ -799,6 +799,37 @@ test("history hold: a day that leaves the window not done is recorded STUCK_SHOR
   assert.deepEqual([index.stuckShort?.status, index.stuckShort?.reason, index.stuckShort?.passes, index.stuckShort?.dayBars], ["STUCK_SHORT", "LEFT_WINDOW", 1, "36/117"]);
 });
 
+/** Rewrite a stored index into main's pre-rule shape (no done, no counts, entries without bars). */
+async function toPreRule(store: MemoryObjectClient, sessionDate: string): Promise<void> {
+  const { sha256Hex } = await import("./intraday-reply-dust");
+  const index = (await readTenMinDailyIndex(store, sessionDate))!;
+  const { checksum: _c, done: _d, notDoneRuns: _n, shortNames: _s, missingDailyBars: _m, dayBars: _b, shortStocks: _ss, dailyBars: _db, stuckShort: _st, doneRule: _r, ...body } = index;
+  const legacy = { ...body, stored: body.stored.map(({ securityId, fetch }) => ({ securityId, fetch })) };
+  const enc = new TextEncoder();
+  await store.put(tenMinDailyIndexKey(sessionDate), enc.encode(JSON.stringify({ ...legacy, checksum: sha256Hex(enc.encode(JSON.stringify(legacy))) })));
+}
+
+test("B1: a pre-rule full index is never stamped STUCK_SHORT when it leaves the window", async () => {
+  const store = new MemoryObjectClient();
+  await baseRun(store, [], { lastCompletedSession: "2026-10-08", catchupSessions: 1 });
+  await toPreRule(store, "2026-10-08");
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.done, undefined, "main's shape: no done field");
+  const next = await baseRun(store, [], { lastCompletedSession: "2026-10-09", catchupSessions: 1 });
+  assert.deepEqual(next.warnings.filter((w) => w.startsWith("TENMIN_DAILY_STUCK_SHORT")), []);
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.stuckShort, undefined, "never stamped 0/N");
+});
+
+test("B1: every tracked unfinished day older than the window is stamped LEFT_WINDOW, not only the 10 before it", async () => {
+  const store = new MemoryObjectClient();
+  const short = async (sec: { securityId: string; symbol: string }, from: string, to: string) =>
+    replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, from === "2026-10-08" ? 12 : 39));
+  await baseRun(store, [], { lastCompletedSession: "2026-10-08", catchupSessions: 1, fetchPages: short });
+  // The daily step was off for weeks: the next run is 25 sessions later.
+  const next = await baseRun(store, [], { lastCompletedSession: "2026-11-12", catchupSessions: 1, fetchPages: short });
+  assert.deepEqual(next.warnings.filter((w) => w.startsWith("TENMIN_DAILY_STUCK_SHORT")), ["TENMIN_DAILY_STUCK_SHORT_LEFT_WINDOW:2026-10-08:36/117"]);
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.stuckShort?.reason, "LEFT_WINDOW");
+});
+
 test("counts: every day and stock status shows bars stored vs. needed (38/39; 20/21 on a half day)", async () => {
   const store = new MemoryObjectClient();
   const calls: string[] = [];
