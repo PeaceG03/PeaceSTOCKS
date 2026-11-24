@@ -6,7 +6,8 @@ import test from "node:test";
 import { FakeMarket, RecordingClient } from "./paper-fakes.test-helper";
 import { paperLedgerKey, PaperLedgerStore, PAPER_CORRECTIONS_PREFIX, type PaperDay, type PaperExits, type PaperFills, type PaperIntents, type PaperStuckResolution } from "./paper-ledger";
 import { loadPaperRules, type LoadedPaperRules } from "./paper-rules";
-import { computeFills, PaperBars, runPaperTrading, sellFillPrice } from "./paper-trading";
+import type { CorporateAction } from "./contracts";
+import { computeFills, PaperBars, runPaperTrading, sellFillPrice, stuckAt, stuckResolutionFor } from "./paper-trading";
 
 const ON = { PAPER_TRADING_ENABLED: "true" };
 const near = (actual: number, expected: number, what = "") => assert.ok(Math.abs(actual - expected) < 1e-6, `${what} ${actual} != ${expected}`);
@@ -167,7 +168,7 @@ test("a later real price appends a correction for the actual amount; the fill is
 });
 
 test("buyout cash or a bankruptcy payout in the data also appends a correction (cash per share, no slippage)", async () => {
-  for (const [type, cash] of [["MERGER", 42], ["CLOSURE", 0.35]] as const) {
+  for (const [type, cash] of [["MERGER", 42], ["CLOSURE", 0]] as const) { // 0: a bankruptcy that paid nothing still resolves
     const { client, m } = await stuckWorld();
     m.settle("a", "2026-12-16", type, cash);
     await step(client, m, "2026-12-16");
@@ -180,11 +181,98 @@ test("buyout cash or a bankruptcy payout in the data also appends a correction (
 });
 
 test("the universe benchmark uses the same rule: a name with no price for 5 straight sessions counts once at -100%", async () => {
-  const { client } = await stuckWorld();
+  const { client, m } = await stuckWorld();
+  await step(client, m, "2026-12-16");
   const day = (S: string) => read<PaperDay>(client, paperLedgerKey("days", S));
   const d14 = await day("2026-12-14");
   const d15 = await day("2026-12-15");
   assert.equal(d14.universeSize, 3, "4th miss: left out, as before");
   assert.equal(d15.universeSize, 4, "5th miss: counted");
+  assert.equal((await day("2026-12-16")).universeSize, 3, "6th miss: left out again (counted once)");
   near(d15.universeReturn!, -1 / 4, "a at -100%, spy/b/c flat");
+});
+
+test("stuck resolution: earliest of a later open (slippage, split-adjusted) and a cash settlement (split-adjusted); only data up to `through`", () => {
+  const stuckPos = { securityId: "a", qty: 100, entryOpen: 100, entryFillPrice: 100.1, entrySessionDate: "2026-12-08", missedExits: 5, stuckSince: "2026-12-15" };
+  const settle = (date: string, cash: unknown, actionType = "MERGER") => ({ actionId: `s_${date}_${actionType}`, securityId: "a", actionType, effectiveDate: date, details: { cash_per_share: cash }, observedAt: "" }) as unknown as CorporateAction;
+  const b = (rows: [string, number][]) => new PaperBars(rows.map(([sessionDate, open]) => ({ securityId: "a", sessionDate, open, close: open, revision: 1 })) as never);
+  const half = new Map([["a", [{ effectiveDate: "2026-12-10", factor: 0.5 }]]]);
+  const now = new Date("2026-12-20T11:15:00.000Z");
+  const resolve = (bars: PaperBars, settlements: CorporateAction[], through = "2026-12-18", position: typeof stuckPos | Omit<typeof stuckPos, "stuckSince"> = stuckPos) =>
+    stuckResolutionFor({ position: position as never, clientOrderId: "o", n: 1, bars, splits: half, settlements, through, loaded, now });
+  // The entry session's own open and opens after `through` do not count.
+  assert.equal(resolve(b([["2026-12-08", 100], ["2026-12-19", 30]]), []), undefined);
+  assert.equal(resolve(b([]), [settle("2026-12-19", 5)]), undefined, "settlement after `through`");
+  assert.equal(resolve(b([]), [settle("2026-12-08", 5)]), undefined, "settlement on the entry session");
+  assert.equal(resolve(b([]), [settle("2026-12-16", 5, "SPLIT")]), undefined, "not a settlement type");
+  assert.equal(resolve(b([]), [settle("2026-12-16", "5")]), undefined, "cash must be a number");
+  assert.equal(resolve(b([]), [settle("2026-12-16", -1)]), undefined, "cash must be >= 0");
+  const { stuckSince: _unused, ...notStuck } = stuckPos;
+  assert.equal(resolve(b([["2026-12-16", 30]]), [], "2026-12-18", notStuck), undefined, "only STUCK holdings");
+  // Price: after a 2-for-1 split, 30 per new share is 60 per entry-time share, less slippage.
+  const p = resolve(b([["2026-12-17", 31], ["2026-12-16", 30]]), [])!;
+  assert.deepEqual([p.source, p.sourceSessionDate, p.rawAmount, p.splitFactorApplied, p.sessionDate, p.n], ["PRICE", "2026-12-16", 30, 0.5, "2026-12-15", 1]);
+  near(p.perShareUsd, sellFillPrice(60, loaded.rules.slippageBpsPerSide));
+  near(p.cashAdjustmentUsd, 100 * sellFillPrice(60, loaded.rules.slippageBpsPerSide));
+  // Settlement: the earliest record wins, split-adjusted, no slippage; on the price's date it wins over the price.
+  const c = resolve(b([["2026-12-17", 31]]), [settle("2026-12-18", 9), settle("2026-12-17", 7, "DELISTING")])!;
+  assert.deepEqual([c.source, c.actionType, c.effectiveDate, c.rawAmount, c.splitFactorApplied, c.perShareUsd, c.cashAdjustmentUsd], ["CASH_SETTLEMENT", "DELISTING", "2026-12-17", 7, 0.5, 14, 1400]);
+  assert.equal(resolve(b([["2026-12-16", 31]]), [settle("2026-12-17", 7)])!.source, "PRICE", "an earlier price wins");
+});
+
+test("storage: loadSettlementActions returns only MERGER / CLOSURE / DELISTING records (local and object store)", async () => {
+  const { MarketStorage } = await import("./storage");
+  const { ObjectMarketStorage } = await import("./object-storage");
+  const { MemoryObjectClient } = await import("./object-store");
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const action = (actionType: string) => ({ actionId: `x_${actionType}`, securityId: "a", actionType, effectiveDate: "2026-12-16", details: { cash_per_share: 1 }, observedAt: "2026-12-16T00:00:00.000Z" }) as unknown as CorporateAction;
+  const records = ["SPLIT", "DIVIDEND", "MERGER", "CLOSURE", "DELISTING", "TICKER_CHANGE"].map(action);
+  const want = ["CLOSURE", "DELISTING", "MERGER"];
+  const root = await mkdtemp(join(tmpdir(), "settle-actions-"));
+  try {
+    const local = new MarketStorage(root);
+    await local.appendActions(records);
+    assert.deepEqual((await local.loadSettlementActions()).map((a) => a.actionType).sort(), want);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+  const remote = new ObjectMarketStorage(new MemoryObjectClient());
+  await remote.appendActions(records);
+  assert.deepEqual((await remote.loadSettlementActions()).map((a) => a.actionType).sort(), want);
+});
+
+test("a resolution is appended once even when its open is not filled yet (no second correction on a re-run)", async () => {
+  const { client, m } = await stuckWorld();
+  m.settle("a", "2026-12-16", "MERGER", 42);
+  const again = () => runPaperTrading({ ledger: new PaperLedgerStore(client), market: m, loaded: e2e, now: at("2026-12-17"), env: ON, killFileExists: false });
+  await again(); // 12-16 bars not stored: the resolution is appended, nothing is filled
+  await again();
+  assert.deepEqual(corrections(client), ["paper/v1/corrections/2026-12-15/a_1.json"]);
+  await step(client, m, "2026-12-16");
+  const f16 = await read<PaperFills>(client, paperLedgerKey("fills", "2026-12-16"));
+  near(f16.correctionsUsd!, 42 * f16.fills.find((f) => f.securityId === "a")!.qty);
+});
+
+test("a later price is never put into cash at an open before that price existed", async () => {
+  const { client, m } = await stuckWorld();
+  const run = (date: string) => runPaperTrading({ ledger: new PaperLedgerStore(client), market: m, loaded: e2e, now: at(date), env: ON, killFileExists: false });
+  await run("2026-12-17"); // 12-16 bars late: 12-16 stays pending, 12-17 exits are written
+  for (const [id, px] of [["spy", 500], ["b", 50], ["c", 20]] as const) for (const S of ["2026-12-16", "2026-12-17"]) m.bar(id, S, px, px);
+  m.bar("a", "2026-12-17", 40, 40);
+  await run("2026-12-18"); // fills 12-16 and 12-17
+  const f16 = await read<PaperFills>(client, paperLedgerKey("fills", "2026-12-16"));
+  assert.ok(!f16.fills.some((f) => f.status === "STUCK_RESOLVED"), "not at the 12-16 open");
+  near(f16.correctionsUsd ?? 0, 0);
+  assert.equal(f16.positionsAfter.find((p) => p.securityId === "a")!.stuckSince, "2026-12-15");
+});
+
+test("universe $0 rule needs N stored sessions in a row: a session with no bars at all is not a missed price", () => {
+  const rows = (dates: string[], withA: string[]) => new PaperBars(dates.flatMap((d) => [{ securityId: "z", sessionDate: d, open: 1, close: 1, revision: 1 }, ...(withA.includes(d) ? [{ securityId: "a", sessionDate: d, open: 1, close: 1, revision: 1 }] : [])]) as never);
+  const all = ["2026-12-08", "2026-12-09", "2026-12-10", "2026-12-11", "2026-12-14", "2026-12-15"];
+  assert.equal(stuckAt(rows(all, ["2026-12-08"]), "a", "2026-12-15", 5), true);
+  assert.equal(stuckAt(rows(all.filter((d) => d !== "2026-12-10"), ["2026-12-08"]), "a", "2026-12-15", 5), false, "12-10 not stored");
+  assert.equal(stuckAt(rows(all, []), "a", "2026-12-15", 5), false, "never had a price");
+  assert.equal(stuckAt(rows(all, ["2026-12-08"]), "a", "2026-12-14", 5), false, "4th miss");
 });
