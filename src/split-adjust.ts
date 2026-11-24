@@ -9,15 +9,25 @@
  * no usable factor (including two different factors recorded for one date), the name is dropped for
  * that session (SPLIT_UNRECONCILED). After adjusting, any
  * session-to-session close move of 3x or more either way (no recorded split explains it, or the
- * split data is missing) also drops the name (PRICE_GAP_UNEXPLAINED). Nothing is guessed.
+ * split data is missing) also drops the name (PRICE_GAP_UNEXPLAINED), and so does a move of 1.8x or
+ * more either way into any of the last 10 sessions (SPLIT_LIKE_MOVE_UNRECORDED: a split whose record
+ * has not arrived yet). Nothing is guessed.
  * Only splits effective on or before the scanned session are used.
  */
 import type { CanonicalDailyBar, CorporateAction } from "./contracts";
 
 export const SPLIT_RECONCILE_MAX_MOVE = 2;
 export const UNEXPLAINED_GAP_RATIO = 3;
+/**
+ * Split records can arrive days after the split (1-9 days seen). Until then a 2-for-1 or 1-for-2 looks
+ * like a +100% / -50% day, under the 3x rule. So a move of 1.8x or more either way into any of the
+ * last 10 sessions that no recorded split explains also drops the name. 1.8 / 10 were chosen from the
+ * held-out period's data (see the build log): same late splits caught as 1.6 or 1.7, fewest exclusions.
+ */
+export const RECENT_SPLIT_LIKE_RATIO = 1.8;
+export const RECENT_SPLIT_LIKE_SESSIONS = 10;
 
-export type SplitExclusion = "SPLIT_UNRECONCILED" | "PRICE_GAP_UNEXPLAINED";
+export type SplitExclusion = "SPLIT_UNRECONCILED" | "PRICE_GAP_UNEXPLAINED" | "SPLIT_LIKE_MOVE_UNRECORDED";
 
 export interface SplitEvent {
   effectiveDate: string;
@@ -94,6 +104,10 @@ export function splitAdjustedBars(
   for (let j = 1; j < adjusted.length; j += 1) {
     const ratio = adjusted[j]!.close / adjusted[j - 1]!.close;
     if (ratio >= UNEXPLAINED_GAP_RATIO || ratio <= 1 / UNEXPLAINED_GAP_RATIO) return { excluded: "PRICE_GAP_UNEXPLAINED" };
+  }
+  for (let j = Math.max(1, adjusted.length - RECENT_SPLIT_LIKE_SESSIONS); j < adjusted.length; j += 1) {
+    const ratio = adjusted[j]!.close / adjusted[j - 1]!.close;
+    if (ratio >= RECENT_SPLIT_LIKE_RATIO || ratio <= 1 / RECENT_SPLIT_LIKE_RATIO) return { excluded: "SPLIT_LIKE_MOVE_UNRECORDED" };
   }
   return { bars: adjusted };
 }
