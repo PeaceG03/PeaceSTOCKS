@@ -22,13 +22,23 @@ if (!names.length || names.some((name) => !/^[A-Z][A-Z0-9_]*$/u.test(name))) {
 }
 
 const env = { ...process.env };
+const trimmed = {};
 for (const name of names) {
   const value = String(env[name] ?? "").trim();
   if (!value) {
     console.error(`::error::${name} is missing or empty after trimming`);
     process.exit(1);
   }
-  env[name] = value;
+  if (/[\r\n]/u.test(value)) {
+    console.error(`::error::${name} contains a newline and was rejected`);
+    process.exit(1);
+  }
+  trimmed[name] = value;
+}
+for (const name of names) {
+  // Re-mask the trimmed value: GitHub's built-in mask is the raw secret, including any trailing newline.
+  console.log(`::add-mask::${trimmed[name]}`);
+  env[name] = trimmed[name];
 }
 
 const result = spawnSync(cmd, args, { stdio: "inherit", env });

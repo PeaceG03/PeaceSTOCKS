@@ -258,6 +258,7 @@ test("site deploy workflow: every Worker secret is trimmed (pasted values often 
     R2_READ_ACCESS_KEY_ID: "READKEYIDAAA",
     R2_READ_SECRET_ACCESS_KEY: "read-secret-bbb",
   });
+  for (const value of Object.values(result.json!)) assert.match(result.out, new RegExp(`::add-mask::${value}`, "u"));
 });
 
 test("site deploy workflow: a secret that is missing or empty after trimming stops the step, naming it only", () => {
@@ -403,8 +404,9 @@ test("trim-step-env: trims Cloudflare credentials for the command, never prints 
     assert.equal(result.status, 0, result.out);
     assert.deepEqual(JSON.parse(readFileSync(outFile, "utf8")), { t: "tok_abc", a: "acct123" });
     assert.equal(readFileSync(githubEnv, "utf8"), "KEEP=1\n", "GITHUB_ENV must be left untouched");
-    assert.doesNotMatch(result.out, /tok_abc/u);
-    assert.doesNotMatch(result.out, /acct123/u);
+    assert.match(result.out, /::add-mask::tok_abc/u);
+    assert.match(result.out, /::add-mask::acct123/u);
+    assert.doesNotMatch(result.out.replaceAll("::add-mask::tok_abc", "").replaceAll("::add-mask::acct123", ""), /tok_abc|acct123/u);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -435,3 +437,56 @@ test("trim-step-env: a Cloudflare credential that is empty after trimming stops 
     }
   }
 });
+
+const INJECT = "INJECTED_VAR=pwned";
+
+test("trim-step-env: a value that still contains a newline after trimming is rejected, naming the variable only", () => {
+  for (const [name, value] of [
+    ["CLOUDFLARE_API_TOKEN", `tok_abc\n${INJECT}`],
+    ["CLOUDFLARE_ACCOUNT_ID", `acct123\r${INJECT}`],
+    ["CLOUDFLARE_API_TOKEN", `tok_abc\r\n${INJECT}`],
+  ] as const) {
+    const dir = mkdtempSync(join(tmpdir(), "trim-nl-"));
+    try {
+      const githubEnv = join(dir, "github.env");
+      writeFileSync(githubEnv, "KEEP=1\n");
+      const sentinel = join(dir, "ran");
+      const env: Record<string, string> = {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        GITHUB_ENV: githubEnv,
+        CLOUDFLARE_API_TOKEN: "tok_abc",
+        CLOUDFLARE_ACCOUNT_ID: "acct123",
+        [name]: value,
+      };
+      const result = runTrimStepEnv(env, [process.execPath, "-e", "require('fs').writeFileSync(process.argv[1], 'ran')", sentinel]);
+      assert.notEqual(result.status, 0, `${name}=${JSON.stringify(value)}`);
+      assert.equal(existsSync(sentinel), false, "command must not run");
+      assert.equal(readFileSync(githubEnv, "utf8"), "KEEP=1\n");
+      assert.match(result.out, new RegExp(`::error::${name} contains a newline and was rejected`, "u"));
+      assert.doesNotMatch(result.out, /INJECTED_VAR/u);
+      assert.doesNotMatch(result.out, /pwned/u);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("site deploy workflow: Worker secrets reject a leftover newline in any trimmed value, naming it only", () => {
+  for (const [name, written] of [
+    ["ALLOWED_EMAIL", "ALLOWED_EMAIL"],
+    ["CLOUDFLARE_ACCOUNT_ID", "R2_ACCOUNT_ID"],
+    ["R2_BUCKET", "R2_BUCKET"],
+    ["R2_READ_ACCESS_KEY_ID", "R2_READ_ACCESS_KEY_ID"],
+    ["R2_READ_SECRET_ACCESS_KEY", "R2_READ_SECRET_ACCESS_KEY"],
+  ] as const) {
+    const env: Record<string, string> = { ...SECRET_ENV, [name]: `ok-value\n${INJECT}` };
+    const result = runSecretsScript(env);
+    assert.notEqual(result.status, 0, `${name}`);
+    assert.equal(result.json, undefined, "no secrets file written");
+    assert.match(result.out, new RegExp(`::error::${written} contains a newline and was rejected`, "u"));
+    assert.doesNotMatch(result.out, /INJECTED_VAR/u);
+    assert.doesNotMatch(result.out, /pwned/u);
+    for (const secret of Object.values(SECRET_ENV)) assert.ok(!result.out.includes(secret.trim()), "no value in the output");
+  }
+});
+
