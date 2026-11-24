@@ -1,0 +1,218 @@
+{
+  "version": "research-preregistration-v1",
+  "createdAt": "2026-11-24",
+  "universeRule": "STOCK only, config/eligibility-floor-v2.json, split-adjusted as-known",
+  "sideBySideRule": "Experimental scoring only; live DEFAULT_SCANNER_CONFIG, TOP_15_OVERALL, and config/paper-rules-v5.json remain fixed.",
+  "developmentWindow": {
+    "from": "2025-03-03",
+    "to": "2026-08-26"
+  },
+  "foldsConfig": {
+    "trainSessions": 63,
+    "testSessions": 63,
+    "embargoSessions": 2,
+    "mode": "rolling"
+  },
+  "heldOutWindow": {
+    "from": "2026-08-27",
+    "to": "2026-11-20"
+  },
+  "contaminationDisclosure": "2026-08-27..2026-11-20 was previously evaluated in #124 and 2026-08-27..2026-11-19 was peeked in the #127 paper-trading replay (-0.558%/day gross on TOP_15_OVERALL, -13.7% universe). No candidate below was designed or tuned around that peek; no data >= 2026-08-27 may be read during development; Auditor will verify anti-peek compliance before any single HeldOutSeal look.",
+  "passBar": {
+    "requireEveryFoldPositive": true,
+    "minFolds": 3,
+    "alphaHolm": 0.05,
+    "minCostBpsPerSide": 10,
+    "maxDrawdownNet": 0.15,
+    "maxDrawdownSpyMultiple": 1.25
+  },
+  "candidates": [
+    {
+      "id": "zscore_baseline_top15",
+      "family": "normalization_and_turnover",
+      "description": "Winsorized cross-sectional z-score blend using existing 5-factor weights (0.25/0.20/0.20/0.20/0.15), top 15.",
+      "rationale": "Production min-max normalization is distorted by single-stock extreme outliers; winsorized z-scores stabilize cross-sectional rankings without changing factor economics.",
+      "featuresUsed": [
+        "MOMENTUM_60D",
+        "RETURN_20D",
+        "RELATIVE_STRENGTH_MARKET_20D",
+        "VOLATILITY_20D",
+        "AVG_DOLLAR_VOLUME_20D"
+      ],
+      "topN": 15,
+      "rebalanceRule": "daily_equal_weight",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "zscore_baseline_top30",
+      "family": "normalization_and_turnover",
+      "description": "Winsorized cross-sectional z-score blend using existing 5-factor weights, top 30.",
+      "rationale": "Doubling breadth from 15 to 30 reduces idiosyncratic variance and drawdown while diluting daily rank-boundary turnover.",
+      "featuresUsed": [
+        "MOMENTUM_60D",
+        "RETURN_20D",
+        "RELATIVE_STRENGTH_MARKET_20D",
+        "VOLATILITY_20D",
+        "AVG_DOLLAR_VOLUME_20D"
+      ],
+      "topN": 30,
+      "rebalanceRule": "daily_equal_weight",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "hysteresis_hold_top15",
+      "family": "normalization_and_turnover",
+      "description": "Winsorized z-score 5-factor composite with rank-retention hysteresis (enter <= 15, hold until rank > 45).",
+      "rationale": "Pre-#136 v2 baseline TOP_15_OVERALL incurred 0.49 daily turnover (~12%/yr cost drag); a hold buffer targets similar gross exposure with much lower slippage (compared against the post-#136 baseline).",
+      "featuresUsed": [
+        "MOMENTUM_60D",
+        "RETURN_20D",
+        "RELATIVE_STRENGTH_MARKET_20D",
+        "VOLATILITY_20D",
+        "AVG_DOLLAR_VOLUME_20D"
+      ],
+      "topN": 15,
+      "rebalanceRule": "rank_hysteresis_enter_15_exit_45",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "hysteresis_hold_top25",
+      "family": "normalization_and_turnover",
+      "description": "Winsorized z-score 5-factor composite with rank-retention hysteresis (enter <= 25, hold until rank > 60).",
+      "rationale": "Combines broader 25-name diversification with turnover damping to lower both slippage and drawdown.",
+      "featuresUsed": [
+        "MOMENTUM_60D",
+        "RETURN_20D",
+        "RELATIVE_STRENGTH_MARKET_20D",
+        "VOLATILITY_20D",
+        "AVG_DOLLAR_VOLUME_20D"
+      ],
+      "topN": 25,
+      "rebalanceRule": "rank_hysteresis_enter_25_exit_60",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "short_term_rev_1d_top20",
+      "family": "short_term_reversal",
+      "description": "1-day close-to-close mean reversion (-return1d) restricted to top-half dollar-volume eligible stocks, top 20.",
+      "rationale": "Liquid US equities often mean-revert over 1-day horizons due to temporary order-flow imbalances; restricting to upper-half liquidity avoids micro-cap bid-ask bounce.",
+      "featuresUsed": [
+        "return1d",
+        "AVG_DOLLAR_VOLUME_20D"
+      ],
+      "topN": 20,
+      "rebalanceRule": "daily_equal_weight",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "short_term_rev_5d_top20",
+      "family": "short_term_reversal",
+      "description": "Volatility-scaled 5-day reversal (-RETURN_5D / VOLATILITY_20D) on eligible stocks, top 20.",
+      "rationale": "Standardizes short-term 5-day oversold moves by each stock's realized volatility so high-beta noise does not dominate the list.",
+      "featuresUsed": [
+        "RETURN_5D",
+        "VOLATILITY_20D"
+      ],
+      "topN": 20,
+      "rebalanceRule": "daily_equal_weight",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "intraday_fade_top20",
+      "family": "short_term_reversal",
+      "description": "Fade sharp single-day intraday moves (-intradayReturn1d) weighted by normalized volumeRatio5v20, top 20.",
+      "rationale": "High-volume intraday dislocations often partially revert at subsequent opens once liquidity replenishes.",
+      "featuresUsed": [
+        "intradayReturn1d",
+        "volumeRatio5v20",
+        "VOLATILITY_20D"
+      ],
+      "topN": 20,
+      "rebalanceRule": "daily_equal_weight",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "mom60_skip5_top20",
+      "family": "short_term_reversal",
+      "description": "Intermediate 60-day momentum skipping the latest 5-day short-term reversal (z(MOMENTUM_60D) - z(RETURN_5D)), top 20.",
+      "rationale": "Classic skip-week momentum separates intermediate trend persistence from 1-week short-term reversal noise.",
+      "featuresUsed": [
+        "MOMENTUM_60D",
+        "RETURN_5D"
+      ],
+      "topN": 20,
+      "rebalanceRule": "daily_equal_weight",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "vol_scaled_mom60_top20",
+      "family": "risk_adjusted_momentum",
+      "description": "Risk-adjusted 60-day momentum (MOMENTUM_60D / VOLATILITY_20D) blended equally with DRAWDOWN_60D proximity, top 20.",
+      "rationale": "Raw momentum selects high-volatility lottery winners; scaling by volatility and shallow drawdown targets steadier trend leaders.",
+      "featuresUsed": [
+        "MOMENTUM_60D",
+        "VOLATILITY_20D",
+        "DRAWDOWN_60D"
+      ],
+      "topN": 20,
+      "rebalanceRule": "daily_equal_weight",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "vol_scaled_mom60_hyst_top20",
+      "family": "risk_adjusted_momentum",
+      "description": "Risk-adjusted 60-day momentum + DRAWDOWN_60D with rank hysteresis (enter <= 20, hold until rank > 50).",
+      "rationale": "Retains smooth risk-adjusted trend exposure while suppressing daily churn around the top-20 boundary.",
+      "featuresUsed": [
+        "MOMENTUM_60D",
+        "VOLATILITY_20D",
+        "DRAWDOWN_60D"
+      ],
+      "topN": 20,
+      "rebalanceRule": "rank_hysteresis_enter_20_exit_50",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "consistent_trend_top20",
+      "family": "risk_adjusted_momentum",
+      "description": "Equal z-score blend of upDays20d consistency, RETURN_20D, and low VOLATILITY_20D, top 20.",
+      "rationale": "Frog-in-the-pan trend consistency (many small positive days) has historically shown stronger continuation than single-spike returns.",
+      "featuresUsed": [
+        "upDays20d",
+        "RETURN_20D",
+        "VOLATILITY_20D"
+      ],
+      "topN": 20,
+      "rebalanceRule": "daily_equal_weight",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "pullback_in_uptrend_top20",
+      "family": "risk_adjusted_momentum",
+      "description": "Filter MOMENTUM_60D > 0, then rank by volatility-scaled 5-day pullback (-RETURN_5D / VOLATILITY_20D), top 20.",
+      "rationale": "Buys temporary 5-day pullbacks inside stocks with established 60-day uptrends rather than chasing overextended highs.",
+      "featuresUsed": [
+        "MOMENTUM_60D",
+        "RETURN_5D",
+        "VOLATILITY_20D"
+      ],
+      "topN": 20,
+      "rebalanceRule": "daily_equal_weight",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "fastest_improving_damped_top20",
+      "family": "turnover_damped_improvement",
+      "description": "Vol-scaled improvement (improvement / VOLATILITY_20D) with rank hysteresis (enter <= 20, hold until rank > 50).",
+      "rationale": "FASTEST_IMPROVING had the highest pre-#136 dev gross return (+0.214%/day) and highest turnover (0.59); vol-scaling and hysteresis test whether cutting churn preserves net edge (to be compared against the post-#136 baseline).",
+      "featuresUsed": [
+        "improvement",
+        "VOLATILITY_20D"
+      ],
+      "topN": 20,
+      "rebalanceRule": "rank_hysteresis_enter_20_exit_50",
+      "status": "NOT_RUN"
+    }
+  ],
+  "backfillNote": "Pre-#136 dev baseline numbers (variants.jsonl seq 5-9) were measured on ACTIVE-only local bars; after #136 delisted backfill lands, the dev baseline must be re-run under a new derived scanner label before scoring candidates so comparisons are survivorship-clean and apples-to-apples."
+}

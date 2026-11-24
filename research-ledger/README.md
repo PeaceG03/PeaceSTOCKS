@@ -15,6 +15,8 @@ it. Outside git the anchor fails open (only the head file guards).
 - `heldout.jsonl`: REGISTER / EVALUATE / RESULT / UNSEAL records of the held-out seal; evaluation
   markers go in `heldout-markers/` and are committed too.
 
+- `preregistration.jsonl`: immutable peek contamination disclosure (`2026-08-27..2026-11-19`) and SHA-256 anchored `PREREGISTER` record for `config/research-preregistration-v1.json` and `docs/RESEARCH_PREREGISTRATION.md` (13 pre-registered ideas; all count in `holmFamily`).
+
 Seeded from the harness-v1 baseline (2026-11-24, scanner "main@f1605fe7 scanner-config-v0.1"):
 5 variants, 5 registrations, held-out not evaluated.
 Then the post-floor (v2) baseline (2026-11-24, derived scanner label

@@ -3,10 +3,12 @@
  * (gitCommittedHead) compares with the head committed at HEAD, so a rewrite of a log and its head
  * file committed as a plain NEW commit passes it. This compares with the base instead: every log
  * whose head is committed on the base must still contain that head at the same seq (and verify as a
- * chain), and every held-out marker committed on the base must still exist unchanged.
+ * chain), every held-out marker committed on the base must still exist unchanged, and every
+ * pre-registered config/doc committed in preregistration.jsonl on the base must remain unchanged.
  * Read-only git (show, ls-tree, merge-base, rev-parse) with an argv array, no shell, no network.
  * Usage (tests.yml): tsx src/research-ledger-check.ts origin/main
  */
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -14,7 +16,7 @@ import { pathToFileURL } from "node:url";
 import { AppendOnlyLog, parseHead } from "./append-only-log";
 
 export const LEDGER_REL = "research-ledger";
-export const LEDGER_LOGS = ["variants.jsonl", "heldout.jsonl"] as const;
+export const LEDGER_LOGS = ["variants.jsonl", "heldout.jsonl", "preregistration.jsonl"] as const;
 export const LEDGER_BASE_REF_MISSING = "LEDGER_BASE_REF_MISSING";
 
 const git = (top: string, args: string[]): string =>
@@ -26,6 +28,7 @@ const gitOr = (top: string, args: string[]): string | undefined => {
     return undefined;
   }
 };
+const fileSha256 = (path: string): string => createHash("sha256").update(readFileSync(path)).digest("hex");
 
 function resolveCommit(top: string, ref: string): string {
   const sha = gitOr(top, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`])?.trim();
@@ -39,6 +42,14 @@ export function ledgerCheckBase(top: string, baseRef: string): string {
   const base = gitOr(top, ["merge-base", "HEAD", baseRef])?.trim();
   if (!base) throw new Error(`${LEDGER_BASE_REF_MISSING}:no-merge-base:${baseRef}`);
   return base;
+}
+
+interface PreregisterEntry {
+  type?: string;
+  configPath?: string;
+  configSha256?: string;
+  docPath?: string;
+  docSha256?: string;
 }
 
 /** Problems with the work tree's ledger against `baseRef` (empty = append-only). */
@@ -63,6 +74,29 @@ export function ledgerProblemsAgainstBase(top: string, baseRef: string): string[
     }
     if (hashes[head.seq] !== head.hash) problems.push(`${log}:base-head-not-in-chain:seq-${head.seq}`);
   }
+  const basePreregRaw = gitOr(top, ["show", `${base}:${LEDGER_REL}/preregistration.jsonl`]);
+  if (basePreregRaw !== undefined) {
+    for (const line of basePreregRaw.split("\n").filter(Boolean)) {
+      let parsed: { entry?: PreregisterEntry };
+      try {
+        parsed = JSON.parse(line) as { entry?: PreregisterEntry };
+      } catch {
+        continue;
+      }
+      const entry = parsed.entry;
+      if (!entry || entry.type !== "PREREGISTER") continue;
+      if (entry.configPath && entry.configSha256) {
+        const cfgPath = join(top, entry.configPath);
+        if (!existsSync(cfgPath) || fileSha256(cfgPath) !== entry.configSha256)
+          problems.push(`preregistration:config-changed:${entry.configPath}`);
+      }
+      if (entry.docPath && entry.docSha256) {
+        const docPath = join(top, entry.docPath);
+        if (!existsSync(docPath) || fileSha256(docPath) !== entry.docSha256)
+          problems.push(`preregistration:doc-changed:${entry.docPath}`);
+      }
+    }
+  }
   const markers = (gitOr(top, ["ls-tree", "-r", "--name-only", base, "--", `${LEDGER_REL}/heldout-markers`]) ?? "")
     .split("\n")
     .filter(Boolean);
@@ -71,6 +105,12 @@ export function ledgerProblemsAgainstBase(top: string, baseRef: string): string[
     const path = join(top, marker);
     if (!existsSync(path)) problems.push(`${name}:missing`);
     else if (readFileSync(path, "utf8") !== git(top, ["show", `${base}:${marker}`])) problems.push(`${name}:changed`);
+  }
+  const tracked = git(top, ["ls-files", "-z"]).split("\0").filter(Boolean);
+  for (const file of tracked) {
+    if (/(^|\/)dev-cache\//u.test(file) || /(^|\/)[^/]*dev-cache[^/]*\.jsonl$/u.test(file)) {
+      problems.push(`dev-cache:committed:${file}`);
+    }
   }
   return problems;
 }

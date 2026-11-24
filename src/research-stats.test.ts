@@ -111,3 +111,38 @@ test("F7: the evaluation carries the strategy's own cost per side, so a 0 bps li
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("maxDrawdown and seriesMetrics compute compounded peak-to-trough drawdown for net and SPY", async () => {
+  const { maxDrawdown, seriesMetrics } = await import("./research-stats");
+  assert.equal(maxDrawdown([]), 0);
+  assert.equal(maxDrawdown([0.05, 0.02, 0.01]), 0);
+  // 1.0 -> 1.10 -> 0.99 (dd = 0.11 / 1.10 = 0.10) -> 1.089 -> 0.8712 (peak 1.10, dd = (1.10 - 0.8712)/1.10 = 0.208)
+  close(maxDrawdown([0.1, -0.1, 0.1, -0.2]), 0.208, 1e-12);
+  const daily = [
+    { sessionDate: "d1", holdings: 1, gross: 0.1, turnover: 0, cost: 0, net: 0.1, universe: 0, spy: 0.05 },
+    { sessionDate: "d2", holdings: 1, gross: -0.1, turnover: 0, cost: 0, net: -0.1, universe: 0, spy: -0.04 },
+    { sessionDate: "d3", holdings: 1, gross: -0.1, turnover: 0, cost: 0, net: -0.1, universe: 0, spy: 0.02 },
+  ];
+  const m = seriesMetrics(daily);
+  // net: 1 -> 1.1 -> 0.99 -> 0.891 => dd = (1.1 - 0.891)/1.1 = 0.19
+  close(m.maxDrawdownNet, 0.19, 1e-12);
+  // spy: 1 -> 1.05 -> 1.008 -> 1.02816 => dd = 0.04
+  close(m.maxDrawdownSpy!, 0.04, 1e-12);
+});
+
+test("holmFamily counts pre-registered unrun ideas via m = max(run variants, strategies, preregisteredCount)", async () => {
+  const { holmFamily } = await import("./research-variants");
+  const dir = mkdtempSync(join(tmpdir(), "holm-prereg-"));
+  try {
+    const log = new AppendOnlyLog<VariantRecord>(join(dir, "variants.jsonl"));
+    const folds = walkForwardFolds(40, strategy("x", ["GOOD"]).folds);
+    const ev = evaluateStrategy(sessions, folds, strategy("good", ["GOOD"]), log);
+    const fam = holmFamily(log.entries(), 16);
+    assert.equal(fam.variantsTried, 1);
+    assert.equal(fam.familySize, 16);
+    const expectedP = Math.min(1, ev.record.pooledP * 16);
+    close(fam.adjustedP(ev.record.strategyHash), expectedP, 1e-12);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -9,7 +9,7 @@ import { EvalHistory, type EvalBar } from "./holdout-eval";
 import { buildHarnessSession, splitDatesById } from "./research-harness-data";
 import type { HarnessSession } from "./research-costs";
 import { HeldOutSeal, walkForwardFolds, type FoldConfig } from "./research-folds";
-import { evaluateStrategy, holmFamily, type StrategyConfig, type VariantRecord } from "./research-variants";
+import { evaluateStrategy, holmFamily, preregisteredPoolSize, type StrategyConfig, type VariantRecord } from "./research-variants";
 import { assertCostFloor, verdictFor } from "./research-verdict";
 import { deriveScannerLabel, SCANNER_LABEL_IS_DERIVED } from "./research-scanner-label";
 
@@ -125,11 +125,12 @@ export async function researchMain(args: string[], deps: ResearchMainDeps = {}):
     if (k % 25 === 0) console.log(`development progress ${k + 1}/${indexes.length}; aggregate only`);
   }
   const folds = walkForwardFolds(sessions.length, foldsConfig);
+  const preregPool = preregisteredPoolSize(ledgerDir);
   const log = new AppendOnlyLog<VariantRecord>(variantsPath, undefined, anchored(variantsPath));
-  const evaluations = strategies.map((s) => evaluateStrategy(sessions, folds, s, log));
+  const evaluations = strategies.map((s) => evaluateStrategy(sessions, folds, s, log, preregPool));
   // Recompute the correction AFTER all five variants were registered/evaluated, not incrementally.
   const all = log.entries();
-  const family = holmFamily(all);
+  const family = holmFamily(all, preregPool);
   const { variantsTried, familySize } = family;
   const results = evaluations.map((evaluation) => {
     evaluation.variantsTried = variantsTried;

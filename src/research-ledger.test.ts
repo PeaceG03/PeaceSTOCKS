@@ -68,7 +68,7 @@ test("the CLI's Holm family counts every candidate variant in the ledger, not ju
     const none = { sessions: 0, mean: 0, t: 0, p: 1 };
     earlier.append({
       strategyHash: "earlier-multi-candidate", name: "EARLIER", candidateHashes: ["v1", "v2", "v3"], folds: [],
-      pooled: { sessions: 0, meanGross: 0, meanNet: 0, meanCost: 0, meanTurnover: 0, meanUniverse: 0, meanSpy: 0, excessUniverse: none, excessSpy: none, sharpeNet: 0 },
+      pooled: { sessions: 0, meanGross: 0, meanNet: 0, meanCost: 0, meanTurnover: 0, meanUniverse: 0, meanSpy: 0, excessUniverse: none, excessSpy: none, sharpeNet: 0, maxDrawdownNet: 0, maxDrawdownSpy: 0 },
       pooledP: 1,
     });
     await researchMain(base(root, join(root, "out")), { ledgerDir, scannerLabel: "scanner-a" });

@@ -157,3 +157,65 @@ test("ledger check CLI: exit 0 when append-only, exit 1 with the problems when n
     assert.match(stdout, /LEDGER_NOT_APPEND_ONLY:variants\.jsonl:base-head-not-in-chain/u);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("ledger check: preregistration config, doc, and preregistration.jsonl are immutable against base", async () => {
+  const { createHash } = await import("node:crypto");
+  const r = repo();
+  try {
+    mkdirSync(join(r.dir, "config"), { recursive: true });
+    mkdirSync(join(r.dir, "docs"), { recursive: true });
+    const cfg = join(r.dir, "config", "research-preregistration-v1.json");
+    const doc = join(r.dir, "docs", "RESEARCH_PREREGISTRATION.md");
+    writeFileSync(cfg, "{\"version\":\"research-preregistration-v1\",\"candidates\":[{\"id\":\"a\"}]}\n");
+    writeFileSync(doc, "# Prereg\n");
+    const sha = (p: string) => createHash("sha256").update(readFileSync(p)).digest("hex");
+    const preregLog = new AppendOnlyLog<Record<string, unknown>>(join(r.ledger, "preregistration.jsonl"), () => "2026-01-01T00:00:00.000Z");
+    preregLog.append({ type: "PEEK_DISCLOSURE", window: { from: "2026-08-27", to: "2026-11-20" } });
+    preregLog.append({
+      type: "PREREGISTER",
+      version: "research-preregistration-v1",
+      configPath: "config/research-preregistration-v1.json",
+      configSha256: sha(cfg),
+      docPath: "docs/RESEARCH_PREREGISTRATION.md",
+      docSha256: sha(doc),
+      candidateCount: 1,
+    });
+    git(r.dir, "add", "-A");
+    git(r.dir, "commit", "-q", "-m", "with prereg");
+    git(r.dir, "branch", "-f", "base");
+
+    assert.deepEqual(ledgerProblemsAgainstBase(r.dir, "base"), []);
+
+    // Editing config fails check
+    writeFileSync(cfg, "{\"version\":\"research-preregistration-v1\",\"candidates\":[{\"id\":\"b\"}]}\n");
+    assert.ok(ledgerProblemsAgainstBase(r.dir, "base").some((p) => /preregistration:config-changed/u.test(p)));
+    git(r.dir, "checkout", "--", "config/research-preregistration-v1.json");
+
+    // Editing doc fails check
+    writeFileSync(doc, "# Tampered\n");
+    assert.ok(ledgerProblemsAgainstBase(r.dir, "base").some((p) => /preregistration:doc-changed/u.test(p)));
+    git(r.dir, "checkout", "--", "docs/RESEARCH_PREREGISTRATION.md");
+
+    // Rewriting preregistration.jsonl fails check
+    rmSync(join(r.ledger, "preregistration.jsonl"));
+    rmSync(join(r.ledger, "preregistration.jsonl.head"));
+    new AppendOnlyLog<Record<string, unknown>>(join(r.ledger, "preregistration.jsonl")).append({ type: "PEEK_DISCLOSURE" });
+    assert.ok(ledgerProblemsAgainstBase(r.dir, "base").some((p) => /preregistration\.jsonl:base-head-not-in-chain/u.test(p)));
+  } finally {
+    rmSync(r.dir, { recursive: true, force: true });
+  }
+});
+
+test("ledger check: committed dev-cache artifacts are refused", () => {
+  const r = repo();
+  try {
+    mkdirSync(join(r.dir, "dev-cache"), { recursive: true });
+    writeFileSync(join(r.dir, "dev-cache", "features.jsonl"), "{}\n");
+    git(r.dir, "add", "-f", "dev-cache/features.jsonl");
+    git(r.dir, "commit", "-q", "-m", "committed dev cache");
+    const problems = ledgerProblemsAgainstBase(r.dir, "base");
+    assert.ok(problems.some((p) => /^dev-cache:committed:dev-cache\/features\.jsonl$/u.test(p)), JSON.stringify(problems));
+  } finally {
+    rmSync(r.dir, { recursive: true, force: true });
+  }
+});
