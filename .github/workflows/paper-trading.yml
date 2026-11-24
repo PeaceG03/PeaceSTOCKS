@@ -1,0 +1,45 @@
+name: Paper trading
+# Simulated paper trading of the frozen picks (docs/PAPER_TRADING.md, src/paper-trading-cli.ts).
+# No broker, no real money: orders are rows in an append-only ledger under paper/v1/ in the bucket.
+# OFF by default: the job runs only on main and only when the repository variable
+# PAPER_TRADING_ENABLED is exactly "true". PAPER_TRADING_KILL (variable), a PAPER_TRADING_KILL file at
+# the repo root, or a paper/KILL object stop all new orders. Weekday runs at 11:15, 12:15 and 13:15 UTC
+# are 06:15-09:15 ET, always before the 09:30 open (orders for an open are only written before it).
+# Reads the scanner's data read-only; never writes outside paper/v1/. Logs one aggregate line.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 11,12,13 * * 1-5"
+permissions:
+  contents: read
+# One ledger writer at a time; a running run is never canceled.
+concurrency:
+  group: peacestocks-paper-ledger
+  cancel-in-progress: false
+jobs:
+  paper:
+    if: ${{ github.ref == 'refs/heads/main' && vars.PAPER_TRADING_ENABLED == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # The paper guards' own tests first, with no secrets in this step.
+      - name: Paper trading tests
+        run: pnpm -s exec tsx --test src/paper-*.test.ts
+      - name: Paper trading run
+        env:
+          PAPER_TRADING_ENABLED: ${{ vars.PAPER_TRADING_ENABLED }}
+          PAPER_TRADING_KILL: ${{ vars.PAPER_TRADING_KILL }}
+          PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+          PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+          PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+          PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+        run: pnpm -s exec tsx src/paper-trading-cli.ts
