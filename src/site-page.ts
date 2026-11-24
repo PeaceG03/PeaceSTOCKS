@@ -1,4 +1,5 @@
 import type { SiteData } from "./site-data";
+import { READ_REASON_MAX } from "./site-read-error";
 
 /** Pure HTML for the private site: no scripts, no external assets, every value escaped. */
 
@@ -141,7 +142,15 @@ export function renderSitePage(data: SiteData): string {
   );
 
   if (data.readErrors.length)
-    parts.push(`<section class="card"><div class="f">Could not read: ${data.readErrors.map(escapeHtml).join(", ")}</div></section>`);
+    parts.push(
+      `<section class="card"><div class="f">Could not read: ${data.readErrors
+        .map((name) => {
+          const why = data.readErrorReasons?.[name];
+          const short = why && why.length > READ_REASON_MAX ? `${why.slice(0, READ_REASON_MAX - 1)}…` : why;
+          return short ? `${escapeHtml(name)} (${escapeHtml(short)})` : escapeHtml(name);
+        })
+        .join(", ")}</div></section>`,
+    );
 
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>PeaceSTOCKS</title><style>${STYLE}</style></head><body><main><h1>PeaceSTOCKS</h1><div class="sub">Scanner status · updated ${escapeHtml(
     localTime(data.generatedAt),
