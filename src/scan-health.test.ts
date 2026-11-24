@@ -72,7 +72,7 @@ function days(n: number, last: string): string[] {
   return out;
 }
 
-async function scanWorld(clock: string, mode: "FORWARD" | "EVIDENCE_ONLY" = "FORWARD") {
+async function scanWorld(clock: string, mode: "FORWARD" | "EVIDENCE_ONLY" = "FORWARD", withSplitLike = false) {
   const { MarketsScanner } = await import("./scanner");
   const { ObjectMarketStorage } = await import("./object-storage");
   const { MemoryObjectClient } = await import("./object-store");
@@ -81,17 +81,17 @@ async function scanWorld(clock: string, mode: "FORWARD" | "EVIDENCE_ONLY" = "FOR
   const hist = days(70, D);
   const record = (id: string, symbol: string) =>
     ({ provider: "fixture-provider", providerSecurityId: id, symbol, assetType: "STOCK", country: "US", exchange: "NYSE", active: true, tradable: true });
-  const ids = ["i-a", "i-b", "i-t"].map((p) => securityId("fixture-provider", p, "STOCK"));
+  const ids = ["i-a", "i-b", "i-t", "i-s"].map((p) => securityId("fixture-provider", p, "STOCK"));
   const mk = (id: string, d: string, close: number, volume: number) =>
     ({ securityId: id, sessionDate: d, open: close, high: close, low: close, close, volume, revision: 1, observedAt: "t", provenance: { provider: "fixture-provider", dataset: "daily-ohlcv", retrievalId: `r-${d}-${id.slice(0, 6)}`, ingestionVersion: "t", normalizerVersion: "t" } }) as unknown as CanonicalDailyBar;
-  const allBars = hist.flatMap((d, k) => [mk(ids[0]!, d, 20 + k * 0.01, 1_000_000), mk(ids[1]!, d, 25 - k * 0.01, 1_000_000), mk(ids[2]!, d, 30, 1_000)]);
+  const allBars = hist.flatMap((d, k) => [mk(ids[0]!, d, 20 + k * 0.01, 1_000_000), mk(ids[1]!, d, 25 - k * 0.01, 1_000_000), mk(ids[2]!, d, 30, 1_000), ...(withSplitLike ? [mk(ids[3]!, d, k < 65 ? 20 : 40, 1_000_000)] : [])]);
   const client = new MemoryObjectClient();
   const storage = new ObjectMarketStorage(client);
   await storage.initialize();
   await storage.appendBars(allBars.filter((b) => b.sessionDate < D));
   const provider = {
     providerName: "fixture-provider",
-    listApprovedSecurities: async () => [record("i-a", "AAA"), record("i-b", "BBB"), record("i-t", "TTT")],
+    listApprovedSecurities: async () => [record("i-a", "AAA"), record("i-b", "BBB"), record("i-t", "TTT"), ...(withSplitLike ? [record("i-s", "SSS")] : [])],
     getDailyBars: async (day: string, want: string[]) => allBars.filter((b) => b.sessionDate === day && want.includes(b.securityId)),
     getCorporateActions: async () => [],
   };
@@ -126,6 +126,15 @@ test("scan writes the health record: before the open, frozen, names covered, flo
   assert.equal(again.status, "ALREADY_FROZEN");
   assert.equal(again.scanHealth, undefined);
   assert.deepEqual(await w.read(scanHealthKey(w.D)), rec);
+});
+
+test("scan health record counts the split guard's exclusions by reason (a 2x jump with no split record)", async () => {
+  const w = await scanWorld("2026-10-03T05:40:00.000Z", "FORWARD", true);
+  const rec = await w.read(scanHealthKey(w.D));
+  assert.ok(rec);
+  assert.equal(rec.namesCovered, 4);
+  assert.deepEqual(rec.splitGuardExcluded, { total: 1, byReason: { SPLIT_LIKE_MOVE_UNRECORDED: 1 } });
+  assert.deepEqual(rec.eligibilityFloorExcluded, { total: 1, byReason: { FLOOR_DOLLAR_VOLUME: 1 } });
 });
 
 test("scan after the open: the record says not before the open and not frozen on time", async () => {
