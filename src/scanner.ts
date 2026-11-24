@@ -16,6 +16,7 @@ import { DEFAULT_SCANNER_CONFIG, rankSecurities } from "./ranking";
 import { fingerprint } from "./identity";
 import { etCalendarDate, sessionCollectionDue } from "./et-time";
 import { makePredictionStatus, sessionAlreadyFrozen } from "./prediction-status";
+import { buildScanHealth, countByReason } from "./scan-health";
 import { forwardFreezeAllowed, nextSessionOpen } from "./session-open";
 import { refreshEligibility, refreshUniverse } from "./universe";
 import type { MarketStore } from "./storage";
@@ -121,9 +122,11 @@ export class MarketsScanner {
   ) {}
 
   private rateLimitedAtRunStart = 0;
+  private runMode: ScannerRunMode = "FORWARD";
 
   async run(sessionDate: string, mode: ScannerRunMode = "FORWARD"): Promise<ScannerRunReport> {
     this.rateLimitedAtRunStart = this.provider.rateLimitedResponses ?? 0;
+    this.runMode = mode;
     await this.storage.initialize();
     const session = this.calendar.getSession(sessionDate);
     const runId = `scan_${fingerprint({ sessionDate, provider: this.provider.providerName, version: SCANNER_VERSION, ...(mode === "EVIDENCE_ONLY" ? { mode } : {}) }).slice(0, 24)}`;
@@ -467,6 +470,8 @@ export class MarketsScanner {
     }
     const result = rankSecurities(securities, allBars, benchmark, sessionDate, DEFAULT_SCANNER_CONFIG, splitActions);
     if (result.excluded?.length) skips.push(`SPLIT_ADJUST_EXCLUDED:${result.excluded.length}`);
+    if (result.floorExcluded?.length) skips.push(`ELIGIBILITY_FLOOR_EXCLUDED:${result.floorExcluded.length}`);
+    if (result.nonStockExcluded) skips.push(`NON_STOCK_EXCLUDED:${result.nonStockExcluded}`);
     const providerNotReady = failures.some((failure) => failure.startsWith("PROVIDER_NOT_READY"));
     const sourceCollectionFailed =
       providerNotReady ||
@@ -605,6 +610,8 @@ export class MarketsScanner {
       ...(skips.length ? { skips } : {}),
       scannerVersion: SCANNER_VERSION,
       ...reportPrediction,
+      ...(result.floorExcluded?.length ? { eligibilityFloorExcludedByReason: countByReason(result.floorExcluded) } : {}),
+      ...(result.excluded?.length ? { splitGuardExcludedByReason: countByReason(result.excluded) } : {}),
       ...(groupedReplyDust ? { groupedReplyDust } : {}),
       ...(dailyBarsSidecar ? { dailyBarsSidecar } : {}),
     });
@@ -630,6 +637,31 @@ export class MarketsScanner {
       storage: await this.storage.measureStorage(),
       ...(readiness ? { providerReadiness: readiness } : {}),
     };
+    // Nightly scan health record: forward scans of a trading session that actually ran (not NOT_DUE,
+    // not the ALREADY_FROZEN no-op, which must not replace the record of the run that froze).
+    const kind = input.session.kind;
+    if (
+      this.runMode === "FORWARD" &&
+      (kind === "NORMAL" || kind === "HALF_DAY") &&
+      report.status !== "NOT_DUE" &&
+      report.status !== "ALREADY_FROZEN" &&
+      this.storage.writeScanHealth
+    ) {
+      try {
+        const next = nextSessionOpen(input.session.sessionDate, this.calendar);
+        await this.storage.writeScanHealth(
+          buildScanHealth(
+            report,
+            next ? { nextSessionDate: next.nextSessionDate, nextSessionOpen: next.nextSessionOpen.toISOString() } : undefined,
+            this.now().toISOString(),
+          ),
+        );
+        report.scanHealth = "WRITTEN";
+      } catch (error) {
+        // Never fails the scan: the freeze watch still sees the session's prediction status.
+        report.scanHealth = `FAILED:${String(error instanceof Error ? error.message : error).slice(0, 120)}`;
+      }
+    }
     await this.storage.writeRunReport(report);
     return report;
   }

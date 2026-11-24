@@ -3,7 +3,10 @@
  * network and writes only the --out file. It prints aggregate metrics only (no symbols or ids).
  *
  *   tsx src/holdout-eval-cli.ts --data <dir> --from YYYY-MM-DD --to YYYY-MM-DD --horizon 1 \
- *     [--draws 1000] [--step 1] [--winsorize 0.01] [--splits effective-date|as-known] [--out result.json]
+ *     [--draws 1000] [--step 1] [--winsorize 0.01] [--splits effective-date|as-known] [--floor on|off] [--out result.json]
+ *
+ * --floor on (default) applies the scan's eligibility floor (config/eligibility-floor-v2.json); off ranks
+ * without it, for the on/off comparison only.
  *
  * --splits as-known uses only split records observed before the next session's open (what a forward
  * scan could have read); effective-date (default) uses every record from its effective date on.
@@ -50,8 +53,10 @@ async function main(): Promise<void> {
   const out = arg("out", "");
   const splitKnowledge = arg("splits", "effective-date");
   if (splitKnowledge !== "effective-date" && splitKnowledge !== "as-known") throw new Error(`BAD_ARG:splits:${splitKnowledge}`);
+  const floorArg = arg("floor", "on");
+  if (floorArg !== "on" && floorArg !== "off") throw new Error(`BAD_ARG:floor:${floorArg}`);
   const log = (line: string) => console.log(`[${new Date().toISOString()}] ${line}`);
-  log(`held-out eval from=${from} to=${to} horizon=${horizon} draws=${draws} step=${step} winsorize=${winsorize} splits=${splitKnowledge}`);
+  log(`held-out eval from=${from} to=${to} horizon=${horizon} draws=${draws} step=${step} winsorize=${winsorize} splits=${splitKnowledge} floor=${floorArg}`);
 
   // Bars: enough before `from` for the scan window and feature lookbacks, and after `to` for outcomes.
   const loadFrom = shiftDays(from, -170);
@@ -104,18 +109,20 @@ async function main(): Promise<void> {
 
   const outcomes: SessionOutcome[] = [];
   let splitExcluded = 0;
+  let floorExcluded = 0;
   const indexes = history.sessions.map((d, i) => [d, i] as const).filter(([d]) => d >= from && d <= to);
   log(`sessions stored ${history.sessions.length} (${history.sessions[0]}..${history.sessions.at(-1)}), evaluated candidates ${indexes.length}`);
   for (const [k, [D, i]] of indexes.entries()) {
     if (k % step !== 0) continue;
     const started = Date.now();
-    const got = evaluateSession(master, history, i, { horizon, randomDraws: draws, seed: 20261124, excluded, splitActions, splitKnowledge, ...(winsorize ? { winsorize } : {}) });
+    const got = evaluateSession(master, history, i, { horizon, randomDraws: draws, seed: 20261124, excluded, splitActions, splitKnowledge, ...(floorArg === "off" ? { floor: null } : {}), ...(winsorize ? { winsorize } : {}) });
     if (!got) {
       log(`${D}: no outcome window (needs ${horizon} later sessions)`);
       continue;
     }
     outcomes.push(got.outcome);
     splitExcluded += got.excluded;
+    floorExcluded += got.floorExcluded;
     const o = got.outcome;
     const fmt = (x: number | undefined) => (x === undefined ? "n/a" : (x * 100).toFixed(3) + "%");
     log(`${D}: universe ${o.universeSize} mean ${fmt(o.universeMean)} spy ${fmt(o.spy)} ic ${o.ic.toFixed(4)} | ${Object.entries(o.lists)
@@ -125,11 +132,12 @@ async function main(): Promise<void> {
   const summary = summarize(outcomes);
   log(`split-dropped name-windows ${droppedForSplit}`);
   log(`names left out of ranking by split adjustment (name-sessions) ${splitExcluded}`);
+  log(`names left out of ranking by the eligibility floor (name-sessions) ${floorExcluded}`);
   log(`SUMMARY sessions ${summary.sessions} meanIC ${summary.meanIC.toFixed(4)} icT ${summary.icTStat.toFixed(2)}`);
   for (const [type, s] of Object.entries(summary.lists))
     log(`SUMMARY ${type}: sessions ${s.sessions} mean ${(s.meanReturn * 100).toFixed(3)}% universe ${(s.universeMean * 100).toFixed(3)}% random ${(s.randomMean * 100).toFixed(3)}% spy ${s.spyMean === undefined ? "n/a" : (s.spyMean * 100).toFixed(3) + "%"} excess ${(s.meanExcess * 100).toFixed(3)}% t ${s.excessTStat.toFixed(2)} hit ${(s.hitRate * 100).toFixed(1)}% randomP ${s.randomP.toFixed(3)}`);
   if (out)
-    writeFileSync(out, JSON.stringify({ from, to, horizon, draws, step, winsorize, splitKnowledge, sessionsEvaluated: outcomes.map((o) => o.sessionDate), droppedForSplit, splitExcluded, summary }, null, 2) + "\n");
+    writeFileSync(out, JSON.stringify({ from, to, horizon, draws, step, winsorize, splitKnowledge, floor: floorArg, sessionsEvaluated: outcomes.map((o) => o.sessionDate), droppedForSplit, splitExcluded, floorExcluded, summary }, null, 2) + "\n");
 }
 
 await main();

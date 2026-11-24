@@ -22,7 +22,8 @@ function world(n: number, days: string[], seed: number) {
     for (const day of days) {
       const open = close * (1 + (r() - 0.5) * 0.002);
       close = open * (1 + (r() - 0.5) * 0.02);
-      bars.push({ securityId: id, sessionDate: day, open, close, volume: 1e5 + r() * 1e5, revision: 1 });
+      // Liquid: $20M+ a day, so every name clears the production eligibility floor ($5M median dollar volume).
+      bars.push({ securityId: id, sessionDate: day, open, close, volume: 1e6 + r() * 1e5, revision: 1 });
     }
   }
   return { bars, ids };
@@ -78,4 +79,24 @@ test("a split taking effect on D+2 removes the name's outcome for picks and univ
   assert.equal(got.session.universeSize, base.session.universeSize - 1);
   const onEntry = { ...split, effectiveDate: days[i + 1]! } as CorporateAction;
   assert.notEqual(buildHarnessSession(ids.map((id) => rec(id)), new EvalHistory(bars), i, { splitActions: [onEntry] })!.session.lists.TOP_15_OVERALL!.returns[0], null);
+});
+
+test("the harness ranks as production does: the eligibility floor and the stocks-only rule apply", () => {
+  const days = weekdays(140);
+  const { bars, ids } = world(30, days, 21);
+  const i = 110;
+  const thin = ids[0]!; // volume 1,000: far under the $5M median dollar volume
+  const fund = ids[1]!; // typed ETF in the master
+  const young = ids[2]!; // only 40 sessions of history at D
+  const adjusted = bars
+    .filter((b) => b.securityId !== young || b.sessionDate > days[i - 40]!)
+    .map((b) => (b.securityId === thin ? { ...b, volume: 1_000 } : b));
+  const master = ids.map((id) => (id === fund ? ({ ...rec(id), assetType: "ETF" } as SecurityMasterRecord) : rec(id)));
+  const got = buildHarnessSession(master, new EvalHistory(adjusted), i, { splitActions: [] })!;
+  assert.equal(got.session.universeSize, 27);
+  for (const list of Object.values(got.session.lists))
+    for (const id of [thin, fund, young]) assert.equal(list.ids.includes(id), false, id);
+  // Same world with all three made eligible: they are back in the universe.
+  const all = buildHarnessSession(ids.map((id) => rec(id)), new EvalHistory(bars), i, { splitActions: [] })!;
+  assert.equal(all.session.universeSize, 30);
 });

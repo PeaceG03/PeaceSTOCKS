@@ -71,6 +71,8 @@ export interface MarketStore {
   writePartitionManifest(manifest: PartitionManifest): Promise<void>;
   writeRunReport(report: unknown): Promise<void>;
   loadRunReports(): Promise<ScannerRunReport[]>;
+  /** Nightly scan health record (permanent/health/scan/<D>.json and latest.json). Optional for test stores. */
+  writeScanHealth?(record: import("./scan-health").ScanHealthRecord): Promise<void>;
   measureStorage(): Promise<StorageReport>;
   readPermanent(relativePath: string): Promise<Buffer>;
   loadSchedulerState(): Promise<unknown>;
@@ -396,6 +398,12 @@ export class MarketStorage implements MarketStore {
         ? `${typed.runId}.already-frozen.json`
         : `${typed.runId}.json`;
     await this.atomicWrite(join(this.root, "runs", file), JSON.stringify(report, null, 2) + "\n");
+  }
+
+  async writeScanHealth(record: import("./scan-health").ScanHealthRecord): Promise<void> {
+    const body = JSON.stringify(record, null, 2) + "\n";
+    await this.atomicWrite(this.path(`health/scan/${record.sessionDate}.json`), body);
+    await this.atomicWrite(this.path("health/scan/latest.json"), body);
   }
 
   async loadRunReports(): Promise<ScannerRunReport[]> {

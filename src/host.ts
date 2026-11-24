@@ -225,9 +225,15 @@ export async function runScannerHost(
     readonly stageSink?: StageSink;
     /** Wall clock in ms for the session budget (tests); defaults to Date.now. */
     readonly clock?: () => number;
+    /**
+     * The scanner's clock (tests). It is read again at the freeze (S4 gate, predictedAt, on-time stats), so it
+     * must be live: defaults to the real time, or to `now` held fixed when a test passes `now` without it.
+     */
+    readonly wallClock?: () => Date;
   } = {},
 ): Promise<SchedulerHostResult> {
   const now = options.now ?? new Date();
+  const wallClock = hostWallClock(options.now, options.wallClock);
   const clock = options.clock ?? Date.now;
   const startedAt = clock();
   const budget = scanHostBudget(options.env ?? process.env);
@@ -334,7 +340,7 @@ export async function runScannerHost(
     groupedDustOn
       ? { enabled: true, ...(groupedReplyDustStore ? { store: groupedReplyDustStore } : {}) }
       : undefined,
-    () => now,
+    wallClock,
     { store: dailyBarsPackStore },
   );
   const collected: ScannerRunReport[] = [];
@@ -561,6 +567,17 @@ export function listOncePerRun<P extends MarketProvider>(provider: P): P {
       };
     },
   });
+}
+
+/**
+ * The scanner's clock. Never the host start frozen: the S4 gate, predictedAt and the on-time stats read it at
+ * the write, so a run that starts before the open and writes after it does not freeze. Live by default; a test
+ * that passes a fixed `now` without a wall clock keeps that time.
+ */
+export function hostWallClock(now?: Date, wallClock?: () => Date): () => Date {
+  if (wallClock) return wallClock;
+  if (now) return () => now;
+  return () => new Date();
 }
 
 /** Scan host exit code: 2 when any session failed or was not ready (a capped run included), else 0. */

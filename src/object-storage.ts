@@ -1,3 +1,5 @@
+import { writeVerifiedHealthJson } from "./health-checkins";
+import { SCAN_HEALTH_LATEST_KEY, type ScanHealthRecord, scanHealthKey } from "./scan-health";
 import { CORPORATE_ACTION_COVERAGE_KEY, type CorporateActionCoverageRecord } from "./corporate-action-coverage";
 import { createHash } from "node:crypto";
 import { isSplitAction, SETTLEMENT_ACTION_TYPES } from "./split-adjust";
@@ -269,6 +271,12 @@ export class ObjectMarketStorage implements MarketStore {
     const file =
       typed.status === "ALREADY_FROZEN" ? `${runId}.already-frozen.json` : `${runId}.json`;
     await this.writeText(`runs/${file}`, JSON.stringify(report, null, 2) + "\n");
+  }
+
+  /** Same size + checksum read-back as the health check's own reports (writeVerifiedHealthJson). */
+  async writeScanHealth(record: ScanHealthRecord): Promise<void> {
+    await writeVerifiedHealthJson(this.client, scanHealthKey(record.sessionDate), record);
+    await writeVerifiedHealthJson(this.client, SCAN_HEALTH_LATEST_KEY, record);
   }
 
   async loadRunReports(): Promise<ScannerRunReport[]> {

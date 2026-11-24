@@ -10,6 +10,7 @@
  * name with an outcome ("universe"), random lists of the same size from that universe, and SPY.
  */
 import type { CanonicalDailyBar, CorporateAction, PredictionSet, SecurityMasterRecord } from "./contracts";
+import { ELIGIBILITY_FLOOR, type EligibilityFloor } from "./eligibility-floor";
 import { DEFAULT_SCANNER_CONFIG, rankSecurities } from "./ranking";
 import { resolveSpyBenchmarkId, scanBarWindowStart, type SessionCalendar } from "./scanner";
 import { nextSessionOpen } from "./session-open";
@@ -135,6 +136,8 @@ export interface EvalOptions {
    * the next session's 09:30 ET open, i.e. what a forward scan of D could have read.
    */
   splitKnowledge?: "effective-date" | "as-known";
+  /** The eligibility floor, as the scan applies it (default); null ranks without it (comparison only). */
+  floor?: EligibilityFloor | null;
 }
 
 /** Split records a forward scan of D could have read: observed before the next session's open. */
@@ -197,7 +200,7 @@ export function evaluateSession(
   history: EvalHistory,
   i: number,
   options: EvalOptions,
-): { predictions: PredictionSet[]; excluded: number; outcome: SessionOutcome } | undefined {
+): { predictions: PredictionSet[]; excluded: number; floorExcluded: number; outcome: SessionOutcome } | undefined {
   const D = history.sessions[i]!;
   if (!history.sessions[i + options.horizon]) return undefined;
   const securities = pointInTimeSecurities(master, history, i);
@@ -208,7 +211,7 @@ export function evaluateSession(
     options.splitKnowledge === "as-known"
       ? splitActionsKnownAt(options.splitActions ?? [], D, options.calendar)
       : (options.splitActions ?? []);
-  const result = rankSecurities(securities, bars, benchmark, D, DEFAULT_SCANNER_CONFIG, splitActions);
+  const result = rankSecurities(securities, bars, benchmark, D, DEFAULT_SCANNER_CONFIG, splitActions, options.floor === undefined ? ELIGIBILITY_FLOOR : options.floor);
   const h = options.horizon;
   const raw = new Map<string, number>();
   for (const item of result.ranked) {
@@ -248,6 +251,7 @@ export function evaluateSession(
   return {
     predictions: result.predictions,
     excluded: result.excluded?.length ?? 0,
+    floorExcluded: result.floorExcluded?.length ?? 0,
     outcome: { sessionDate: D, universeSize: universe.length, universeMean, ...(spy !== undefined ? { spy } : {}), ic, lists },
   };
 }

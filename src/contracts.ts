@@ -419,6 +419,12 @@ export interface ScannerRunReport {
   nextSessionOpen?: string;
   nextSessionDate?: string;
   calendarSha256?: string;
+  /** Names the eligibility floor left out of ranking, by reason (FLOOR_PRICE, ...). */
+  eligibilityFloorExcludedByReason?: Record<string, number>;
+  /** Names the split guard left out of ranking, by reason (SPLIT_CONFLICT, ...). */
+  splitGuardExcludedByReason?: Record<string, number>;
+  /** Whether this run's scan health record (permanent/health/scan/) was written. */
+  scanHealth?: "WRITTEN" | `FAILED:${string}`;
   /** HTTP 429 responses the provider received during this run, including ones a retry recovered. */
   rateLimitedResponses?: number;
   /**
