@@ -312,3 +312,25 @@ test("two split dates on one bar are excluded even when either factor alone woul
   // Control: the reconciling record alone is used.
   assert.ok("bars" in splitAdjustedBars(b, [reconciles], ds.at(-1)!));
 });
+
+test("reconcile band edges are inclusive: an adjusted move of exactly 1.5x or exactly 1/1.5 is kept", async () => {
+  const { splitAdjustedBars, SPLIT_RECONCILE_MAX_MOVE } = await import("./split-adjust");
+  assert.equal(SPLIT_RECONCILE_MAX_MOVE, 1.5);
+  const ds = sessions(40);
+  const asOf = ds.at(-1)!;
+  // before x factor = 20, after = 30: move = 30 / 20 = 1.5 exactly.
+  const up = ds.map((d, k) => bar("z", d, k < 5 ? 10 : 30));
+  const gotUp = splitAdjustedBars(up, [{ effectiveDate: ds[5]!, factor: 2 }], asOf);
+  assert.equal(30 / (10 * 2), SPLIT_RECONCILE_MAX_MOVE);
+  assert.ok("bars" in gotUp, JSON.stringify(gotUp));
+  // before x factor = 1.5, after = 1: move = 1 / 1.5, the same double as the lower edge.
+  const down = ds.map((d, k) => bar("z", d, k < 5 ? 0.75 : 1));
+  assert.equal(1 / (0.75 * 2), 1 / SPLIT_RECONCILE_MAX_MOVE);
+  const gotDown = splitAdjustedBars(down, [{ effectiveDate: ds[5]!, factor: 2 }], asOf);
+  assert.ok("bars" in gotDown, JSON.stringify(gotDown));
+  // Just outside either edge is excluded.
+  for (const after of [30.000001, 0.999999]) {
+    const bs = ds.map((d, k) => bar("z", d, k < 5 ? (after > 2 ? 10 : 0.75) : after));
+    assert.deepEqual(splitAdjustedBars(bs, [{ effectiveDate: ds[5]!, factor: 2 }], asOf), { excluded: "SPLIT_UNRECONCILED" }, String(after));
+  }
+});
