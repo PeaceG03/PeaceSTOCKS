@@ -14,6 +14,8 @@ export interface AccessJwtConfig {
   fetchImpl?: typeof fetch;
   /** Seconds since epoch. */
   nowSeconds?: () => number;
+  /** Milliseconds since epoch, for the certs cache (defaults to Date.now). */
+  nowMs?: () => number;
 }
 
 export type AccessJwtResult = { ok: true; email: string } | { ok: false; reason: string };
@@ -28,6 +30,8 @@ interface Jwk {
 
 const TEAM_DOMAIN = /^https:\/\/[a-z0-9][a-z0-9-]{0,62}\.cloudflareaccess\.com$/u;
 const CERTS_TTL_MS = 10 * 60_000;
+/** An unknown kid forces a refetch at most this often per team, so junk tokens cannot hammer the certs URL. */
+export const CERTS_REFETCH_MIN_MS = 60_000;
 const CLOCK_SKEW_SECONDS = 60;
 
 const certCache = new Map<string, { at: number; keys: Jwk[] }>();
@@ -59,14 +63,18 @@ function base64UrlJson(value: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-async function certs(teamDomain: string, fetchImpl: typeof fetch, refresh: boolean): Promise<Jwk[]> {
+async function certs(teamDomain: string, fetchImpl: typeof fetch, refresh: boolean, nowMs: number): Promise<Jwk[]> {
   const cached = certCache.get(teamDomain);
-  if (cached && !refresh && Date.now() - cached.at < CERTS_TTL_MS) return cached.keys;
+  if (cached) {
+    const age = nowMs - cached.at;
+    if (!refresh && age < CERTS_TTL_MS) return cached.keys;
+    if (refresh && age < CERTS_REFETCH_MIN_MS) return cached.keys;
+  }
   const response = await fetchImpl(`${teamDomain}/cdn-cgi/access/certs`);
   if (!response.ok) throw new Error(`CERTS_${response.status}`);
   const body = (await response.json()) as { keys?: Jwk[] };
   const keys = Array.isArray(body.keys) ? body.keys : [];
-  certCache.set(teamDomain, { at: Date.now(), keys });
+  certCache.set(teamDomain, { at: nowMs, keys });
   return keys;
 }
 
@@ -93,9 +101,10 @@ export async function verifyAccessJwt(token: string | null | undefined, config: 
   const fetchImpl = config.fetchImpl ?? fetch;
   let jwk: Jwk | undefined;
   try {
-    jwk = (await certs(teamDomain, fetchImpl, false)).find((key) => key.kid === header.kid);
-    // Access rotates keys: an unknown kid gets one fresh fetch.
-    if (!jwk) jwk = (await certs(teamDomain, fetchImpl, true)).find((key) => key.kid === header.kid);
+    const nowMs = (config.nowMs ?? Date.now)();
+    jwk = (await certs(teamDomain, fetchImpl, false, nowMs)).find((key) => key.kid === header.kid);
+    // Access rotates keys: an unknown kid gets a fresh fetch, at most once a minute (CERTS_REFETCH_MIN_MS).
+    if (!jwk) jwk = (await certs(teamDomain, fetchImpl, true, nowMs)).find((key) => key.kid === header.kid);
   } catch {
     return { ok: false, reason: "CERTS_UNAVAILABLE" };
   }

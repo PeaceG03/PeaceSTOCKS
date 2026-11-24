@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync, createSign } from "node:crypto";
 import test from "node:test";
-import { clearAccessCertCache, normalizeTeamDomain, verifyAccessJwt, type AccessJwtConfig } from "./access-jwt";
+import { CERTS_REFETCH_MIN_MS, clearAccessCertCache, normalizeTeamDomain, verifyAccessJwt, type AccessJwtConfig } from "./access-jwt";
 
 const TEAM = "https://example-team.cloudflareaccess.com";
 const AUD = "aud-tag-123";
@@ -83,4 +83,24 @@ test("access jwt: missing config or unreachable certs fail closed", async () => 
   const down = config({ fetchImpl: (async () => new Response("no", { status: 500 })) as typeof fetch });
   assert.deepEqual(await verifyAccessJwt(token, down), { ok: false, reason: "CERTS_UNAVAILABLE" });
   assert.equal(normalizeTeamDomain("example-team.cloudflareaccess.com/"), TEAM);
+});
+
+test("access jwt: unknown-kid refetch of the certs is throttled to once a minute", async () => {
+  clearAccessCertCache();
+  let ms = 1_000_000;
+  const c = config({ nowMs: () => ms });
+  assert.equal((await verifyAccessJwt(sign(claims()), c)).ok, true);
+  assert.equal(c.calls.length, 1);
+  for (let i = 0; i < 5; i += 1) assert.deepEqual(await verifyAccessJwt(sign(claims(), { kid: `junk-${i}` }), c), { ok: false, reason: "UNKNOWN_KEY" });
+  assert.equal(c.calls.length, 1, "junk kids inside the window cause no refetch");
+  ms += CERTS_REFETCH_MIN_MS - 1;
+  await verifyAccessJwt(sign(claims(), { kid: "junk-x" }), c);
+  assert.equal(c.calls.length, 1);
+  ms += 1;
+  await verifyAccessJwt(sign(claims(), { kid: "junk-y" }), c);
+  assert.equal(c.calls.length, 2, "a rotated key is picked up once the minute has passed");
+  await verifyAccessJwt(sign(claims(), { kid: "junk-z" }), c);
+  assert.equal(c.calls.length, 2);
+  assert.equal((await verifyAccessJwt(sign(claims()), c)).ok, true);
+  assert.equal(c.calls.length, 2);
 });
