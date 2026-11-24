@@ -144,7 +144,8 @@ test("site page: phone layout stacks session and check-in rows; issue codes wrap
   const html = renderSitePage(SAMPLE_PAGE);
   assert.match(html, /@media \(max-width:480px\)/u);
   assert.match(html, /\.stack,\.stack tbody,\.stack tr,\.stack td\{display:block/u);
-  assert.match(html, /overflow-x:hidden/u);
+  assert.match(html, /html,body\{max-width:100%;overflow-x:hidden\}/u);
+  assert.match(html, /\.table-wrap\{[^}]*overflow-x:hidden/u);
   assert.match(html, /\.session-date,\.when,\.valid\{white-space:nowrap\}/u);
   assert.match(html, /\.issues\{overflow-wrap:anywhere/u);
   assert.equal(html.match(/<div class="table-wrap">/gu)?.length, 2);
