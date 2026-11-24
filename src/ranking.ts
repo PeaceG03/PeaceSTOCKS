@@ -53,6 +53,23 @@ function latestBars(own: readonly CanonicalDailyBar[] | undefined): CanonicalDai
   return [...byDate.values()].sort((a, b) => a.sessionDate.localeCompare(b.sessionDate));
 }
 
+/** Recipe of the FASTEST_IMPROVING list (stored on the set and part of its predictionId). */
+export const FASTEST_IMPROVING_RECIPE = "fastest-improving-return20-delta-v1";
+/** Closes needed for the improvement value: the latest close plus 40 before it. */
+export const IMPROVEMENT_MIN_CLOSES = 41;
+
+/**
+ * Improvement: the 20-session return to the latest close minus the 20-session return just before
+ * it, from one bar per session (oldest first). Null with fewer than 41 closes or a zero close.
+ */
+export function improvementValue(closes: readonly number[]): number | null {
+  if (closes.length < IMPROVEMENT_MIN_CLOSES) return null;
+  const at = (back: number) => closes[closes.length - 1 - back]!;
+  if (at(20) === 0 || at(40) === 0) return null;
+  const value = at(0) / at(20) - 1 - (at(20) / at(40) - 1);
+  return Number.isFinite(value) ? value : null;
+}
+
 export interface RankedSecurity {
   securityId: string;
   features: DerivedFeatures;
@@ -200,22 +217,38 @@ export function rankSecurities(
         a.securityId.localeCompare(b.securityId),
     )
     .map((item) => item.securityId);
+  // Its own list (it used to copy TOP_15_OVERALL): ranked names with an improvement value, largest
+  // first, ties by id. None has enough history: empty and marked unavailable, never filled from overall.
+  const improving = ranked
+    .map((item) => ({ id: item.securityId, value: improvementValue(latestFor(item.securityId).map((bar) => bar.close)) }))
+    .filter((entry): entry is { id: string; value: number } => entry.value !== null)
+    .sort((a, b) => b.value - a.value || a.id.localeCompare(b.id))
+    .map((entry) => entry.id);
   const frozenAt = `${sessionDate}T23:59:59.999Z`;
   const sets: Array<[PredictionSet["setType"], string[]]> = [
     ["TOP_15_OVERALL", rankedIds.slice(0, 15)],
     ["TOP_50_OVERALL", rankedIds.slice(0, 50)],
     ["STRONGEST_MOMENTUM", strongestMomentum.slice(0, 15)],
-    ["FASTEST_IMPROVING", rankedIds.slice(0, 15)],
+    ["FASTEST_IMPROVING", improving.slice(0, 15)],
     ["DEFENSIVE_LOW_RISK", defensive.slice(0, 15)],
   ];
-  const predictions = sets.map(([setType, securityIds]) => ({
-    predictionId: `prediction_${sha256(`${sessionDate}|${setType}|${SCANNER_VERSION}|${configFingerprint}`)}`,
-    sessionDate,
-    setType,
-    securityIds,
-    scannerVersion: SCANNER_VERSION,
-    configFingerprint,
-    frozenAt,
-  }));
+  const predictions = sets.map(([setType, securityIds]): PredictionSet => {
+    const improvingSet = setType === "FASTEST_IMPROVING";
+    return {
+      predictionId: `prediction_${sha256(
+        `${sessionDate}|${setType}|${SCANNER_VERSION}|${configFingerprint}${improvingSet ? `|${FASTEST_IMPROVING_RECIPE}` : ""}`,
+      )}`,
+      sessionDate,
+      setType,
+      securityIds,
+      scannerVersion: SCANNER_VERSION,
+      configFingerprint,
+      frozenAt,
+      ...(improvingSet ? { recipeVersion: FASTEST_IMPROVING_RECIPE } : {}),
+      ...(improvingSet && ranked.length > 0 && securityIds.length === 0
+        ? { unavailableReason: "INSUFFICIENT_HISTORY" as const }
+        : {}),
+    };
+  });
   return { beliefs, ranked, predictions };
 }

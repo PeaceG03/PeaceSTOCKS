@@ -112,11 +112,15 @@ Current selection threshold is versioned.
 
 Scanner currently defines:
 
-- TOP_15_OVERALL
-- TOP_50_OVERALL
-- STRONGEST_MOMENTUM
-- FASTEST_IMPROVING
-- DEFENSIVE_LOW_RISK
+- TOP_15_OVERALL: the 15 highest overall scores (weighted family scores above).
+- TOP_50_OVERALL: the 50 highest overall scores.
+- STRONGEST_MOMENTUM: the 15 highest 60-session returns (20-session return when 60 is missing).
+- FASTEST_IMPROVING: the 15 largest rises in 20-session return versus the 20 sessions before
+  (needs 41 closes; recipe `fastest-improving-return20-delta-v1`). When no ranked name has that
+  much history the list is empty with `unavailableReason: INSUFFICIENT_HISTORY`; it is never
+  filled from the overall ranking. Lists frozen before this recipe (through 2026-11-23) were a
+  copy of TOP_15_OVERALL.
+- DEFENSIVE_LOW_RISK: the 15 highest risk family scores (lowest 20-session volatility).
 
 These are candidate sets, not orders.
 
