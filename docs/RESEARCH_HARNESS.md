@@ -28,11 +28,13 @@ always Peace's own decision.
 # Baseline: the current 5 scanner lists, development period only. The held-out window is registered, not evaluated.
 pnpm research baseline --data <local raw dir> --out <dir> \
   --from 2025-03-03 --heldout-from 2026-08-27 --heldout-to 2026-11-20 \
-  --bps 10 --train 63 --test 63 --embargo 2 --mode rolling --scanner "<head> <config>"
+  --bps 10 --train 63 --test 63 --embargo 2 --mode rolling
 
 # A recorded human decision to allow one more held-out look (TTY only):
 pnpm research unseal --out <dir> --strategy <strategyHash> --by <name> --reason "<why>"
 ```
+
+The scanner label stamped into every registered strategy is derived, not typed (`src/research-scanner-label.ts`): `<12-char commit> scanner-v0.1 config-<12-char hash>`, where the hash covers the scanner version, the ranking config, the list asset type and the eligibility floor. `--scanner` is refused (`SCANNER_LABEL_IS_DERIVED`), and so is a run with uncommitted changes under `src/` or `config/` (`SCANNER_TREE_DIRTY`) or outside git (`SCANNER_LABEL_NEEDS_GIT`), because then the commit would not describe the code that ran. A different commit or config is a different label and so new variants in the Holm family; a label can never repeat the hand-typed harness-v1 label.
 
 `--bps` below 5 (bps per side) or not a number is refused (`COST_BELOW_FLOOR`) before any data is read: 5 bps is a conservative floor for one-way slippage on these names, and anything lower would make turnover look nearly free.
 
