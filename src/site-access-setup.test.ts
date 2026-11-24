@@ -245,3 +245,17 @@ test("access setup: the policy is found by name; an unrelated policy listed firs
   assert.deepEqual(lone.policies.get("pol-unrelated"), unrelated);
   assert.deepEqual(lone.apps.get(created.appId)!.policies, [{ id: created.policyId, precedence: 1 }]);
 });
+
+const writes = (calls: string[]) => calls.filter((c) => !c.startsWith("GET "));
+
+test("access setup: two apps on the hostname is an error, and nothing is changed", async () => {
+  const cf = fakeCloudflare();
+  const ours = { id: "pol-ours", name: SITE_ACCESS_POLICY_NAME, decision: "allow", include: [{ email: { email: "old@example.test" } }], exclude: [], require: [] };
+  cf.policies.set("pol-ours", structuredClone(ours));
+  cf.apps.set("app-1", { id: "app-1", name: SITE_ACCESS_APP_NAME, type: "self_hosted", domain: HOST, aud: "aud-1", policies: [{ id: "pol-ours" }] });
+  cf.apps.set("app-2", { id: "app-2", name: "Another", type: "self_hosted", domain: HOST.toUpperCase(), aud: "aud-2", policies: [] });
+  const before = structuredClone({ apps: [...cf.apps], policies: [...cf.policies] });
+  await assert.rejects(setupSiteAccess(input(cf.fetchImpl)), /more than one Access app covers stocks\.example\.test/u);
+  assert.deepEqual(writes(cf.calls), [], "no PUT/POST before the error");
+  assert.deepEqual({ apps: [...cf.apps], policies: [...cf.policies] }, before);
+});
