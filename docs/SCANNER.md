@@ -146,7 +146,11 @@ session). A name is dropped for that session, nothing is guessed:
   7%, on 49 of 61 sessions) and 129 TOP_50 slots. The held-out conclusion (no robust edge) is the same
   with or without the rule.
 
-The thresholds were chosen from the 2026 split records (build log `predictions-on.md`). The run
+The thresholds were chosen from the 2026 split records (build log `predictions-on.md`). Reconcile
+band count, splits effective 2026-05-01..11-30 with one usable factor and a close both before and
+on/after the effective date: 492 of 514 (95.7%) are within [1/1.5, 1.5] and 507 within [1/2, 2].
+An earlier count of 488 of 508 (96.1%) loaded bars only from May 1, so it dropped 6 such splits: 5
+effective on May 1 itself (no earlier bar loaded) and 1 whose last earlier bar was in April. The run
 report lists the count in `skips` as `SPLIT_ADJUST_EXCLUDED:<n>`. If the split records cannot be read,
 the scan reports `SPLIT_ACTIONS_READ_FAILED:<message>` and the session is not frozen (UNAVAILABLE /
 SOURCE_COLLECTION_FAILED, like a provider failure). This and loading the records are the only
