@@ -293,8 +293,10 @@ raises the existing alert: the one "PeaceSTOCKS health needs attention" issue (l
 `permanent/health/scan/missed-freeze-alerts/<D>.json` keeps it to once per session: each run claims
 it with one conditional put (`If-None-Match: *`) before alerting, and a 412 means another run
 already alerted, so the scan job's last step and the :47 tick cannot both comment. A failed alert
-deletes its claim so the next run retries; a run killed between the claim and the alert leaves a
-`CLAIMED` marker and no alert for that session (src/freeze-watch-claim.test.ts). It runs as the last step of every scan job and on the hourly :47 tick
+deletes its claim so the next run retries. A run killed between the claim and the alert leaves a
+`CLAIMED` marker; once that claim is more than 2 hours old and never reached `ALERTED`, the next run
+takes it over with one conditional replace (`If-Match: <etag>`), so exactly one run re-alerts
+(src/freeze-watch-claim.test.ts, src/freeze-watch-claim-expiry.test.ts). It runs as the last step of every scan job and on the hourly :47 tick
 (`freeze_watch` job), so a session whose scan never ran is still reported within the hour after the
 open. No Massive request and no tickers in the alert.
 

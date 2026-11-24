@@ -62,10 +62,27 @@ export interface StrategyEvaluation {
   /** Holm-adjusted pooledP over the latest record of every strategy in the log. */
   adjustedP: number;
   foldsPositive: number;
+  /** Slippage charged, bps per side (the verdict's cost floor reads it). */
+  costBpsPerSide: number;
 }
 
 /** A fold counts as positive when net beats both benchmarks on its test window. */
 export const foldPositive = (m: SeriesMetrics): boolean => m.excessUniverse.mean > 0 && m.excessSpy.mean > 0;
+
+/**
+ * The Holm family over a whole variant log: the latest record of every strategy, the distinct
+ * candidate variants ever tried, family size max(variants, strategies) and each strategy's
+ * adjusted p. Used by evaluateStrategy and by the research CLI (one definition, one set of tests).
+ */
+export function holmFamily(all: readonly VariantRecord[]): { strategies: VariantRecord[]; variantsTried: number; familySize: number; adjustedP: (strategyHash: string) => number } {
+  const latest = new Map<string, VariantRecord>();
+  for (const entry of all) latest.set(entry.strategyHash, entry);
+  const strategies = [...latest.values()];
+  const variantsTried = new Set(all.flatMap((e) => e.candidateHashes)).size;
+  const familySize = Math.max(variantsTried, strategies.length);
+  const adjusted = holmAdjusted(strategies.map((x) => x.pooledP), familySize);
+  return { strategies, variantsTried, familySize, adjustedP: (hash) => adjusted[strategies.findIndex((x) => x.strategyHash === hash)]! };
+}
 
 export function evaluateStrategy(
   sessions: readonly HarnessSession[],
@@ -110,13 +127,8 @@ export function evaluateStrategy(
     pooledP: Math.max(pooled.excessUniverse.p, pooled.excessSpy.p),
   };
   log.append(record);
-  const all = log.entries();
-  const latest = new Map<string, VariantRecord>();
-  for (const entry of all) latest.set(entry.strategyHash, entry);
-  const variantsTried = new Set(all.flatMap((e) => e.candidateHashes)).size;
-  const strategies = [...latest.values()];
-  const familySize = Math.max(variantsTried, strategies.length);
-  const adjusted = holmAdjusted(strategies.map((s) => s.pooledP), familySize);
-  const adjustedP = adjusted[strategies.findIndex((s) => s.strategyHash === record.strategyHash)]!;
-  return { record, daily, variantsTried, familySize, adjustedP, foldsPositive: results.filter((r) => r.positive).length };
+  const family = holmFamily(log.entries());
+  const { variantsTried, familySize } = family;
+  const adjustedP = family.adjustedP(record.strategyHash);
+  return { record, daily, variantsTried, familySize, adjustedP, foldsPositive: results.filter((r) => r.positive).length, costBpsPerSide: strategy.costs.slippageBpsPerSide };
 }

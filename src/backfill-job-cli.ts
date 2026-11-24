@@ -112,6 +112,7 @@ export async function backfillJobMain(args: readonly string[], env: NodeJS.Proce
   const log = deps.log ?? ((line: string) => process.stdout.write(`${line}\n`));
   const report = deps.report ?? reportPart;
   const options = parseBackfillJobArgs(args, env);
+  if (env.GITHUB_ACTIONS === "true" && env.GITHUB_REF !== "refs/heads/main") throw new Error("BACKFILL_MAIN_ONLY");
   const apiKey = env.MASSIVE_API_KEY?.trim();
   if (!apiKey) throw new Error("MASSIVE_API_KEY_REQUIRED");
   let storage = deps.storage;
