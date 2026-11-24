@@ -298,10 +298,11 @@ open. No Massive request and no tickers in the alert.
 ### Freeze reliability: Oct 13 - Nov 20, 2026 (root cause)
 
 No session from Oct 13 to Nov 20 had picks frozen before the next open. From the scanner.yml run
-history (gh run list/view, scan job logs, codes only): 100 scan-job attempts from Oct 13 to Nov 24;
-every session had 1 to 4 attempts that started after its close and before the next open, so the
-late-firing crons (scheduled runs created hours after 05:30/09:30 UTC) were not the cause. Every
-attempt died in the scan host:
+history (gh run list/view, scan job logs, codes only): 100 scan-job attempts from Oct 13 to Nov 24,
+94 of which died and 6 succeeded (3 on Oct 13, all before that session's close, and 3 on or after the
+Nov 24 catch-up). Every session had 1 to 4 attempts that started after its close and before the next open,
+so the late-firing crons (scheduled runs created hours after 05:30/09:30 UTC) were not the cause.
+The 94 deaths, all in the scan host:
 
 - Oct 14 - Oct 30, 38 attempts: `MARKETS_SCHEDULER_HOST_FAILED:fetch failed` after about 50 min.
   The R2 client had no timeout and no retry, and the scan read the whole stored history, so one
@@ -314,12 +315,16 @@ attempt died in the scan host:
 - Oct 14: one attempt cancelled at the 120 min job limit. Nov 24 02:08 UTC: one attempt failed
   on `DAILY_BARS_PACK_EXISTS_DIFFERENT` while re-collecting sealed sessions.
 
+(38 + 47 + 7 + 1 + 1 = 94.)
+
 Fixed on main on Nov 23 (#114 batch): the body is read inside the retry loop with a size-aware
 timeout (d0b7e3e, src/object-store-body-retry.test.ts), the scan loads only its bar window
-(45ec0e9), a sealed pack is checked before any session write (922e085), the security list is
+(45ea0e9, widened to 100 sessions in 7ce489e), a sealed pack is checked before any session write (922e085), the security list is
 fetched once per run (efb9fb5), and the backlog per run is capped (5b07f04). Run history since:
-the Nov 24 06:19 UTC run caught up the 29 missed sessions as evidence and froze the Nov 23 picks
-at 06:42:58 UTC, 7 h 47 min before the 14:30 UTC open; the two later runs that day found the
+the Nov 24 06:19 UTC run caught up the 29 missed sessions as evidence and wrote the Nov 23 picks
+at 06:42:58 UTC (its `writePredictions` log line), 7 h 47 min before the 14:30 UTC open. That
+record's stored `predictedAt` is 06:20:10 UTC, the host start (the clock was frozen at start until
+the write-time fix above); both are before the open, so Nov 23 is on time either way; the two later runs that day found the
 session complete. The missed sessions stay UNAVAILABLE (evidence only): forward picks cannot be
 made honestly after the fact.
 
