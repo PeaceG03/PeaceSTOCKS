@@ -14,7 +14,7 @@ import {
   backfillHistoricalIntradayEvidence,
   type IntradayBackfillResult,
 } from "./intraday-backfill";
-import type { MarketProvider } from "./contracts";
+import type { MarketProvider, ProviderSecurityRecord } from "./contracts";
 import { collectionDue } from "./scheduler";
 import {
   forwardFreezeAllowed,
@@ -309,7 +309,7 @@ export async function runScannerHost(
   const env = options.env ?? process.env;
   const groupedDustOn = scanGroupedReplyDustEnabled(env);
   const provider = stageTimed(
-    options.provider ?? new MassiveMarketProvider(groupedDustOn ? { keepRawReplies: true } : {}),
+    listOncePerRun(options.provider ?? new MassiveMarketProvider(groupedDustOn ? { keepRawReplies: true } : {})),
     "provider",
     tracker,
     stageSink,
@@ -533,5 +533,29 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import
   main().catch((error: unknown) => {
     process.stderr.write(`${hostFailureLine(error)}\n`);
     process.exitCode = 2;
+  });
+}
+
+/**
+ * One approved-securities listing per host run. Live it is about 37 paced Massive requests (~463 s) and
+ * it was repeated for every catch-up session. The first successful listing is reused by later sessions
+ * of the same run; its ticker reference capture is handed over once (to the first session), so later
+ * sessions write no ticker index. A failed listing is not kept: the next session lists again.
+ */
+export function listOncePerRun<P extends MarketProvider>(provider: P): P {
+  let listed: ProviderSecurityRecord[] | undefined;
+  return new Proxy(provider, {
+    get(target, prop, receiver) {
+      if (prop !== "listApprovedSecurities") {
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return async (...args: Parameters<MarketProvider["listApprovedSecurities"]>) => {
+        if (listed) return [...listed];
+        const result = await target.listApprovedSecurities(...args);
+        listed = result;
+        return result;
+      };
+    },
   });
 }
