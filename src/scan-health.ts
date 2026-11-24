@@ -9,6 +9,30 @@ import type { ScannerRunReport } from "./contracts";
 export const SCAN_HEALTH_SCHEMA = "scan-health-v1" as const;
 export const SCAN_HEALTH_PREFIX = "permanent/health/scan/" as const;
 export const SCAN_HEALTH_LATEST_KEY = "permanent/health/scan/latest.json" as const;
+/** Freeze reliability (on-time share over the last 20 and 60 sessions), written by src/freeze-watch.ts. */
+export const FREEZE_RELIABILITY_KEY = "permanent/health/scan/reliability.json" as const;
+export const FREEZE_RELIABILITY_SCHEMA = "freeze-reliability-v1" as const;
+
+export interface FreezeShare {
+  /** Judged sessions in the window (always the window size unless the calendar walk ran short). */
+  sessions: number;
+  onTime: number;
+  late: number;
+  unavailable: number;
+  noRecord: number;
+  /** onTime / sessions, or null for an empty window. */
+  share: number | null;
+}
+
+export interface FreezeReliability {
+  schemaVersion: typeof FREEZE_RELIABILITY_SCHEMA;
+  at: string;
+  /** Newest judged session (its next open has passed). */
+  through?: string;
+  last20: FreezeShare;
+  last60: FreezeShare;
+}
+
 /** One marker per session already alerted as a missed freeze (so the alert is raised once). */
 export const MISSED_FREEZE_ALERT_PREFIX = "permanent/health/scan/missed-freeze-alerts/" as const;
 

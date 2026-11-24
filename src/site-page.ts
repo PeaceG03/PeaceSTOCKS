@@ -126,6 +126,28 @@ export function scanHealthBlock(scan: SiteData["scanHealth"]): string {
   );
 }
 
+function shareText(label: string, s: { sessions: number; onTime: number; late: number; unavailable: number; noRecord: number }): string {
+  const pct = s.sessions ? Math.round((100 * s.onTime) / s.sessions) : 0;
+  const missed = [
+    s.late ? `${s.late} late` : "",
+    s.unavailable ? `${s.unavailable} unavailable` : "",
+    s.noRecord ? `${s.noRecord} with no record` : "",
+  ].filter(Boolean);
+  const cls = !s.sessions ? "muted" : pct >= 95 ? "ok" : pct >= 80 ? "warn" : "bad";
+  return `<li><span class="${cls}">${escapeHtml(label)}: ${escapeHtml(s.onTime)} of ${escapeHtml(s.sessions)} on time (${escapeHtml(pct)}%)</span>${
+    missed.length ? ` <span class="mute">${escapeHtml(missed.join(", "))}</span>` : ""
+  }</li>`;
+}
+
+/** On-time freeze share over the last 20 and 60 sessions, inside the Health card. */
+export function freezeShareBlock(r: SiteData["freezeReliability"]): string {
+  if (!r) return `<div class="mute">No freeze on-time record has been saved yet.</div>`;
+  return (
+    `<div class="mute" style="margin-top:8px">Picks frozen before the next open${r.through ? `, sessions through ${escapeHtml(r.through)}` : ""}</div>` +
+    `<ul>${shareText("Last 20 sessions", r.last20)}${shareText("Last 60 sessions", r.last60)}</ul>`
+  );
+}
+
 export function renderSitePage(data: SiteData): string {
   const parts: string[] = [];
 
@@ -138,7 +160,7 @@ export function renderSitePage(data: SiteData): string {
           `<div class="mute">Checked ${escapeHtml(localTime(health.at))}</div>` +
           (health.lines.length ? `<ul>${health.lines.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>` : "")
         : `<div class="mute">No health check has been saved yet.</div>`
-    }${scanHealthBlock(data.scanHealth)}</section>`,
+    }${scanHealthBlock(data.scanHealth)}${freezeShareBlock(data.freezeReliability)}</section>`,
   );
 
   // Catch-up / backlog.

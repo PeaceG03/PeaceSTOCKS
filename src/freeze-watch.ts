@@ -11,7 +11,13 @@ import { type HealthCheckinStore, errorMessage, redactHealthMessage, writeVerifi
 import { runHealthAlert } from "./health-alert";
 import { R2ObjectClient } from "./object-store";
 import { resolveSessionPredictionStatus } from "./prediction-status";
-import { MISSED_FREEZE_ALERT_PREFIX } from "./scan-health";
+import {
+  FREEZE_RELIABILITY_KEY,
+  FREEZE_RELIABILITY_SCHEMA,
+  type FreezeReliability,
+  type FreezeShare,
+  MISSED_FREEZE_ALERT_PREFIX,
+} from "./scan-health";
 import { type EligibleSessionCalendar, nextSessionOpen, previousEligibleSession } from "./session-open";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 
@@ -26,6 +32,8 @@ export interface SessionFreeze {
 
 /** Sessions checked for a missed freeze on each run (the newest ones whose next open has passed). */
 export const MISSED_FREEZE_LOOKBACK_SESSIONS = 3;
+/** The on-time windows shown on the site. */
+export const FREEZE_SHARE_WINDOWS = [20, 60] as const;
 
 /**
  * Pure: the newest `count` trading sessions whose NEXT session's open is at or before `now`
@@ -71,6 +79,35 @@ export function sessionFreezeOutcome(
   return { ...base, outcome: resolved.reason === "FREEZE_AFTER_OPEN" ? "LATE" : "UNAVAILABLE", reason: resolved.reason };
 }
 
+/**
+ * Pure: on-time share over the newest `window` judged sessions (`outcomes` newest first). A session
+ * with no record counts against the share: a scan that never ran is a missed freeze.
+ */
+export function onTimeShare(outcomes: readonly SessionFreeze[], window: number): FreezeShare {
+  const slice = outcomes.slice(0, window);
+  const count = (o: FreezeOutcome) => slice.filter((x) => x.outcome === o).length;
+  const onTime = count("ON_TIME");
+  return {
+    sessions: slice.length,
+    onTime,
+    late: count("LATE"),
+    unavailable: count("UNAVAILABLE"),
+    noRecord: count("NO_RECORD"),
+    share: slice.length ? onTime / slice.length : null,
+  };
+}
+
+/** Pure: the reliability record the site reads. */
+export function freezeReliability(outcomes: readonly SessionFreeze[], now: Date): FreezeReliability {
+  return {
+    schemaVersion: FREEZE_RELIABILITY_SCHEMA,
+    at: now.toISOString(),
+    ...(outcomes[0] ? { through: outcomes[0].sessionDate } : {}),
+    last20: onTimeShare(outcomes, 20),
+    last60: onTimeShare(outcomes, 60),
+  };
+}
+
 export function describeMiss(miss: SessionFreeze): string {
   const what =
     miss.outcome === "LATE"
@@ -105,19 +142,23 @@ export interface FreezeWatchDeps {
 }
 
 /** Check the newest judged sessions; alert once per missed one. Returns a log line (no tickers). */
-export async function runFreezeWatch(deps: FreezeWatchDeps): Promise<{ missed: SessionFreeze[]; alerted: string[]; line: string }> {
+export async function runFreezeWatch(
+  deps: FreezeWatchDeps,
+): Promise<{ missed: SessionFreeze[]; alerted: string[]; reliability: FreezeReliability; line: string }> {
   const now = deps.now ?? new Date();
   const calendar = deps.calendar ?? US_EQUITY_MARKET_CALENDAR;
-  const missed: SessionFreeze[] = [];
-  for (const { sessionDate, nextSessionOpen: open } of judgedSessions(now, MISSED_FREEZE_LOOKBACK_SESSIONS, calendar)) {
-    const outcome = sessionFreezeOutcome(sessionDate, open, await loadSessionStatuses(deps.store, sessionDate));
-    if (outcome.outcome !== "ON_TIME") missed.push(outcome);
-  }
+  const outcomes: SessionFreeze[] = [];
+  for (const { sessionDate, nextSessionOpen: open } of judgedSessions(now, Math.max(...FREEZE_SHARE_WINDOWS), calendar))
+    outcomes.push(sessionFreezeOutcome(sessionDate, open, await loadSessionStatuses(deps.store, sessionDate)));
+  // Reliability first: a failed alert below must not leave the site's on-time share stale.
+  const reliability = freezeReliability(outcomes, now);
+  await writeVerifiedHealthJson(deps.store, FREEZE_RELIABILITY_KEY, reliability);
+  const missed = outcomes.slice(0, MISSED_FREEZE_LOOKBACK_SESSIONS).filter((o) => o.outcome !== "ON_TIME");
   const fresh: SessionFreeze[] = [];
   for (const miss of missed)
     if (!(await deps.store.head(`${MISSED_FREEZE_ALERT_PREFIX}${miss.sessionDate}.json`))) fresh.push(miss);
   if (!fresh.length)
-    return { missed, alerted: [], line: `freeze watch: ${missed.length} missed in the last ${MISSED_FREEZE_LOOKBACK_SESSIONS} sessions, none new` };
+    return { missed, alerted: [], reliability, line: `freeze watch: ${shareLine(reliability)}; ${missed.length} missed in the last ${MISSED_FREEZE_LOOKBACK_SESSIONS} sessions, none new` };
   const headline = `missed freeze: ${fresh.length} session${fresh.length === 1 ? "" : "s"}`;
   const alert = deps.alert ?? runHealthAlert;
   const did = await alert({
@@ -133,7 +174,11 @@ export async function runFreezeWatch(deps: FreezeWatchDeps): Promise<{ missed: S
       ...miss,
       alert: did,
     });
-  return { missed, alerted: fresh.map((m) => m.sessionDate), line: `freeze watch: ${headline}; alert ${did}` };
+  return { missed, alerted: fresh.map((m) => m.sessionDate), reliability, line: `freeze watch: ${shareLine(reliability)}; ${headline}; alert ${did}` };
+}
+
+function shareLine(r: FreezeReliability): string {
+  return `on time ${r.last20.onTime}/${r.last20.sessions} (last 20), ${r.last60.onTime}/${r.last60.sessions} (last 60)`;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {

@@ -6,6 +6,8 @@ A read-only status page for the scanner, for one person, on phone or computer.
 - **Health**: the latest health check headline and its per-part lines.
   Under it, **Nightly scan**: the newest scan health record (finished before the open, picks frozen
   on time, names covered, names left out by the eligibility floor and the split guard).
+  Below it, the share of sessions whose picks were frozen before the next open, over the last 20
+  and 60 sessions (late, unavailable and no-record counted separately).
 - **Catch-up**: the day the scanner has collected through and, if the last scan ran out of time,
   how many market days are still to collect.
 - **Latest check-ins**: each part's newest check-in (scan, daily 10-minute step, history chain,
