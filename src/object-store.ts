@@ -20,6 +20,13 @@ export interface ObjectClient {
   delete(key: string): Promise<void>;
   /** Every key under the prefix (all pages), sorted. */
   list(prefix: string): Promise<string[]>;
+  /** Every key under the prefix with its size, from the listing alone (no GET or HEAD per key). */
+  listSizes?(prefix: string): Promise<ObjectListing[]>;
+}
+
+export interface ObjectListing {
+  readonly key: string;
+  readonly size: number;
 }
 
 /** Kept at S3's 2 KB user-metadata limit (R2 allows more) so objects stay portable. */
@@ -127,6 +134,10 @@ export class MemoryObjectClient implements ObjectClient {
   async list(prefix: string): Promise<string[]> {
     return [...this.objects.keys()].filter((key) => key.startsWith(prefix)).sort();
   }
+
+  async listSizes(prefix: string): Promise<ObjectListing[]> {
+    return (await this.list(prefix)).map((key) => ({ key, size: this.objects.get(key)?.length ?? 0 }));
+  }
 }
 
 export interface R2Config {
@@ -209,6 +220,24 @@ export function authorizationHeader(input: {
   };
 }
 
+/** Time allowed for R2 to send response headers. */
+export const R2_HEADERS_TIMEOUT_MS = 30_000;
+const R2_BODY_MIN_TIMEOUT_MS = 30_000;
+const R2_BODY_MAX_TIMEOUT_MS = 15 * 60_000;
+/** Slowest body transfer treated as healthy: 256 KiB/s. */
+const R2_BODY_MIN_BYTES_PER_SECOND = 256 * 1024;
+const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
+
+/**
+ * Time allowed to read a response body of contentLength bytes (unknown: the floor): 30 s plus the
+ * time to move it at 256 KiB/s, capped at 15 min. One 30 s budget for the whole call, body
+ * included, is what cut off large GETs.
+ */
+export function r2BodyTimeoutMs(contentLength: number): number {
+  if (!Number.isFinite(contentLength) || contentLength <= 0) return R2_BODY_MIN_TIMEOUT_MS;
+  return Math.min(R2_BODY_MAX_TIMEOUT_MS, R2_BODY_MIN_TIMEOUT_MS + Math.ceil((contentLength / R2_BODY_MIN_BYTES_PER_SECOND) * 1000));
+}
+
 export class R2ObjectClient implements ObjectClient {
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => Date;
@@ -263,9 +292,25 @@ export class R2ObjectClient implements ObjectClient {
         },
       };
       if (method !== "GET" && method !== "DELETE" && method !== "HEAD") init.body = body;
-      let response;
+      // One controller covers both halves of the call: R2_HEADERS_TIMEOUT_MS until the response
+      // headers arrive, then r2BodyTimeoutMs(content-length) to read the body. The body is read here,
+      // inside the retry loop, so a body that stalls or is cut off is retried like a failed fetch
+      // instead of escaping as a raw "The operation was aborted due to timeout" with no retry.
+      const controller = new AbortController();
+      const arm = (ms: number) =>
+        setTimeout(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")), ms);
+      let timer = arm(R2_HEADERS_TIMEOUT_MS);
+      let response: Response;
       try {
-        response = await this.fetchImpl(url, { ...init, signal: AbortSignal.timeout(30000) });
+        const raw = await this.fetchImpl(url, { ...init, signal: controller.signal });
+        clearTimeout(timer);
+        timer = arm(r2BodyTimeoutMs(Number(raw.headers.get("content-length") ?? "")));
+        const bytes = new Uint8Array(await raw.arrayBuffer());
+        response = new Response(NULL_BODY_STATUSES.has(raw.status) ? null : bytes, {
+          status: raw.status,
+          statusText: raw.statusText,
+          headers: raw.headers,
+        });
       } catch (error) {
         if (!r2RetryAllowed(attempt + 1)) {
           throw new Error(
@@ -278,6 +323,8 @@ export class R2ObjectClient implements ObjectClient {
         }
         await this.sleep(r2RetryDelayMs(attempt, 500));
         continue;
+      } finally {
+        clearTimeout(timer);
       }
       if (!isRetryableR2Status(response.status) || !r2RetryAllowed(attempt + 1)) return response;
       await this.sleep(r2RetryDelayMs(attempt, 500));
@@ -335,6 +382,33 @@ export class R2ObjectClient implements ObjectClient {
       const truncated = /<IsTruncated>true<\/IsTruncated>/u.test(xml);
       token = /<NextContinuationToken>([^<]+)<\/NextContinuationToken>/u.exec(xml)?.[1];
       if (!truncated) return keys.sort();
+      if (!token) throw new Error("R2_LIST_TRUNCATED_WITHOUT_TOKEN");
+      token = xmlText(token);
+    }
+    throw new Error("R2_LIST_TOO_MANY_PAGES");
+  }
+
+  async listSizes(prefix: string): Promise<ObjectListing[]> {
+    // ListObjectsV2 returns at most 1000 keys per page, each with its Size; follow continuation
+    // tokens to the end.
+    const entries: ObjectListing[] = [];
+    let token: string | undefined;
+    for (let page = 0; page < 100_000; page += 1) {
+      const query: Record<string, string> = { "list-type": "2", prefix };
+      if (token) query["continuation-token"] = token;
+      const response = await this.request("GET", this.endpoint("", query));
+      if (!response.ok) throw new Error(`R2_LIST_${response.status}`);
+      const xml = await response.text();
+      for (const match of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/gu)) {
+        const body = match[1] ?? "";
+        const key = xmlText(/<Key>([^<]+)<\/Key>/u.exec(body)?.[1] ?? "");
+        if (!key) continue;
+        const size = Number(/<Size>(\d+)<\/Size>/u.exec(body)?.[1] ?? "0");
+        entries.push({ key, size: Number.isFinite(size) ? size : 0 });
+      }
+      const truncated = /<IsTruncated>true<\/IsTruncated>/u.test(xml);
+      token = /<NextContinuationToken>([^<]+)<\/NextContinuationToken>/u.exec(xml)?.[1];
+      if (!truncated) return entries.sort((left, right) => (left.key < right.key ? -1 : left.key > right.key ? 1 : 0));
       if (!token) throw new Error("R2_LIST_TRUNCATED_WITHOUT_TOKEN");
       token = xmlText(token);
     }

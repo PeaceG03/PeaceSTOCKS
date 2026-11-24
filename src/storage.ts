@@ -48,6 +48,11 @@ export interface MarketStore {
   appendMembership(records: UniverseMembershipEvidence[]): Promise<void>;
   loadBars(sessionDate?: string): Promise<CanonicalDailyBar[]>;
   /**
+   * Bars with from <= sessionDate <= to, reading only the month files in that range, one at a time.
+   * The scan uses this for its lookback window instead of loading every stored month.
+   */
+  loadBarsBetween(from: string, to: string): Promise<CanonicalDailyBar[]>;
+  /**
    * securityId -> sessionDates with a stored daily bar, for one YYYY-MM file only. Streams the
    * month's lines and keeps just those two fields (monthly files are ~100 MB).
    */
@@ -91,6 +96,26 @@ async function readJson<T>(path: string): Promise<T | undefined> {
   }
 }
 
+/** Every YYYY-MM from from's month through to's month (inclusive); empty when to < from. */
+export function monthsBetween(from: string, to: string): string[] {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(from) || !/^\d{4}-\d{2}-\d{2}$/u.test(to)) throw new Error("INVALID_SESSION_DATE");
+  const months: string[] = [];
+  let year = Number(from.slice(0, 4));
+  let month = Number(from.slice(5, 7));
+  const last = to.slice(0, 7);
+  for (let guard = 0; guard < 1200; guard += 1) {
+    const current = `${year}-${String(month).padStart(2, "0")}`;
+    if (current > last) break;
+    months.push(current);
+    month += 1;
+    if (month > 12) {
+      month = 1;
+      year += 1;
+    }
+  }
+  return months;
+}
+
 async function readJsonLines<T>(path: string): Promise<T[]> {
   assertSafeStoreFile(path, MARKET_STORAGE_PATH_ERROR);
   try {
@@ -103,6 +128,11 @@ async function readJsonLines<T>(path: string): Promise<T[]> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
   }
+}
+
+/** A record as it reads back from storage (undefined fields dropped), as canonical JSON. */
+function storedJson(record: unknown): string {
+  return stableJson(JSON.parse(JSON.stringify(record)));
 }
 
 function lineText(records: StoredRecord[]): string {
@@ -228,6 +258,14 @@ export class MarketStorage implements MarketStore {
     return this.readTree("daily-bars", async (file) => readJsonLines<CanonicalDailyBar>(file));
   }
 
+  async loadBarsBetween(from: string, to: string): Promise<CanonicalDailyBar[]> {
+    const output: CanonicalDailyBar[] = [];
+    for (const month of monthsBetween(from, to))
+      for (const bar of await readJsonLines<CanonicalDailyBar>(this.path(`daily-bars/${month}.jsonl`)))
+        if (bar.sessionDate >= from && bar.sessionDate <= to) output.push(bar);
+    return output;
+  }
+
   async loadDailyBarSessions(month: string): Promise<DailyBarSessionIndex> {
     requireMonth(month);
     const path = this.path(`daily-bars/${month}.jsonl`);
@@ -242,21 +280,23 @@ export class MarketStorage implements MarketStore {
 
   async appendBars(records: CanonicalDailyBar[]): Promise<void> {
     const byMonth = new Map<string, CanonicalDailyBar[]>();
-    for (const record of records)
-      byMonth.set(record.sessionDate.slice(0, 7), [
-        ...(byMonth.get(record.sessionDate.slice(0, 7)) ?? []),
-        record,
-      ]);
+    for (const record of records) {
+      const month = record.sessionDate.slice(0, 7);
+      const list = byMonth.get(month);
+      if (list) list.push(record);
+      else byMonth.set(month, [record]);
+    }
     const corrections: CorrectionRecord[] = [];
     for (const [month, monthRecords] of byMonth) {
       const existing = await readJsonLines<CanonicalDailyBar>(this.path(`daily-bars/${month}.jsonl`));
+      // Index once (was a scan of existing + incoming per record), first match wins as before.
+      const firstByKey = new Map<string, CanonicalDailyBar>();
+      for (const item of [...existing, ...monthRecords]) {
+        const k = `${item.securityId}|${item.sessionDate}|${item.revision}`;
+        if (!firstByKey.has(k)) firstByKey.set(k, item);
+      }
       for (const record of monthRecords) {
-        const prior = [...existing, ...monthRecords].find(
-          (item) =>
-            item.securityId === record.securityId &&
-            item.sessionDate === record.sessionDate &&
-            item.revision === record.revision - 1,
-        );
+        const prior = firstByKey.get(`${record.securityId}|${record.sessionDate}|${record.revision - 1}`);
         if (prior)
           corrections.push({
             correctionId: `${record.securityId}|${record.sessionDate}|${record.revision}`,
@@ -475,12 +515,18 @@ export class MarketStorage implements MarketStore {
     const path = this.path(name);
     const existing = await readJsonLines<T>(path);
     const byKey = new Map(existing.map((record) => [key(record), record]));
+    let changed = false;
     for (const record of incoming) {
       const prior = byKey.get(key(record));
-      if (prior && stableJson(prior) !== stableJson(record))
-        throw new Error(`IMMUTABLE_RECORD_CONFLICT:${key(record)}`);
+      if (prior) {
+        // Compare as stored: JSON drops undefined fields. Same content => no-op; any difference throws.
+        if (storedJson(prior) !== storedJson(record)) throw new Error(`IMMUTABLE_RECORD_CONFLICT:${key(record)}`);
+        continue;
+      }
       byKey.set(key(record), record);
+      changed = true;
     }
+    if (!changed) return;
     await this.atomicWrite(
       path,
       lineText([...byKey.values()].sort((a, b) => key(a).localeCompare(key(b))) as StoredRecord[]),

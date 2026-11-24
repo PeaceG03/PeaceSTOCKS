@@ -34,6 +34,8 @@ import {
 } from "./tenmin-history";
 import { tenMinRunOutcome, tenMinScanCheckFailure } from "./tenmin-redispatch";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
+import { scanStageLine } from "./scan-stage-line";
+import { defaultStageSink, hostFailureLine, stageTimed, type StageSink, type StageTracker } from "./scan-stages";
 
 export const DEFAULT_MARKETS_ROOT = "C:\\ProgramData\\PeaceAI\\Markets";
 export const MARKET_SCHEDULER_HOST_PATH_ERROR = "MARKET_SCHEDULER_HOST_PATH_INVALID";
@@ -61,11 +63,14 @@ export interface SchedulerHostResult {
     | "PROVIDER_NOT_READY"
     | "COLLECTION_FAILED"
     | "CATCH_UP_EVIDENCE_ONLY"
+    | "BACKLOG_REMAINS"
     | "PROBE_ONLY";
   readonly sessions: readonly string[];
   readonly reports: readonly ScannerRunReport[];
   readonly completedAt: string;
   readonly intraday?: IntradayBackfillResult;
+  /** Sessions left for the next run when the host stopped at its time or session budget. */
+  readonly backlogRemaining?: readonly string[];
 }
 
 function dateValue(value: string): Date {
@@ -166,6 +171,28 @@ function makeResult(
   });
 }
 
+/** Default wall-clock budget for starting sessions in one host run (the scan job has 120 min in total). */
+export const DEFAULT_SCAN_BUDGET_MS = 65 * 60_000;
+
+/**
+ * PEACESTOCKS_SCAN_BUDGET_MS (ms after which the host starts no new session; blank = 65 min) and
+ * PEACESTOCKS_SCAN_MAX_SESSIONS (most sessions per run; blank = no cap). Plain digits only, anything
+ * else throws so a typo cannot remove the cap.
+ */
+export function scanHostBudget(env: NodeJS.ProcessEnv): { readonly budgetMs: number; readonly maxSessions: number } {
+  const read = (name: string, fallback: number, max: number): number => {
+    const s = env[name]?.trim() ?? "";
+    if (!s) return fallback;
+    if (!/^\d{1,9}$/u.test(s) || Number(s) < 1 || Number(s) > max)
+      throw new Error(`${name}_INVALID:${JSON.stringify(s.slice(0, 20))}`);
+    return Number(s);
+  };
+  return {
+    budgetMs: read("PEACESTOCKS_SCAN_BUDGET_MS", DEFAULT_SCAN_BUDGET_MS, 6 * 3_600_000),
+    maxSessions: read("PEACESTOCKS_SCAN_MAX_SESSIONS", Number.POSITIVE_INFINITY, 100_000),
+  };
+}
+
 /** PEACESTOCKS_REQUIRE_OBJECT_STORE: unset/""/"0" -> off, "1" -> on; anything else throws (a typo must not turn the requirement off). */
 export function hostRequiresObjectStore(value: string | undefined): boolean {
   const s = value?.trim() ?? "";
@@ -191,9 +218,16 @@ export async function runScannerHost(
       readonly to: string;
       readonly maxSessions?: number;
     };
+    /** SCAN_STAGE line sink (tests); defaults to stderr outside the test runner. */
+    readonly stageSink?: StageSink;
+    /** Wall clock in ms for the session budget (tests); defaults to Date.now. */
+    readonly clock?: () => number;
   } = {},
 ): Promise<SchedulerHostResult> {
   const now = options.now ?? new Date();
+  const clock = options.clock ?? Date.now;
+  const startedAt = clock();
+  const budget = scanHostBudget(options.env ?? process.env);
   const configuredRoot =
     options.storageRoot ?? process.env.PEACEAI_MARKETS_ROOT ?? DEFAULT_MARKETS_ROOT;
   if (typeof configuredRoot !== "string" || !configuredRoot.trim())
@@ -212,7 +246,9 @@ export async function runScannerHost(
   }
 
   const calendar = options.calendar ?? US_EQUITY_MARKET_CALENDAR;
-  const storage = openMarketStore(root);
+  const stageSink = options.stageSink ?? defaultStageSink();
+  const tracker: StageTracker = { session: "host" };
+  const storage = stageTimed(openMarketStore(root), "storage", tracker, stageSink);
   await storage.initialize();
   const reports = await storage.loadRunReports();
   // ALREADY_FROZEN counts as completed. NOT_DUE / FAILED / PROVIDER_NOT_READY do not
@@ -269,8 +305,12 @@ export async function runScannerHost(
 
   const env = options.env ?? process.env;
   const groupedDustOn = scanGroupedReplyDustEnabled(env);
-  const provider =
-    options.provider ?? new MassiveMarketProvider(groupedDustOn ? { keepRawReplies: true } : {});
+  const provider = stageTimed(
+    options.provider ?? new MassiveMarketProvider(groupedDustOn ? { keepRawReplies: true } : {}),
+    "provider",
+    tracker,
+    stageSink,
+  );
   let groupedReplyDustStore: ReplyDustStore | undefined;
   if (groupedDustOn) {
     groupedReplyDustStore =
@@ -298,13 +338,31 @@ export async function runScannerHost(
   const collectedSessions = new Set<string>();
   const credentialRejected = (report: ScannerRunReport) =>
     report.unresolvedFailures.some((failure) => failure.includes("MASSIVE_CREDENTIAL_REJECTED"));
+  // Backlog cap: start no new session once the time budget is used or maxSessions have run; the
+  // cursor parks before the first session not started, so the next run picks up the rest.
+  const backlog: string[] = [];
+  const budgetLeft = () => collected.length < budget.maxSessions && clock() - startedAt < budget.budgetMs;
   for (const missedSession of missed) {
+    if (!budgetLeft()) {
+      backlog.push(missedSession);
+      continue;
+    }
+    tracker.session = missedSession;
     const report = await scanner.run(missedSession, "EVIDENCE_ONLY");
     collected.push(report);
     collectedSessions.add(report.session.sessionDate);
     if (credentialRejected(report) || report.status === "PROVIDER_NOT_READY") break;
   }
+  const dueWanted =
+    due.due &&
+    !completed.has(due.session.sessionDate) &&
+    !collectedSessions.has(due.session.sessionDate) &&
+    !collected.some((report) => credentialRejected(report) || report.status === "PROVIDER_NOT_READY");
+  if (dueWanted && (backlog.length > 0 || !budgetLeft())) backlog.push(due.session.sessionDate);
+  if (backlog.length > 0)
+    stageSink(scanStageLine(`${backlog[0]}..${backlog.at(-1)}`, `BACKLOG_REMAINS:${backlog.length}`, clock() - startedAt));
   if (
+    backlog.length === 0 &&
     due.due &&
     !completed.has(due.session.sessionDate) &&
     !collectedSessions.has(due.session.sessionDate) &&
@@ -314,6 +372,7 @@ export async function runScannerHost(
     const mode = forwardFreezeAllowed(due.session.sessionDate, now, calendar)
       ? "FORWARD"
       : "EVIDENCE_ONLY";
+    tracker.session = due.session.sessionDate;
     const report = await scanner.run(due.session.sessionDate, mode);
     collected.push(report);
     collectedSessions.add(report.session.sessionDate);
@@ -332,9 +391,11 @@ export async function runScannerHost(
   // unresolved session. Otherwise park on due.session: when READY that session was collected
   // or already complete; when CLOSED the closed day needs no collection and must not jump to
   // `today` (D+1 would skip today's still-uncollected trading day, e.g. Tue after Labor Day).
-  const nextObserved = unresolved[0]
-    ? addDays(unresolved[0], -1)
+  const firstUnfinished = [unresolved[0], backlog[0]].filter((d): d is string => Boolean(d)).sort()[0];
+  const nextObserved = firstUnfinished
+    ? addDays(firstUnfinished, -1)
     : due.session.sessionDate;
+  tracker.session = "host";
   const nextState = {
     ...state,
     lastObservedSessionDate: nextObserved,
@@ -379,7 +440,7 @@ export async function runScannerHost(
       : collected.length
         ? makeResult(
             missed.length ? "CATCH_UP_COMPLETED" : "COMPLETED",
-            missed.length ? "CATCH_UP_EVIDENCE_ONLY" : "NO_MISSED_SESSION",
+            backlog.length ? "BACKLOG_REMAINS" : missed.length ? "CATCH_UP_EVIDENCE_ONLY" : "NO_MISSED_SESSION",
             collected.map((report) => report.session.sessionDate),
             collected,
           )
@@ -391,7 +452,8 @@ export async function runScannerHost(
                 ? "NO_MISSED_SESSION"
                 : due.reason,
           );
-  const final = intraday ? { ...finalBase, intraday } : finalBase;
+  const withBacklog = backlog.length ? { ...finalBase, backlogRemaining: Object.freeze([...backlog]) } : finalBase;
+  const final = intraday ? { ...withBacklog, intraday } : withBacklog;
   await writeHostResult(root, final);
   return final;
 }
@@ -450,9 +512,7 @@ async function main(): Promise<void> {
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
   main().catch((error: unknown) => {
-    process.stderr.write(
-      `MARKETS_SCHEDULER_HOST_FAILED:${error instanceof Error ? error.message : "UNKNOWN"}\n`,
-    );
+    process.stderr.write(`${hostFailureLine(error)}\n`);
     process.exitCode = 2;
   });
 }
