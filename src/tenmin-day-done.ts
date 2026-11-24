@@ -34,9 +34,36 @@ export interface TenMinSessionDoneInput {
   calendar?: SessionCalendar;
 }
 
+/** Bars stored vs. needed, e.g. "38/39" (20/21 on a half day). Used in every day and stock status. */
+export function barCount(stored: number, needed: number): string {
+  return `${stored}/${needed}`;
+}
+
+/** One stock short of its bars: securityId and the bars it has (capped at the bars needed). */
+export interface TenMinStockBars {
+  securityId: string;
+  bars: number;
+}
+
+/**
+ * Pure: short stocks grouped by their count, e.g. { "38/39": 2, "0/39": 1 }, fewest bars first.
+ * Logs carry this (no stock names); R2 carries the per-stock list.
+ */
+export function shortStockCounts(shortStocks: readonly TenMinStockBars[], needed: number): Record<string, number> {
+  const byBars = new Map<number, number>();
+  for (const stock of shortStocks) byBars.set(stock.bars, (byBars.get(stock.bars) ?? 0) + 1);
+  return Object.fromEntries([...byBars.entries()].sort((a, b) => a[0] - b[0]).map(([bars, n]) => [barCount(bars, needed), n]));
+}
+
 export interface TenMinSessionDone {
   done: boolean;
   expectedBars: number;
+  /** Ten-minute bars stored over every selected stock (each capped at expectedBars). */
+  barsStored: number;
+  /** selected stocks x expectedBars. */
+  barsNeeded: number;
+  /** Each short stock with the bars it has, in selection order. */
+  shortStocks: TenMinStockBars[];
   /** Stocks short of the expected bars (or with none saved). */
   shortNames: string[];
   /** Stocks with no saved daily bar for the session. */
@@ -50,6 +77,7 @@ export interface TenMinSessionDone {
  */
 export function tenMinSessionDone(input: TenMinSessionDoneInput): TenMinSessionDone {
   const expectedBars = expectedTenMinBars(input.sessionDate, input.calendar);
+  const capped = (securityId: string) => Math.min(input.savedBars.get(securityId) ?? 0, expectedBars);
   const shortNames = incompleteNames(
     input.selected.map((securityId) => ({
       securityId,
@@ -61,6 +89,9 @@ export function tenMinSessionDone(input: TenMinSessionDoneInput): TenMinSessionD
   return {
     done: dayFullyStored(tenMinDone, missingDailyBars.length === 0),
     expectedBars,
+    barsStored: input.selected.reduce((sum, securityId) => sum + capped(securityId), 0),
+    barsNeeded: input.selected.length * expectedBars,
+    shortStocks: shortNames.map((securityId) => ({ securityId, bars: capped(securityId) })),
     shortNames,
     missingDailyBars,
   };

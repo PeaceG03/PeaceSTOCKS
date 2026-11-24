@@ -53,9 +53,9 @@ test("health run: a day the daily step keeps re-running short of 39 bars is flag
   await put("2026-10-22", { notDoneRuns: 2, shortNames: 1, missingDailyBars: 0 });
   await put("2026-10-23", { done: { at: "t", expectedBars: 39 }, notDoneRuns: 9, shortNames: 0, missingDailyBars: 0 });
   const stuck = await readStuckDays(store, NOW);
-  assert.deepEqual(stuck, [{ sessionDate: "2026-10-21", expectedBars: 39, shortNames: 3, missingDailyBars: 0, reRuns: 6 }]);
+  assert.deepEqual(stuck, [{ sessionDate: "2026-10-21", expectedBars: 39, shortNames: 3, missingDailyBars: 0, reRuns: 6, bars: "0/0", shortStocks: [], dailyBars: "0/0" }]);
   const result = await runHealthCheck(store, NOW);
-  assert.ok(result.lines.includes("daily 10-minute step: 2026-10-21 stuck short of 39 bars (3 stock/s short) after 6 re-run/s"));
+  assert.ok(result.lines.includes("daily 10-minute step: 2026-10-21 stuck short of 39 bars: 0/0 bars, 3 stock/s short (), daily bars 0/0, after 6 re-run/s"));
 });
 
 test("health workflow: scheduled outside the scan guard windows, R2 only, runs the health check", async () => {

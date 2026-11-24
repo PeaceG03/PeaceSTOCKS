@@ -26,7 +26,7 @@ import { isCheckinSilent } from "./health-silent";
 import { silentParts } from "./health-silent-parts";
 import { R2ObjectClient } from "./object-store";
 import { expectedTenMinBars } from "./tenmin-day-done";
-import { TENMIN_DAILY_CATCHUP_SESSIONS, readTenMinDailyIndex, tenMinDailyCatchupSessions } from "./tenmin-daily-liquid";
+import { TENMIN_DAILY_CATCHUP_SESSIONS, readTenMinDailyIndex, tenMinDailyCatchupSessions, tenMinDailyIndexCounts } from "./tenmin-daily-liquid";
 import { lastCompletedSessionDate } from "./tenmin-history";
 
 export const HEALTHY = "Healthy" as const;
@@ -63,6 +63,22 @@ export interface HealthStuckDay {
   shortNames: number;
   missingDailyBars: number;
   reRuns: number;
+  /** Ten-minute bars stored vs. needed over every selected stock, e.g. "19461/19500". */
+  bars: string;
+  /** Daily bars saved vs. needed, e.g. "500/500". */
+  dailyBars: string;
+  /** Each short stock with its bars stored vs. needed, e.g. "38/39" (R2 only; lines carry counts). */
+  shortStocks: { securityId: string; bars: string }[];
+}
+
+/** Pure: "2 at 38/39, 1 at 0/39" from short stocks (no stock names), fewest bars first. */
+export function shortStocksLine(shortStocks: readonly { bars: string }[]): string {
+  const counts = new Map<string, number>();
+  for (const stock of shortStocks) counts.set(stock.bars, (counts.get(stock.bars) ?? 0) + 1);
+  return [...counts.entries()]
+    .sort((a, b) => Number(a[0].split("/")[0]) - Number(b[0].split("/")[0]))
+    .map(([bars, n]) => `${n} at ${bars}`)
+    .join(", ");
 }
 
 export interface HealthCheckResult {
@@ -87,9 +103,9 @@ function ageMinutes(atIso: string, now: Date): number {
 export function stuckDayLine(day: HealthStuckDay): string {
   const what =
     day.shortNames > 0
-      ? `stuck short of ${day.expectedBars} bars (${day.shortNames} stock/s short)`
-      : `stuck waiting for daily bars (${day.missingDailyBars} stock/s)`;
-  return `daily 10-minute step: ${day.sessionDate} ${what} after ${day.reRuns} re-run/s`;
+      ? `stuck short of ${day.expectedBars} bars: ${day.bars} bars, ${day.shortNames} stock/s short (${shortStocksLine(day.shortStocks)})`
+      : `stuck waiting for daily bars: ${day.bars} bars`;
+  return `daily 10-minute step: ${day.sessionDate} ${what}, daily bars ${day.dailyBars}, after ${day.reRuns} re-run/s`;
 }
 
 export function evaluateHealth(input: {
@@ -161,12 +177,14 @@ export async function readStuckDays(
   for (const sessionDate of tenMinDailyCatchupSessions(lastCompletedSessionDate(now), catchupSessions)) {
     const index = await readTenMinDailyIndex(store, sessionDate).catch(() => undefined);
     if (!index || index.done || !dayStuck(index.notDoneRuns ?? 0)) continue;
+    const expectedBars = expectedTenMinBars(sessionDate);
     output.push({
       sessionDate,
-      expectedBars: expectedTenMinBars(sessionDate),
+      expectedBars,
       shortNames: index.shortNames ?? 0,
       missingDailyBars: index.missingDailyBars ?? 0,
       reRuns: index.notDoneRuns ?? 0,
+      ...(({ dayBars, ...rest }) => ({ bars: dayBars, ...rest }))(tenMinDailyIndexCounts(index, expectedBars)),
     });
   }
   return output;

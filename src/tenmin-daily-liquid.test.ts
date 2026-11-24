@@ -779,3 +779,42 @@ test("history hold: a failed day in the catch-up window holds the chain until a 
   // Outside the window it never blocks.
   assert.equal(await tenMinDailyHistoryHold(new MemoryObjectClient(), { lastCompletedSession: "2026-10-09", catchupSessions: 2 }), undefined);
 });
+
+test("counts: every day and stock status shows bars stored vs. needed (38/39; 20/21 on a half day)", async () => {
+  const store = new MemoryObjectClient();
+  const calls: string[] = [];
+  const short = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+    calls.push(`${sec.symbol}:${from}`);
+    return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, sec.symbol === "BBB" ? 38 : 39));
+  };
+  const run = await baseRun(store, calls, { catchupSessions: 1, fetchPages: short });
+  const day = run.sessions[0]!;
+  assert.equal(day.bars, "116/117", "3 stocks x 39 bars, BBB has 38");
+  assert.equal(day.dailyBars, "3/3");
+  assert.deepEqual(day.shortStockBars, { "38/39": 1 });
+  const index = (await readTenMinDailyIndex(store, "2026-10-09"))!;
+  assert.equal(index.dayBars, "116/117");
+  assert.deepEqual(index.shortStocks, [{ securityId: "sec_bbb", bars: "38/39" }]);
+  assert.equal(index.dailyBars, "3/3");
+  // The run log line (stdout summary) carries the counts but no stock names.
+  assert.ok(!JSON.stringify(run.sessions).includes("sec_bbb"));
+
+  // Half day (2026-11-27): one stock at 20 of 21 bars.
+  const half = new MemoryObjectClient();
+  const halfPages = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+    const open = Date.parse(`${from}T14:30:00Z`);
+    const count = sec.symbol === "CCC" ? 20 : 21;
+    return replyPages(sec.symbol, sec.securityId, from, to, Array.from({ length: count }, (_, i) => aggBar(new Date(open + i * 600_000).toISOString(), 50)));
+  };
+  const halfRun = await baseRun(half, [], { lastCompletedSession: "2026-11-27", catchupSessions: 1, fetchPages: halfPages });
+  assert.equal(halfRun.sessions[0]!.bars, "62/63");
+  assert.deepEqual(halfRun.sessions[0]!.shortStockBars, { "20/21": 1 });
+  assert.deepEqual((await readTenMinDailyIndex(half, "2026-11-27"))!.shortStocks, [{ securityId: "sec_ccc", bars: "20/21" }]);
+
+  // A done day shows its full count, also when skipped on the next run.
+  const done = new MemoryObjectClient();
+  await baseRun(done, [], { catchupSessions: 1 });
+  const again = await baseRun(done, [], { catchupSessions: 1 });
+  assert.equal(again.sessions[0]!.status, "COMPLETE");
+  assert.equal(again.sessions[0]!.bars, "117/117");
+});

@@ -34,7 +34,7 @@ import type { SessionCalendar } from "./scanner";
 import { TENMIN_DAILY_CLOSE_ORIGIN } from "./tenmin-range-entries";
 import { errorMessage, reportPart } from "./health-checkins";
 import { type HistoryHoldDay, historyBlockingDay } from "./history-blocked";
-import { expectedTenMinBars, presentTenMinBars, tenMinSessionDone } from "./tenmin-day-done";
+import { barCount, expectedTenMinBars, presentTenMinBars, shortStockCounts, tenMinSessionDone } from "./tenmin-day-done";
 import { lastCompletedSessionDate, pairRangeForDate } from "./tenmin-history";
 import {
   TENMIN_RANGE_OUTAGE_STREAK,
@@ -297,6 +297,12 @@ export interface TenMinDailyIndex {
   /** Stocks still short of the expected bars / without a saved daily bar after the last pass. */
   shortNames?: number;
   missingDailyBars?: number;
+  /** Day status count: ten-minute bars stored vs. needed over every selected stock, e.g. "19461/19500". */
+  dayBars?: string;
+  /** Each short stock's bars stored vs. needed, e.g. { securityId, bars: "38/39" }. */
+  shortStocks?: { securityId: string; bars: string }[];
+  /** Daily bars saved vs. needed for the selected stocks, e.g. "497/500". */
+  dailyBars?: string;
   updatedAt: string;
   checksum: string;
 }
@@ -380,6 +386,31 @@ async function verifyExistingDaily(
 }
 
 /**
+ * Pure: a day's counts from its index, bars stored vs. needed. Indexes written before the counts
+ * existed get them from their stored entries (a stock with no stored entry has 0 bars).
+ */
+export function tenMinDailyIndexCounts(
+  index: Pick<TenMinDailyIndex, "selected" | "stored" | "done" | "missingDailyBars" | "dayBars" | "shortStocks" | "dailyBars">,
+  expectedBars: number,
+): { dayBars: string; shortStocks: { securityId: string; bars: string }[]; dailyBars: string } {
+  const n = index.selected.length;
+  if (index.done)
+    return { dayBars: index.dayBars ?? barCount(n * expectedBars, n * expectedBars), shortStocks: [], dailyBars: index.dailyBars ?? barCount(n, n) };
+  const saved = new Map(index.stored.map((entry) => [entry.securityId, Math.min(entry.bars ?? 0, expectedBars)]));
+  const shortStocks =
+    index.shortStocks ??
+    index.selected
+      .filter((name) => (saved.get(name.securityId) ?? 0) < expectedBars)
+      .map((name) => ({ securityId: name.securityId, bars: barCount(saved.get(name.securityId) ?? 0, expectedBars) }));
+  const stored = index.selected.reduce((sum, name) => sum + (saved.get(name.securityId) ?? 0), 0);
+  return {
+    dayBars: index.dayBars ?? barCount(stored, n * expectedBars),
+    shortStocks,
+    dailyBars: index.dailyBars ?? barCount(n - (index.missingDailyBars ?? 0), n),
+  };
+}
+
+/**
  * COMPLETE only when the day is done by the done-day rule. WAITING_DAILY_BARS: every stock has all its
  * ten-minute bars but some daily bars are not saved yet (catch-up keeps re-running the day).
  */
@@ -402,6 +433,12 @@ export interface TenMinDailySessionReport {
   missingDailyBars?: number;
   /** Stored names whose short reply was fetched again this run. */
   refetchedThisRun?: number;
+  /** Ten-minute bars stored vs. needed over every selected stock, e.g. "19461/19500". */
+  bars?: string;
+  /** Daily bars saved vs. needed, e.g. "500/500". */
+  dailyBars?: string;
+  /** Short stocks by count, e.g. { "38/39": 2, "0/39": 1 } (no stock names in the run log). */
+  shortStockBars?: Record<string, number>;
 }
 
 export interface TenMinDailyRunReport {
@@ -497,6 +534,10 @@ export async function runTenMinDailyLiquid(options: {
       sessionReport.stored = index.stored.length;
       sessionReport.shortNames = 0;
       sessionReport.missingDailyBars = 0;
+      // A done day has every bar (indexes written before the counts carry no dayBars).
+      sessionReport.bars = index.dayBars ?? barCount(index.selected.length * expectedBars, index.selected.length * expectedBars);
+      sessionReport.dailyBars = index.dailyBars ?? barCount(index.selected.length, index.selected.length);
+      sessionReport.shortStockBars = {};
       report.sessions.push(sessionReport);
       continue;
     }
@@ -672,7 +713,18 @@ export async function runTenMinDailyLiquid(options: {
       calendar,
     });
     const notDoneRuns = (index.notDoneRuns ?? 0) + (!verdict.done && !sessionStopped ? 1 : 0);
-    const { done: _done, notDoneRuns: _runs, shortNames: _short, missingDailyBars: _missing, ...indexBody } = index;
+    const {
+      done: _done,
+      notDoneRuns: _runs,
+      shortNames: _short,
+      missingDailyBars: _missing,
+      dayBars: _dayBars,
+      shortStocks: _shortStocks,
+      dailyBars: _dailyBars,
+      ...indexBody
+    } = index;
+    const dayBars = barCount(verdict.barsStored, verdict.barsNeeded);
+    const dailyBars = barCount(index.selected.length - verdict.missingDailyBars.length, index.selected.length);
     index = finalizeIndex({
       ...indexBody,
       stored: [...stored.values()],
@@ -681,6 +733,9 @@ export async function runTenMinDailyLiquid(options: {
       ...(notDoneRuns ? { notDoneRuns } : {}),
       shortNames: verdict.shortNames.length,
       missingDailyBars: verdict.missingDailyBars.length,
+      dayBars,
+      shortStocks: verdict.shortStocks.map((stock) => ({ securityId: stock.securityId, bars: barCount(stock.bars, verdict.expectedBars) })),
+      dailyBars,
       updatedAt: stamp(),
     });
     await writeTenMinDailyIndex(store, index);
@@ -690,6 +745,9 @@ export async function runTenMinDailyLiquid(options: {
     sessionReport.shortNames = verdict.shortNames.length;
     sessionReport.missingDailyBars = verdict.missingDailyBars.length;
     if (refetched) sessionReport.refetchedThisRun = refetched;
+    sessionReport.bars = dayBars;
+    sessionReport.dailyBars = dailyBars;
+    sessionReport.shortStockBars = shortStockCounts(verdict.shortStocks, verdict.expectedBars);
     sessionReport.status = verdict.done ? "COMPLETE" : !verdict.shortNames.length ? "WAITING_DAILY_BARS" : "PARTIAL";
     report.sessions.push(sessionReport);
   }
