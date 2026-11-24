@@ -167,3 +167,12 @@ test("memory store: putIfMatch replaces only the version it read", async () => {
   assert.equal(dec(await m.get("k"))!.v, 3);
   assert.equal(await m.putIfMatch("missing", enc({}), second.etag), false);
 });
+
+test("state ALERTED is authoritative: even an old marker that says ALERTED with alert CLAIMED never re-alerts", async () => {
+  const client = new MemoryObjectClient();
+  await seed(client);
+  await client.put(MARKER, enc({ at: "2026-10-03T15:00:00.000Z", sessionDate: "2026-10-02", alert: "CLAIMED", state: "ALERTED" }));
+  const c = counter();
+  const r = await runFreezeWatch({ store: client, env: {}, now: NOW, alert: c.alert as never });
+  assert.deepEqual([r.alerted, c.calls()], [[], 0]);
+});
