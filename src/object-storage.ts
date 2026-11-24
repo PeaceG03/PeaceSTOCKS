@@ -150,6 +150,7 @@ export class ObjectMarketStorage implements MarketStore {
   }
 
   async appendBars(records: CanonicalDailyBar[]): Promise<void> {
+    if (!records.length) return;
     const byMonth = new Map<string, CanonicalDailyBar[]>();
     for (const record of records) {
       const month = record.sessionDate.slice(0, 7);
@@ -159,18 +160,31 @@ export class ObjectMarketStorage implements MarketStore {
     }
     const corrections: CorrectionRecord[] = [];
     for (const [month, monthRecords] of byMonth) {
-      const existing = lines<CanonicalDailyBar>(
-        await this.readText(`permanent/daily-bars/${month}.jsonl`),
-      );
-      // Index once (was a full-array scan per record: O(month x incoming), minutes per session on a full month).
-      // First match wins, same order as before (existing, then incoming).
-      const firstByKey = new Map<string, CanonicalDailyBar>();
-      for (const item of [...existing, ...monthRecords]) {
+      const keyName = `permanent/daily-bars/${month}.jsonl`;
+      const got = this.client.getWithEtag
+        ? await this.client.getWithEtag(keyName)
+        : await this.client.get(keyName).then((body) => (body ? { body, etag: undefined } : undefined));
+      const readSha = got ? createHash("sha256").update(got.body).digest("hex") : undefined;
+      const oldLines = got ? text(got.body).split("\n").filter(Boolean) : [];
+      // Keep existing lines byte-for-byte; only append new (securityId, sessionDate, revision) keys.
+      const firstByKey = new Map<string, { record: CanonicalDailyBar; line: string }>();
+      for (const rawLine of oldLines) {
+        const item = JSON.parse(rawLine) as CanonicalDailyBar;
         const k = `${item.securityId}|${item.sessionDate}|${item.revision}`;
-        if (!firstByKey.has(k)) firstByKey.set(k, item);
+        if (!firstByKey.has(k)) firstByKey.set(k, { record: item, line: rawLine });
       }
+      let added = 0;
+      const addedRecords: CanonicalDailyBar[] = [];
       for (const record of monthRecords) {
-        const prior = firstByKey.get(`${record.securityId}|${record.sessionDate}|${record.revision - 1}`);
+        const k = `${record.securityId}|${record.sessionDate}|${record.revision}`;
+        if (firstByKey.has(k)) continue;
+        firstByKey.set(k, { record, line: stableJson(record) });
+        added += 1;
+        addedRecords.push(record);
+      }
+      if (added === 0) continue;
+      for (const record of addedRecords) {
+        const prior = firstByKey.get(`${record.securityId}|${record.sessionDate}|${record.revision - 1}`)?.record;
         if (prior)
           corrections.push({
             correctionId: `${record.securityId}|${record.sessionDate}|${record.revision}`,
@@ -182,15 +196,38 @@ export class ObjectMarketStorage implements MarketStore {
             provenance: record.provenance,
           });
       }
-      this.barCountsByKey.delete(`permanent/daily-bars/${month}.jsonl`);
-      await this.appendUnique(
-        `permanent/daily-bars/${month}.jsonl`,
-        monthRecords,
-        (record) => `${record.securityId}|${record.sessionDate}|${record.revision}`,
-      );
-      this.barCountsByKey.delete(`permanent/daily-bars/${month}.jsonl`);
+      const newLines = [...firstByKey.entries()]
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([, entry]) => entry.line);
+      const newLineSet = new Set(newLines);
+      for (const oldLine of oldLines) {
+        if (!newLineSet.has(oldLine)) throw new Error(`DAILY_BARS_MONTH_LINE_LOST:${keyName}`);
+      }
+      if (newLines.length < oldLines.length) throw new Error(`DAILY_BARS_MONTH_SHRUNK:${keyName}`);
+      const nextBytes = bytes(newLines.join("\n") + "\n");
+      const nextSha = createHash("sha256").update(nextBytes).digest("hex");
+      if (readSha !== undefined && nextSha === readSha) continue;
+      this.barCountsByKey.delete(keyName);
+      if (!got) {
+        if (this.client.putIfAbsent) {
+          if (!(await this.client.putIfAbsent(keyName, nextBytes)))
+            throw new Error(`DAILY_BARS_MONTH_SHA_DRIFT:${keyName}`);
+        } else {
+          if (await this.client.get(keyName)) throw new Error(`DAILY_BARS_MONTH_SHA_DRIFT:${keyName}`);
+          await this.client.put(keyName, nextBytes);
+        }
+      } else if (got.etag !== undefined && this.client.putIfMatch) {
+        if (!(await this.client.putIfMatch(keyName, nextBytes, got.etag)))
+          throw new Error(`DAILY_BARS_MONTH_SHA_DRIFT:${keyName}`);
+      } else {
+        const current = await this.client.get(keyName);
+        if (!current || createHash("sha256").update(current).digest("hex") !== readSha)
+          throw new Error(`DAILY_BARS_MONTH_SHA_DRIFT:${keyName}`);
+        await this.client.put(keyName, nextBytes);
+      }
+      this.barCountsByKey.delete(keyName);
     }
-    await this.appendCorrections(corrections);
+    if (corrections.length > 0) await this.appendCorrections(corrections);
   }
 
   async appendCorrections(records: CorrectionRecord[]): Promise<void> {
@@ -430,9 +467,17 @@ export class ObjectMarketStorage implements MarketStore {
     incoming: T[],
     key: (record: T) => string,
   ): Promise<void> {
+    if (!incoming.length) return;
     const existing = lines<T>(await this.readText(keyName));
     const byKey = new Map(existing.map((record) => [key(record), record]));
-    for (const record of incoming) if (!byKey.has(key(record))) byKey.set(key(record), record);
+    let added = 0;
+    for (const record of incoming) {
+      if (!byKey.has(key(record))) {
+        byKey.set(key(record), record);
+        added += 1;
+      }
+    }
+    if (added === 0) return;
     await this.writeText(keyName, lineText([...byKey.values()].sort((a, b) => key(a).localeCompare(key(b))) as StoredRecord[]));
   }
 
