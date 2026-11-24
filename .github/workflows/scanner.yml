@@ -99,6 +99,7 @@ concurrency:
 
 jobs:
   scan:
+    environment: scanner-data
     # Not on the restarter or daily liquid crons: those ticks only run their own jobs below.
     if: ${{ (github.event_name == 'schedule' && github.event.schedule != '47 * * * *' && github.event.schedule != '20 6 * * 2-6' && github.event.schedule != '20 10 * * 2-6') || github.event.inputs.mode == 'scan' }}
     # Pinned so the runner image cannot change mid-rollout; move to 26.04 deliberately later.
@@ -245,6 +246,7 @@ jobs:
   # and never refetches or overwrites a stored session. Shares the R2 writer group, so it never runs
   # at the same time as a scan or history run (one Massive key, one pace).
   tenmin_daily:
+    environment: scanner-data
     if: ${{ vars.TENMIN_DAILY_ENABLED == 'true' && ((github.event_name == 'schedule' && (github.event.schedule == '20 6 * * 2-6' || github.event.schedule == '20 10 * * 2-6')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'tenmin_daily')) }}
     runs-on: ubuntu-24.04
     # actions: read lets the step see a waiting scheduled scan and yield to it.
@@ -378,6 +380,7 @@ jobs:
   # Freeze watch on the :47 tick too, so a session whose scan never ran (no scan job at all) still raises
   # the missed-freeze alert within the hour after the open. Same script and marker as the scan job's step.
   freeze_watch:
+    environment: scanner-data
     if: ${{ github.event_name == 'schedule' && github.event.schedule == '47 * * * *' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -422,6 +425,7 @@ jobs:
     uses: ./.github/workflows/scan-backstop.yml
 
   backfill:
+    environment: scanner-data
     # No backfill from a topic branch: the job writes the canonical evidence store.
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'backfill' && github.ref == 'refs/heads/main' }}
     # Pinned so the runner image cannot change mid-rollout; move to 26.04 deliberately later.
@@ -506,6 +510,7 @@ jobs:
   # tenmin-history-fallback.yml (wait_for_guard_window_end), which sleeps outside this concurrency
   # group until the window ends and then restarts the chain; the hourly restarter covers the rest.
   tenmin_history:
+    environment: scanner-data
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'tenmin_history' }}
     runs-on: ubuntu-24.04
     # actions: write lets the last step dispatch the next run (GITHUB_TOKEN workflow_dispatch does

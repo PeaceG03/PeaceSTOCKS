@@ -31,6 +31,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   check:
+    environment: scanner-data
     if: ${{ github.ref == 'refs/heads/main' && ((github.event_name == 'schedule' && github.event.schedule == '40 1,7,13,19 * * *') || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'check')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -66,6 +67,7 @@ jobs:
           HEALTH_RESULT_FILE: ${{ runner.temp }}/health-result.json
         run: pnpm -s exec tsx src/health-alert.ts
   weekly:
+    environment: scanner-data
     if: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'schedule' && github.event.workflow_run.head_branch == 'main') || (github.ref == 'refs/heads/main' && ((github.event_name == 'schedule' && github.event.schedule == '30 21 * * 0') || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'weekly'))) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10

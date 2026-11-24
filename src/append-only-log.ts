@@ -54,7 +54,7 @@ export interface LogHead {
 
 export const headPath = (path: string): string => `${path}.head`;
 
-function parseHead(text: string, where: string): LogHead {
+export function parseHead(text: string, where: string): LogHead {
   try {
     const head = JSON.parse(text) as LogHead;
     if (Number.isInteger(head.seq) && head.seq >= 0 && typeof head.hash === "string" && /^[0-9a-f]{64}$/u.test(head.hash)) return head;

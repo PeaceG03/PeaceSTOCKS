@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -95,4 +95,19 @@ test("a fold is positive only when it beats BOTH the universe and SPY", () => {
   assert.equal(foldPositive(m(0.001, -0.001)), false, "beats the universe, loses to SPY");
   assert.equal(foldPositive(m(-0.001, 0.001)), false, "beats SPY, loses to the universe");
   assert.equal(foldPositive(m(0.001, 0)), false);
+});
+
+test("F7: the evaluation carries the strategy's own cost per side, so a 0 bps library run fails the floor", async () => {
+  const { verdictFor } = await import("./research-verdict");
+  const folds = walkForwardFolds(40, strategy("x", ["GOOD"]).folds);
+  for (const bps of [0, 7, 25]) {
+    const dir = mkdtempSync(join(tmpdir(), "var-f7-"));
+    const log = new AppendOnlyLog<VariantRecord>(join(dir, "variants.jsonl"));
+    const s = { ...strategy(`cost-${bps}`, ["GOOD"]), costs: { slippageBpsPerSide: bps } };
+    const evaluation = evaluateStrategy(sessions, folds, s, log);
+    assert.equal(evaluation.costBpsPerSide, bps);
+    const verdict = verdictFor(evaluation, undefined);
+    assert.equal(verdict.reasons.some((r) => /COST_BELOW_FLOOR/u.test(r)), bps < 5, `bps=${bps}`);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

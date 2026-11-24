@@ -11,6 +11,7 @@ import type { HarnessSession } from "./research-costs";
 import { HeldOutSeal, walkForwardFolds, type FoldConfig } from "./research-folds";
 import { evaluateStrategy, holmFamily, type StrategyConfig, type VariantRecord } from "./research-variants";
 import { assertCostFloor, verdictFor } from "./research-verdict";
+import { deriveScannerLabel, SCANNER_LABEL_IS_DERIVED } from "./research-scanner-label";
 
 export function dateArg(value: string): string {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(Date.parse(value)) || new Date(value).toISOString().slice(0, 10) !== value)
@@ -65,11 +66,14 @@ export const RESEARCH_LEDGER_DIR = fileURLToPath(new URL("../research-ledger", i
 export interface ResearchMainDeps {
   /** Tests only: a ledger in a temp folder. The CLI always uses RESEARCH_LEDGER_DIR. */
   ledgerDir?: string;
+  /** Tests only: a fixed scanner label. The CLI always derives it (deriveScannerLabel). */
+  scannerLabel?: string;
 }
 
 export async function researchMain(args: string[], deps: ResearchMainDeps = {}): Promise<void> {
   for (const flag of ["--ledger", "--variants", "--seal", "--heldout-log", "--variants-log"])
     if (args.includes(flag)) throw new Error(`LEDGER_IS_PINNED:${flag}`);
+  if (args.includes("--scanner")) throw new Error(`${SCANNER_LABEL_IS_DERIVED}:git-sha-plus-config-hash`);
   const out = arg(args, "out");
   mkdirSync(out, { recursive: true });
   const ledgerDir = deps.ledgerDir ?? RESEARCH_LEDGER_DIR;
@@ -95,7 +99,8 @@ export async function researchMain(args: string[], deps: ResearchMainDeps = {}):
     trainSessions: Number(arg(args, "train", "63")), testSessions: Number(arg(args, "test", "63")),
     embargoSessions: Number(arg(args, "embargo", "2")), mode: arg(args, "mode", "rolling") === "expanding" ? "expanding" : "rolling",
   };
-  const scanner = arg(args, "scanner"); // exact head/tree supplied by caller, makes the experiment reproducible
+  // Derived from the commit and the scanner config hash (src/research-scanner-label.ts), never typed.
+  const scanner = deps.scannerLabel ?? deriveScannerLabel();
   const lists = ["TOP_15_OVERALL", "TOP_50_OVERALL", "STRONGEST_MOMENTUM", "FASTEST_IMPROVING", "DEFENSIVE_LOW_RISK"];
   const strategies: StrategyConfig[] = lists.map((list) => ({
     name: list, candidates: [{ kind: "scanner-list", list, scanner }], costs: { slippageBpsPerSide: bps },
