@@ -38,6 +38,6 @@ test("real failures still alert; the weekly refill's budget stop is unchanged", 
 });
 
 test("gap-refill.ts main uses refillStopExit, and the scan job's tail passes the refill's own outcome", () => {
-  assert.match(source, /if \(res\.stopped\) \{\n\s+const stop = refillStopExit\(res\.stopped, Boolean\(afterScan\), \{ fetched, sessions: sessions\.length \}\);\n\s+console\.log\(stop\.line\);\n\s+if \(stop\.behind\) behindRemaining = stop\.behind\.remaining;\n\s+return stop\.code;\n\s+\}/u);
+  assert.match(source, /if \(res\.stopped\) \{\n\s+const stop = refillStopExit\(res\.stopped, Boolean\(afterScan\), \{ fetched, sessions: sessions\.length \}\);\n\s+console\.log\(stop\.line\);\n\s+if \(stop\.behind\) behindRemaining = stop\.behind\.remaining;\n\s+if \(stop\.runsCheckFailed\) runsCheckFailedUntilDeadline = true;\n\s+return stop\.code;\n\s+\}/u);
   assert.match(scanner, /outcome: \$\{\{ steps\.post_scan_refill\.outcome \}\}/u);
 });
