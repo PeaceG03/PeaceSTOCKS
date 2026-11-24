@@ -53,6 +53,8 @@ baseline's 5 variants and 5 registrations.
 No command in this PR evaluates the held-out period. That is a deliberate, separate step.
 
 ## Baseline (post-floor v2, 2026-11-24)
+> **Post-`#136` backfill note:** When the `#136` delisted backfill lands, the development baseline must be re-run under a new derived scanner label (and any dev-cache rebuilt against the new data SHA-256 manifest) before scoring new ideas. Do not run it until `#136` completes.
+
 
 Scanner label `7586e96ac8e4 scanner-v0.1 config-d003c0562045` (derived: commit 7586e96 on
 builder/harness-next, which ranks with eligibility floor v2; the harness-v1 label is not reused).

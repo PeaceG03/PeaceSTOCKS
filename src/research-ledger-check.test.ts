@@ -205,3 +205,17 @@ test("ledger check: preregistration config, doc, and preregistration.jsonl are i
     rmSync(r.dir, { recursive: true, force: true });
   }
 });
+
+test("ledger check: committed dev-cache artifacts are refused", () => {
+  const r = repo();
+  try {
+    mkdirSync(join(r.dir, "dev-cache"), { recursive: true });
+    writeFileSync(join(r.dir, "dev-cache", "features.jsonl"), "{}\n");
+    git(r.dir, "add", "-f", "dev-cache/features.jsonl");
+    git(r.dir, "commit", "-q", "-m", "committed dev cache");
+    const problems = ledgerProblemsAgainstBase(r.dir, "base");
+    assert.ok(problems.some((p) => /^dev-cache:committed:dev-cache\/features\.jsonl$/u.test(p)), JSON.stringify(problems));
+  } finally {
+    rmSync(r.dir, { recursive: true, force: true });
+  }
+});

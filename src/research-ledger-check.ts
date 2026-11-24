@@ -106,6 +106,12 @@ export function ledgerProblemsAgainstBase(top: string, baseRef: string): string[
     if (!existsSync(path)) problems.push(`${name}:missing`);
     else if (readFileSync(path, "utf8") !== git(top, ["show", `${base}:${marker}`])) problems.push(`${name}:changed`);
   }
+  const tracked = git(top, ["ls-files", "-z"]).split("\0").filter(Boolean);
+  for (const file of tracked) {
+    if (/(^|\/)dev-cache\//u.test(file) || /(^|\/)[^/]*dev-cache[^/]*\.jsonl$/u.test(file)) {
+      problems.push(`dev-cache:committed:${file}`);
+    }
+  }
   return problems;
 }
 

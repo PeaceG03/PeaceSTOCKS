@@ -3,11 +3,14 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { SecurityMasterRecord } from "./contracts";
+import type { CorporateAction, SecurityMasterRecord } from "./contracts";
 import { EvalHistory, rng, type EvalBar } from "./holdout-eval";
 import { buildHarnessSession } from "./research-harness-data";
 import {
   buildDevFeatureCache,
+  computeDevDataManifest,
+  DEV_CACHE_MANIFEST_MISMATCH,
+  DEV_CACHE_OUT_IN_REPO,
   DEV_CACHE_REFUSED_HELDOUT,
   extractDevCacheSession,
   readDevFeatureCache,
@@ -39,38 +42,32 @@ function world(n: number, days: string[], seed: number) {
   return { bars, ids };
 }
 
-test("dev cache refuses any session or outcome >= heldOutStart", async () => {
+test("dev cache refuses any session or outcome >= heldOutStart, plus DC_READ_NO_META_CHECK and DC_READ_NO_EXIT_CHECK", async () => {
   const days = weekdays(130);
   const { bars, ids } = world(25, days, 11);
   const master = ids.map((id) => rec(id));
   const history = new EvalHistory(bars);
   const heldOutStart = days[120]!;
 
-  // Session D == heldOutStart -> refused
   assert.throws(
     () => extractDevCacheSession(master, history, 120, heldOutStart, { splitActions: [] }),
     new RegExp(DEV_CACHE_REFUSED_HELDOUT),
   );
-  // Session D > heldOutStart -> refused
   assert.throws(
     () => extractDevCacheSession(master, history, 122, heldOutStart, { splitActions: [] }),
     new RegExp(DEV_CACHE_REFUSED_HELDOUT),
   );
-  // Session D is heldOutStart - 1: entry (D+1) is heldOutStart -> refused
   assert.throws(
     () => extractDevCacheSession(master, history, 119, heldOutStart, { splitActions: [] }),
     new RegExp(DEV_CACHE_REFUSED_HELDOUT),
   );
-  // Session D is heldOutStart - 2: exit (D+2) is heldOutStart -> refused
   assert.throws(
     () => extractDevCacheSession(master, history, 118, heldOutStart, { splitActions: [] }),
     new RegExp(DEV_CACHE_REFUSED_HELDOUT),
   );
-  // Session D is heldOutStart - 3: exit (D+2) is heldOutStart - 1 (< heldOutStart) -> allowed
   const ok = extractDevCacheSession(master, history, 117, heldOutStart, { splitActions: [] });
   assert.ok(ok && ok.sessionDate === days[117] && ok.exitDate === days[119]);
 
-  // buildDevFeatureCache refuses from >= heldOutStart or tampered cache files on read
   const dir = mkdtempSync(join(tmpdir(), "dev-cache-refuse-"));
   try {
     writeSyntheticStore(dir, { from: "2025-01-01", to: "2025-08-29" });
@@ -84,7 +81,45 @@ test("dev cache refuses any session or outcome >= heldOutStart", async () => {
       }),
       new RegExp(DEV_CACHE_REFUSED_HELDOUT),
     );
+    // Refuses heldOutStart later than 2026-08-27
+    await assert.rejects(
+      buildDevFeatureCache({
+        dataRoot: dir,
+        outFile: join(dir, "cache.jsonl"),
+        from: "2025-04-01",
+        heldOutStart: "2026-08-28",
+        minBars: 1,
+      }),
+      new RegExp(DEV_CACHE_REFUSED_HELDOUT),
+    );
+    // Refuses non-integer or < 1 minBars
+    for (const badMin of [0, -1, 1.5, Number.NaN]) {
+      await assert.rejects(
+        buildDevFeatureCache({
+          dataRoot: dir,
+          outFile: join(dir, "cache.jsonl"),
+          from: "2025-04-01",
+          heldOutStart: "2025-08-01",
+          minBars: badMin,
+        }),
+        /INVALID_MIN_BARS/u,
+      );
+    }
+    // Refuses --out inside repo
+    await assert.rejects(
+      buildDevFeatureCache({
+        dataRoot: dir,
+        outFile: join(dir, "repo", "dev-cache", "cache.jsonl"),
+        from: "2025-04-01",
+        heldOutStart: "2025-08-01",
+        minBars: 1,
+        repoRoot: join(dir, "repo"),
+      }),
+      new RegExp(DEV_CACHE_OUT_IN_REPO),
+    );
+
     const cacheFile = join(dir, "cache.jsonl");
+    const manifest = computeDevDataManifest(dir, "2025-04-01", "2025-08-01");
     await buildDevFeatureCache({
       dataRoot: dir,
       outFile: cacheFile,
@@ -92,24 +127,76 @@ test("dev cache refuses any session or outcome >= heldOutStart", async () => {
       heldOutStart: "2025-08-01",
       minBars: 1,
     });
-    const loaded = readDevFeatureCache(cacheFile, "2025-08-01");
+    const loaded = readDevFeatureCache(cacheFile, "2025-08-01", manifest);
     assert.ok(loaded.sessions.length > 0);
+    assert.equal(loaded.meta.manifest.manifestSha256, manifest.manifestSha256);
     assert.ok(loaded.sessions.every((s) => s.sessionDate < "2025-08-01" && s.exitDate < "2025-08-01"));
 
-    // Reading with an earlier heldOutStart refuses contaminated cached rows
+    // DC_READ_NO_META_CHECK: empty cache with meta.heldOutStart > expectedHeldOutStart must still be refused
+    const emptyCache = join(dir, "empty-cache.jsonl");
+    const metaLine = readFileSync(cacheFile, "utf8").split("\n")[0]!;
+    writeFileSync(emptyCache, `${metaLine}\n`);
     assert.throws(
-      () => readDevFeatureCache(cacheFile, loaded.sessions[0]!.exitDate),
-      new RegExp(DEV_CACHE_REFUSED_HELDOUT),
+      () => readDevFeatureCache(emptyCache, "2025-07-01", manifest),
+      new RegExp(`${DEV_CACHE_REFUSED_HELDOUT}:meta`),
     );
 
-    // Injecting a held-out session line into the cache file is refused on read
+    // DC_READ_NO_EXIT_CHECK: meta.heldOutStart <= expected, sessionDate < entryDate < expected <= exitDate -> refused
     const lines = readFileSync(cacheFile, "utf8").trimEnd().split("\n");
     const last = JSON.parse(lines.at(-1)!) as Record<string, unknown>;
-    writeFileSync(cacheFile, `${lines.join("\n")}\n${JSON.stringify({ ...last, sessionDate: "2025-08-01", entryDate: "2025-08-04", exitDate: "2025-08-05" })}\n`);
-    assert.throws(() => readDevFeatureCache(cacheFile, "2025-08-01"), new RegExp(DEV_CACHE_REFUSED_HELDOUT));
+    const exitContaminated = join(dir, "exit-contaminated.jsonl");
+    writeFileSync(
+      exitContaminated,
+      `${lines.join("\n")}\n${JSON.stringify({ ...last, sessionDate: "2025-07-30", entryDate: "2025-07-31", exitDate: "2025-08-01" })}\n`,
+    );
+    assert.throws(
+      () => readDevFeatureCache(exitContaminated, "2025-08-01", manifest),
+      new RegExp(`${DEV_CACHE_REFUSED_HELDOUT}:cached-exit`),
+    );
+
+    // B3: changing data (e.g. corporate actions or bars or expected manifest) triggers DEV_CACHE_MANIFEST_MISMATCH
+    assert.throws(
+      () => readDevFeatureCache(cacheFile, "2025-08-01", "deadbeef".repeat(8)),
+      new RegExp(DEV_CACHE_MANIFEST_MISMATCH),
+    );
+    writeFileSync(join(dir, "permanent/corporate-actions.jsonl"), readFileSync(join(dir, "permanent/corporate-actions.jsonl"), "utf8") + "\n ");
+    const changedManifest = computeDevDataManifest(dir, "2025-04-01", "2025-08-01");
+    assert.throws(
+      () => readDevFeatureCache(cacheFile, "2025-08-01", changedManifest),
+      new RegExp(DEV_CACHE_MANIFEST_MISMATCH),
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("DC_NO_SPLIT_EXIT_NULL: a split taking effect on D+2 nulls that stock's cached outcome and drops it from universeSize", () => {
+  const days = weekdays(125);
+  const { bars, ids } = world(30, days, 19);
+  const master = ids.map((id) => rec(id));
+  const history = new EvalHistory(bars);
+  const heldOutStart = days[120]!;
+  const i = 110;
+  const base = extractDevCacheSession(master, history, i, heldOutStart, { splitActions: [] })!;
+  const targetId = base.candidates[0]!.securityId;
+  assert.notEqual(base.candidates[0]!.outcome, null);
+
+  const splitOnExit = {
+    actionId: "split-exit",
+    securityId: targetId,
+    actionType: "SPLIT",
+    effectiveDate: days[i + 2]!,
+    details: { split_from: 1, split_to: 2 },
+    observedAt: "2020-01-01T00:00:00Z",
+  } as unknown as CorporateAction;
+  const withSplit = extractDevCacheSession(master, history, i, heldOutStart, { splitActions: [splitOnExit] })!;
+  const targetEntry = withSplit.candidates.find((c) => c.securityId === targetId)!;
+  assert.equal(targetEntry.outcome, null);
+  assert.equal(withSplit.universeSize, base.universeSize - 1);
+
+  const splitOnEntry = { ...splitOnExit, effectiveDate: days[i + 1]! } as CorporateAction;
+  const withEntrySplit = extractDevCacheSession(master, history, i, heldOutStart, { splitActions: [splitOnEntry] })!;
+  assert.notEqual(withEntrySplit.candidates.find((c) => c.securityId === targetId)!.outcome, null);
 });
 
 test("dev cache matches buildHarnessSession universeSize, universeMean, and outcomes point-in-time", () => {
@@ -125,6 +212,6 @@ test("dev cache matches buildHarnessSession universeSize, universeMean, and outc
   assert.equal(cached.universeSize, harness.session.universeSize);
   assert.ok(Math.abs(cached.universeMean - harness.session.universeMean) < 1e-12);
   assert.equal(cached.candidates.length, harness.session.universeSize);
-  assert.ok(cached.candidates.every((c) => c.securityId !== ids[0])); // ETF excluded
+  assert.ok(cached.candidates.every((c) => c.securityId !== ids[0]));
   assert.ok(cached.candidates.every((c) => typeof c.features.RETURN_20D === "number" && typeof c.extra.return1d === "number"));
 });

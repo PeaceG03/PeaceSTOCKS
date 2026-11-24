@@ -3,12 +3,17 @@
  *
  * Precomputes per-session eligible STOCK features and open(D+1) -> open(D+2) outcomes strictly
  * before `heldOutStart` (default 2026-08-27) so Phase 2 scoring experiments run in seconds without
- * re-streaming ~2.5 GB of raw JSONL bars. Refuses any session, entry, or exit >= heldOutStart.
+ * re-streaming ~2.5 GB of raw JSONL bars. Refuses any session, entry, or exit >= heldOutStart,
+ * refuses heldOutStart > 2026-08-27, refuses --out inside the repository, and embeds a SHA-256
+ * manifest of raw bars, security master, corporate actions, and scanner/floor config so stale
+ * pre-#136 caches are refused on read.
  * Offline only: no network, no provider, no live bucket, and no tickers/symbols stored.
  */
-import { createWriteStream, mkdirSync, readFileSync } from "node:fs";
-import { dirname } from "node:path";
-import { pathToFileURL } from "node:url";
+import { createHash } from "node:crypto";
+import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { stableJson } from "./append-only-log";
 import type { CanonicalDailyBar, CorporateAction, SecurityMasterRecord } from "./contracts";
 import { ELIGIBILITY_FLOOR, floorExclusion } from "./eligibility-floor";
 import { reconstructFeatures } from "./features";
@@ -16,12 +21,26 @@ import { EvalHistory, pointInTimeSecurities, scanInputBars, splitActionsKnownAt 
 import { improvementValue, STOCK_LIST_ASSET_TYPE } from "./ranking";
 import { dateArg, loadResearchData } from "./research-harness-cli";
 import { openToNextOpen, splitDatesById } from "./research-harness-data";
+import { scannerConfigHash } from "./research-scanner-label";
 import { resolveSpyBenchmarkId, type SessionCalendar } from "./scanner";
 import { splitAdjustedBars, splitEventsBySecurity } from "./split-adjust";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 
 export const DEV_CACHE_REFUSED_HELDOUT = "DEV_CACHE_REFUSED_HELDOUT";
+export const DEV_CACHE_MANIFEST_MISMATCH = "DEV_CACHE_MANIFEST_MISMATCH";
+export const DEV_CACHE_OUT_IN_REPO = "DEV_CACHE_OUT_IN_REPO";
 export const DEFAULT_HELDOUT_START = "2026-08-27";
+
+const REPO_TOP = fileURLToPath(new URL("..", import.meta.url));
+const shift = (s: string, n: number) => new Date(Date.parse(`${s}T00:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
+
+export interface DevCacheManifest {
+  dailyBars: Array<{ file: string; sha256: string }>;
+  securityMasterSha256: string;
+  corporateActionsSha256: string;
+  scannerConfigHash: string;
+  manifestSha256: string;
+}
 
 export interface DevCacheExtraFeatures {
   return1d: number | null;
@@ -56,14 +75,69 @@ export interface DevCacheSession {
 
 export interface DevCacheMeta {
   kind: "dev-cache-meta";
-  version: 1;
+  version: 2;
   from: string;
   heldOutStart: string;
   sessionCount: number;
+  manifest: DevCacheManifest;
 }
 
 export function assertBeforeHeldOut(date: string, heldOutStart: string, role: string): void {
   if (date >= heldOutStart) throw new Error(`${DEV_CACHE_REFUSED_HELDOUT}:${role}:${date}>=${heldOutStart}`);
+}
+
+function hashFileSync(path: string): string {
+  const hash = createHash("sha256");
+  const fd = openSync(path, "r");
+  const buf = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    let n = 0;
+    while ((n = readSync(fd, buf, 0, buf.length, null)) > 0) {
+      hash.update(buf.subarray(0, n));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest("hex");
+}
+
+function resolveForPathCheck(target: string): string {
+  const abs = resolve(target);
+  if (existsSync(abs)) return realpathSync(abs);
+  const parent = dirname(abs);
+  if (parent !== abs && existsSync(parent)) return join(realpathSync(parent), abs.slice(parent.length + 1));
+  return abs;
+}
+
+function assertOutOutsideRepo(outFile: string, repoRoot: string): void {
+  const repoReal = resolveForPathCheck(repoRoot);
+  const outReal = resolveForPathCheck(outFile);
+  const rel = relative(repoReal, outReal);
+  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
+    throw new Error(`${DEV_CACHE_OUT_IN_REPO}:${outFile}`);
+  }
+}
+
+export function computeDevDataManifest(dataRoot: string, from: string, heldOutStart: string): DevCacheManifest {
+  const loadFromMonth = shift(from, -370).slice(0, 7);
+  const beforeMonth = heldOutStart.slice(0, 7);
+  const barsDir = join(dataRoot, "permanent/daily-bars");
+  const dailyBars = existsSync(barsDir)
+    ? readdirSync(barsDir)
+        .filter((f) => /^\d{4}-\d{2}\.jsonl$/u.test(f))
+        .filter((f) => {
+          const ym = f.slice(0, 7);
+          return ym >= loadFromMonth && ym <= beforeMonth;
+        })
+        .sort()
+        .map((file) => ({ file, sha256: hashFileSync(join(barsDir, file)) }))
+    : [];
+  const securityMasterSha256 = hashFileSync(join(dataRoot, "permanent/security-master.json"));
+  const corporateActionsSha256 = hashFileSync(join(dataRoot, "permanent/corporate-actions.jsonl"));
+  const cfgHash = scannerConfigHash();
+  const payload = { dailyBars, securityMasterSha256, corporateActionsSha256, scannerConfigHash: cfgHash };
+  const manifestSha256 = createHash("sha256").update(stableJson(payload)).digest("hex");
+  return { ...payload, manifestSha256 };
 }
 
 function retBack(closes: readonly number[], back: number): number | null {
@@ -217,11 +291,19 @@ export async function buildDevFeatureCache(options: {
   from?: string;
   heldOutStart?: string;
   minBars?: number;
+  repoRoot?: string;
 }): Promise<DevCacheMeta> {
   const from = dateArg(options.from ?? "2025-03-03");
   const heldOutStart = dateArg(options.heldOutStart ?? DEFAULT_HELDOUT_START);
+  if (heldOutStart > DEFAULT_HELDOUT_START) {
+    throw new Error(`${DEV_CACHE_REFUSED_HELDOUT}:heldout-after-${DEFAULT_HELDOUT_START}:${heldOutStart}`);
+  }
   assertBeforeHeldOut(from, heldOutStart, "from");
   const minBars = options.minBars ?? 1000;
+  if (!(Number.isInteger(minBars) && minBars >= 1)) throw new Error("INVALID_MIN_BARS");
+  assertOutOutsideRepo(options.outFile, options.repoRoot ?? REPO_TOP);
+
+  const manifest = computeDevDataManifest(options.dataRoot, from, heldOutStart);
   const { history, master, actions } = await loadResearchData(options.dataRoot, from, heldOutStart, minBars);
   for (const s of history.sessions) assertBeforeHeldOut(s, heldOutStart, "loaded-session");
   const splitDates = splitDatesById(actions);
@@ -232,12 +314,12 @@ export async function buildDevFeatureCache(options: {
     if (got) sessions.push(got);
     if (k % 25 === 0) console.log(`dev-cache progress ${k + 1}/${indexes.length}; aggregate only`);
   }
-  const meta: DevCacheMeta = { kind: "dev-cache-meta", version: 1, from, heldOutStart, sessionCount: sessions.length };
+  const meta: DevCacheMeta = { kind: "dev-cache-meta", version: 2, from, heldOutStart, sessionCount: sessions.length, manifest };
   mkdirSync(dirname(options.outFile), { recursive: true });
-  await new Promise<void>((resolve, reject) => {
+  await new Promise<void>((resolveWrite, rejectWrite) => {
     const stream = createWriteStream(options.outFile, { encoding: "utf8" });
-    stream.on("error", reject);
-    stream.on("finish", resolve);
+    stream.on("error", rejectWrite);
+    stream.on("finish", resolveWrite);
     stream.write(`${JSON.stringify(meta)}\n`);
     for (const s of sessions) stream.write(`${JSON.stringify({ kind: "session", ...s })}\n`);
     stream.end();
@@ -245,16 +327,28 @@ export async function buildDevFeatureCache(options: {
   return meta;
 }
 
-export function readDevFeatureCache(cachePath: string, expectedHeldOutStart: string = DEFAULT_HELDOUT_START): {
+export function readDevFeatureCache(
+  cachePath: string,
+  expectedHeldOutStart: string,
+  expectedManifest: DevCacheManifest | string,
+): {
   meta: DevCacheMeta;
   sessions: DevCacheSession[];
 } {
+  if (expectedHeldOutStart > DEFAULT_HELDOUT_START) {
+    throw new Error(`${DEV_CACHE_REFUSED_HELDOUT}:heldout-after-${DEFAULT_HELDOUT_START}:${expectedHeldOutStart}`);
+  }
   const lines = readFileSync(cachePath, "utf8").split("\n").filter(Boolean);
   if (!lines.length) throw new Error("DEV_CACHE_EMPTY");
   const meta = JSON.parse(lines[0]!) as DevCacheMeta;
-  if (meta.kind !== "dev-cache-meta" || meta.version !== 1) throw new Error("DEV_CACHE_INVALID_META");
+  if (meta.kind !== "dev-cache-meta" || meta.version !== 2) throw new Error("DEV_CACHE_INVALID_META");
   if (meta.heldOutStart > expectedHeldOutStart) {
     throw new Error(`${DEV_CACHE_REFUSED_HELDOUT}:meta:${meta.heldOutStart}>${expectedHeldOutStart}`);
+  }
+  const wantSha = typeof expectedManifest === "string" ? expectedManifest : expectedManifest.manifestSha256;
+  const gotSha = meta.manifest?.manifestSha256;
+  if (!gotSha || gotSha !== wantSha) {
+    throw new Error(`${DEV_CACHE_MANIFEST_MISMATCH}:${gotSha ?? "missing"}!=${wantSha}`);
   }
   const sessions: DevCacheSession[] = [];
   for (const line of lines.slice(1)) {
@@ -291,5 +385,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     heldOutStart: get("heldout-from", DEFAULT_HELDOUT_START),
     minBars: Number(get("min-bars", "1000")),
   });
-  console.log(`dev-cache built: sessions=${meta.sessionCount} heldOutStart=${meta.heldOutStart}`);
+  console.log(`dev-cache built: sessions=${meta.sessionCount} heldOutStart=${meta.heldOutStart} manifest=${meta.manifest.manifestSha256.slice(0, 12)}`);
 }
