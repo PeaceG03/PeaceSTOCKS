@@ -199,9 +199,14 @@ export class ObjectMarketStorage implements MarketStore {
       const newLines = [...firstByKey.entries()]
         .sort((a, b) => a[0].localeCompare(b[0]))
         .map(([, entry]) => entry.line);
-      const newLineSet = new Set(newLines);
+      const newIndex = new Map<string, number>();
+      newLines.forEach((line, idx) => newIndex.set(line, idx));
+      let prevIdx = -1;
       for (const oldLine of oldLines) {
-        if (!newLineSet.has(oldLine)) throw new Error(`DAILY_BARS_MONTH_LINE_LOST:${keyName}`);
+        const idx = newIndex.get(oldLine);
+        if (idx === undefined) throw new Error(`DAILY_BARS_MONTH_LINE_LOST:${keyName}`);
+        if (idx <= prevIdx) throw new Error(`DAILY_BARS_MONTH_ORDER_DRIFT:${keyName}`);
+        prevIdx = idx;
       }
       if (newLines.length < oldLines.length) throw new Error(`DAILY_BARS_MONTH_SHRUNK:${keyName}`);
       const nextBytes = bytes(newLines.join("\n") + "\n");

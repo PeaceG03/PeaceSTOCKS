@@ -191,3 +191,23 @@ test("appendBars is a no-op when 0 new bar keys exist, preserves existing lines 
   };
   await assert.rejects(() => new ObjectMarketStorage(fallbackClient).appendBars([bar(idC, "2026-01-22", 60)]), /DAILY_BARS_MONTH_SHA_DRIFT/);
 });
+
+test("appendBars preserves relative order of existing lines and refuses unsorted existing order drift", async () => {
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
+  const idA = securityId("fixture-provider", "issuer-a", "STOCK");
+  const idB = securityId("fixture-provider", "issuer-b", "STOCK");
+  const idC = securityId("fixture-provider", "issuer-c", "STOCK");
+  const key = "permanent/daily-bars/2026-01.jsonl";
+  const lA = JSON.stringify(bar(idA, "2026-01-22", 10));
+  const lC = JSON.stringify(bar(idC, "2026-01-22", 30));
+  // Sorted existing lines [A, C] + inserting B preserves A before C.
+  await client.put(key, new TextEncoder().encode(`${lA}\n${lC}\n`));
+  await storage.appendBars([bar(idB, "2026-01-22", 20)]);
+  const after = new TextDecoder().decode((await client.get(key))!).split("\n").filter(Boolean);
+  assert.ok(after.indexOf(lA) < after.indexOf(lC));
+  // Unsorted existing lines [C, A] + inserting another key refuses order drift.
+  const idD = securityId("fixture-provider", "issuer-d", "STOCK");
+  await client.put(key, new TextEncoder().encode(`${lC}\n${lA}\n`));
+  await assert.rejects(() => storage.appendBars([bar(idD, "2026-01-22", 40)]), /DAILY_BARS_MONTH_ORDER_DRIFT/);
+});

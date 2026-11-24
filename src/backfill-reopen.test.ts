@@ -538,3 +538,21 @@ test("B1 reopen appends INACTIVE-only: skips non-colliding ACTIVE missing rows a
   assert.deepEqual(report.backfill.reopenSkippedCollisionByStatus, { INACTIVE: 1 });
   assert.deepEqual(report.backfill.reopenSkippedNonInactiveByStatus, { ACTIVE: 1 });
 });
+
+test("corrupt backfill-reopen-state.json refuses instead of silently restarting", async () => {
+  const { client, storage } = await seedStore({ withReplyDust: true });
+  await client.put("backfill-reopen-state.json", new TextEncoder().encode("{not-valid-json"));
+  const fake = makeFake();
+  await assert.rejects(
+    () => runBackfillJob(jobOpts(client, storage, fake, DAYS[0]!, DAYS[0]!, { reopenInactiveTails: true })),
+    /JSON|BACKFILL_REOPEN_STATE_CORRUPT/u,
+  );
+  await client.put(
+    "backfill-reopen-state.json",
+    new TextEncoder().encode(JSON.stringify({ schemaVersion: "wrong", provider: "massive-stocks" })),
+  );
+  await assert.rejects(
+    () => runBackfillJob(jobOpts(client, storage, fake, DAYS[0]!, DAYS[0]!, { reopenInactiveTails: true })),
+    /BACKFILL_REOPEN_STATE_CORRUPT/u,
+  );
+});

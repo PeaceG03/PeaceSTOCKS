@@ -225,21 +225,20 @@ function emptyReopenState(provider: string): BackfillReopenState {
 }
 
 async function readReopenProgress(storage: MarketStore, provider: string): Promise<BackfillReopenState> {
-  try {
-    const raw = (await storage.loadBackfillReopenProgress?.()) as BackfillReopenState | undefined;
-    if (
-      raw &&
-      raw.schemaVersion === REOPEN_STATE_VERSION &&
-      raw.provider === provider &&
-      Array.isArray(raw.completedSessions) &&
-      raw.failedSessions &&
-      typeof raw.failedSessions === "object"
-    )
-      return raw;
-  } catch {
-    // Treat corrupt or missing reopen progress as fresh.
+  const raw = (await storage.loadBackfillReopenProgress?.()) as BackfillReopenState | undefined;
+  if (raw === undefined) return emptyReopenState(provider);
+  if (
+    typeof raw !== "object" ||
+    raw === null ||
+    raw.schemaVersion !== REOPEN_STATE_VERSION ||
+    raw.provider !== provider ||
+    !Array.isArray(raw.completedSessions) ||
+    !raw.failedSessions ||
+    typeof raw.failedSessions !== "object"
+  ) {
+    throw new Error("BACKFILL_REOPEN_STATE_CORRUPT");
   }
-  return emptyReopenState(provider);
+  return raw;
 }
 
 async function writeReopenProgress(storage: MarketStore, state: BackfillReopenState): Promise<void> {
