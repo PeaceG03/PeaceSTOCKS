@@ -519,3 +519,25 @@ test("site deploy workflow: EVERY wrangler command (deploy and secret bulk) runs
     assert.equal(wrapped, expected, `${name}: wrapped command lines`);
   }
 });
+
+test("trim-step-env: the child gets exactly the given command and argv, nothing appended (no values on argv)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "trim-argv-"));
+  try {
+    const outFile = join(dir, "argv.json");
+    const result = runTrimStepEnv(
+      { PATH: process.env.PATH ?? "/usr/bin:/bin", CLOUDFLARE_API_TOKEN: " tok_abc\n", CLOUDFLARE_ACCOUNT_ID: "acct123 " },
+      [process.execPath, "-e", "require('fs').writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(1)))", outFile, "two words", "--", "x"],
+    );
+    assert.equal(result.status, 0, result.out);
+    // process.argv for `node -e code a b ...` is [node, a, b, ...]: exactly the arguments given after the command.
+    assert.deepEqual(JSON.parse(readFileSync(outFile, "utf8")), [outFile, "two words", "--", "x"]);
+    // And with no arguments at all, the child sees none.
+    const bare = join(dir, "bare.json");
+    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", CLOUDFLARE_API_TOKEN: "tok_abc", CLOUDFLARE_ACCOUNT_ID: "acct123", OUT: bare };
+    const none = runTrimStepEnv(env, [process.execPath, "-e", "require('fs').writeFileSync(process.env.OUT, JSON.stringify(process.argv.slice(1)))"]);
+    assert.equal(none.status, 0, none.out);
+    assert.deepEqual(JSON.parse(readFileSync(bare, "utf8")), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
