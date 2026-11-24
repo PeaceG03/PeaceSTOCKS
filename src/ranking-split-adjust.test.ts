@@ -285,3 +285,17 @@ test("reconcile band is [1/1.5, 1.5]: a split record that leaves a ~90% move is 
   assert.ok("bars" in at(10 * 1.45, 10));
   assert.ok("bars" in at(10 / 1.45, 10));
 });
+
+test("same-date conflict is excluded even when one of the two factors alone would reconcile (either order)", () => {
+  // Raw prices jump exactly 10x: the 1-for-10 record alone would reconcile; the 2-for-1 alone would not.
+  const { securities, bars } = world(10);
+  const reverse = split("rs", SPLIT_DAY, 10, 1);
+  const forward = { ...split("rs", SPLIT_DAY, 1, 2), actionId: "a_rs_forward" };
+  for (const actions of [[reverse, forward], [forward, reverse]]) {
+    const result = rank(securities, bars, [], D, DEFAULT_SCANNER_CONFIG, actions);
+    assert.equal(result.ranked.some((r) => r.securityId === "rs"), false);
+    assert.deepEqual(result.excluded, [{ securityId: "rs", reason: "SPLIT_UNRECONCILED" }]);
+  }
+  // Control: the 1-for-10 record on its own is used and the name is ranked.
+  assert.ok(rank(securities, bars, [], D, DEFAULT_SCANNER_CONFIG, [reverse]).ranked.some((r) => r.securityId === "rs"));
+});
