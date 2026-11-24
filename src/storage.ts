@@ -7,6 +7,7 @@ import {
   prepareSafeStoreDirectory,
   prepareSafeStoreFile,
 } from "./store-path";
+import { isSplitAction } from "./split-adjust";
 import type {
   CanonicalDailyBar,
   CorporateAction,
@@ -59,6 +60,8 @@ export interface MarketStore {
   loadDailyBarSessions(month: string): Promise<DailyBarSessionIndex>;
   appendBars(records: CanonicalDailyBar[]): Promise<void>;
   appendActions(records: CorporateAction[]): Promise<void>;
+  /** Stored SPLIT / REVERSE_SPLIT records (for split-adjusting features). Optional for test stores. */
+  loadSplitActions?(): Promise<CorporateAction[]>;
   /** Optional: record sessions whose corporate actions were fetched (object store only). */
   recordCorporateActionCoverage?(records: import("./corporate-action-coverage").CorporateActionCoverageRecord[]): Promise<void>;
   writePredictions(records: PredictionSet[]): Promise<void>;
@@ -323,6 +326,10 @@ export class MarketStorage implements MarketStore {
 
   async appendActions(records: CorporateAction[]): Promise<void> {
     await this.appendUnique("corporate-actions.jsonl", records, (record) => record.actionId);
+  }
+
+  async loadSplitActions(): Promise<CorporateAction[]> {
+    return (await readJsonLines<CorporateAction>(this.path("corporate-actions.jsonl"))).filter(isSplitAction);
   }
 
   async loadBarsForSecurity(

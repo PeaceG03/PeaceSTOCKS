@@ -12,7 +12,7 @@ import type {
   SecurityMasterRecord,
 } from "./contracts";
 import { MARKET_SCHEMA_VERSION, SCANNER_VERSION } from "./contracts";
-import { rankSecurities } from "./ranking";
+import { DEFAULT_SCANNER_CONFIG, rankSecurities } from "./ranking";
 import { fingerprint } from "./identity";
 import { etCalendarDate, sessionCollectionDue } from "./et-time";
 import { makePredictionStatus, sessionAlreadyFrozen } from "./prediction-status";
@@ -455,10 +455,22 @@ export class MarketsScanner {
     if (!spyId) skips.push("RELATIVE_STRENGTH_SKIP:SPY_NOT_IN_SECURITY_MASTER");
     else if (spySessions.size < SPY_HISTORY_SESSIONS_REQUIRED)
       skips.push("RELATIVE_STRENGTH_SKIP:SPY_HISTORY_SHORT");
-    const result = rankSecurities(securities, allBars, benchmark, sessionDate);
+    // Split records for split-adjusted features (stored bars are unadjusted). If they cannot be read,
+    // that is a source failure: the session is not frozen (UNAVAILABLE / SOURCE_COLLECTION_FAILED).
+    let splitActions: CorporateAction[] = [];
+    let splitActionsReadFailed = false;
+    try {
+      splitActions = (await this.storage.loadSplitActions?.()) ?? [];
+    } catch (error) {
+      splitActionsReadFailed = true;
+      failures.push(`SPLIT_ACTIONS_READ_FAILED:${error instanceof Error ? error.message : String(error)}`);
+    }
+    const result = rankSecurities(securities, allBars, benchmark, sessionDate, DEFAULT_SCANNER_CONFIG, splitActions);
+    if (result.excluded?.length) skips.push(`SPLIT_ADJUST_EXCLUDED:${result.excluded.length}`);
     const providerNotReady = failures.some((failure) => failure.startsWith("PROVIDER_NOT_READY"));
     const sourceCollectionFailed =
       providerNotReady ||
+      splitActionsReadFailed ||
       failures.some((failure) => failure.startsWith("EVIDENCE_PROVIDER_ERROR:"));
     const predictionIds = result.predictions.map((prediction) => prediction.predictionId);
     const emptyPredictionSets = result.predictions.every(

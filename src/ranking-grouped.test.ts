@@ -72,7 +72,8 @@ function oldLatestBars(bars: CanonicalDailyBar[], securityId: string, date: stri
 test("rankings are byte-identical to the per-security filter on a varied dataset", () => {
   const { securities, bars, benchmark, D } = dataset(400, 110, 7);
   const result = rankSecurities(securities, bars, benchmark, D);
-  // Golden digest recorded from the pre-change code (91efd143) on this exact dataset.
+  // Golden digest recorded from the pre-change code (91efd143) on this exact dataset; re-recorded when
+  // FASTEST_IMPROVING became its own list (ranking-fastest-improving.test.ts pins everything else).
   assert.equal(sha256(stableJson(result)), GOLDEN);
   assert.ok(result.ranked.length > 100 && result.beliefs.length === 400);
   const byId = new Map(result.beliefs.map((b) => [b.securityId, b]));
@@ -81,7 +82,7 @@ test("rankings are byte-identical to the per-security filter on a varied dataset
   for (const item of result.ranked)
     assert.deepEqual(item.features, reconstructFeatures(item.securityId, D, oldLatestBars(bars, item.securityId, D), benchmark));
 });
-const GOLDEN = "37ecb845beecdba01c4dd5471179a6137d96d9e1aee978315402837c097e2665";
+const GOLDEN = "7d394e1a09fbbbce338e4b3633c81c63a3e6da5bd439277798868bfbe5189775";
 
 test("rankSecurities reads each bar's securityId a constant number of times (not once per security)", () => {
   const { securities, bars, benchmark, D } = dataset(1_500, 40, 11);
@@ -97,6 +98,7 @@ test("rankSecurities reads each bar's securityId a constant number of times (not
   assert.ok(reads <= 3 * counted.length, `securityId reads=${reads} bars=${counted.length} securities=${securities.length}`);
 });
 
+// Prices stay within 10..13.2 so no session-to-session move reaches the split-sized 3x gap rule.
 test("10.7k securities x 100 sessions ranks in seconds", (t) => {
   const days = sessions(100);
   const D = days.at(-1)!;
@@ -106,7 +108,7 @@ test("10.7k securities x 100 sessions ranks in seconds", (t) => {
     const id = `sec_${String(i).padStart(6, "0")}`;
     securities.push(security(id, "ACTIVE", "LEVEL_2"));
     for (let d = 0; d < days.length; d++)
-      bars.push({ securityId: id, sessionDate: days[d]!, close: 10 + ((i * 7 + d * 13) % 97) / 3, volume: 1000 + d, revision: 1 } as unknown as CanonicalDailyBar);
+      bars.push({ securityId: id, sessionDate: days[d]!, close: 10 + ((i * 7 + d * 13) % 97) / 30, volume: 1000 + d, revision: 1 } as unknown as CanonicalDailyBar);
   }
   const started = performance.now();
   const result = rankSecurities(securities, bars, bars.filter((b) => b.securityId === "sec_000000"), D);

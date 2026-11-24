@@ -112,13 +112,39 @@ Current selection threshold is versioned.
 
 Scanner currently defines:
 
-- TOP_15_OVERALL
-- TOP_50_OVERALL
-- STRONGEST_MOMENTUM
-- FASTEST_IMPROVING
-- DEFENSIVE_LOW_RISK
+- TOP_15_OVERALL: the 15 highest overall scores (weighted family scores above).
+- TOP_50_OVERALL: the 50 highest overall scores.
+- STRONGEST_MOMENTUM: the 15 highest 60-session returns (20-session return when 60 is missing).
+- FASTEST_IMPROVING: the 15 largest rises in 20-session return versus the 20 sessions before
+  (needs 41 closes; recipe `fastest-improving-return20-delta-v1`). When no ranked name has that
+  much history the list is empty with `unavailableReason: INSUFFICIENT_HISTORY`; it is never
+  filled from the overall ranking. Lists frozen before this recipe (through 2026-11-23) were a
+  copy of TOP_15_OVERALL.
+- DEFENSIVE_LOW_RISK: the 15 highest risk family scores (lowest 20-session volatility).
 
 These are candidate sets, not orders.
+
+### Split adjustment
+
+Stored daily bars are unadjusted. Before features and ranking, `src/split-adjust.ts` rescales each
+name's bars before a recorded SPLIT / REVERSE_SPLIT (prices x split_from/split_to, volume divided by
+it) using `permanent/corporate-actions.jsonl` (only splits effective on or before the scanned
+session). A name is dropped for that session, nothing is guessed:
+
+- SPLIT_UNRECONCILED: the adjusted close-to-close move across the split is outside [1/1.5, 1.5];
+  the record has no usable factor; two different factors are recorded for the same date (never
+  multiplied); or two split dates fall on the same bar.
+- PRICE_GAP_UNEXPLAINED: any remaining session-to-session close move of 3x or more either way.
+- SPLIT_LIKE_MOVE_UNRECORDED: a move of 1.8x or more either way into any of the last 20 sessions.
+  Split records arrive late (none in 2026-07..11 was recorded on its effective date), so a 2-for-1
+  or 1-for-2 whose record has not arrived would otherwise read as a -50% / +100% day.
+
+The thresholds were chosen from the 2026 split records (build log `predictions-on.md`). The run
+report lists the count in `skips` as `SPLIT_ADJUST_EXCLUDED:<n>`. If the split records cannot be read,
+the scan reports `SPLIT_ACTIONS_READ_FAILED:<message>` and the session is not frozen (UNAVAILABLE /
+SOURCE_COLLECTION_FAILED, like a provider failure). This and loading the records are the only
+`scanner.ts` changes. The D-010 freeze rules and `host.ts` are unchanged. Lists frozen through
+2026-11-23 used unadjusted closes.
 
 ## Provider baseline
 
@@ -414,3 +440,42 @@ The Grok team should focus on:
 - multi-session reliability.
 
 Only then should Scanner V0 be declared operational.
+
+## Held-out evaluation of the pick lists
+
+`src/holdout-eval.ts` (with the offline CLI `src/holdout-eval-cli.ts`) scores the lists on stored
+daily bars copied to a local directory. It never reads R2 or the network and prints aggregates only.
+
+- The ranker has no fitted parameters: its weights (above) were set by hand on 2026-08-26 and have
+  not changed. Sessions after that date are the held-out window. Earlier sessions (2025-03-03 to
+  2026-08-26) are in-sample: the weights were chosen after them, so they are not evidence.
+- For each session D it rebuilds what a forward scan at D saw: bars up to D in the scan's own
+  window, ACTIVE = has a bar on D, eligibility from the bar count up to D (not the all-time count),
+  then the production `rankSecurities` with the stored split records. Two variants:
+  `--splits effective-date` (default) uses every record from its effective date on, which is
+  look-ahead, since records arrive days to months late. `--splits as-known` uses only records
+  observed before the next session's open, which is what a forward scan could have read. Both are
+  reported. Dropping a name whose split falls inside the outcome window uses all records in both.
+- It is a replay of the current code on today's stored (gap-refilled) data, not a reproduction of
+  the lists that were actually published: some bars were ingested after a past freeze, and past
+  lists used unadjusted closes and the old FASTEST_IMPROVING.
+- Outcome: enter at the next session's open (lists freeze before it), exit at the close h sessions
+  after D. A name-window with a known split or reverse split after entry is dropped. Optional
+  winsorizing clips picks and baselines alike to the session's universe quantiles.
+- Baselines on the same sessions and names: the equal-weight universe average (every ranked name
+  with an outcome), random same-size lists from that universe (one-sided p = share of random
+  averages at or above the list's), and SPY. Also the mean daily Spearman IC of the overall score.
+- Reading the numbers: the random-list p treats picks as independent draws, so it overstates
+  significance when a list's names move together (a style or beta tilt). The per-session excess
+  t-stat and the alpha after regressing on the universe mean are the stricter checks. Five lists
+  and several variants are tested at once, so expect some nominal p < 0.05 by chance (Bonferroni
+  for 5 lists: 0.01). A list whose mean return is near zero "beats" a falling universe through low
+  beta, not selection (DEFENSIVE_LOW_RISK in 2026-08-27..11-20).
+- Results after the split fixes (held-out 2026-08-27..11-20, aggregates in the build log): no list
+  has a robust edge in either split variant. TOP_15 / TOP_50 beat the universe next day (excess
+  +0.60% / +0.34% effective-date, +0.72% / +0.43% as-known, per-session t 1.2-1.6), but alpha after
+  the universe beta is about zero (t <= 0.53) and both are below the universe at h=5 (t -1.2 to
+  -2.0; -2.7 to -3.8 winsorized). STRONGEST_MOMENTUM is about zero; FASTEST_IMPROVING is negative;
+  DEFENSIVE_LOW_RISK is low beta in a falling universe.
+- Site label from these results (`PICKS_EXPERIMENTAL_LABEL`, docs/SITE.md): "Experimental:
+  back-tests on held-out data show no reliable edge over random picks. Not investment advice."

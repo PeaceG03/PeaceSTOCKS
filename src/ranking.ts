@@ -1,5 +1,6 @@
 import type {
   CanonicalDailyBar,
+  CorporateAction,
   DerivedFeatures,
   PredictionSet,
   ScannerBelief,
@@ -9,6 +10,7 @@ import type {
 import { SCANNER_VERSION } from "./contracts";
 import { reconstructFeatures } from "./features";
 import { fingerprint, sha256 } from "./identity";
+import { splitAdjustedBars, splitEventsBySecurity, type SplitExclusion } from "./split-adjust";
 
 export const DEFAULT_SCANNER_CONFIG: ScannerConfig = {
   version: "scanner-config-v0.1",
@@ -53,6 +55,23 @@ function latestBars(own: readonly CanonicalDailyBar[] | undefined): CanonicalDai
   return [...byDate.values()].sort((a, b) => a.sessionDate.localeCompare(b.sessionDate));
 }
 
+/** Recipe of the FASTEST_IMPROVING list (stored on the set and part of its predictionId). */
+export const FASTEST_IMPROVING_RECIPE = "fastest-improving-return20-delta-v1";
+/** Closes needed for the improvement value: the latest close plus 40 before it. */
+export const IMPROVEMENT_MIN_CLOSES = 41;
+
+/**
+ * Improvement: the 20-session return to the latest close minus the 20-session return just before
+ * it, from one bar per session (oldest first). Null with fewer than 41 closes or a zero close.
+ */
+export function improvementValue(closes: readonly number[]): number | null {
+  if (closes.length < IMPROVEMENT_MIN_CLOSES) return null;
+  const at = (back: number) => closes[closes.length - 1 - back]!;
+  if (at(20) === 0 || at(40) === 0) return null;
+  const value = at(0) / at(20) - 1 - (at(20) / at(40) - 1);
+  return Number.isFinite(value) ? value : null;
+}
+
 export interface RankedSecurity {
   securityId: string;
   features: DerivedFeatures;
@@ -64,6 +83,8 @@ export interface RankingResult {
   beliefs: ScannerBelief[];
   ranked: RankedSecurity[];
   predictions: PredictionSet[];
+  /** Eligible names left out because their splits could not be adjusted honestly (absent when none). */
+  excluded?: Array<{ securityId: string; reason: SplitExclusion }>;
 }
 
 export function rankSecurities(
@@ -72,6 +93,7 @@ export function rankSecurities(
   benchmarkBars: CanonicalDailyBar[],
   sessionDate: string,
   config: ScannerConfig = DEFAULT_SCANNER_CONFIG,
+  splitActions: readonly CorporateAction[] = [],
 ): RankingResult {
   const eligible = securities.filter(
     (security) =>
@@ -85,17 +107,19 @@ export function rankSecurities(
     if (!found) latestById.set(id, (found = latestBars(bySecurity.get(id))));
     return found;
   };
+  // Features use split-adjusted closes (stored bars are unadjusted); names whose splits cannot be
+  // reconciled are left out. The evidence fingerprint below still hashes the raw bars.
+  const splits = splitEventsBySecurity(splitActions);
+  const adjustedById = new Map<string, CanonicalDailyBar[]>();
+  const excluded: Array<{ securityId: string; reason: SplitExclusion }> = [];
+  for (const security of eligible) {
+    const adjusted = splitAdjustedBars(latestFor(security.securityId), splits.get(security.securityId), sessionDate);
+    if ("excluded" in adjusted) excluded.push({ securityId: security.securityId, reason: adjusted.excluded });
+    else adjustedById.set(security.securityId, adjusted.bars);
+  }
   const featureById = new Map<string, DerivedFeatures>();
-  for (const security of eligible)
-    featureById.set(
-      security.securityId,
-      reconstructFeatures(
-        security.securityId,
-        sessionDate,
-        latestFor(security.securityId),
-        benchmarkBars,
-      ),
-    );
+  for (const [securityId, adjusted] of adjustedById)
+    featureById.set(securityId, reconstructFeatures(securityId, sessionDate, adjusted, benchmarkBars));
   const momentum = normalized(
     new Map(
       [...featureById].map(([id, features]): [string, number | null] => [
@@ -200,22 +224,38 @@ export function rankSecurities(
         a.securityId.localeCompare(b.securityId),
     )
     .map((item) => item.securityId);
+  // Its own list (it used to copy TOP_15_OVERALL): ranked names with an improvement value, largest
+  // first, ties by id. None has enough history: empty and marked unavailable, never filled from overall.
+  const improving = ranked
+    .map((item) => ({ id: item.securityId, value: improvementValue(adjustedById.get(item.securityId)!.map((bar) => bar.close)) }))
+    .filter((entry): entry is { id: string; value: number } => entry.value !== null)
+    .sort((a, b) => b.value - a.value || a.id.localeCompare(b.id))
+    .map((entry) => entry.id);
   const frozenAt = `${sessionDate}T23:59:59.999Z`;
   const sets: Array<[PredictionSet["setType"], string[]]> = [
     ["TOP_15_OVERALL", rankedIds.slice(0, 15)],
     ["TOP_50_OVERALL", rankedIds.slice(0, 50)],
     ["STRONGEST_MOMENTUM", strongestMomentum.slice(0, 15)],
-    ["FASTEST_IMPROVING", rankedIds.slice(0, 15)],
+    ["FASTEST_IMPROVING", improving.slice(0, 15)],
     ["DEFENSIVE_LOW_RISK", defensive.slice(0, 15)],
   ];
-  const predictions = sets.map(([setType, securityIds]) => ({
-    predictionId: `prediction_${sha256(`${sessionDate}|${setType}|${SCANNER_VERSION}|${configFingerprint}`)}`,
-    sessionDate,
-    setType,
-    securityIds,
-    scannerVersion: SCANNER_VERSION,
-    configFingerprint,
-    frozenAt,
-  }));
-  return { beliefs, ranked, predictions };
+  const predictions = sets.map(([setType, securityIds]): PredictionSet => {
+    const improvingSet = setType === "FASTEST_IMPROVING";
+    return {
+      predictionId: `prediction_${sha256(
+        `${sessionDate}|${setType}|${SCANNER_VERSION}|${configFingerprint}${improvingSet ? `|${FASTEST_IMPROVING_RECIPE}` : ""}`,
+      )}`,
+      sessionDate,
+      setType,
+      securityIds,
+      scannerVersion: SCANNER_VERSION,
+      configFingerprint,
+      frozenAt,
+      ...(improvingSet ? { recipeVersion: FASTEST_IMPROVING_RECIPE } : {}),
+      ...(improvingSet && ranked.length > 0 && securityIds.length === 0
+        ? { unavailableReason: "INSUFFICIENT_HISTORY" as const }
+        : {}),
+    };
+  });
+  return { beliefs, ranked, predictions, ...(excluded.length ? { excluded } : {}) };
 }

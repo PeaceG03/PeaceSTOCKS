@@ -357,6 +357,10 @@ export interface PredictionSet {
   scannerVersion: string;
   configFingerprint: string;
   frozenAt: string;
+  /** Recipe of a list that has one (FASTEST_IMPROVING). Absent on records written before it. */
+  recipeVersion?: string;
+  /** Set when the list could not be computed honestly (it is then empty, never copied). */
+  unavailableReason?: "INSUFFICIENT_HISTORY";
 }
 
 export interface PartitionManifest {
