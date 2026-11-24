@@ -1,0 +1,8 @@
+{
+  "version": "eligibility-floor-v2",
+  "minLastCloseUsd": 5,
+  "minMedianDollarVolumeUsd": 5000000,
+  "dollarVolumeSessions": 20,
+  "minHistorySessions": 60,
+  "requireBarOnSession": true
+}

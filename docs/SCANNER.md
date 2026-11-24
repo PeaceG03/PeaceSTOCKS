@@ -86,12 +86,14 @@ skips, and production lists' configFingerprint names the rule (`listAssetType: S
 
 ## Eligibility floor
 
-Every stock list is drawn only from names that pass a fixed floor (`config/eligibility-floor-v1.json`,
-`src/eligibility-floor.ts`). It was set before looking at the held-out window and is not tuned on it:
+Every stock list is drawn only from names that pass a fixed floor (`config/eligibility-floor-v2.json`,
+`src/eligibility-floor.ts`). Its thresholds are v1's, set before looking at the held-out window and not
+tuned on it; v2 adds only the bar-on-session rule:
 
 | Rule | Value |
 | --- | --- |
-| Price | split-adjusted last close on or before the scanned session >= $5 (`minLastCloseUsd`) |
+| Bar on the session | the name has a stored bar on the scanned session (`requireBarOnSession`, v2): a halted or missing name is not passed on an earlier close (`FLOOR_NO_BAR_ON_SESSION`) |
+| Price | split-adjusted last close (on the scanned session) >= $5 (`minLastCloseUsd`) |
 | Liquidity | median dollar volume (close x volume) of the last 20 bars >= $5,000,000 (`minMedianDollarVolumeUsd`, `dollarVolumeSessions`) |
 | History | >= 60 sessions with a stored bar in the scan's 100-session bar window (`minHistorySessions`) |
 
@@ -99,7 +101,9 @@ The floor is applied after split adjustment (dollar volume is unchanged by it) a
 and ranking, so a name below it is in no list. The scan reports the count as
 `ELIGIBILITY_FLOOR_EXCLUDED:<n>` in its skips. The floor's version is part of the lists'
 configFingerprint, so lists frozen with it have different predictionIds from lists frozen without it.
-A change to the floor is a new file and version (`eligibility-floor-v2`), never an edit.
+A change to the floor is a new file and version, never an edit: v1 (`eligibility-floor-v1.json`, no
+bar-on-session rule) is kept unchanged; production lists use v2 from 2026-11-24, so their predictionIds
+differ from v1 lists.
 
 ## Current daily feature set
 

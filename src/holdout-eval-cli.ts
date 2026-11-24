@@ -5,7 +5,7 @@
  *   tsx src/holdout-eval-cli.ts --data <dir> --from YYYY-MM-DD --to YYYY-MM-DD --horizon 1 \
  *     [--draws 1000] [--step 1] [--winsorize 0.01] [--splits effective-date|as-known] [--floor on|off] [--out result.json]
  *
- * --floor on (default) applies the scan's eligibility floor (config/eligibility-floor-v1.json); off ranks
+ * --floor on (default) applies the scan's eligibility floor (config/eligibility-floor-v2.json); off ranks
  * without it, for the on/off comparison only.
  *
  * --splits as-known uses only split records observed before the next session's open (what a forward
