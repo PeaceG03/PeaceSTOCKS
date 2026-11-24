@@ -30,6 +30,7 @@ import { FileReplyDustStore, type ReplyDustStore } from "./intraday-reply-dust";
 import { scanGroupedReplyDustEnabled } from "./scan-grouped-reply-dust";
 import { tenMinHistoryDailyStepHold } from "./tenmin-daily-liquid";
 import { errorMessage, reportPart } from "./health-checkins";
+import { scanCheckin } from "./health-behind";
 import {
   runTenMinHistoryFromEnv,
   tenMinHistorySummary,
@@ -523,12 +524,9 @@ async function main(): Promise<void> {
     `${JSON.stringify({ status: output.status, reason: output.reason, sessions: output.sessions, ...(packFailures.length ? { packFailures } : {}) })}\n`,
   );
   process.exitCode = output.status === "FAILED" || output.status === "NOT_READY" ? 2 : 0;
-  await reportPart(
-    process.env,
-    "scan",
-    output.status === "FAILED" || output.status === "NOT_READY" ? "ERROR" : "OK",
-    `${output.status}:${output.reason}`,
-  );
+  // A capped run (BACKLOG_REMAINS) checks in as BEHIND with the remaining count (src/health-behind.ts).
+  const checkin = scanCheckin(output);
+  await reportPart(process.env, "scan", checkin.state, checkin.message, {}, checkin.remaining === undefined ? {} : { remaining: checkin.remaining });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {

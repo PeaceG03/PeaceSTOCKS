@@ -61,10 +61,11 @@ test("parts: the five real parts each declare a schedule", () => {
 test("wiring: scan, daily 10-minute step, history chain, backfill and gap refill report in on success and on failure", async () => {
   const src = async (file: string) => readFile(new URL(`./${file}`, import.meta.url), "utf8");
   const host = await src("host.ts");
-  for (const part of ["scan", "history-chain"]) {
+  for (const part of ["scan", "history-chain"])
     assert.ok(new RegExp(`reportPart\\(process\\.env, "${part}", "ERROR"`, "u").test(host), `${part} on a thrown error`);
-    assert.ok(new RegExp(`reportPart\\(\\s*process\\.env,\\s*"${part}",\\s*[^;]*?\\? "ERROR" : "OK"`, "u").test(host), `${part} on a finished run`);
-  }
+  assert.ok(/reportPart\(\s*process\.env,\s*"history-chain",\s*[^;]*?\? "ERROR" : "OK"/u.test(host), "history-chain on a finished run");
+  // A finished scan: OK, ERROR or BEHIND (a capped run) from scanCheckin (health-behind.test.ts).
+  assert.match(host, /const checkin = scanCheckin\(output\);\n\s+await reportPart\(process\.env, "scan", checkin\.state, checkin\.message/u);
   const daily = await src("tenmin-daily-liquid.ts");
   assert.match(daily, /reportPart\(process\.env, "tenmin-daily", isScanCheckFailure\(yielded\) \? "ERROR" : "OK"/u);
   assert.match(daily, /reportPart\(process\.env, "tenmin-daily", "ERROR", errorMessage\(error\)\)/u);

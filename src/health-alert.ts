@@ -17,6 +17,8 @@ export const HEALTH_CHECK_DID_NOT_FINISH = "health check did not finish" as cons
 export interface HealthAlertResult {
   headline: string;
   lines: readonly string[];
+  /** False for a result that is not Healthy but needs no person (only behind parts). Absent: headline decides. */
+  attention?: boolean;
 }
 
 /** Pure: Denver wall time with a short label. */
@@ -35,7 +37,7 @@ function mountainTime(d: Date): string {
 
 /** Pure: undefined when the result is OK (Healthy); otherwise the comment/issue body. */
 export function healthAlertBody(result: HealthAlertResult | undefined, runUrl: string, now: Date): string | undefined {
-  if (result && result.headline === HEALTHY) return undefined;
+  if (result && (result.attention === false || result.headline === HEALTHY)) return undefined;
   const headline = result?.headline ?? HEALTH_CHECK_DID_NOT_FINISH;
   const lines = (result?.lines ?? []).slice(1).map((line) => `- ${redactHealthMessage(line) ?? ""}`);
   return [`**${redactHealthMessage(headline)}** (${mountainTime(now)})`, "", ...lines, "", `Run: ${runUrl}`].join("\n").slice(0, 60_000);
@@ -61,7 +63,7 @@ export async function runHealthAlert(options: {
   const now = options.now ?? new Date();
   const runUrl = `${env.GITHUB_SERVER_URL ?? "https://github.com"}/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}`;
   const body = healthAlertBody(options.result, runUrl, now);
-  if (!body) return "none: Healthy";
+  if (!body) return options.result?.headline === HEALTHY ? "none: Healthy" : "none: behind only (no person needed)";
   const doFetch = options.fetchImpl ?? fetch;
   const token = env.GITHUB_TOKEN;
   if (!token || !env.GITHUB_REPOSITORY) throw new Error("HEALTH_ALERT_NO_TOKEN_OR_REPO");
@@ -93,7 +95,9 @@ function readResult(path: string | undefined): HealthAlertResult | undefined {
   if (!path || !existsSync(path)) return undefined;
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<HealthAlertResult>;
-    return typeof parsed.headline === "string" ? { headline: parsed.headline, lines: Array.isArray(parsed.lines) ? parsed.lines : [] } : undefined;
+    return typeof parsed.headline === "string"
+      ? { headline: parsed.headline, lines: Array.isArray(parsed.lines) ? parsed.lines : [], ...(typeof parsed.attention === "boolean" ? { attention: parsed.attention } : {}) }
+      : undefined;
   } catch {
     return undefined;
   }

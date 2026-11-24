@@ -48,6 +48,8 @@ export interface HealthCheckinFacts {
   state: string;
   at: string;
   message?: string;
+  /** BEHIND check-ins: what the capped run left (sessions). */
+  remaining?: number;
 }
 
 export interface HealthPartResult {
@@ -57,6 +59,8 @@ export interface HealthPartResult {
   /** Consecutive health checks this part did not answer (0 when it answered). */
   requests: number;
   lastCheckinAt?: string;
+  /** Behind parts: the remaining count from the latest check-in. */
+  remaining?: number;
 }
 
 /** A day the daily 10-minute step keeps re-running without finishing it. */
@@ -95,6 +99,8 @@ export interface HealthCheckResult {
   likelyCheckFault: boolean;
   stuckDays: HealthStuckDay[];
   lines: string[];
+  /** True when the result needs a person (opens or comments on the health issue). Behind alone does not. */
+  attention: boolean;
   /** Carry to the next check: no-response counts per part. */
   requests: Record<string, number>;
 }
@@ -102,6 +108,12 @@ export interface HealthCheckResult {
 function ageMinutes(atIso: string, now: Date): number {
   const at = Date.parse(atIso);
   return Number.isFinite(at) ? (now.getTime() - at) / 60_000 : Number.POSITIVE_INFINITY;
+}
+
+/** Plain line for a behind part: "scan: behind, 12 remaining (CATCH_UP_COMPLETED:BACKLOG_REMAINS remaining=12)". */
+export function behindLine(name: string, latest: HealthCheckinFacts | undefined): string {
+  const remaining = latest?.remaining === undefined ? "unknown count" : `${latest.remaining} remaining`;
+  return `${name}: behind, ${remaining}${latest?.message?.trim() ? ` (${latest.message.trim()})` : ""}`;
 }
 
 /** Plain line for a stuck day (the health check flags days stuck short of 39 bars, 21 on half days). */
@@ -133,6 +145,7 @@ export function evaluateHealth(input: {
       error: latest?.state === "ERROR",
       silent,
       unrecognized: !!latest && !isRecognizedStateWord(word),
+      behind: latest?.state === "BEHIND",
     });
     const asked = silent ? (input.priorRequests?.[part.name] ?? 0) + 1 : 0;
     requests[part.name] = asked;
@@ -141,12 +154,21 @@ export function evaluateHealth(input: {
         ? `${part.name}: error: ${latest?.message?.trim() || "(no message)"}`
         : status === "no response"
           ? noResponseLine(part.name, asked)
+          : status === "behind"
+            ? behindLine(part.name, latest)
           : status === "unrecognized word"
             ? `${part.name}: unrecognized word ${JSON.stringify(word)}`
             : latest
               ? partOkLine(part.name)
               : `${part.name}: OK (runs only when started; no check-in yet)`;
-    results.push({ name: part.name, status, line, requests: asked, ...(latest ? { lastCheckinAt: latest.at } : {}) });
+    results.push({
+      name: part.name,
+      status,
+      line,
+      requests: asked,
+      ...(latest ? { lastCheckinAt: latest.at } : {}),
+      ...(status === "behind" && latest?.remaining !== undefined ? { remaining: latest.remaining } : {}),
+    });
   }
   const states = results.map((r) => (r.status === "error" ? "ERROR" : r.status === "no response" ? "SILENT" : "OK"));
   const errors = countErrorParts(states);
@@ -157,15 +179,19 @@ export function evaluateHealth(input: {
   const anyReported = results.some((r) => r.lastCheckinAt !== undefined);
   const attention = results.filter((r) => r.status === "error" || r.status === "no response").map((r) => `${r.name} (${r.status})`);
   if (stuckDays.length) attention.push(`daily 10-minute step (${stuckDays.length} stuck day/s)`);
+  const behind = results.filter((r) => r.status === "behind").map((r) => `${r.name} (${r.remaining ?? "?"} remaining)`);
   const headline = !input.parts.length || !anyReported
     ? NO_PARTS_REPORTING
     : attention.length
-      ? `needs attention: ${attention.join(", ")}`
-      : HEALTHY;
+      ? `needs attention: ${attention.join(", ")}${behind.length ? `; behind: ${behind.join(", ")}` : ""}`
+      : behind.length
+        ? `behind: ${behind.join(", ")}`
+        : HEALTHY;
   const lines = [headline, `errors: ${errors}, missing: ${missing}`];
   if (fault) lines.push(`health check likely at fault: ${silent.length} parts silent at once (${silent.join(", ")})`);
   lines.push(...results.map((r) => r.line), ...stuckDays.map(stuckDayLine));
-  return { headline, parts: results, errors, missing, silentParts: silent, likelyCheckFault: fault, stuckDays, lines, requests };
+  const needsPerson = headline === NO_PARTS_REPORTING || attention.length > 0;
+  return { headline, parts: results, errors, missing, silentParts: silent, likelyCheckFault: fault, stuckDays, lines, attention: needsPerson, requests };
 }
 
 export const HEALTH_CHECK_SCHEMA = "health-check-v1" as const;
@@ -234,10 +260,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     .then(async (result) => {
       for (const line of result.lines) process.stdout.write(`${line}\n`);
       process.stdout.write(`pruned check-ins older than one month: ${result.prunedCheckins}\n`);
-      if (result.headline !== HEALTHY) process.stdout.write(`::warning title=PeaceSTOCKS health::${result.headline}\n`);
+      if (result.attention) process.stdout.write(`::warning title=PeaceSTOCKS health::${result.headline}\n`);
       // The alert step (src/health-alert.ts) reads this file; a missing file means the check failed.
       if (process.env.HEALTH_RESULT_FILE)
-        await writeFile(process.env.HEALTH_RESULT_FILE, `${JSON.stringify({ headline: result.headline, lines: result.lines })}\n`, "utf8");
+        await writeFile(process.env.HEALTH_RESULT_FILE, `${JSON.stringify({ headline: result.headline, lines: result.lines, attention: result.attention })}\n`, "utf8");
     })
     .catch((error: unknown) => {
       process.stdout.write(`HEALTH_CHECK_FAILED:${redactHealthMessage(errorMessage(error))?.slice(0, 120) ?? ""}\n`);

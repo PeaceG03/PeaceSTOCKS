@@ -57,6 +57,8 @@ export interface HealthCheckin {
   at: string;
   message?: string;
   runId?: string;
+  /** BEHIND only: how much the capped run left for the next run (sessions). */
+  remaining?: number;
 }
 
 export interface HealthCheckinStore {
@@ -109,6 +111,10 @@ export async function pruneHealthCheckins(store: Pick<HealthPruneStore, "list" |
   return deleted;
 }
 
+function validRemaining(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
 export function healthCheckinKey(checkin: Pick<HealthCheckin, "part" | "at" | "runId">, nonce: string): string {
   const stamp = checkin.at.replaceAll(/[^0-9]/gu, "").slice(0, 17);
   const run = (checkin.runId ?? "local").replaceAll(/[^A-Za-z0-9-]/gu, "").slice(0, 24) || "local";
@@ -117,7 +123,7 @@ export function healthCheckinKey(checkin: Pick<HealthCheckin, "part" | "at" | "r
 
 export async function writeHealthCheckin(
   store: HealthCheckinStore,
-  input: { part: HealthPartId; state: string; at: string; message?: string; runId?: string },
+  input: { part: HealthPartId; state: string; at: string; message?: string; runId?: string; remaining?: number },
   nonce: string = Math.random().toString(36).slice(2, 8),
 ): Promise<{ key: string; checkin: HealthCheckin }> {
   const message = redactHealthMessage(input.message);
@@ -128,6 +134,7 @@ export async function writeHealthCheckin(
     at: input.at,
     ...(message ? { message } : {}),
     ...(input.runId ? { runId: input.runId } : {}),
+    ...(validRemaining(input.remaining) ? { remaining: input.remaining } : {}),
   };
   const key = healthCheckinKey(checkin, nonce);
   const bytes = new TextEncoder().encode(`${JSON.stringify(checkin)}\n`);
@@ -153,6 +160,7 @@ function parseCheckin(key: string, bytes: Uint8Array | undefined, part: HealthPa
       at: raw.at,
       ...(typeof raw.message === "string" ? { message: raw.message } : {}),
       ...(typeof raw.runId === "string" ? { runId: raw.runId } : {}),
+      ...(validRemaining(raw.remaining) ? { remaining: raw.remaining } : {}),
     };
   } catch {
     return { key, schemaVersion: HEALTH_CHECKIN_SCHEMA, part, state: "UNREADABLE", at: `${day}T00:00:00.000Z` };
@@ -215,9 +223,10 @@ export function errorMessage(error: unknown): string {
 export async function reportPart(
   env: NodeJS.ProcessEnv,
   part: HealthPartId,
-  state: "OK" | "ERROR",
+  state: "OK" | "ERROR" | "BEHIND",
   message?: string,
   deps: { openStore?: (env: NodeJS.ProcessEnv) => HealthCheckinStore; now?: () => Date; log?: (line: string) => void } = {},
+  facts: { remaining?: number } = {},
 ): Promise<string> {
   const log = deps.log ?? ((line: string) => process.stdout.write(`${line}\n`));
   if (!env.PEACESTOCKS_R2_BUCKET?.trim()) return "SKIPPED_NO_STORE";
@@ -230,7 +239,14 @@ export async function reportPart(
       timer.unref?.();
     });
     const { checkin } = await Promise.race([
-      writeHealthCheckin(store, { part, state, at, ...(message ? { message } : {}), ...(env.GITHUB_RUN_ID ? { runId: env.GITHUB_RUN_ID } : {}) }),
+      writeHealthCheckin(store, {
+        part,
+        state,
+        at,
+        ...(message ? { message } : {}),
+        ...(env.GITHUB_RUN_ID ? { runId: env.GITHUB_RUN_ID } : {}),
+        ...(facts.remaining === undefined ? {} : { remaining: facts.remaining }),
+      }),
       timeout,
     ]).finally(() => clearTimeout(timer));
     log(checkinLine(part, state, checkin.message ?? ""));

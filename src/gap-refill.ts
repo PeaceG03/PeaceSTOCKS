@@ -65,10 +65,15 @@ export function refillStopExit(
   stopped: string,
   afterScan: boolean,
   progress: { fetched: number; sessions: number },
-): { code: number; line: string } {
+): { code: number; line: string; behind?: { remaining: number } } {
   const safe = stopped.replace(/[^A-Z0-9_]/gu, "").slice(0, 40) || "UNKNOWN";
+  // Behind, not OK: health shows the remaining count (missing sessions this run did not fetch).
   if (afterScan && stopped === "DEADLINE")
-    return { code: 0, line: `gap-refill: BACKLOG_REMAINS stopped=DEADLINE fetched=${progress.fetched}/${progress.sessions}` };
+    return {
+      code: 0,
+      line: `gap-refill: BACKLOG_REMAINS stopped=DEADLINE fetched=${progress.fetched}/${progress.sessions}`,
+      behind: { remaining: Math.max(0, progress.sessions - progress.fetched) },
+    };
   return { code: 4, line: `gap-refill: STOPPED ${safe} fetched=${progress.fetched}/${progress.sessions}` };
 }
 
@@ -120,6 +125,9 @@ function noDelete(c: ObjectClient): ObjectClient {
   };
   return { get: wrap(c.get.bind(c)), put: wrap(c.put.bind(c)), head: wrap(c.head.bind(c)), list: wrap(c.list.bind(c)), delete: async () => { throw new Error("NO_DELETE"); } };
 }
+
+/** Set by main when an after-scan refill stopped on its budget (BACKLOG_REMAINS): the check-in is BEHIND. */
+let behindRemaining: number | undefined;
 
 async function main(): Promise<number> {
   if (process.argv[2] === "--check-asof") {
@@ -184,6 +192,7 @@ async function main(): Promise<number> {
   if (res.stopped) {
     const stop = refillStopExit(res.stopped, Boolean(afterScan), { fetched, sessions: sessions.length });
     console.log(stop.line);
+    if (stop.behind) behindRemaining = stop.behind.remaining;
     return stop.code;
   }
   const rows = await verifySessions(client, sessions);
@@ -200,12 +209,14 @@ async function main(): Promise<number> {
  */
 export function refillCheckin(
   argv: readonly string[],
-  outcome: { readonly code: number } | { readonly fail: string },
-): { state: "OK" | "ERROR"; message?: string } | undefined {
+  outcome: { readonly code: number; readonly behind?: { readonly remaining: number } } | { readonly fail: string },
+): { state: "OK" | "ERROR" | "BEHIND"; message?: string; remaining?: number } | undefined {
   const afterScan = argv.includes("--after-scan");
   if (argv.length > 0 && !afterScan) return undefined;
   const tag = afterScan ? " (after-scan)" : "";
   if ("fail" in outcome) return { state: "ERROR", message: `GAP_REFILL_FAIL_${outcome.fail}${tag}` };
+  if (outcome.code === 0 && outcome.behind)
+    return { state: "BEHIND", message: `BACKLOG_REMAINS stopped=DEADLINE remaining=${outcome.behind.remaining}${tag}`, remaining: outcome.behind.remaining };
   return outcome.code === 0
     ? { state: "OK", ...(afterScan ? { message: "AFTER_SCAN" } : {}) }
     : { state: "ERROR", message: `GAP_REFILL_EXIT_${outcome.code}${tag}` };
@@ -213,13 +224,13 @@ export function refillCheckin(
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const argv = process.argv.slice(2);
-  const checkIn = async (outcome: { code: number } | { fail: string }) => {
+  const checkIn = async (outcome: Parameters<typeof refillCheckin>[1]) => {
     const c = refillCheckin(argv, outcome);
-    if (c) await reportPart(process.env, "gap-refill", c.state, c.message);
+    if (c) await reportPart(process.env, "gap-refill", c.state, c.message, {}, c.remaining === undefined ? {} : { remaining: c.remaining });
   };
   main().then(
     async (c) => {
-      await checkIn({ code: c });
+      await checkIn({ code: c, ...(behindRemaining === undefined ? {} : { behind: { remaining: behindRemaining } }) });
       process.exit(c);
     },
     async (e) => {
