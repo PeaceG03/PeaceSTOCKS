@@ -12,7 +12,7 @@ A read-only status page for the scanner, for one person, on phone or computer.
   **Predictions off**. A list stored as unavailable (for example FASTEST_IMPROVING without enough
   price history) says "unavailable" instead of showing an empty list.
   When picks are shown, a note above them and an "experimental" tag on each list say: "Experimental:
-  in back-tests on held-out data these lists have not beaten random picks. Not investment advice."
+  back-tests on held-out data show no reliable edge over random picks. Not investment advice."
   (held-out evaluation in PR #124; see docs/SCANNER.md).
 - **Recent sessions**: the newest 20 run reports: session, status, valid/expected, and the first
   few issues.

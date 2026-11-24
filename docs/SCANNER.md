@@ -456,3 +456,5 @@ daily bars copied to a local directory. It never reads R2 or the network and pri
   and several variants are tested at once, so expect some nominal p < 0.05 by chance (Bonferroni
   for 5 lists: 0.01). A list whose mean return is near zero "beats" a falling universe through low
   beta, not selection (DEFENSIVE_LOW_RISK in 2026-08-27..11-20).
+- Site label from these results (`PICKS_EXPERIMENTAL_LABEL`, docs/SITE.md): "Experimental:
+  back-tests on held-out data show no reliable edge over random picks. Not investment advice."

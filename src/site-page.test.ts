@@ -224,7 +224,7 @@ test("site page: every card field escapes <script> and attribute-break payloads"
 });
 
 test("site page: picks carry a visible experimental label above the lists and on each list", async () => {
-  const LABEL = "Experimental: in back-tests on held-out data these lists have not beaten random picks. Not investment advice.";
+  const LABEL = "Experimental: back-tests on held-out data show no reliable edge over random picks. Not investment advice.";
   const client = await seeded();
   const line = (setType: string, securityIds: string[], extra = {}) =>
     JSON.stringify({ predictionId: `p-${setType}`, sessionDate: "2026-11-21", setType, securityIds, scannerVersion: "v", configFingerprint: "f", frozenAt: "x", ...extra });
@@ -233,6 +233,9 @@ test("site page: picks carry a visible experimental label above the lists and on
   await client.put("permanent/security-master.json", enc([{ securityId: "sec-a", currentSymbol: "AAA" }]));
   const html = renderSitePage(await loadSiteData(client));
   const picks = html.slice(html.indexOf("<h2>Picks</h2>"), html.indexOf("<h2>Recent sessions</h2>"));
+  // The exact text (the earlier "have not beaten random picks" wording was not literally true).
+  assert.equal(sitePage.PICKS_EXPERIMENTAL_LABEL, LABEL);
+  assert.equal(html.includes("have not beaten"), false);
   // Once, as the first thing under the heading, before any list.
   assert.equal(picks.split(LABEL).length - 1, 1);
   assert.match(picks, new RegExp(`^<h2>Picks</h2><div class="exp" role="note">${LABEL.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}</div>`, "u"));

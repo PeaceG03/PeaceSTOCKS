@@ -83,7 +83,7 @@ html,body{max-width:100%;overflow-x:hidden}
  * found no edge over random same-size lists, so the lists are labelled as experimental.
  */
 export const PICKS_EXPERIMENTAL_LABEL =
-  "Experimental: in back-tests on held-out data these lists have not beaten random picks. Not investment advice.";
+  "Experimental: back-tests on held-out data show no reliable edge over random picks. Not investment advice.";
 
 export function renderSitePage(data: SiteData): string {
   const parts: string[] = [];
