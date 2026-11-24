@@ -63,7 +63,7 @@
       "id": "hysteresis_hold_top15",
       "family": "normalization_and_turnover",
       "description": "Winsorized z-score 5-factor composite with rank-retention hysteresis (enter <= 15, hold until rank > 45).",
-      "rationale": "v2 baseline TOP_15_OVERALL incurred 0.49 daily turnover (~12%/yr cost drag); a hold buffer targets similar gross exposure with much lower slippage.",
+      "rationale": "Pre-#136 v2 baseline TOP_15_OVERALL incurred 0.49 daily turnover (~12%/yr cost drag); a hold buffer targets similar gross exposure with much lower slippage (compared against the post-#136 baseline).",
       "featuresUsed": [
         "MOMENTUM_60D",
         "RETURN_20D",
@@ -201,25 +201,10 @@
       "status": "NOT_RUN"
     },
     {
-      "id": "low_vol_mom_quality_top30",
-      "family": "defensive_and_damped_improvement",
-      "description": "Equal z-score blend of low volatility60d, MOMENTUM_60D / VOLATILITY_20D, and shallow DRAWDOWN_60D, top 30.",
-      "rationale": "Pure low-volatility lost to the market in v2 (-0.157%/day vs universe); pairing low volatility with positive momentum avoids stagnant defensives.",
-      "featuresUsed": [
-        "volatility60d",
-        "MOMENTUM_60D",
-        "VOLATILITY_20D",
-        "DRAWDOWN_60D"
-      ],
-      "topN": 30,
-      "rebalanceRule": "daily_equal_weight",
-      "status": "NOT_RUN"
-    },
-    {
       "id": "fastest_improving_damped_top20",
-      "family": "defensive_and_damped_improvement",
+      "family": "turnover_damped_improvement",
       "description": "Vol-scaled improvement (improvement / VOLATILITY_20D) with rank hysteresis (enter <= 20, hold until rank > 50).",
-      "rationale": "FASTEST_IMPROVING had the highest v2 dev gross return (+0.214%/day) but highest turnover (0.59); vol-scaling and hysteresis test whether cutting churn preserves net edge.",
+      "rationale": "FASTEST_IMPROVING had the highest pre-#136 dev gross return (+0.214%/day) and highest turnover (0.59); vol-scaling and hysteresis test whether cutting churn preserves net edge (to be compared against the post-#136 baseline).",
       "featuresUsed": [
         "improvement",
         "VOLATILITY_20D"
@@ -227,37 +212,7 @@
       "topN": 20,
       "rebalanceRule": "rank_hysteresis_enter_20_exit_50",
       "status": "NOT_RUN"
-    },
-    {
-      "id": "regime_vol_scaled_mom_top20",
-      "family": "regime_conditioned",
-      "description": "Use vol_scaled_mom60_top20 when spyReturn20d > 0, else switch to low_vol_mom_quality_top30 (all <= D).",
-      "rationale": "Momentum factors suffer sharp crashes during market drawdowns; shifting to low-vol quality when trailing 20d market trend is negative controls portfolio drawdown.",
-      "featuresUsed": [
-        "spyReturn20d",
-        "MOMENTUM_60D",
-        "VOLATILITY_20D",
-        "DRAWDOWN_60D",
-        "volatility60d"
-      ],
-      "topN": 20,
-      "rebalanceRule": "daily_equal_weight",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "regime_rev_vs_mom_top20",
-      "family": "regime_conditioned",
-      "description": "Use mom60_skip5_top20 when spyVolatility20d <= 0.20, else switch to short_term_rev_5d_top20 (all <= D).",
-      "rationale": "Cross-sectional momentum tends to perform better in calm markets while short-term reversal dominates high-volatility dispersion regimes.",
-      "featuresUsed": [
-        "spyVolatility20d",
-        "MOMENTUM_60D",
-        "RETURN_5D",
-        "VOLATILITY_20D"
-      ],
-      "topN": 20,
-      "rebalanceRule": "daily_equal_weight",
-      "status": "NOT_RUN"
     }
-  ]
+  ],
+  "backfillNote": "Pre-#136 dev baseline numbers (variants.jsonl seq 5-9) were measured on ACTIVE-only local bars; after #136 delisted backfill lands, the dev baseline must be re-run under a new derived scanner label before scoring candidates so comparisons are survivorship-clean and apples-to-apples."
 }
