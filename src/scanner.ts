@@ -456,11 +456,13 @@ export class MarketsScanner {
     else if (spySessions.size < SPY_HISTORY_SESSIONS_REQUIRED)
       skips.push("RELATIVE_STRENGTH_SKIP:SPY_HISTORY_SHORT");
     // Split records for split-adjusted features (stored bars are unadjusted). If they cannot be read,
-    // rank without them: the 3x-gap rule still drops any name with an unexplained split-sized jump.
+    // that is a source failure: the session is not frozen (UNAVAILABLE / SOURCE_COLLECTION_FAILED).
     let splitActions: CorporateAction[] = [];
+    let splitActionsReadFailed = false;
     try {
       splitActions = (await this.storage.loadSplitActions?.()) ?? [];
     } catch (error) {
+      splitActionsReadFailed = true;
       failures.push(`SPLIT_ACTIONS_READ_FAILED:${error instanceof Error ? error.message : String(error)}`);
     }
     const result = rankSecurities(securities, allBars, benchmark, sessionDate, DEFAULT_SCANNER_CONFIG, splitActions);
@@ -468,6 +470,7 @@ export class MarketsScanner {
     const providerNotReady = failures.some((failure) => failure.startsWith("PROVIDER_NOT_READY"));
     const sourceCollectionFailed =
       providerNotReady ||
+      splitActionsReadFailed ||
       failures.some((failure) => failure.startsWith("EVIDENCE_PROVIDER_ERROR:"));
     const predictionIds = result.predictions.map((prediction) => prediction.predictionId);
     const emptyPredictionSets = result.predictions.every(

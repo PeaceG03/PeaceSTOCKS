@@ -138,8 +138,12 @@ test("the scan loads the stored split records: an unreconcilable split keeps the
   const ids = { a: securityId("fixture-provider", "i-a", "STOCK"), b: securityId("fixture-provider", "i-b", "STOCK"), spy: securityId("fixture-provider", "i-spy", "ETF") };
   const mk = (id: string, d: string, close: number) => ({ ...bar(id, d, close), provenance: { provider: "fixture-provider", dataset: "daily-ohlcv", retrievalId: `r-${d}-${id.slice(0, 6)}`, ingestionVersion: "t", normalizerVersion: "t" } }) as CanonicalDailyBar;
   const allBars = hist.flatMap((d, k) => [mk(ids.a, d, 20 + k * 0.01), mk(ids.b, d, 30 + k * 0.02), mk(ids.spy, d, 400 + k)]);
-  const run = async (actions: CorporateAction[]) => {
+  const run = async (actions: CorporateAction[], splitReadFails = false) => {
     const storage = new ObjectMarketStorage(new MemoryObjectClient());
+    if (splitReadFails)
+      (storage as unknown as { loadSplitActions(): Promise<CorporateAction[]> }).loadSplitActions = async () => {
+        throw new Error("split records unreadable");
+      };
     await storage.initialize();
     await storage.appendBars(allBars.filter((b) => b.sessionDate < D2));
     await storage.appendActions(actions);
@@ -150,7 +154,8 @@ test("the scan loads the stored split records: an unreconcilable split keeps the
       getCorporateActions: async () => [],
     };
     const report = await new MarketsScanner(provider as never, storage, undefined, undefined, () => new Date("2026-10-03T05:40:00.000Z")).run(D2, "FORWARD");
-    return { report, top: (await storage.loadPredictions(D2)).find((p) => p.setType === "TOP_15_OVERALL")!.securityIds };
+    const status = (await storage.loadPredictionStatuses(D2)).at(-1);
+    return { report, status, top: (await storage.loadPredictions(D2)).find((p) => p.setType === "TOP_15_OVERALL")?.securityIds ?? [] };
   };
   const plain = await run([]);
   assert.ok(plain.top.includes(ids.a));
@@ -161,6 +166,14 @@ test("the scan loads the stored split records: an unreconcilable split keeps the
   assert.equal(bad.top.includes(ids.a), false);
   assert.ok(bad.top.includes(ids.b));
   assert.ok((bad.report.skips ?? []).includes("SPLIT_ADJUST_EXCLUDED:1"));
+  // Split records cannot be read: reported, and nothing is frozen (a source failure).
+  const unread = await run([], true);
+  assert.ok((unread.report.unresolvedFailures ?? []).some((f) => f.startsWith("SPLIT_ACTIONS_READ_FAILED:")), JSON.stringify(unread.report.unresolvedFailures));
+  assert.equal(unread.report.predictionStatus, "UNAVAILABLE");
+  assert.equal(unread.report.predictionReason, "SOURCE_COLLECTION_FAILED");
+  assert.equal(unread.status?.status, "UNAVAILABLE");
+  assert.equal(unread.status?.reason, "SOURCE_COLLECTION_FAILED");
+  assert.deepEqual(unread.top, []);
 });
 
 test("bars before the split: prices x factor, volume / factor (dollar volume kept); bars on/after untouched", async () => {
