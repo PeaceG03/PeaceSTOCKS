@@ -295,7 +295,9 @@ it with one conditional put (`If-None-Match: *`) before alerting, and a 412 mean
 already alerted, so the scan job's last step and the :47 tick cannot both comment. A failed alert
 deletes its claim so the next run retries. A run killed between the claim and the alert leaves a
 `CLAIMED` marker; once that claim is more than 2 hours old and never reached `ALERTED`, the next run
-takes it over with one conditional replace (`If-Match: <etag>`), so exactly one run re-alerts
+takes it over with one conditional replace (`If-Match: <etag>`), so exactly one run re-alerts. A claim
+stamped up to 5 minutes in the future counts as stamped now; one further ahead, or with a missing or
+unparseable time, is corrupt and can be taken over at once (unreadable JSON never is)
 (src/freeze-watch-claim.test.ts, src/freeze-watch-claim-expiry.test.ts). It runs as the last step of every scan job and on the hourly :47 tick
 (`freeze_watch` job), so a session whose scan never ran is still reported within the hour after the
 open. No Massive request and no tickers in the alert.
