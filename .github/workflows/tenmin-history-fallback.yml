@@ -100,8 +100,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/daily"
-          run_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=tenmin-daily-report&per_page=20" \
-            --jq '[.artifacts[] | select(.expired | not)] | sort_by(.created_at) | last | .workflow_run.id // empty')"
+          # Main's runs only: a branch dispatch's report must not resolve the main chain's held day.
+          run_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=tenmin-daily-report&per_page=100" \
+            --jq '[.artifacts[] | select((.expired | not) and .workflow_run.head_branch == "main")] | sort_by(.created_at) | last | .workflow_run.id // empty')"
           if [ -n "$run_id" ]; then
             gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n tenmin-daily-report -D "$RUNNER_TEMP/daily" || echo "daily report not readable yet"
           fi
