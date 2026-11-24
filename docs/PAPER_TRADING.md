@@ -59,8 +59,21 @@ trading session before T, all of these must hold, else no entries are made (exit
 6. The paper run writing the entry orders runs before T's open (`now < nextSessionOpen`). Orders are
    never written after the open, so nothing can be entered with hindsight.
 
-When D has no status record yet (the scan has not frozen D), the run writes nothing for T and tries
-again on its next run.
+## When the scan is late
+
+Exits never depend on the freeze. Before each open T, the first paper run writes
+`paper/v1/exits/<T>.json`: a SELL for every name held (plus every name bought at an earlier open whose
+fills are not computed yet, to be safe; a SELL for a name no longer held fills as `NOT_HELD`). So the
+1-session hold, "sell at the following open", holds even when the scan is late or fails.
+
+Entries do depend on it. When D has no status record yet at a pre-open run, the run writes the exits
+only and tries the entries again on its next pre-open run (11:15, 12:15 and 13:15 UTC):
+- the freeze lands before T's open and passes the proof: the entries for T are written then, and T
+  fills exits and entries together;
+- the freeze lands after T's open, or never: no entries are made at T (the day row for the window
+  that opens at T says `NO_FREEZE_STATUS`), and the book sits in cash until the next timely freeze.
+
+Nothing is ever entered after the open it is for.
 
 ## Switches (all default off)
 
@@ -80,7 +93,8 @@ Stored in the same R2 bucket the scanner uses, under `paper/v1/`, written by the
 
 | Key | Written | What |
 | --- | --- | --- |
-| `paper/v1/intents/<T>.json` | before T's open | the orders for T's open: SELL every held name, BUY each picked name, or why entries were refused |
+| `paper/v1/exits/<T>.json` | before T's open, whenever anything is held, whatever the freeze | a SELL for every held name |
+| `paper/v1/intents/<T>.json` | before T's open, once D's freeze status is stored | the entries for T's open: BUY each picked name, or why entries were refused |
 | `paper/v1/fills/<T>.json` | once T's bars are stored | each order's fill (price, shares, slippage, commission) or why it did not fill; cash and positions after |
 | `paper/v1/days/<T>.json` | with the fills | the window from the previous open to T's open: paper return vs SPY and vs the equal-weight universe, plus cumulative |
 | `paper/v1/corrections/<S>/<securityId>_<n>.json` | when a late split record changes an exit's price | the n-th correction of the exit fill of that name at S's open: old and new split factor and price, and the cash difference |
@@ -89,14 +103,15 @@ Stored in the same R2 bucket the scanner uses, under `paper/v1/`, written by the
   single conditional put (`If-None-Match: *`): R2 itself refuses to overwrite an existing key (412),
   so even a writer racing outside the workflow's concurrency group cannot replace a stored object; the
   run keeps the stored object. The ledger writer can only write keys of exactly these
-  four shapes; it has no delete.
+  five shapes; it has no delete.
 - **Idempotent orders**: each order's id is `<rulesVersion>_<session>_<securityId>_<side>` (the
   client order id), unique per session, name and side. A retried run finds the object already stored
   and does not write or fill it again.
 - **Restart-safe**: state (cash, positions) is read back from the newest fills object; a crash between
   steps is finished by the next run, with the same result as an uninterrupted run.
-- Order of a run: fill any stored intents whose session bars exist (oldest first, stopping at the first
-  session not yet stored), write the missing day rows, then write the intents for the next open.
+- Order of a run: append corrections for late split records, fill any stored exits and intents whose
+  session bars exist (oldest first, stopping at the first session not yet stored), write the missing
+  day rows, then write the exits and the intents for the next open.
 
 ### Fill rules
 - Exits first, at the session's actual open. Splits effective after entry and on or before the exit

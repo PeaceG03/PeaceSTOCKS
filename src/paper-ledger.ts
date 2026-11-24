@@ -2,7 +2,7 @@
  * Simulated paper-trading ledger (docs/PAPER_TRADING.md). No node: imports, so the site Worker can read it.
  *
  * Append-only: every object is written once under paper/v1/ and never overwritten or deleted. Keys have
- * exactly these shapes: intents, fills, days (one per trading session) and corrections (one per
+ * exactly these shapes: intents, exits, fills, days (one per trading session) and corrections (one per
  * correction of an exit fill). A write to a key that already
  * exists keeps the stored object (a retried step is a no-op), so an order can never be duplicated.
  * Writes are conditional puts (If-None-Match: *): the store refuses an overwrite.
@@ -10,6 +10,7 @@
 
 export const PAPER_LEDGER_PREFIX = "paper/v1/";
 export const PAPER_INTENTS_PREFIX = "paper/v1/intents/";
+export const PAPER_EXITS_PREFIX = "paper/v1/exits/";
 export const PAPER_FILLS_PREFIX = "paper/v1/fills/";
 export const PAPER_DAYS_PREFIX = "paper/v1/days/";
 export const PAPER_CORRECTIONS_PREFIX = "paper/v1/corrections/";
@@ -17,12 +18,13 @@ export const PAPER_CORRECTIONS_PREFIX = "paper/v1/corrections/";
 export const PAPER_KILL_KEY = "paper/KILL";
 
 const SESSION = /^\d{4}-\d{2}-\d{2}$/u;
-const LEDGER_KEY = /^paper\/v1\/(intents|fills|days)\/(\d{4}-\d{2}-\d{2})\.json$/u;
+const LEDGER_KEY = /^paper\/v1\/(intents|exits|fills|days)\/(\d{4}-\d{2}-\d{2})\.json$/u;
 /** paper/v1/corrections/<fill session>/<securityId>_<n>.json: the n-th correction of that exit fill. */
 const CORRECTION_KEY = /^paper\/v1\/corrections\/(\d{4}-\d{2}-\d{2})\/([A-Za-z0-9._-]{1,64})_([1-9][0-9]?)\.json$/u;
 const SECURITY = /^[A-Za-z0-9._-]{1,64}$/u;
 
-export type PaperLedgerKind = "intents" | "fills" | "days";
+/** intents = entry (BUY) orders from a freeze; exits = SELL orders for everything held, written regardless of the freeze. */
+export type PaperLedgerKind = "intents" | "exits" | "fills" | "days";
 export type PaperSide = "BUY" | "SELL";
 
 export function paperLedgerKey(kind: PaperLedgerKind, sessionDate: string): string {
@@ -81,7 +83,19 @@ export type PaperEntryRefusal =
   | "DAILY_LOSS_LIMIT"
   | "FILLS_PENDING";
 
-/** The orders for one session's open, written before that open. */
+/**
+ * The exit (SELL) orders for one session's open: every name held, written before that open whenever
+ * anything is held, whatever the freeze status, so "sell at the following open" holds when the scan is late.
+ */
+export interface PaperExits extends RulesStamp {
+  schemaVersion: "paper-exits-v1";
+  sessionDate: string;
+  recordedAt: string;
+  sessionOpen: string;
+  orders: PaperOrderIntent[];
+}
+
+/** The entry (BUY) orders for one session's open from the freeze before it, written before that open. */
 export interface PaperIntents extends RulesStamp {
   schemaVersion: "paper-intents-v1";
   /** Session whose 09:30 ET open the orders are for. */
@@ -220,7 +234,7 @@ export class PaperLedgerStore {
    * Write once, as one conditional put: the store itself refuses to overwrite an existing key, so the
    * stored object is kept (KEPT_EXISTING) even if two writers race.
    */
-  async putOnce(key: string, value: PaperIntents | PaperFills | PaperDay | PaperCorrection): Promise<"WRITTEN" | "KEPT_EXISTING"> {
+  async putOnce(key: string, value: PaperIntents | PaperExits | PaperFills | PaperDay | PaperCorrection): Promise<"WRITTEN" | "KEPT_EXISTING"> {
     if (!LEDGER_KEY.test(key) && !CORRECTION_KEY.test(key)) throw new Error("PAPER_LEDGER_KEY_REFUSED");
     const written = await this.client.putIfAbsent(key, new TextEncoder().encode(`${JSON.stringify(value)}\n`));
     return written ? "WRITTEN" : "KEPT_EXISTING";

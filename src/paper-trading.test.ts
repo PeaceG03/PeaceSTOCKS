@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { FakeMarket, RecordingClient } from "./paper-fakes.test-helper";
-import { paperCorrectionKey, paperLedgerKey, PaperLedgerStore, PAPER_KILL_KEY, type PaperCorrection, type PaperDay, type PaperFills, type PaperIntents } from "./paper-ledger";
+import { paperCorrectionKey, paperLedgerKey, PaperLedgerStore, PAPER_KILL_KEY, type PaperCorrection, type PaperDay, type PaperExits, type PaperFills, type PaperIntents } from "./paper-ledger";
 import { loadPaperRules, type LoadedPaperRules } from "./paper-rules";
 import {
   buyFillPrice,
@@ -50,6 +50,13 @@ async function run(client: RecordingClient, market: FakeMarket, now: Date, env: 
 }
 async function read<T>(client: RecordingClient, key: string): Promise<T> {
   return (await new PaperLedgerStore(client).read<T>(key))!;
+}
+/** Every order for S's open: the exits object, then the entry intents ("SELL a", "BUY b"). */
+async function ordersFor(client: RecordingClient, S: string): Promise<string[]> {
+  const store = new PaperLedgerStore(client);
+  const exits = await store.read<PaperExits>(paperLedgerKey("exits", S));
+  const entries = await store.read<PaperIntents>(paperLedgerKey("intents", S));
+  return [...(exits?.orders ?? []), ...(entries?.orders ?? [])].map((o) => `${o.side} ${o.securityId}`);
 }
 
 test("gate: default off; only exactly 'true' turns it on; nothing is read or written when off", async () => {
@@ -167,8 +174,10 @@ test("end to end: intents before the open, fills from stored opens, day row vs S
   near(f1.fills[0]!.fillPrice!, 100.1);
   near(f1.cashAfter, 100000 - 99 * 100.1 - 199 * 50.05, "cash");
   for (const fill of f1.fills) assert.ok(fill.notionalUsd <= 0.1 * f1.equityAtOpen, "position cap");
+  assert.deepEqual(await ordersFor(client, "2026-12-09"), ["SELL a", "SELL b", "BUY b", "BUY c"]);
   const i2 = await read<PaperIntents>(client, paperLedgerKey("intents", "2026-12-09"));
-  assert.deepEqual(i2.orders.map((o) => `${o.side} ${o.securityId}`), ["SELL a", "SELL b", "BUY b", "BUY c"]);
+  const e2 = await read<PaperExits>(client, paperLedgerKey("exits", "2026-12-09"));
+  assert.deepEqual(r2.intents, { sessionDate: "2026-12-09", outcome: "WRITTEN", entries: 2, exits: 2 });
 
   day3(m);
   const r3 = await run(client, m, at("2026-12-10"));
@@ -189,7 +198,7 @@ test("end to end: intents before the open, fills from stored opens, day row vs S
 
   // Every ledger row carries the rules version and file hash.
   const { rulesSha256 } = loadPaperRules();
-  for (const row of [i1, i2, f1, f2, d, ...i1.orders, ...f1.fills, ...f2.fills]) assert.deepEqual([row.rulesVersion, row.rulesSha256], ["paper-rules-v2", rulesSha256]);
+  for (const row of [i1, i2, e2, f1, f2, d, ...i1.orders, ...e2.orders, ...f1.fills, ...f2.fills]) assert.deepEqual([row.rulesVersion, row.rulesSha256], ["paper-rules-v2", rulesSha256]);
   // Append-only: no key was ever put twice.
   assert.equal(new Set(client.puts).size, client.puts.length);
 });
@@ -223,8 +232,7 @@ test("daily loss limit: a 3% open-to-close loss blocks the next entries; exits s
   day2(m, 60); // a closes at 60: book marks about -4% from the open
   const r = await run(client, m, at("2026-12-09"));
   assert.deepEqual(r.intents, { sessionDate: "2026-12-09", outcome: "WRITTEN", entries: 0, exits: 2, entriesRefused: "DAILY_LOSS_LIMIT" });
-  const i2 = await read<PaperIntents>(client, paperLedgerKey("intents", "2026-12-09"));
-  assert.deepEqual(i2.orders.map((o) => `${o.side} ${o.securityId}`), ["SELL a", "SELL b"]);
+  assert.deepEqual(await ordersFor(client, "2026-12-09"), ["SELL a", "SELL b"]);
 
   const client2 = new RecordingClient();
   const m2 = world();
@@ -244,8 +252,7 @@ test("EVIDENCE_ONLY / UNAVAILABLE sessions: no entries, exits still written; no 
     const r = await run(client, m, at("2026-12-09"));
     assert.equal(r.intents!.entries, 0);
     assert.equal(r.intents!.entriesRefused, patch.reason === "EVIDENCE_ONLY" ? "EVIDENCE_ONLY" : "UNAVAILABLE");
-    const i2 = await read<PaperIntents>(client, paperLedgerKey("intents", "2026-12-09"));
-    assert.deepEqual(i2.orders.map((o) => o.side), ["SELL", "SELL"]);
+    assert.deepEqual(await ordersFor(client, "2026-12-09"), ["SELL a", "SELL b"]);
   }
   const client = new RecordingClient();
   const m = world();
@@ -287,7 +294,9 @@ test("idempotent retry: a second run writes nothing; a crash mid-run resumes to 
   }
   // Client order ids are unique across the whole ledger.
   const ids: string[] = [];
-  for (const s of ["2026-12-08", "2026-12-09", "2026-12-10"]) ids.push(...(await read<PaperIntents>(clean, paperLedgerKey("intents", s))).orders.map((o) => o.clientOrderId));
+  for (const s of ["2026-12-08", "2026-12-09", "2026-12-10"])
+    for (const kind of ["intents", "exits"] as const) ids.push(...((await read<PaperIntents | undefined>(clean, paperLedgerKey(kind, s)))?.orders ?? []).map((o) => o.clientOrderId));
+  assert.ok(ids.length >= 6);
   assert.equal(new Set(ids).size, ids.length);
 });
 
@@ -298,8 +307,7 @@ test("fills wait for stored bars; entries are refused while fills are pending, h
   m.freeze("2026-12-08", "2026-12-09", ["c"]); // frozen, but 12-08 bars not stored
   const r = await run(client, m, at("2026-12-09"));
   assert.deepEqual([r.filled, r.pendingFills, r.intents!.entriesRefused], [[], 1, "FILLS_PENDING"]);
-  const i2 = await read<PaperIntents>(client, paperLedgerKey("intents", "2026-12-09"));
-  assert.deepEqual(i2.orders.map((o) => `${o.side} ${o.securityId}`), ["SELL a", "SELL b"]);
+  assert.deepEqual(await ordersFor(client, "2026-12-09"), ["SELL a", "SELL b"]);
 });
 
 test("exits fill at the actual open: a real crash is booked, splits adjust, conflicts use the raw open", () => {
@@ -482,4 +490,63 @@ test("corrections end to end: the late split is appended, the fill stays byte-id
   near(f11.cashBefore, f10.cashAfter, "not applied twice");
   assert.deepEqual([f11.correctionsUsd, f11.correctionsApplied], [0, [key]]);
   assert.equal([...client.objects.keys()].filter((k) => k.includes("/corrections/")).length, 1);
+});
+
+test("late scan: held names still get exit orders before the open and are sold at the following open", async () => {
+  const client = new RecordingClient();
+  const m = world();
+  await run(client, m, at("2026-12-08")); // buys a, b at 12-08's open
+  for (const [id, px] of [["spy", 500], ["a", 100], ["b", 50], ["c", 20]] as const) m.bar(id, "2026-12-08", px, px);
+  // The 12-08 scan is late: no freeze status for 12-08 at any pre-open run of 12-09.
+  const r = await run(client, m, at("2026-12-09"));
+  assert.deepEqual(r.intents, { sessionDate: "2026-12-09", outcome: "DEFERRED_NO_FREEZE_STATUS", entries: 0, exits: 2 });
+  assert.deepEqual(await ordersFor(client, "2026-12-09"), ["SELL a", "SELL b"]);
+  const e = await read<PaperExits>(client, paperLedgerKey("exits", "2026-12-09"));
+  assert.ok(Date.parse(e.recordedAt) < Date.parse(e.sessionOpen));
+  // Later pre-open runs do not write the exits again.
+  const puts = client.puts.length;
+  await run(client, m, new Date("2026-12-09T12:15:00.000Z"));
+  assert.equal(client.puts.length, puts);
+  // The freeze lands after the open: too late for 12-09 entries; nothing for 12-09 is written. (That run
+  // already prepares 12-10: 12-09's fills are not known yet, so a and b get 12-10 exits too, to be safe.)
+  m.freeze("2026-12-08", "2026-12-09", ["c"], { predictedAt: "2026-12-09T15:00:00.000Z" });
+  const late = await run(client, m, new Date("2026-12-09T15:05:00.000Z"));
+  assert.equal(late.intents!.sessionDate, "2026-12-10");
+  assert.deepEqual(client.puts.slice(puts), [paperLedgerKey("exits", "2026-12-10")]);
+  // Next day: the held names were sold at 12-09's open, at the actual open.
+  for (const [id, px] of [["spy", 500], ["a", 90], ["b", 55], ["c", 20]] as const) m.bar(id, "2026-12-09", px, px);
+  m.freeze("2026-12-09", "2026-12-10", ["c"]);
+  const r2 = await run(client, m, at("2026-12-10"));
+  assert.deepEqual(r2.filled, ["2026-12-09"]);
+  const f = await read<PaperFills>(client, paperLedgerKey("fills", "2026-12-09"));
+  assert.deepEqual(f.fills.map((x) => `${x.side} ${x.securityId} ${x.status}`), ["SELL a FILLED", "SELL b FILLED"]);
+  near(f.fills[0]!.fillPrice!, 90 * 0.999);
+  assert.deepEqual(f.positionsAfter, []);
+  assert.equal(client.objects.has(paperLedgerKey("intents", "2026-12-09")), false);
+  // 12-10: a and b were already sold, so their safety exits will find nothing held; c is bought.
+  assert.deepEqual(await ordersFor(client, "2026-12-10"), ["SELL a", "SELL b", "BUY c"]);
+  // The day row for the window that opened at 12-09 says why nothing was entered then.
+  for (const [id, px] of [["spy", 500], ["a", 90], ["b", 55], ["c", 20]] as const) m.bar(id, "2026-12-10", px, px);
+  m.freeze("2026-12-10", "2026-12-11", ["c"]);
+  await run(client, m, at("2026-12-11"));
+  assert.equal((await read<PaperDay>(client, paperLedgerKey("days", "2026-12-10"))).entriesRefused, "NO_FREEZE_STATUS");
+  const f10 = await read<PaperFills>(client, paperLedgerKey("fills", "2026-12-10"));
+  assert.deepEqual(f10.fills.map((x) => `${x.side} ${x.securityId} ${x.status}`), ["SELL a NOT_HELD", "SELL b NOT_HELD", "BUY c FILLED"]);
+});
+
+test("late scan that lands before the open: exits first, entries added by a later pre-open run", async () => {
+  const client = new RecordingClient();
+  const m = world();
+  await run(client, m, at("2026-12-08"));
+  for (const [id, px] of [["spy", 500], ["a", 100], ["b", 50], ["c", 20]] as const) m.bar(id, "2026-12-08", px, px);
+  await run(client, m, at("2026-12-09")); // 11:15 UTC: no status yet, exits only
+  m.freeze("2026-12-08", "2026-12-09", ["b", "c"]); // frozen at 06:00 UTC proof, stored before the 12:15 run
+  const r = await run(client, m, new Date("2026-12-09T12:15:00.000Z"));
+  assert.deepEqual(r.intents, { sessionDate: "2026-12-09", outcome: "WRITTEN", entries: 2, exits: 0 });
+  assert.deepEqual(await ordersFor(client, "2026-12-09"), ["SELL a", "SELL b", "BUY b", "BUY c"]);
+  for (const [id, px] of [["spy", 500], ["a", 100], ["b", 50], ["c", 20]] as const) m.bar(id, "2026-12-09", px, px);
+  m.freeze("2026-12-09", "2026-12-10", ["c"]);
+  await run(client, m, at("2026-12-10"));
+  const f = await read<PaperFills>(client, paperLedgerKey("fills", "2026-12-09"));
+  assert.deepEqual(f.fills.map((x) => `${x.side} ${x.securityId} ${x.status}`), ["SELL a FILLED", "SELL b FILLED", "BUY b FILLED", "BUY c FILLED"]);
 });

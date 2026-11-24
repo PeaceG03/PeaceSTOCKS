@@ -3,10 +3,11 @@
  * (config/paper-rules-v2.json, docs/PAPER_TRADING.md). No broker: every order is a ledger row filled from
  * the stored daily bars. Nothing here sends an order anywhere.
  *
- * One run: (1) gates (enabled, kill switches) before anything is read or written; (2) fill stored
- * intents whose session bars exist, oldest first; (3) write missing day rows; (4) before the next open,
- * write that open's intents: SELL everything held, BUY the frozen picks if the freeze proof holds and the
- * daily loss limit was not hit. Every write is write-once (src/paper-ledger.ts).
+ * One run: (1) gates (enabled, kill switches) before anything is read or written; (1b) corrections for
+ * late split records; (2) fill stored exits and intents whose session bars exist, oldest first; (3)
+ * write missing day rows; (4) before the next open, write its exits (SELL everything held, whatever the
+ * freeze status) and, once the freeze status is stored, its entries (BUY the frozen picks if the freeze
+ * proof holds and the daily loss limit was not hit). Every write is write-once (src/paper-ledger.ts).
  */
 import type {
   CanonicalDailyBar,
@@ -24,6 +25,7 @@ import {
   type PaperCorrection,
   type PaperDay,
   type PaperEntryRefusal,
+  type PaperExits,
   type PaperFill,
   type PaperFills,
   type PaperIntents,
@@ -408,7 +410,12 @@ export function computeDay(input: {
     positions: from.positionsAfter.length,
     costsUsd,
     ...(to.correctionsUsd ? { correctionsUsd: to.correctionsUsd } : {}),
-    ...(input.fromIntents?.entriesRefused ? { entriesRefused: input.fromIntents.entriesRefused } : {}),
+    // No entry intents at the window's opening open: the freeze status never arrived before it.
+    ...(input.fromIntents
+      ? input.fromIntents.entriesRefused
+        ? { entriesRefused: input.fromIntents.entriesRefused }
+        : {}
+      : { entriesRefused: "NO_FREEZE_STATUS" as const }),
   };
 }
 
@@ -463,17 +470,19 @@ export async function runPaperTrading(options: {
   if (await ledger.killed()) return { gate: "KILLED", killedBy: "BUCKET", filled: [], pendingFills: 0, days: [] };
 
   const intentSessions = await ledger.sessions("intents");
+  const exitSessions = await ledger.sessions("exits");
   const fillSessions = await ledger.sessions("fills");
   const daySessions = new Set(await ledger.sessions("days"));
   const filledSet = new Set(fillSessions);
   const lastFilled = fillSessions.at(-1);
-  const pending = intentSessions.filter((s) => !filledSet.has(s));
+  const pending = [...new Set([...intentSessions, ...exitSessions])].filter((s) => !filledSet.has(s)).sort();
   if (lastFilled && pending.some((s) => s < lastFilled)) throw new Error("PAPER_LEDGER_OUT_OF_ORDER");
   const T = nextOpenSession(now, calendar);
   const D = previousEligibleSession(T, calendar);
   if (!D) throw new Error("PAPER_NO_PREVIOUS_SESSION");
   const missingDays = fillSessions.filter((s, i) => i > 0 && !daySessions.has(s));
   const needIntents = !intentSessions.includes(T);
+  const needExits = !exitSessions.includes(T);
 
   const result: PaperRunResult = { gate: "ON", filled: [], pendingFills: 0, days: [] };
   const splits = splitEventsBySecurity(await market.loadSplitActions());
@@ -507,7 +516,7 @@ export async function runPaperTrading(options: {
     }
   }
 
-  if (!pending.length && !missingDays.length && !needIntents) {
+  if (!pending.length && !missingDays.length && !needIntents && !needExits) {
     result.intents = { sessionDate: T, outcome: "KEPT_EXISTING", entries: 0, exits: 0 };
     return result;
   }
@@ -526,8 +535,14 @@ export async function runPaperTrading(options: {
   const allFilled = [...fillSessions];
   for (const S of pending) {
     if (!bars.hasSession(S)) break;
-    const intents = await ledger.read<PaperIntents>(paperLedgerKey("intents", S));
-    if (!intents) throw new Error("PAPER_LEDGER_INTENTS_MISSING");
+    const entries = intentSessions.includes(S) ? await ledger.read<PaperIntents>(paperLedgerKey("intents", S)) : undefined;
+    const exits = exitSessions.includes(S) ? await ledger.read<PaperExits>(paperLedgerKey("exits", S)) : undefined;
+    if (!entries && !exits) throw new Error("PAPER_LEDGER_INTENTS_MISSING");
+    // Exits and entries for S's open, filled together (exits first).
+    const intents: PaperIntents = {
+      ...(entries ?? { schemaVersion: "paper-intents-v1", rulesVersion: rules.rulesVersion, rulesSha256, sessionDate: S, freezeSessionDate: "", recordedAt: "", sessionOpen: "" }),
+      orders: [...(exits?.orders ?? []), ...(entries?.orders ?? [])],
+    };
     // Corrections not yet in cash enter it at this open.
     const applied = new Set((allFilled.length ? (await readFills(allFilled.at(-1)!)).correctionsApplied : undefined) ?? []);
     let usd = 0;
@@ -545,7 +560,7 @@ export async function runPaperTrading(options: {
     allFilled.push(S);
     result.filled.push(S);
   }
-  result.pendingFills = pending.length - result.filled.length;
+  result.pendingFills = pending.filter((s) => s < T).length - result.filled.length;
 
   // (3) Day rows for every filled session after the first that has none, in order.
   let previousDay: PaperDay | undefined;
@@ -573,9 +588,10 @@ export async function runPaperTrading(options: {
     result.days.push(S);
   }
 
-  // (4) Intents for the next open, written only before it.
+  // (4) Orders for the next open, written only before it: exits whenever anything is held (whatever
+  // the freeze), then entries once the freeze status of D is stored.
   const sessionOpen = etWallClockToUtc(T, 9, 30);
-  if (!needIntents) {
+  if (!needIntents && !needExits) {
     result.intents = { sessionDate: T, outcome: "KEPT_EXISTING", entries: 0, exits: 0 };
     return result;
   }
@@ -583,16 +599,43 @@ export async function runPaperTrading(options: {
     result.intents = { sessionDate: T, outcome: "TOO_LATE", entries: 0, exits: 0 };
     return result;
   }
-  const statuses = await market.loadPredictionStatuses(D);
-  if (!statuses.some((status) => status.sessionDate === D)) {
-    result.intents = { sessionDate: T, outcome: "DEFERRED_NO_FREEZE_STATUS", entries: 0, exits: 0 };
-    return result;
-  }
-  const stillPending = pending.filter((s) => !result.filled.includes(s));
+  const stamp = { rulesVersion: rules.rulesVersion, rulesSha256 };
+  const order = (securityId: string, side: "BUY" | "SELL"): PaperOrderIntent => ({
+    ...stamp,
+    clientOrderId: paperClientOrderId(rules.rulesVersion, T, securityId, side),
+    sessionDate: T,
+    securityId,
+    side,
+    purpose: side === "BUY" ? "ENTRY" : "EXIT",
+  });
+  // Sessions before T still waiting for their fills (T's own exits, if already written, are not).
+  const stillPending = pending.filter((s) => s < T && !result.filled.includes(s));
   const holdings = new Set(state.positions.map((p) => p.securityId));
   for (const s of stillPending) {
-    const intents = await ledger.read<PaperIntents>(paperLedgerKey("intents", s));
-    for (const order of intents?.orders ?? []) if (order.side === "BUY") holdings.add(order.securityId);
+    const intents = intentSessions.includes(s) ? await ledger.read<PaperIntents>(paperLedgerKey("intents", s)) : undefined;
+    for (const o of intents?.orders ?? []) if (o.side === "BUY") holdings.add(o.securityId);
+  }
+  let exitsWritten = 0;
+  if (needExits && holdings.size) {
+    const exits: PaperExits = {
+      schemaVersion: "paper-exits-v1",
+      ...stamp,
+      sessionDate: T,
+      recordedAt: now.toISOString(),
+      sessionOpen: sessionOpen.toISOString(),
+      orders: [...holdings].sort().map((id) => order(id, "SELL")),
+    };
+    await ledger.putOnce(paperLedgerKey("exits", T), exits);
+    exitsWritten = holdings.size;
+  }
+  if (!needIntents) {
+    result.intents = { sessionDate: T, outcome: "KEPT_EXISTING", entries: 0, exits: exitsWritten };
+    return result;
+  }
+  const statuses = await market.loadPredictionStatuses(D);
+  if (!statuses.some((status) => status.sessionDate === D)) {
+    result.intents = { sessionDate: T, outcome: "DEFERRED_NO_FREEZE_STATUS", entries: 0, exits: exitsWritten };
+    return result;
   }
   let refused: PaperEntryRefusal | undefined;
   let picks: string[] = [];
@@ -611,19 +654,7 @@ export async function runPaperTrading(options: {
       if (!refused) picks = proof.securityIds;
     }
   }
-  const stamp = { rulesVersion: rules.rulesVersion, rulesSha256 };
-  const order = (securityId: string, side: "BUY" | "SELL"): PaperOrderIntent => ({
-    ...stamp,
-    clientOrderId: paperClientOrderId(rules.rulesVersion, T, securityId, side),
-    sessionDate: T,
-    securityId,
-    side,
-    purpose: side === "BUY" ? "ENTRY" : "EXIT",
-  });
-  const orders = [
-    ...[...holdings].sort().map((id) => order(id, "SELL")),
-    ...picks.map((id) => order(id, "BUY")),
-  ];
+  const orders = picks.map((id) => order(id, "BUY"));
   if (new Set(orders.map((o) => o.clientOrderId)).size !== orders.length) throw new Error("PAPER_DUPLICATE_ORDER_ID");
   const intents: PaperIntents = {
     schemaVersion: "paper-intents-v1",
@@ -640,7 +671,7 @@ export async function runPaperTrading(options: {
     sessionDate: T,
     outcome,
     entries: picks.length,
-    exits: holdings.size,
+    exits: exitsWritten,
     ...(refused ? { entriesRefused: refused } : {}),
   };
   return result;
