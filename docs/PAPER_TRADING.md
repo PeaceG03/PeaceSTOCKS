@@ -74,8 +74,10 @@ Stored in the same R2 bucket the scanner uses, under `paper/v1/`, written by the
 | `paper/v1/fills/<T>.json` | once T's bars are stored | each order's fill (price, shares, slippage, commission) or why it did not fill; cash and positions after |
 | `paper/v1/days/<T>.json` | with the fills | the window from the previous open to T's open: paper return vs SPY and vs the equal-weight universe, plus cumulative |
 
-- **Append-only**: every object is written once and never overwritten or deleted. If the key already
-  exists the run keeps the stored object. The ledger writer can only write keys of exactly these
+- **Append-only**: every object is written once and never overwritten or deleted. Each write is a
+  single conditional put (`If-None-Match: *`): R2 itself refuses to overwrite an existing key (412),
+  so even a writer racing outside the workflow's concurrency group cannot replace a stored object; the
+  run keeps the stored object. The ledger writer can only write keys of exactly these
   three shapes; it has no delete.
 - **Idempotent orders**: each order's id is `<rulesVersion>_<session>_<securityId>_<side>` (the
   client order id), unique per session, name and side. A retried run finds the object already stored

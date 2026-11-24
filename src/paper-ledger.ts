@@ -4,6 +4,7 @@
  * Append-only: every object is written once under paper/v1/ and never overwritten or deleted. Keys have
  * exactly three shapes (intents, fills, days, one per trading session). A write to a key that already
  * exists keeps the stored object (a retried step is a no-op), so an order can never be duplicated.
+ * Writes are conditional puts (If-None-Match: *): the store refuses an overwrite.
  */
 
 export const PAPER_LEDGER_PREFIX = "paper/v1/";
@@ -139,10 +140,14 @@ export interface PaperDay extends RulesStamp {
   entriesRefused?: PaperEntryRefusal;
 }
 
-/** The minimal object-store surface the ledger needs. It has no delete on purpose. */
+/**
+ * The minimal object-store surface the ledger needs: read, list, and create-only writes (a conditional
+ * put, If-None-Match: *). It has no plain put and no delete on purpose.
+ */
 export interface PaperObjectClient {
   get(key: string): Promise<Uint8Array | undefined>;
-  put(key: string, body: Uint8Array): Promise<void>;
+  /** True when written; false when the key already exists (nothing is overwritten). */
+  putIfAbsent(key: string, body: Uint8Array): Promise<boolean>;
   list(prefix: string): Promise<string[]>;
 }
 
@@ -151,12 +156,14 @@ const text = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 export class PaperLedgerStore {
   constructor(private readonly client: PaperObjectClient) {}
 
-  /** Write once. An existing object is kept (never overwritten) and reported as KEPT_EXISTING. */
+  /**
+   * Write once, as one conditional put: the store itself refuses to overwrite an existing key, so the
+   * stored object is kept (KEPT_EXISTING) even if two writers race.
+   */
   async putOnce(key: string, value: PaperIntents | PaperFills | PaperDay): Promise<"WRITTEN" | "KEPT_EXISTING"> {
     if (!LEDGER_KEY.test(key)) throw new Error("PAPER_LEDGER_KEY_REFUSED");
-    if ((await this.client.get(key)) !== undefined) return "KEPT_EXISTING";
-    await this.client.put(key, new TextEncoder().encode(`${JSON.stringify(value)}\n`));
-    return "WRITTEN";
+    const written = await this.client.putIfAbsent(key, new TextEncoder().encode(`${JSON.stringify(value)}\n`));
+    return written ? "WRITTEN" : "KEPT_EXISTING";
   }
 
   async read<T>(key: string): Promise<T | undefined> {

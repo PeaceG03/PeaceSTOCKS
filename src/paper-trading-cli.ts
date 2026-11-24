@@ -21,6 +21,9 @@ export const PAPER_KILL_FILE = "PAPER_TRADING_KILL";
 /** The scanner's data, read-only: put and delete throw. */
 export function readOnlyObjectClient(client: ObjectClient): ObjectClient {
   return {
+    putIfAbsent: async () => {
+      throw new Error("PAPER_MARKET_READ_ONLY");
+    },
     get: (key) => client.get(key),
     head: (key) => client.head(key),
     list: (prefix) => client.list(prefix),
@@ -33,11 +36,13 @@ export function readOnlyObjectClient(client: ObjectClient): ObjectClient {
   };
 }
 
-/** The ledger's view of the bucket: get, put, list. No delete. */
+/** The ledger's view of the bucket: get, create-only put (If-None-Match: *), list. No plain put, no delete. */
 export function ledgerObjectClient(client: ObjectClient): PaperObjectClient {
+  const putIfAbsent = client.putIfAbsent?.bind(client);
+  if (!putIfAbsent) throw new Error("PAPER_LEDGER_NEEDS_CONDITIONAL_PUT");
   return {
     get: (key) => client.get(key),
-    put: (key, body) => client.put(key, body),
+    putIfAbsent: (key, body) => putIfAbsent(key, body),
     list: (prefix) => client.list(prefix),
   };
 }

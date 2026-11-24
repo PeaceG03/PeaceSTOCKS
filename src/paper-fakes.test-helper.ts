@@ -14,11 +14,14 @@ export class RecordingClient implements PaperObjectClient {
     const found = this.objects.get(key);
     return found ? new Uint8Array(found) : undefined;
   }
-  async put(key: string, body: Uint8Array) {
+  /** Conditional put, as R2 does it with If-None-Match: *: refuses an existing key (412 -> false). */
+  async putIfAbsent(key: string, body: Uint8Array) {
     this.calls.push(`put ${key}`);
     if (this.failPutOn?.(key)) throw new Error("INJECTED_CRASH");
+    if (this.objects.has(key)) return false;
     this.puts.push(key);
     this.objects.set(key, new Uint8Array(body));
+    return true;
   }
   async list(prefix: string) {
     this.calls.push(`list ${prefix}`);

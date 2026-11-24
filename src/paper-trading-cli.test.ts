@@ -34,6 +34,8 @@ test("cli: scanner data is read-only; the ledger view has no delete", async () =
   await assert.rejects(ro.delete("permanent/x"), /PAPER_MARKET_READ_ONLY/u);
   assert.deepEqual(await client.list(""), []);
   assert.equal("delete" in ledgerObjectClient(client), false);
+  assert.equal("put" in ledgerObjectClient(client), false);
+  await assert.rejects(ro.putIfAbsent!("permanent/x", new Uint8Array()), /PAPER_MARKET_READ_ONLY/u);
 });
 
 test("cli: end to end over the scanner's real storage layout, writing only paper/v1/ keys, logging no symbols", async () => {
