@@ -14,7 +14,7 @@ import type {
 import { MARKET_SCHEMA_VERSION, SCANNER_VERSION } from "./contracts";
 import { rankSecurities } from "./ranking";
 import { fingerprint } from "./identity";
-import { sessionCollectionDue } from "./et-time";
+import { etCalendarDate, sessionCollectionDue } from "./et-time";
 import { makePredictionStatus, sessionAlreadyFrozen } from "./prediction-status";
 import { forwardFreezeAllowed, nextSessionOpen } from "./session-open";
 import { refreshEligibility, refreshUniverse } from "./universe";
@@ -248,7 +248,7 @@ export class MarketsScanner {
     }
     let refresh;
     try {
-      refresh = await refreshUniverse(this.provider, this.storage, sessionDate);
+      refresh = await refreshUniverse(this.provider, this.storage, sessionDate, {}, etCalendarDate(this.now()));
       for (const warning of refresh.warnings ?? []) process.stderr.write(`${warning}\n`);
       const bindUniverse = (
         this.provider as MarketProvider & {

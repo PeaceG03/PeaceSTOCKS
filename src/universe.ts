@@ -40,6 +40,8 @@ export async function refreshUniverse(
   storage: MarketStore,
   asOf: string,
   options: ListSecuritiesOptions = {},
+  /** ET calendar date the listing is taken; the ticker index is labelled with it (a catch-up's asOf is past). */
+  listedOn?: string,
 ): Promise<UniverseRefreshResult> {
   await storage.initialize();
   const existing = await storage.loadSecurities();
@@ -188,7 +190,7 @@ export async function refreshUniverse(
     try {
       const manifest = await storage.saveTickerReferenceIndex(capture, {
         provider: provider.providerName,
-        asOf,
+        asOf: listedOn && listedOn > asOf ? listedOn : asOf,
       });
       tickerReferenceIndex = { pages: manifest.pages, records: manifest.records };
     } catch (error) {
