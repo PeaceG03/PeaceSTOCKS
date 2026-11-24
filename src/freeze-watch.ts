@@ -2,8 +2,8 @@
 // opens without picks frozen before that open: frozen late, unavailable, or no decision stored at all
 // (for example the scan never ran). Each missed session raises the existing alert once: the one
 // "PeaceSTOCKS health needs attention" issue (label scanner-alert, src/health-alert.ts), opened or
-// commented on; a marker under permanent/health/scan/missed-freeze-alerts/ keeps it to once per
-// session. Reads prediction-status records only; no Massive request, no tickers in the alert.
+// commented on; a marker under permanent/health/scan/missed-freeze-alerts/, claimed with one conditional
+// put (If-None-Match: *) before the alert, keeps it to once per session even when two runs race. Reads prediction-status records only; no Massive request, no tickers in the alert.
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PredictionStatus } from "./contracts";
@@ -132,8 +132,14 @@ export async function loadSessionStatuses(store: Pick<HealthCheckinStore, "get">
   return jsonl<PredictionStatus>(await store.get(`permanent/prediction-status/${sessionDate}.jsonl`));
 }
 
+/** The health store plus a create-only put (the alert marker claim) and delete (release a failed claim). */
+export type FreezeWatchStore = HealthCheckinStore & {
+  putIfAbsent(key: string, body: Uint8Array): Promise<boolean>;
+  delete(key: string): Promise<void>;
+};
+
 export interface FreezeWatchDeps {
-  store: HealthCheckinStore;
+  store: FreezeWatchStore;
   env: NodeJS.ProcessEnv;
   now?: Date;
   calendar?: EligibleSessionCalendar;
@@ -154,26 +160,35 @@ export async function runFreezeWatch(
   const reliability = freezeReliability(outcomes, now);
   await writeVerifiedHealthJson(deps.store, FREEZE_RELIABILITY_KEY, reliability);
   const missed = outcomes.slice(0, MISSED_FREEZE_LOOKBACK_SESSIONS).filter((o) => o.outcome !== "ON_TIME");
+  // Claim each marker with one conditional put (If-None-Match: *). The scan job's last step and the :47 tick
+  // are in different concurrency groups; head-then-put let both see no marker and both alert. A refused
+  // claim (412) means another run already alerted (or is alerting) for that session.
   const fresh: SessionFreeze[] = [];
-  for (const miss of missed)
-    if (!(await deps.store.head(`${MISSED_FREEZE_ALERT_PREFIX}${miss.sessionDate}.json`))) fresh.push(miss);
+  const markerKey = (miss: SessionFreeze) => `${MISSED_FREEZE_ALERT_PREFIX}${miss.sessionDate}.json`;
+  for (const miss of missed) {
+    const claim = new TextEncoder().encode(`${JSON.stringify({ at: now.toISOString(), ...miss, alert: "CLAIMED" }, null, 2)}\n`);
+    if (await deps.store.putIfAbsent(markerKey(miss), claim)) fresh.push(miss);
+  }
   if (!fresh.length)
     return { missed, alerted: [], reliability, line: `freeze watch: ${shareLine(reliability)}; ${missed.length} missed in the last ${MISSED_FREEZE_LOOKBACK_SESSIONS} sessions, none new` };
   const headline = `missed freeze: ${fresh.length} session${fresh.length === 1 ? "" : "s"}`;
   const alert = deps.alert ?? runHealthAlert;
-  const did = await alert({
-    result: { headline, lines: [headline, ...fresh.map(describeMiss)], attention: true },
-    env: deps.env,
-    now,
-    ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
-  });
-  // Marker only after the alert went out, so a failed alert is retried by the next run.
-  for (const miss of fresh)
-    await writeVerifiedHealthJson(deps.store, `${MISSED_FREEZE_ALERT_PREFIX}${miss.sessionDate}.json`, {
-      at: now.toISOString(),
-      ...miss,
-      alert: did,
+  let did: string;
+  try {
+    did = await alert({
+      result: { headline, lines: [headline, ...fresh.map(describeMiss)], attention: true },
+      env: deps.env,
+      now,
+      ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
     });
+  } catch (error) {
+    // A failed alert releases its claims, so the next run retries.
+    for (const miss of fresh) await deps.store.delete(markerKey(miss)).catch(() => undefined);
+    throw error;
+  }
+  // The claim is ours: record what the alert did.
+  for (const miss of fresh)
+    await writeVerifiedHealthJson(deps.store, markerKey(miss), { at: now.toISOString(), ...miss, alert: did });
   return { missed, alerted: fresh.map((m) => m.sessionDate), reliability, line: `freeze watch: ${shareLine(reliability)}; ${headline}; alert ${did}` };
 }
 
