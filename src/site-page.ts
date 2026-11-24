@@ -59,7 +59,7 @@ main{max-width:760px;margin:0 auto;padding:16px}h1{font-size:22px;margin:4px 0 2
 .sub{color:var(--mute);font-size:13px;margin-bottom:14px}.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
 .big{font-size:17px;font-weight:600}.mute{color:var(--mute);font-size:13px}ul{margin:6px 0 0;padding-left:18px}li{margin:2px 0}
 .b{display:inline-block;border-radius:999px;padding:1px 8px;font-size:12px;font-weight:600;border:1px solid currentColor}
-.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--mute)}
+.exp{margin:0 0 8px;padding:6px 8px;border-left:3px solid var(--warn);color:var(--warn);font-size:13px;font-weight:600;overflow-wrap:anywhere}.exp-tag{color:var(--warn);font-size:11px;font-weight:600;text-transform:uppercase}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--mute)}
 table{width:100%;border-collapse:collapse;font-size:14px}td,th{text-align:left;padding:6px 4px;border-top:1px solid var(--line);vertical-align:top}th{color:var(--mute);font-weight:500;font-size:12px;border-top:0}
 .r{text-align:right;white-space:nowrap}.f{color:var(--bad);font-size:12px;word-break:break-word}
 html,body{max-width:100%;overflow-x:hidden}
@@ -77,6 +77,13 @@ html,body{max-width:100%;overflow-x:hidden}
 .stack td::before{content:attr(data-label);display:block;color:var(--mute);font-size:12px;font-weight:500}
 }
 `;
+
+/**
+ * Shown above the picks and beside each list. The held-out evaluation (PR #124, src/holdout-eval.ts)
+ * found no edge over random same-size lists, so the lists are labelled as experimental.
+ */
+export const PICKS_EXPERIMENTAL_LABEL =
+  "Experimental: in back-tests on held-out data these lists have not beaten random picks. Not investment advice.";
 
 export function renderSitePage(data: SiteData): string {
   const parts: string[] = [];
@@ -134,10 +141,10 @@ export function renderSitePage(data: SiteData): string {
         ? `<div class="big muted">Predictions off</div><div class="mute">No picks are being made right now.${
             p.status ? ` Last status: ${escapeHtml(p.status)}${p.reason ? ` (${escapeHtml(p.reason)})` : ""}.` : ""
           }</div>`
-        : `<div class="mute">Session ${escapeHtml(p.sessionDate)}</div>${p.picks
+        : `<div class="exp" role="note">${escapeHtml(PICKS_EXPERIMENTAL_LABEL)}</div><div class="mute">Session ${escapeHtml(p.sessionDate)}</div>${p.picks
             .map(
               (set) =>
-                `<div><b>${escapeHtml(set.setType)}</b>: ${
+                `<div><b>${escapeHtml(set.setType)}</b> <span class="exp-tag">experimental</span>: ${
                   set.unavailableReason
                     ? `<span class="mute">unavailable${set.unavailableReason === "INSUFFICIENT_HISTORY" ? " (not enough price history)" : ""}</span>`
                     : set.symbols.map(escapeHtml).join(", ")

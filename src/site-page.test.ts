@@ -73,7 +73,7 @@ test("site page: shows the latest picks by symbol only when prediction sets exis
   assert.deepEqual(data.predictions.picks, [{ setType: "TOP_15_OVERALL", symbols: ["AAA", "BBB", "sec-z"] }]);
   const html = renderSitePage(data);
   assert.doesNotMatch(html, /Predictions off/u);
-  assert.match(html, /TOP_15_OVERALL<\/b>: AAA, BBB, sec-z/u);
+  assert.match(html, /TOP_15_OVERALL<\/b> <span class="exp-tag">experimental<\/span>: AAA, BBB, sec-z/u);
 });
 
 test("site data: bounded run-report reads, newest by listing date, and a failed read still renders", async () => {
@@ -111,8 +111,8 @@ test("site page: a list marked unavailable says so, and is not shown as an empty
     { setType: "FASTEST_IMPROVING", symbols: [], unavailableReason: "INSUFFICIENT_HISTORY" },
   ]);
   const html = renderSitePage(data);
-  assert.match(html, /FASTEST_IMPROVING<\/b>: <span class="mute">unavailable \(not enough price history\)<\/span>/u);
-  assert.match(html, /TOP_15_OVERALL<\/b>: AAA</u);
+  assert.match(html, /FASTEST_IMPROVING<\/b> <span class="exp-tag">experimental<\/span>: <span class="mute">unavailable \(not enough price history\)<\/span>/u);
+  assert.match(html, /TOP_15_OVERALL<\/b> <span class="exp-tag">experimental<\/span>: AAA</u);
 });
 
 const SAMPLE_PAGE: Parameters<typeof renderSitePage>[0] = {
@@ -221,4 +221,28 @@ test("site page: every card field escapes <script> and attribute-break payloads"
     assert.match(html, new RegExp(`data-label="Part">${safe}<div class="mute">${safe}</div></td>`, "u"));
     assert.match(html, new RegExp(`<span class="valid">${safe} / ${safe}</span><div class="mute">${safe} incomplete</div>`, "u"));
   }
+});
+
+test("site page: picks carry a visible experimental label above the lists and on each list", async () => {
+  const LABEL = "Experimental: in back-tests on held-out data these lists have not beaten random picks. Not investment advice.";
+  const client = await seeded();
+  const line = (setType: string, securityIds: string[], extra = {}) =>
+    JSON.stringify({ predictionId: `p-${setType}`, sessionDate: "2026-11-21", setType, securityIds, scannerVersion: "v", configFingerprint: "f", frozenAt: "x", ...extra });
+  const types = ["TOP_15_OVERALL", "TOP_50_OVERALL", "STRONGEST_MOMENTUM", "FASTEST_IMPROVING", "DEFENSIVE_LOW_RISK"];
+  await client.put("permanent/predictions/2026-11-21.jsonl", enc(types.map((t) => line(t, ["sec-a"])).join("\n") + "\n"));
+  await client.put("permanent/security-master.json", enc([{ securityId: "sec-a", currentSymbol: "AAA" }]));
+  const html = renderSitePage(await loadSiteData(client));
+  const picks = html.slice(html.indexOf("<h2>Picks</h2>"), html.indexOf("<h2>Recent sessions</h2>"));
+  // Once, as the first thing under the heading, before any list.
+  assert.equal(picks.split(LABEL).length - 1, 1);
+  assert.match(picks, new RegExp(`^<h2>Picks</h2><div class="exp" role="note">${LABEL.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}</div>`, "u"));
+  assert.ok(picks.indexOf(LABEL) < picks.indexOf("<b>"));
+  // And on every list, so a screenshot of any one line still says it.
+  for (const t of types) assert.match(picks, new RegExp(`<b>${t}</b> <span class="exp-tag">experimental</span>: AAA`, "u"));
+  // Readable on a phone: wraps, and its style is defined.
+  assert.match(html, /\.exp\{[^}]*overflow-wrap:anywhere/u);
+  assert.match(html, /\.exp-tag\{/u);
+  // No label when predictions are off.
+  const off = renderSitePage(await loadSiteData(await seeded()));
+  assert.equal(off.includes(LABEL), false);
 });
