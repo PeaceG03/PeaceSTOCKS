@@ -107,9 +107,11 @@ export async function researchMain(args: string[]): Promise<void> {
   for (const entry of all) latest.set(entry.strategyHash, entry);
   const family = [...latest.values()];
   const variantsTried = new Set(all.flatMap((r) => r.candidateHashes)).size;
-  const adjusted = holmAdjusted(family.map((r) => r.pooledP), Math.max(variantsTried, family.length));
+  const familySize = Math.max(variantsTried, family.length);
+  const adjusted = holmAdjusted(family.map((r) => r.pooledP), familySize);
   const results = evaluations.map((evaluation) => {
     evaluation.variantsTried = variantsTried;
+    evaluation.familySize = familySize;
     evaluation.adjustedP = adjusted[family.findIndex((r) => r.strategyHash === evaluation.record.strategyHash)]!;
     const result = { ...evaluation, daily: undefined, verdict: verdictFor(evaluation, undefined) };
     const file = `${evaluation.record.name}.json`;

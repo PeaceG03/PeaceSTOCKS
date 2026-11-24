@@ -30,6 +30,7 @@ const evaluation = (over: { exU?: number; exS?: number; positive?: number; folds
     },
     daily: [],
     variantsTried: 5,
+    familySize: 5,
     adjustedP: over.adjustedP ?? 0.01,
     foldsPositive: over.positive ?? 3,
   };

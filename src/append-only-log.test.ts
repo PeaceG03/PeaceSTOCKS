@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,6 +38,13 @@ test("an edited, deleted or reordered record is refused, and so is appending to 
   assert.throws(() => log.read(), new RegExp(LOG_TAMPERED));
   writeFileSync(path, `${rows[1]}\n${rows[0]}\n${rows[2]}\n`);
   assert.throws(() => log.read(), new RegExp(LOG_TAMPERED));
+  // A forger who knows the scheme rewrites the middle record and recomputes its own hash: the next
+  // record's link (prev) no longer matches, so the chain refuses it.
+  const middle = JSON.parse(rows[1]!) as { seq: number; prev: string; at: string; entry: { p: number }; hash: string };
+  middle.entry = { p: 0.0001 };
+  middle.hash = createHash("sha256").update(`${middle.seq}|${middle.prev}|${middle.at}|${stableJson(middle.entry)}`).digest("hex");
+  writeFileSync(path, `${rows[0]}\n${JSON.stringify(middle)}\n${rows[2]}\n`);
+  assert.throws(() => log.read(), new RegExp(`${LOG_TAMPERED}.*line-2`));
   writeFileSync(path, good.slice(0, -5));
   assert.throws(() => log.read(), new RegExp(LOG_TAMPERED));
   // Dropping whole lines from the end is detectable only against a known count; the variant

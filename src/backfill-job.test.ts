@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { classifyStop, runBackfillJob, type BackfillJobOptions } from "./backfill-job";
-import { dailyBarsSidecarFileKey } from "./daily-bars-sidecar";
+import { dailyBarsSidecarFileKey, dailyBarsSidecarManifestKey, maybeWriteScanDailyBarsSidecar } from "./daily-bars-sidecar";
 import { dailyReplyDustFileKey } from "./daily-reply-dust";
 import { FAKE_MASSIVE_BASE_URL, fakeMassive, syntheticMarket, type FakeMassiveOptions } from "./fake-massive";
 import { MemoryObjectClient } from "./object-store";
@@ -63,6 +63,7 @@ test("a restart partway resumes after the last completed session; nothing is fet
   const resumed = await runBackfillJob(base(second, "2026-01-20", "2026-01-23"));
   assert.equal(resumed.status, "COMPLETE");
   assert.deepEqual(second.calls.grouped, ["2026-01-22", "2026-01-23"]);
+  assert.equal(second.calls.splits, 2); // corporate actions too: only the two missing sessions
   assert.equal(resumed.packsWritten, 2);
   assert.equal(resumed.packsAlreadySealed, 2);
   assert.equal(resumed.sessionsVerified, 4);
@@ -80,6 +81,8 @@ test("losing the checkpoint does not re-fetch or overwrite a stored session", as
   const report = await runBackfillJob(base(again, "2026-01-20", "2026-01-21"));
   assert.equal(report.status, "COMPLETE");
   assert.deepEqual(again.calls.grouped, []);
+  assert.equal(again.calls.splits + again.calls.dividends, 0);
+  assert.equal(report.requests, 2); // the two ticker-list passes only
   assert.equal(report.packsWritten, 0);
   assert.equal(report.packsAlreadySealed, 2);
   assert.deepEqual(await snapshot(client), before);
@@ -104,6 +107,38 @@ test("a sha mismatch in a stored pack or Reply Dust file refuses the run", async
   const refusedDust = await runBackfillJob(base(fake(), "2026-01-20", "2026-01-22"));
   assert.equal(refusedDust.status, "REFUSED_SHA_MISMATCH");
   assert.deepEqual(refusedDust.shaMismatches, ["2026-01-22"]);
+});
+
+test("a valid but different pack already in the store is refused, never overwritten", async () => {
+  const { client, storage, base, fake } = rig();
+  await runBackfillJob(base(fake(), "2026-01-20", "2026-01-21"));
+  const packKey = dailyBarsSidecarFileKey("2026-01-21");
+  await client.delete(packKey);
+  await client.delete(dailyBarsSidecarManifestKey("2026-01-21"));
+  // Someone else's well-formed pack for that session, built from different values.
+  const rows = (await storage.loadBars("2026-01-21")).map((r, k) => (k === 0 ? { ...r, close: r.close + 0.01 } : r));
+  const other = await maybeWriteScanDailyBarsSidecar({ enabled: true, store: client, sessionDate: "2026-01-21", bars: rows, securities: await storage.loadSecurities(), zstdVersionProbe: pinnedZstd });
+  assert.equal(other.failure, undefined);
+  const theirs = Buffer.from((await client.get(packKey))!).toString("base64");
+  const report = await runBackfillJob(base(fake(), "2026-01-20", "2026-01-21"));
+  assert.equal(report.status, "REFUSED_PACK_CONFLICT");
+  assert.deepEqual(report.packConflicts, ["2026-01-21"]);
+  assert.equal(Buffer.from((await client.get(packKey))!).toString("base64"), theirs);
+});
+
+test("a tampered Reply Dust file is refused even for a session with no rows (no pack to cross-check)", async () => {
+  const { client, base, fake } = rig();
+  const empty = fake({ grouped: (d) => (d === "2026-01-21" ? [] : market.grouped(d)) });
+  const ok = await runBackfillJob(base(empty, "2026-01-20", "2026-01-22"));
+  assert.equal(ok.status, "COMPLETE");
+  assert.equal(ok.sessionsVerified, 3);
+  const dustKey = dailyReplyDustFileKey("2026-01-21");
+  const dust = Uint8Array.from((await client.get(dustKey))!);
+  dust.set([dust.at(-1)! ^ 0xff], dust.length - 1);
+  await client.put(dustKey, dust);
+  const refused = await runBackfillJob(base(fake(), "2026-01-20", "2026-01-22"));
+  assert.equal(refused.status, "REFUSED_SHA_MISMATCH");
+  assert.deepEqual(refused.shaMismatches, ["2026-01-21"]);
 });
 
 test("the rate limit is respected: no two provider requests closer than the configured spacing", async () => {

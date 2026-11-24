@@ -54,14 +54,17 @@ test("variant evaluation: chooses on train only, logs every variant, counts them
   const both = evaluateStrategy(sessions, folds, strategy("pick", ["BAD", "GOOD"]), log);
   assert.ok(both.record.folds.every((f) => f.chosen === both.record.candidateHashes[1]));
   assert.equal(both.variantsTried, 2);
+  assert.equal(both.familySize, 2); // one strategy, but two variants were tried inside it
   assert.equal(both.foldsPositive, folds.length);
   const first = both.adjustedP;
   const again = evaluateStrategy(sessions, folds, strategy("bad-only", ["BAD"]), log);
   assert.equal(again.variantsTried, 2); // BAD was already tried inside "pick"
+  assert.equal(again.familySize, 2);
   assert.equal(again.foldsPositive, 0);
   const topOne: StrategyConfig = { ...strategy("good-top1", []), candidates: [{ kind: "scanner-list", list: "GOOD", topN: 1, scanner: "test" }] };
   const third = evaluateStrategy(sessions, folds, topOne, log);
   assert.equal(third.variantsTried, 3);
+  assert.equal(third.familySize, 3);
   assert.equal(log.entries().length, 3);
   // More variants tried -> the same evidence is worth less.
   const p = both.record.pooledP;

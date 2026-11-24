@@ -57,6 +57,8 @@ export interface StrategyEvaluation {
   daily: DailyResult[];
   /** Distinct variants (candidate hashes) in the log after this record. */
   variantsTried: number;
+  /** Holm family size: max(distinct candidate variants in the log, strategies in the log). */
+  familySize: number;
   /** Holm-adjusted pooledP over the latest record of every strategy in the log. */
   adjustedP: number;
   foldsPositive: number;
@@ -113,7 +115,8 @@ export function evaluateStrategy(
   for (const entry of all) latest.set(entry.strategyHash, entry);
   const variantsTried = new Set(all.flatMap((e) => e.candidateHashes)).size;
   const strategies = [...latest.values()];
-  const adjusted = holmAdjusted(strategies.map((s) => s.pooledP), Math.max(variantsTried, strategies.length));
+  const familySize = Math.max(variantsTried, strategies.length);
+  const adjusted = holmAdjusted(strategies.map((s) => s.pooledP), familySize);
   const adjustedP = adjusted[strategies.findIndex((s) => s.strategyHash === record.strategyHash)]!;
-  return { record, daily, variantsTried, adjustedP, foldsPositive: results.filter((r) => r.positive).length };
+  return { record, daily, variantsTried, familySize, adjustedP, foldsPositive: results.filter((r) => r.positive).length };
 }
