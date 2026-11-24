@@ -194,3 +194,79 @@ test("access setup: a retry after a failed deploy reuses the app and policy the 
   assert.equal(again.aud, "aud-prior");
   assert.ok(!cf.calls.some((c) => c.startsWith("POST ")));
 });
+
+test("access setup: the app is found by hostname only; a same-named app on another hostname is never chosen", async () => {
+  // Only a same-named app elsewhere: ours must be created, the other left alone.
+  const elsewhere = { id: "app-elsewhere", name: SITE_ACCESS_APP_NAME, type: "self_hosted", domain: "other.example.test", aud: "aud-elsewhere", policies: [{ id: "pol-x" }] };
+  const lone = fakeCloudflare();
+  lone.apps.set("app-elsewhere", structuredClone(elsewhere));
+  const created = await setupSiteAccess(input(lone.fetchImpl));
+  assert.deepEqual(created.created, { app: true, policy: true });
+  assert.notEqual(created.appId, "app-elsewhere");
+  assert.ok(lone.calls.includes("POST /apps"), lone.calls.join(", "));
+  assert.ok(!lone.calls.some((c) => c.startsWith("PUT /apps")), lone.calls.join(", "));
+  assert.deepEqual(lone.apps.get("app-elsewhere"), elsewhere);
+  assert.equal(lone.apps.size, 2);
+
+  // Ours on the hostname (under an old name) plus the same-named app elsewhere: ours is updated.
+  const both = fakeCloudflare();
+  both.apps.set("app-elsewhere", structuredClone(elsewhere));
+  both.apps.set("app-ours", { id: "app-ours", name: "renamed earlier", type: "self_hosted", domain: HOST, aud: "aud-ours", policies: [] });
+  const updated = await setupSiteAccess(input(both.fetchImpl));
+  assert.equal(updated.appId, "app-ours");
+  assert.equal(updated.aud, "aud-ours");
+  assert.equal(updated.created.app, false);
+  assert.ok(!both.calls.includes("POST /apps"), both.calls.join(", "));
+  assert.deepEqual(both.calls.filter((c) => c.startsWith("PUT /apps")), ["PUT /apps/app-ours"]);
+  assert.equal(both.apps.get("app-ours")!.name, SITE_ACCESS_APP_NAME);
+  assert.deepEqual(both.apps.get("app-elsewhere"), elsewhere);
+});
+
+test("access setup: the policy is found by name; an unrelated policy listed first is never overwritten", async () => {
+  const unrelated = { id: "pol-unrelated", name: "Someone else's policy", decision: "allow", include: [{ everyone: {} }], exclude: [], require: [] };
+  // Unrelated first and ours second: ours is updated, the unrelated one untouched.
+  const both = fakeCloudflare();
+  both.policies.set("pol-unrelated", structuredClone(unrelated));
+  both.policies.set("pol-ours", { id: "pol-ours", name: SITE_ACCESS_POLICY_NAME, decision: "allow", include: [{ email: { email: "old@example.test" } }] });
+  const updated = await setupSiteAccess(input(both.fetchImpl));
+  assert.equal(updated.policyId, "pol-ours");
+  assert.equal(updated.created.policy, false);
+  assert.deepEqual(both.calls.filter((c) => c.startsWith("PUT /policies") || c === "POST /policies"), ["PUT /policies/pol-ours"]);
+  assert.deepEqual(both.policies.get("pol-unrelated"), unrelated);
+  assert.deepEqual(both.policies.get("pol-ours")!.include, [{ email: { email: EMAIL } }]);
+
+  // Only the unrelated one: ours is created, the unrelated one untouched and not attached.
+  const lone = fakeCloudflare();
+  lone.policies.set("pol-unrelated", structuredClone(unrelated));
+  const created = await setupSiteAccess(input(lone.fetchImpl));
+  assert.equal(created.created.policy, true);
+  assert.notEqual(created.policyId, "pol-unrelated");
+  assert.ok(!lone.calls.some((c) => c.startsWith("PUT /policies")), lone.calls.join(", "));
+  assert.deepEqual(lone.policies.get("pol-unrelated"), unrelated);
+  assert.deepEqual(lone.apps.get(created.appId)!.policies, [{ id: created.policyId, precedence: 1 }]);
+});
+
+const writes = (calls: string[]) => calls.filter((c) => !c.startsWith("GET "));
+
+test("access setup: two apps on the hostname is an error, and nothing is changed", async () => {
+  const cf = fakeCloudflare();
+  const ours = { id: "pol-ours", name: SITE_ACCESS_POLICY_NAME, decision: "allow", include: [{ email: { email: "old@example.test" } }], exclude: [], require: [] };
+  cf.policies.set("pol-ours", structuredClone(ours));
+  cf.apps.set("app-1", { id: "app-1", name: SITE_ACCESS_APP_NAME, type: "self_hosted", domain: HOST, aud: "aud-1", policies: [{ id: "pol-ours" }] });
+  cf.apps.set("app-2", { id: "app-2", name: "Another", type: "self_hosted", domain: HOST.toUpperCase(), aud: "aud-2", policies: [] });
+  const before = structuredClone({ apps: [...cf.apps], policies: [...cf.policies] });
+  await assert.rejects(setupSiteAccess(input(cf.fetchImpl)), /more than one Access app covers stocks\.example\.test/u);
+  assert.deepEqual(writes(cf.calls), [], "no PUT/POST before the error");
+  assert.deepEqual({ apps: [...cf.apps], policies: [...cf.policies] }, before);
+});
+
+test("access setup: two policies with our name is an error, and nothing is changed", async () => {
+  const cf = fakeCloudflare();
+  cf.policies.set("pol-a", { id: "pol-a", name: SITE_ACCESS_POLICY_NAME, decision: "allow", include: [{ email: { email: "old@example.test" } }], exclude: [], require: [] });
+  cf.policies.set("pol-b", { id: "pol-b", name: SITE_ACCESS_POLICY_NAME, decision: "allow", include: [{ everyone: {} }], exclude: [], require: [] });
+  cf.apps.set("app-ours", { id: "app-ours", name: SITE_ACCESS_APP_NAME, type: "self_hosted", domain: HOST, aud: "aud-ours", policies: [{ id: "pol-b" }] });
+  const before = structuredClone({ apps: [...cf.apps], policies: [...cf.policies] });
+  await assert.rejects(setupSiteAccess(input(cf.fetchImpl)), /more than one Access policy named "PeaceSTOCKS site owner"/u);
+  assert.deepEqual(writes(cf.calls), [], "no PUT/POST before the error");
+  assert.deepEqual({ apps: [...cf.apps], policies: [...cf.policies] }, before);
+});

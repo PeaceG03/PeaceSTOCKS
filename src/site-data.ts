@@ -1,6 +1,7 @@
 import type { PredictionSet, PredictionStatus, ScannerRunReport, SecurityMasterRecord } from "./contracts";
 import { HEALTH_PARTS, latestHealthCheckin, type HealthCheckin } from "./health-checkins";
 import { resolveSessionPredictionStatus } from "./prediction-status";
+import { readReason } from "./site-read-error";
 
 /** Same key as health-check.ts HEALTH_CHECK_LATEST_KEY (not imported: that module pulls in node:fs). */
 export const SITE_HEALTH_LATEST_KEY = "permanent/health/check/latest.json";
@@ -72,6 +73,8 @@ export interface SiteData {
   predictions: SitePredictions;
   /** Reads that failed (key prefix only); the page still renders what it could read. */
   readErrors: string[];
+  /** Why each failed read failed: HTTP status + S3 <Code>, or an error name. Never values or body text. */
+  readErrorReasons?: Record<string, string>;
 }
 
 export const SITE_MAX_REPORTS = 20;
@@ -97,11 +100,17 @@ function clip(value: string): string {
   return value.length > TEXT_MAX ? `${value.slice(0, TEXT_MAX - 1)}…` : value;
 }
 
-async function attempt<T>(label: string, errors: string[], read: () => Promise<T>): Promise<T | undefined> {
+interface ReadErrors {
+  names: string[];
+  reasons: Record<string, string>;
+}
+
+async function attempt<T>(label: string, errors: ReadErrors, read: () => Promise<T>): Promise<T | undefined> {
   try {
     return await read();
-  } catch {
-    errors.push(label);
+  } catch (error) {
+    errors.names.push(label);
+    errors.reasons[label] ??= readReason(error);
     return undefined;
   }
 }
@@ -139,7 +148,7 @@ export async function loadSiteData(
   options: { now?: () => Date; maxReports?: number } = {},
 ): Promise<SiteData> {
   const now = options.now ?? (() => new Date());
-  const readErrors: string[] = [];
+  const readErrors: ReadErrors = { names: [], reasons: {} };
 
   const rawHealth = await attempt("health", readErrors, async () =>
     json<{ at?: string; headline?: string; attention?: boolean; errors?: number; missing?: number; lines?: string[] }>(
@@ -229,6 +238,7 @@ export async function loadSiteData(
     },
     reports,
     predictions,
-    readErrors: [...new Set(readErrors)],
+    readErrors: [...new Set(readErrors.names)],
+    ...(readErrors.names.length ? { readErrorReasons: { ...readErrors.reasons } } : {}),
   };
 }

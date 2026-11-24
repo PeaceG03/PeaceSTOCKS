@@ -145,9 +145,14 @@ export async function setupSiteAccess(input: AccessSetupInput): Promise<AccessSe
     require: [],
     session_duration: SESSION,
   };
+  // Look up both and check they are unambiguous before any write, so an ambiguous account is left
+  // exactly as it was.
   const policies = (await listAll<AccessPolicy>(call, "/policies")).filter((p) => p.name === SITE_ACCESS_POLICY_NAME);
   if (policies.length > 1) throw new AccessSetupError(`more than one Access policy named "${SITE_ACCESS_POLICY_NAME}"`);
   const existingPolicy = policies[0];
+  const apps = (await listAll<AccessApp>(call, "/apps")).filter((a) => (a.domain ?? "").toLowerCase() === hostname);
+  if (apps.length > 1) throw new AccessSetupError(`more than one Access app covers ${hostname}`);
+  const existingApp = apps[0];
   const savedPolicy = existingPolicy?.id
     ? await call<AccessPolicy>("PUT", `/policies/${encodeURIComponent(existingPolicy.id)}`, policyBody)
     : await call<AccessPolicy>("POST", "/policies", policyBody);
@@ -165,9 +170,6 @@ export async function setupSiteAccess(input: AccessSetupInput): Promise<AccessSe
     same_site_cookie_attribute: "lax",
     policies: [{ id: policyId, precedence: 1 }],
   };
-  const apps = (await listAll<AccessApp>(call, "/apps")).filter((a) => (a.domain ?? "").toLowerCase() === hostname);
-  if (apps.length > 1) throw new AccessSetupError(`more than one Access app covers ${hostname}`);
-  const existingApp = apps[0];
   const savedApp = existingApp?.id
     ? await call<AccessApp>("PUT", `/apps/${encodeURIComponent(existingApp.id)}`, appBody)
     : await call<AccessApp>("POST", "/apps", appBody);
