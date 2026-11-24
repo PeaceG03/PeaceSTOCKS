@@ -9,6 +9,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { backfillChunks, backfillJobMain, parseBackfillJobArgs, type BackfillJobCliDeps } from "./backfill-job-cli";
 import { FAKE_MASSIVE_BASE_URL, fakeMassive, syntheticMarket } from "./fake-massive";
+import { dailyBarsSidecarFileKey } from "./daily-bars-sidecar";
 import { MemoryObjectClient } from "./object-store";
 import { ObjectMarketStorage } from "./object-storage";
 
@@ -142,6 +143,20 @@ test("the time budget stops at a session boundary (resumable, exit 0); a plan-wi
   const stopped = await backfillJobMain(workflowArgs(plan.vars("", "5")), env, { ...plan.deps, fetchImpl: refused.fetchImpl });
   assert.equal(stopped.exitCode, 2);
   assert.equal(stopped.chunks[0]!.stopReason, "PLAN_WINDOW");
+});
+
+test("a tampered sealed pack refuses the run with exit 3 and is never rewritten", async () => {
+  const { client, deps, vars } = rig(0);
+  assert.equal((await backfillJobMain(workflowArgs(vars("", "2")), env, deps)).exitCode, 0);
+  const key = dailyBarsSidecarFileKey("2026-01-22");
+  const bad = Uint8Array.from((await client.get(key))!);
+  bad.set([bad.at(-1)! ^ 0xff], bad.length - 1);
+  await client.put(key, bad);
+  const refused = await backfillJobMain(workflowArgs(vars("", "2")), env, deps);
+  assert.equal(refused.exitCode, 3);
+  assert.equal(refused.chunks.at(-1)!.status, "REFUSED_SHA_MISMATCH");
+  assert.equal(refused.chunks.length, 2, "stops at the refusing chunk");
+  assert.deepEqual(Uint8Array.from((await client.get(key))!), bad);
 });
 
 test("no key, or no object store when one is required: refused before anything runs", async () => {
