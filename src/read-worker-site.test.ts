@@ -213,3 +213,14 @@ test("site worker: an R2 setting that is missing or blank after trimming gives a
     }
   }
 });
+
+test("site worker entry module: every named export is a function or a handler (workerd refuses anything else)", async () => {
+  // workerd treats each export of the main module as an entrypoint; an exported string such as a
+  // hostname constant makes the whole Worker fail to load: "Incorrect type for map entry ...: the
+  // provided value is not of type 'function or ExportedHandler'".
+  const entry = (await import("./read-worker")) as Record<string, unknown>;
+  for (const [name, value] of Object.entries(entry)) {
+    const handler = typeof value === "object" && value !== null && typeof (value as { fetch?: unknown }).fetch === "function";
+    assert.ok(typeof value === "function" || handler, `export ${name} is a ${typeof value}`);
+  }
+});

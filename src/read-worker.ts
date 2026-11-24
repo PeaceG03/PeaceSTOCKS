@@ -161,9 +161,10 @@ export function siteReadClient(env: SiteEnv, fetchImpl?: typeof fetch): ReadOnly
 /**
  * The one host the site answers on: the Access-protected custom domain (wrangler.toml route). Any other
  * host (a *.workers.dev or preview URL, if ever switched on) sits outside Access, so it gets 404 before
- * the JWT check or any storage read.
+ * the JWT check or any storage read. Not exported: workerd refuses any entry-module export that is
+ * not a function or handler, and the whole Worker would fail to load.
  */
-export const SITE_HOSTNAME = "stocks.jjpeace.com";
+const SITE_HOSTNAME = "stocks.jjpeace.com";
 
 export default {
   async fetch(request: Request, env: SiteEnv): Promise<Response> {
