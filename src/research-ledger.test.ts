@@ -104,3 +104,26 @@ test("the CLI reads its ledger against the committed heads: rewriting a committe
     await assert.rejects(researchMain(base(root, join(root, "out2"), "scanner-a"), { ledgerDir }), /LOG_TAMPERED.*anchor/u);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("A9: with no injected ledger the CLI uses the repository ledger (research-ledger/), never --out", async () => {
+  // Same TOP_15_OVERALL config the committed seal registered, but a different held-out window: the
+  // committed seal must refuse it before any data is read. Were the ledger defaulted to --out (an
+  // empty folder), registration would succeed and the run would fail later on the missing data.
+  const out = mkdtempSync(join(tmpdir(), "a9-out-"));
+  const files = ["variants.jsonl", "variants.jsonl.head", "heldout.jsonl", "heldout.jsonl.head"];
+  const before = files.map((f) => readFileSync(join(RESEARCH_LEDGER_DIR, f), "utf8"));
+  try {
+    await assert.rejects(
+      researchMain([
+        "baseline", "--data", join(out, "no-data"), "--out", out, "--scanner", "main@f1605fe7 scanner-config-v0.1",
+        "--from", "2025-03-03", "--heldout-from", "2026-08-27", "--heldout-to", "2026-11-19",
+        "--bps", "10", "--train", "63", "--test", "63", "--embargo", "2", "--mode", "rolling",
+      ]),
+      /HELD_OUT_WINDOW_CHANGED/u,
+    );
+    assert.deepEqual(files.map((f) => readFileSync(join(RESEARCH_LEDGER_DIR, f), "utf8")), before);
+    assert.deepEqual(readdirSync(out), []); // no ledger or results written to --out
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
+});
