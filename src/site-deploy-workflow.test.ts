@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -39,13 +39,12 @@ test("site deploy workflow: Access is set up and read back before the deploy, wh
   const deploy = workflow.indexOf("- name: Deploy Worker");
   const secrets = workflow.indexOf("- name: Worker secrets");
   assert.ok(access > 0 && access < deploy && deploy < secrets);
-  assert.match(block("Cloudflare Access app"), /run: pnpm exec tsx src\/site-access-setup\.ts/u);
+  assert.match(block("Cloudflare Access app"), /trim-step-env\.cjs CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID -- pnpm exec tsx src\/site-access-setup\.ts/u);
   assert.match(block("Cloudflare Access app"), /SITE_ALLOWED_EMAIL: \$\{\{ secrets\.PEACESTOCKS_SITE_ALLOWED_EMAIL \}\}/u);
   const deployStep = block("Deploy Worker");
   assert.match(deployStep, /ACCESS_AUD: \$\{\{ steps\.access\.outputs\.aud \}\}/u);
   assert.match(deployStep, /ACCESS_TEAM_DOMAIN: \$\{\{ steps\.access\.outputs\.team_domain \}\}/u);
   assert.match(deployStep, /--var "ACCESS_AUD:\$\{ACCESS_AUD\}" --var "ACCESS_TEAM_DOMAIN:\$\{ACCESS_TEAM_DOMAIN\}"/u);
-  assert.match(deployStep, /CLOUDFLARE_API_TOKEN: \$\{\{ secrets\.CLOUDFLARE_API_TOKEN \}\}/u);
 });
 
 test("site deploy workflow: only read-only R2 keys reach the Worker; nothing secret is echoed", () => {
@@ -219,12 +218,13 @@ test("site deploy post-check: only an Access login redirect or 401/403 passes; a
 /** Runs the Worker-secrets step's `node -e` script (not wrangler) and returns the JSON it writes. */
 function runSecretsScript(env: Record<string, string>): { status: number; out: string; json?: Record<string, string> } {
   const step = block("Worker secrets");
-  const line = step.split("\n").find((l) => l.trim().startsWith("node -e "));
+  const line = step.split("\n").find((l) => l.includes("node -e "));
   assert.ok(line, "the step builds the secrets file with node -e");
+  const cmd = line!.slice(line!.indexOf("node -e ")).trim();
   const dir = mkdtempSync(join(tmpdir(), "secrets-"));
   try {
     const file = join(dir, "site-secrets.json");
-    const result = spawnSync("bash", ["-e", "-c", line!.trim()], {
+    const result = spawnSync("bash", ["-e", "-c", cmd], {
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin", file, ...env },
       encoding: "utf8",
     });
@@ -258,6 +258,7 @@ test("site deploy workflow: every Worker secret is trimmed (pasted values often 
     R2_READ_ACCESS_KEY_ID: "READKEYIDAAA",
     R2_READ_SECRET_ACCESS_KEY: "read-secret-bbb",
   });
+  for (const value of Object.values(result.json!)) assert.match(result.out, new RegExp(`::add-mask::${value}`, "u"));
 });
 
 test("site deploy workflow: a secret that is missing or empty after trimming stops the step, naming it only", () => {
@@ -322,3 +323,170 @@ test("site deploy post-check: passing on 401/403 warns that Access may be off (o
     assert.match(ok.out, new RegExp(`::warning::https://stocks\\.example\\.test/ answered ${code}, not a redirect to the Access login: Access may be off, and only the Worker's own JWT check is refusing`, "u"));
   }
 });
+
+const TRIM_SCRIPT = new URL("../scripts/trim-step-env.cjs", import.meta.url);
+const CF_NAMES = ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"] as const;
+const STEPS_THAT_USE_CF = ["Cloudflare Access app", "Deploy Worker", "Worker secrets"] as const;
+
+function steps(): { title: string; text: string }[] {
+  return workflow
+    .split("\n      - ")
+    .slice(1)
+    .map((text) => {
+      const first = text.split("\n")[0] ?? "";
+      const title = first.startsWith("name: ") ? first.slice("name: ".length) : first.startsWith("uses: ") ? `uses:${first.slice("uses: ".length)}` : first;
+      return { title, text };
+    });
+}
+
+function runTrimStepEnv(
+  env: Record<string, string | undefined>,
+  command: string[],
+  names: readonly string[] = CF_NAMES,
+): { status: number; out: string; stdout: string } {
+  assert.ok(existsSync(TRIM_SCRIPT), "scripts/trim-step-env.cjs is missing");
+  const githubEnv = env.GITHUB_ENV;
+  const result = spawnSync(process.execPath, [TRIM_SCRIPT.pathname, ...names, "--", ...command], {
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...env },
+    encoding: "utf8",
+  });
+  return { status: result.status ?? -1, out: `${result.stdout}${result.stderr}`, stdout: result.stdout };
+}
+
+test("site deploy workflow: no secret is written to GITHUB_ENV; only the 3 steps that use the Cloudflare credentials receive them", () => {
+  assert.doesNotMatch(workflow, /GITHUB_ENV/u);
+  assert.doesNotMatch(workflow, /- name: Trim Cloudflare API token and account id/u);
+
+  const allowed = new Set(
+    STEPS_THAT_USE_CF.map((name) => {
+      const step = steps().find((s) => s.title.startsWith(name));
+      assert.ok(step, `missing step ${name}`);
+      return step!.title;
+    }),
+  );
+  for (const step of steps()) {
+    const mentionsToken = /CLOUDFLARE_API_TOKEN/u.test(step.text) || /secrets\.CLOUDFLARE_/u.test(step.text);
+    if (allowed.has(step.title)) {
+      assert.match(step.text, /CLOUDFLARE_API_TOKEN: \$\{\{ secrets\.CLOUDFLARE_API_TOKEN \}\}/u, step.title);
+      assert.match(step.text, /CLOUDFLARE_ACCOUNT_ID: \$\{\{ secrets\.PEACESTOCKS_R2_ACCOUNT_ID \}\}/u, step.title);
+      assert.match(step.text, /scripts\/trim-step-env\.cjs CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID --/u, step.title);
+      assert.doesNotMatch(step.text, /GITHUB_ENV/u, step.title);
+    } else {
+      assert.ok(!mentionsToken, `${step.title} must not have CLOUDFLARE_API_TOKEN or read secrets.CLOUDFLARE_*`);
+      assert.doesNotMatch(step.text, /secrets\.CLOUDFLARE_/u, step.title);
+    }
+  }
+
+  // Named examples from the review: tests, post-check, and setup must not receive the token.
+  for (const name of ["Worker typecheck and site tests", "Confirm the site is not public", "actions/setup-node@v4", "actions/checkout@v4", "pnpm/action-setup@v4", "Required secrets present"]) {
+    const step = steps().find((s) => s.title.startsWith(name) || s.title.includes(name));
+    assert.ok(step, `missing step ${name}`);
+    assert.doesNotMatch(step!.text, /CLOUDFLARE_API_TOKEN/u, name);
+    assert.doesNotMatch(step!.text, /secrets\.CLOUDFLARE_/u, name);
+  }
+});
+
+test("trim-step-env: trims Cloudflare credentials for the command, never prints them, never writes GITHUB_ENV", () => {
+  const dir = mkdtempSync(join(tmpdir(), "trim-step-"));
+  try {
+    const githubEnv = join(dir, "github.env");
+    writeFileSync(githubEnv, "KEEP=1\n");
+    const outFile = join(dir, "out.json");
+    const result = runTrimStepEnv(
+      {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        GITHUB_ENV: githubEnv,
+        CLOUDFLARE_API_TOKEN: "  tok_abc\n",
+        CLOUDFLARE_ACCOUNT_ID: "\tacct123\r\n",
+      },
+      [process.execPath, "-e", "require('fs').writeFileSync(process.argv[1], JSON.stringify({t:process.env.CLOUDFLARE_API_TOKEN,a:process.env.CLOUDFLARE_ACCOUNT_ID}))", outFile],
+    );
+    assert.equal(result.status, 0, result.out);
+    assert.deepEqual(JSON.parse(readFileSync(outFile, "utf8")), { t: "tok_abc", a: "acct123" });
+    assert.equal(readFileSync(githubEnv, "utf8"), "KEEP=1\n", "GITHUB_ENV must be left untouched");
+    assert.match(result.out, /::add-mask::tok_abc/u);
+    assert.match(result.out, /::add-mask::acct123/u);
+    assert.doesNotMatch(result.out.replaceAll("::add-mask::tok_abc", "").replaceAll("::add-mask::acct123", ""), /tok_abc|acct123/u);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("trim-step-env: a Cloudflare credential that is empty after trimming stops the command, naming it only", () => {
+  for (const name of CF_NAMES) {
+    for (const value of [" \n", undefined]) {
+      const dir = mkdtempSync(join(tmpdir(), "trim-empty-"));
+      try {
+        const sentinel = join(dir, "ran");
+        const env: Record<string, string | undefined> = {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          CLOUDFLARE_API_TOKEN: "tok_abc",
+          CLOUDFLARE_ACCOUNT_ID: "acct123",
+        };
+        if (value === undefined) delete env[name];
+        else env[name] = value;
+        const result = runTrimStepEnv(env, [process.execPath, "-e", "require('fs').writeFileSync(process.argv[1], 'ran')", sentinel]);
+        assert.notEqual(result.status, 0, `${name}=${JSON.stringify(value)}`);
+        assert.equal(existsSync(sentinel), false, "command must not run");
+        assert.match(result.out, new RegExp(`::error::${name} is missing or empty after trimming`, "u"));
+        assert.doesNotMatch(result.out, /tok_abc/u);
+        assert.doesNotMatch(result.out, /acct123/u);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+const INJECT = "INJECTED_VAR=pwned";
+
+test("trim-step-env: a value that still contains a newline after trimming is rejected, naming the variable only", () => {
+  for (const [name, value] of [
+    ["CLOUDFLARE_API_TOKEN", `tok_abc\n${INJECT}`],
+    ["CLOUDFLARE_ACCOUNT_ID", `acct123\r${INJECT}`],
+    ["CLOUDFLARE_API_TOKEN", `tok_abc\r\n${INJECT}`],
+  ] as const) {
+    const dir = mkdtempSync(join(tmpdir(), "trim-nl-"));
+    try {
+      const githubEnv = join(dir, "github.env");
+      writeFileSync(githubEnv, "KEEP=1\n");
+      const sentinel = join(dir, "ran");
+      const env: Record<string, string> = {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        GITHUB_ENV: githubEnv,
+        CLOUDFLARE_API_TOKEN: "tok_abc",
+        CLOUDFLARE_ACCOUNT_ID: "acct123",
+        [name]: value,
+      };
+      const result = runTrimStepEnv(env, [process.execPath, "-e", "require('fs').writeFileSync(process.argv[1], 'ran')", sentinel]);
+      assert.notEqual(result.status, 0, `${name}=${JSON.stringify(value)}`);
+      assert.equal(existsSync(sentinel), false, "command must not run");
+      assert.equal(readFileSync(githubEnv, "utf8"), "KEEP=1\n");
+      assert.match(result.out, new RegExp(`::error::${name} contains a newline and was rejected`, "u"));
+      assert.doesNotMatch(result.out, /INJECTED_VAR/u);
+      assert.doesNotMatch(result.out, /pwned/u);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("site deploy workflow: Worker secrets reject a leftover newline in any trimmed value, naming it only", () => {
+  for (const [name, written] of [
+    ["ALLOWED_EMAIL", "ALLOWED_EMAIL"],
+    ["CLOUDFLARE_ACCOUNT_ID", "R2_ACCOUNT_ID"],
+    ["R2_BUCKET", "R2_BUCKET"],
+    ["R2_READ_ACCESS_KEY_ID", "R2_READ_ACCESS_KEY_ID"],
+    ["R2_READ_SECRET_ACCESS_KEY", "R2_READ_SECRET_ACCESS_KEY"],
+  ] as const) {
+    const env: Record<string, string> = { ...SECRET_ENV, [name]: `ok-value\n${INJECT}` };
+    const result = runSecretsScript(env);
+    assert.notEqual(result.status, 0, `${name}`);
+    assert.equal(result.json, undefined, "no secrets file written");
+    assert.match(result.out, new RegExp(`::error::${written} contains a newline and was rejected`, "u"));
+    assert.doesNotMatch(result.out, /INJECTED_VAR/u);
+    assert.doesNotMatch(result.out, /pwned/u);
+    for (const secret of Object.values(SECRET_ENV)) assert.ok(!result.out.includes(secret.trim()), "no value in the output");
+  }
+});
+

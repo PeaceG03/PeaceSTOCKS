@@ -6,6 +6,7 @@ import { healthCheckinKey } from "./health-checkins";
 import { MemoryObjectClient } from "./object-store";
 import { loadSiteData, SITE_HEALTH_LATEST_KEY, type SiteReader } from "./site-data";
 import { renderSitePage, SITE_HEADERS } from "./site-page";
+import * as sitePage from "./site-page";
 
 const enc = (value: unknown) => new TextEncoder().encode(typeof value === "string" ? value : JSON.stringify(value));
 
@@ -112,4 +113,112 @@ test("site page: a list marked unavailable says so, and is not shown as an empty
   const html = renderSitePage(data);
   assert.match(html, /FASTEST_IMPROVING<\/b>: <span class="mute">unavailable \(not enough price history\)<\/span>/u);
   assert.match(html, /TOP_15_OVERALL<\/b>: AAA</u);
+});
+
+const SAMPLE_PAGE: Parameters<typeof renderSitePage>[0] = {
+  generatedAt: "2026-11-24T09:00:00.000Z",
+  checkins: [
+    { part: "scan", name: "Scan", state: "OK", at: "2026-11-24T06:43:00.000Z", message: "all good" },
+    { part: "gap-refill", name: "Gap refill", state: "OK", at: "2026-11-22T14:50:00.000Z" },
+  ],
+  caughtUpThrough: "2026-11-23",
+  backlog: { state: "OK" },
+  reports: [
+    {
+      sessionDate: "2026-11-21",
+      status: "FAILED",
+      completedAt: "2026-11-21T22:00:00.000Z",
+      expected: 10,
+      valid: 8,
+      incomplete: 2,
+      failures: ["MISSING_SECURITY_EVIDENCE", "EVIDENCE_PROVIDER_ERROR:<script>x</script>", "<_foo_&>"],
+      failureCount: 3,
+    },
+    {
+      sessionDate: "2026-11-20",
+      status: "COMPLETE",
+      completedAt: "2026-11-20T22:00:00.000Z",
+      expected: 10,
+      valid: 10,
+      incomplete: 0,
+      failures: [],
+      failureCount: 0,
+    },
+  ],
+  predictions: { state: "off", picks: [] },
+  readErrors: [],
+};
+
+test("wrapAtUnderscores: escapes first, then inserts <wbr> after each underscore", () => {
+  assert.equal(sitePage.wrapAtUnderscores("MISSING_SECURITY_EVIDENCE"), "MISSING_<wbr>SECURITY_<wbr>EVIDENCE");
+  assert.equal(sitePage.wrapAtUnderscores("<_foo_&>"), "&lt;_<wbr>foo_<wbr>&amp;&gt;");
+  assert.equal(sitePage.wrapAtUnderscores("nope"), "nope");
+  assert.equal(sitePage.wrapAtUnderscores(""), "");
+});
+
+test("site page: phone layout stacks session and check-in rows; issue codes wrap at underscores and stay escaped", () => {
+  const html = renderSitePage(SAMPLE_PAGE);
+  assert.match(html, /@media \(max-width:480px\)/u);
+  assert.match(html, /\.stack,\.stack tbody,\.stack tr,\.stack td\{display:block/u);
+  assert.match(html, /html,body\{max-width:100%;overflow-x:hidden\}/u);
+  assert.match(html, /\.table-wrap\{[^}]*overflow-x:hidden/u);
+  assert.match(html, /\.session-date,\.when,\.valid\{white-space:nowrap\}/u);
+  assert.match(html, /\.issues\{overflow-wrap:anywhere/u);
+  assert.equal(html.match(/<div class="table-wrap">/gu)?.length, 2);
+  assert.match(html, /<div class="table-wrap"><table class="stack">/u);
+  assert.match(html, /data-label="Session"/u);
+  assert.match(html, /data-label="Status"/u);
+  assert.match(html, /data-label="Valid"/u);
+  assert.match(html, /data-label="Part"/u);
+  assert.match(html, /data-label="State"/u);
+  assert.match(html, /data-label="When"/u);
+  assert.match(html, /<span class="session-date">2026-11-21<\/span>/u);
+  assert.match(html, /<span class="valid">8 \/ 10<\/span>/u);
+  assert.match(html, /MISSING_<wbr>SECURITY_<wbr>EVIDENCE/u);
+  assert.match(html, /EVIDENCE_<wbr>PROVIDER_<wbr>ERROR:&lt;script&gt;x&lt;\/script&gt;/u);
+  assert.match(html, /&lt;_<wbr>foo_<wbr>&amp;&gt;/u);
+  assert.doesNotMatch(html, /<script/u);
+  assert.doesNotMatch(html, /MISSING_SECURITY_EVIDENCE/u);
+  assert.doesNotMatch(html, /&lt;wbr&gt;/u);
+});
+
+
+const XSS_PAYLOADS = ["<script>", '"><img onerror>'] as const;
+
+test("site page: every card field escapes <script> and attribute-break payloads", () => {
+  for (const payload of XSS_PAYLOADS) {
+    const html = renderSitePage({
+      generatedAt: payload,
+      health: { headline: payload, attention: false, at: payload, lines: [payload] },
+      checkins: [{ part: payload, name: payload, state: payload, at: payload, message: payload, remaining: payload as unknown as number }],
+      caughtUpThrough: payload,
+      backlog: { state: "BEHIND", remaining: 1, message: payload },
+      reports: [
+        {
+          sessionDate: payload,
+          status: payload,
+          completedAt: payload,
+          expected: payload as unknown as number,
+          valid: payload as unknown as number,
+          incomplete: payload as unknown as number,
+          failures: [payload],
+          failureCount: 1,
+        },
+      ],
+      predictions: { state: "off", status: payload, reason: payload, sessionDate: payload, picks: [{ setType: payload, symbols: [payload] }] },
+      readErrors: ["health"],
+      readErrorReasons: { health: payload },
+    });
+    const safe = sitePage.escapeHtml(payload);
+    assert.match(html, new RegExp(safe.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+    assert.equal(html.includes(payload), false, `raw payload leaked: ${JSON.stringify(payload)}`);
+    assert.doesNotMatch(html, /<script/u);
+    assert.doesNotMatch(html, /<img/u);
+    assert.match(html, new RegExp(`<div class="mute">${safe}</div>`, "u")); // check-in message (and other mute lines)
+    assert.match(html, new RegExp(`<span class="session-date">${safe}</span>`, "u"));
+    assert.match(html, new RegExp(`<span class="valid">${safe} / ${safe}</span>`, "u"));
+    assert.match(html, new RegExp(`data-label="When">${safe}</td>`, "u"));
+    assert.match(html, new RegExp(`data-label="Part">${safe}<div class="mute">${safe}</div></td>`, "u"));
+    assert.match(html, new RegExp(`<span class="valid">${safe} / ${safe}</span><div class="mute">${safe} incomplete</div>`, "u"));
+  }
 });

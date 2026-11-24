@@ -12,6 +12,11 @@ export function escapeHtml(value: unknown): string {
     .replaceAll("'", "&#39;");
 }
 
+/** Escape first, then offer a break after each underscore so long issue codes wrap cleanly on a phone. */
+export function wrapAtUnderscores(value: unknown): string {
+  return escapeHtml(value).replaceAll("_", "_<wbr>");
+}
+
 const DISPLAY_ZONE = "America/Denver";
 
 export function localTime(iso: string | undefined): string {
@@ -57,6 +62,20 @@ main{max-width:760px;margin:0 auto;padding:16px}h1{font-size:22px;margin:4px 0 2
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--mute)}
 table{width:100%;border-collapse:collapse;font-size:14px}td,th{text-align:left;padding:6px 4px;border-top:1px solid var(--line);vertical-align:top}th{color:var(--mute);font-weight:500;font-size:12px;border-top:0}
 .r{text-align:right;white-space:nowrap}.f{color:var(--bad);font-size:12px;word-break:break-word}
+html,body{max-width:100%;overflow-x:hidden}
+.table-wrap{width:100%;max-width:100%;overflow-x:hidden}
+.session-date,.when,.valid{white-space:nowrap}
+.issues{overflow-wrap:anywhere;word-break:normal}
+@media (max-width:480px){
+.stack thead{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.stack,.stack tbody,.stack tr,.stack td{display:block;width:100%}
+.stack{border-collapse:separate;border-spacing:0}
+.stack tr{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:0 0 10px}
+.stack tr:last-child{margin-bottom:0}
+.stack td,.stack th{border:0;padding:6px 0;text-align:left}
+.stack td.r{text-align:left}
+.stack td::before{content:attr(data-label);display:block;color:var(--mute);font-size:12px;font-weight:500}
+}
 `;
 
 export function renderSitePage(data: SiteData): string {
@@ -95,14 +114,14 @@ export function renderSitePage(data: SiteData): string {
   parts.push(
     `<section class="card"><h2>Latest check-ins</h2>${
       data.checkins.length
-        ? `<table><tr><th>Part</th><th>State</th><th class="r">When</th></tr>${data.checkins
+        ? `<div class="table-wrap"><table class="stack"><thead><tr><th>Part</th><th>State</th><th class="r">When</th></tr></thead><tbody>${data.checkins
             .map(
               (c) =>
-                `<tr><td>${escapeHtml(c.name)}${c.message ? `<div class="mute">${escapeHtml(c.message)}</div>` : ""}</td><td>${badge(c.state)}${
+                `<tr><td data-label="Part">${escapeHtml(c.name)}${c.message ? `<div class="mute">${escapeHtml(c.message)}</div>` : ""}</td><td data-label="State">${badge(c.state)}${
                   c.remaining !== undefined ? ` <span class="mute">${escapeHtml(c.remaining)} left</span>` : ""
-                }</td><td class="r mute">${escapeHtml(localTime(c.at))}</td></tr>`,
+                }</td><td class="r mute when" data-label="When">${escapeHtml(localTime(c.at))}</td></tr>`,
             )
-            .join("")}</table>`
+            .join("")}</tbody></table></div>`
         : `<div class="mute">No check-ins yet.</div>`
     }</section>`,
   );
@@ -132,18 +151,18 @@ export function renderSitePage(data: SiteData): string {
   parts.push(
     `<section class="card"><h2>Recent sessions</h2>${
       data.reports.length
-        ? `<table><tr><th>Session</th><th>Status</th><th class="r">Valid</th></tr>${data.reports
+        ? `<div class="table-wrap"><table class="stack"><thead><tr><th>Session</th><th>Status</th><th class="r">Valid</th></tr></thead><tbody>${data.reports
             .map(
               (r) =>
-                `<tr><td>${escapeHtml(r.sessionDate)}<div class="mute">${escapeHtml(localTime(r.completedAt))}</div>${
+                `<tr><td data-label="Session"><span class="session-date">${escapeHtml(r.sessionDate)}</span><div class="mute">${escapeHtml(localTime(r.completedAt))}</div>${
                   r.failureCount
-                    ? `<div class="f">${escapeHtml(plural(r.failureCount, "issue"))}: ${r.failures.map(escapeHtml).join("; ")}</div>`
+                    ? `<div class="f issues">${escapeHtml(plural(r.failureCount, "issue"))}: ${r.failures.map(wrapAtUnderscores).join("; ")}</div>`
                     : ""
-                }</td><td>${badge(r.status)}</td><td class="r">${escapeHtml(r.valid)} / ${escapeHtml(r.expected)}${
+                }</td><td data-label="Status">${badge(r.status)}</td><td class="r" data-label="Valid"><span class="valid">${escapeHtml(r.valid)} / ${escapeHtml(r.expected)}</span>${
                   r.incomplete ? `<div class="mute">${escapeHtml(r.incomplete)} incomplete</div>` : ""
                 }</td></tr>`,
             )
-            .join("")}</table>`
+            .join("")}</tbody></table></div>`
         : `<div class="mute">No session reports yet.</div>`
     }</section>`,
   );

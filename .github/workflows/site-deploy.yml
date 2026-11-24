@@ -41,15 +41,13 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Required secrets present (names only)
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
           PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
           PEACESTOCKS_R2_READ_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_READ_ACCESS_KEY_ID }}
           PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY }}
           PEACESTOCKS_SITE_ALLOWED_EMAIL: ${{ secrets.PEACESTOCKS_SITE_ALLOWED_EMAIL }}
         run: |
           missing=0
-          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID PEACESTOCKS_R2_BUCKET PEACESTOCKS_R2_READ_ACCESS_KEY_ID PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY PEACESTOCKS_SITE_ALLOWED_EMAIL; do
+          for name in PEACESTOCKS_R2_BUCKET PEACESTOCKS_R2_READ_ACCESS_KEY_ID PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY PEACESTOCKS_SITE_ALLOWED_EMAIL; do
             if [ -z "${!name}" ]; then echo "::error::missing secret: $name"; missing=1; fi
           done
           exit "$missing"
@@ -64,7 +62,8 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
           SITE_ALLOWED_EMAIL: ${{ secrets.PEACESTOCKS_SITE_ALLOWED_EMAIL }}
           ACCESS_TEAM_DOMAIN: ${{ inputs.team_domain }}
-        run: pnpm exec tsx src/site-access-setup.ts
+        # Trim in this step only, not for later steps: a pasted secret often keeps a trailing newline.
+        run: node scripts/trim-step-env.cjs CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID -- pnpm exec tsx src/site-access-setup.ts
       - name: Deploy Worker (custom domain stocks.jjpeace.com)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -73,7 +72,7 @@ jobs:
           ACCESS_TEAM_DOMAIN: ${{ steps.access.outputs.team_domain }}
         run: |
           test -n "$ACCESS_AUD" && test -n "$ACCESS_TEAM_DOMAIN"
-          npx --yes "wrangler@${WRANGLER_VERSION}" deploy --var "ACCESS_AUD:${ACCESS_AUD}" --var "ACCESS_TEAM_DOMAIN:${ACCESS_TEAM_DOMAIN}"
+          node scripts/trim-step-env.cjs CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID -- npx --yes "wrangler@${WRANGLER_VERSION}" deploy --var "ACCESS_AUD:${ACCESS_AUD}" --var "ACCESS_TEAM_DOMAIN:${ACCESS_TEAM_DOMAIN}"
       - name: Worker secrets (allowed email, read-only R2 keys)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -87,8 +86,9 @@ jobs:
           file="$RUNNER_TEMP/site-secrets.json"
           trap 'rm -f "$file"' EXIT
           # Every value trimmed: a value pasted into the GitHub UI often ends in a newline, which breaks SigV4.
-          node -e 'const e=process.env; const v={ALLOWED_EMAIL:e.ALLOWED_EMAIL,R2_ACCOUNT_ID:e.CLOUDFLARE_ACCOUNT_ID,R2_BUCKET:e.R2_BUCKET,R2_READ_ACCESS_KEY_ID:e.R2_READ_ACCESS_KEY_ID,R2_READ_SECRET_ACCESS_KEY:e.R2_READ_SECRET_ACCESS_KEY}; for (const k of Object.keys(v)) { v[k]=String(v[k] ?? "").trim(); if (!v[k]) { console.error("::error::"+k+" is missing or empty after trimming"); process.exit(1); } } require("fs").writeFileSync(process.argv[1], JSON.stringify(v))' "$file"
-          npx --yes "wrangler@${WRANGLER_VERSION}" secret bulk "$file"
+          # Cloudflare credentials are trimmed only for the child command, not for later steps.
+          node scripts/trim-step-env.cjs CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID -- node -e 'const e=process.env; const v={ALLOWED_EMAIL:e.ALLOWED_EMAIL,R2_ACCOUNT_ID:e.CLOUDFLARE_ACCOUNT_ID,R2_BUCKET:e.R2_BUCKET,R2_READ_ACCESS_KEY_ID:e.R2_READ_ACCESS_KEY_ID,R2_READ_SECRET_ACCESS_KEY:e.R2_READ_SECRET_ACCESS_KEY}; for (const k of Object.keys(v)) { v[k]=String(v[k] ?? "").trim(); if (!v[k]) { console.error("::error::"+k+" is missing or empty after trimming"); process.exit(1); } if (/[\r\n]/.test(v[k])) { console.error("::error::"+k+" contains a newline and was rejected"); process.exit(1); } } for (const k of Object.keys(v)) console.log("::add-mask::"+v[k]); require("fs").writeFileSync(process.argv[1], JSON.stringify(v))' "$file"
+          node scripts/trim-step-env.cjs CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID -- npx --yes "wrangler@${WRANGLER_VERSION}" secret bulk "$file"
       - name: Confirm the site is not public
         # A brand-new custom domain can take minutes to get DNS and a certificate, so keep trying for
         # about 10 minutes. No answer (000), DNS or TLS errors and anything else unexpected: wait and
