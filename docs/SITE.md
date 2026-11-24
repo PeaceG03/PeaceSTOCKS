@@ -63,6 +63,8 @@ Do this before dispatching the deploy, so the deploy secrets are only given to t
    | `PEACESTOCKS_R2_BUCKET` | **keep** the repository secret: the same scanner workflows read it |
 
    So the four site-only secrets are moved into `site`, and the two shared ones are copied into it.
+   (The scanner jobs now read their copies from the `scanner-data` environment, docs/SCANNER.md; the
+   repository-level copies go only after a scan has succeeded from that environment.)
    Moving the shared two would break the live scanner. An environment secret takes precedence over a
    repository secret with the same name for jobs in that environment.
 4. For `PEACESTOCKS_R2_READ_ACCESS_KEY_ID` / `PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY`, use a **fresh
