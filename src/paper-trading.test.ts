@@ -564,7 +564,7 @@ test("rules come from the loaded config: non-default capital, cap, slippage and 
   const client = new RecordingClient();
   const m = world();
   await run(client, m, at("2026-12-08"), ON, false, loaded);
-  day2(m, 60); // about -4% on the book: under this config's 50% limit, so entries go ahead
+  day2(m, 20); // a -80% by the close: about -4% on the book (5% cap), over 3% but under this config's 50%
   const r = await run(client, m, at("2026-12-09"), ON, false, loaded);
   assert.equal(r.intents!.entries, 2);
   const f = await read<PaperFills>(client, paperLedgerKey("fills", "2026-12-08"));
