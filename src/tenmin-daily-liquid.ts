@@ -36,7 +36,7 @@ import { errorMessage, reportPart } from "./health-checkins";
 import { dayStuck } from "./day-stuck";
 import { type HistoryHoldDay, historyBlockingDay } from "./history-blocked";
 import { barCount, expectedTenMinBars, presentTenMinBars, shortStockCounts, tenMinSessionDone } from "./tenmin-day-done";
-import { lastCompletedSessionDate, pairRangeForDate } from "./tenmin-history";
+import { lastCompletedSessionDate, pairRangeForDate, tradingSessionsBetween } from "./tenmin-history";
 import {
   TENMIN_RANGE_OUTAGE_STREAK,
   type TenMinRangeTickerFetch,
@@ -550,14 +550,16 @@ export async function runTenMinDailyLiquid(options: {
       gaps: 0,
       requests: 0,
     };
-    if (await tenMinRangeSealedFor(store, sessionDate)) {
+    let index = await readTenMinDailyIndex(store, sessionDate);
+    // A sealed range owns a day the daily step never tracked. A day it tracks counts as done only by
+    // its own bars (seal guard): one still short keeps being worked even under a sealed range.
+    if ((!index || index.done) && (await tenMinRangeSealedFor(store, sessionDate))) {
       sessionReport.status = "SKIPPED_RANGE_SEALED";
       report.sessions.push(sessionReport);
       continue;
     }
     const expectedBars = expectedTenMinBars(sessionDate, calendar);
     sessionReport.expectedBars = expectedBars;
-    let index = await readTenMinDailyIndex(store, sessionDate);
     if (index?.done) {
       sessionReport.status = "COMPLETE";
       sessionReport.selected = index.selected.length;
@@ -810,7 +812,8 @@ export async function runTenMinDailyLiquid(options: {
 
 /**
  * The session (inside the 10-session catch-up window) that holds the history chain, or undefined.
- * Reads only the daily indexes and range manifests (no Massive request). A sealed range counts as done.
+ * Reads only the daily indexes and range manifests (no Massive request). A sealed range counts as done
+ * only for days the daily step never tracked; a tracked day is done only by its own bars.
  */
 export async function tenMinDailyHistoryHold(
   store: Pick<ReplyDustStore, "get" | "head">,
@@ -821,27 +824,67 @@ export async function tenMinDailyHistoryHold(
   const sessions = tenMinDailyCatchupSessions(lastCompleted, options.catchupSessions ?? TENMIN_DAILY_CATCHUP_SESSIONS, calendar);
   const days: HistoryHoldDay[] = [];
   for (const sessionDate of sessions) {
-    if (await tenMinRangeSealedFor(store, sessionDate)) {
+    const index = await readTenMinDailyIndex(store, sessionDate);
+    // A sealed range counts as done only for a day the daily step never tracked (seal guard).
+    if (!index && (await tenMinRangeSealedFor(store, sessionDate))) {
       days.push({ sessionDate, done: true, failed: false });
       continue;
     }
-    const index = await readTenMinDailyIndex(store, sessionDate);
     const done = !!index?.done;
     days.push({ sessionDate, done, failed: !done && (index?.notDoneRuns ?? 0) >= 1, stuckShort: !done && !!index?.stuckShort });
   }
   return historyBlockingDay(days, sessions);
 }
 
+/** Seal-guard refusal prefix: a day in the range is still retrying in the daily step. */
+export const TENMIN_SEAL_REFUSED_DAY_RETRYING = "TENMIN_SEAL_REFUSED_DAY_RETRYING" as const;
+
+/**
+ * Seal guard (Peace, Nov 23): a history range may seal (and so count as done) only if every day in
+ * it is full or STUCK_SHORT. A day the daily step tracks (it has an index) must be done or
+ * STUCK_SHORT; a day still inside the daily step's catch-up window that it has not tried yet must
+ * wait for it. Days older than the window with no index are history-only (the range's own checks).
+ * Returns the refusal for the first such day, or undefined. Reads only daily indexes.
+ */
+export async function tenMinRangeSealRefusal(
+  store: Pick<ReplyDustStore, "get">,
+  calendarFrom: string,
+  calendarTo: string,
+  options: { now?: Date; lastCompletedSession?: string; catchupSessions?: number; calendar?: SessionCalendar } = {},
+): Promise<string | undefined> {
+  const calendar = options.calendar ?? US_EQUITY_MARKET_CALENDAR;
+  const lastCompleted = options.lastCompletedSession ?? lastCompletedSessionDate(options.now ?? new Date(), calendar);
+  const window = new Set(tenMinDailyCatchupSessions(lastCompleted, options.catchupSessions ?? TENMIN_DAILY_CATCHUP_SESSIONS, calendar));
+  for (const sessionDate of tradingSessionsBetween(calendarFrom, calendarTo, calendar)) {
+    if (sessionDate > lastCompleted) break;
+    const index = await readTenMinDailyIndex(store, sessionDate);
+    if (index) {
+      if (index.done || index.stuckShort) continue;
+      const counts = tenMinDailyIndexCounts(index, expectedTenMinBars(sessionDate, calendar));
+      return `${TENMIN_SEAL_REFUSED_DAY_RETRYING}:${sessionDate}:${counts.dayBars}`;
+    }
+    if (window.has(sessionDate)) return `${TENMIN_SEAL_REFUSED_DAY_RETRYING}:${sessionDate}:not-tried`;
+  }
+  return undefined;
+}
+
 /**
  * History-run override (host): when the daily step is on and R2 is configured, the chain checks the
- * done-day hold before any Massive request. Off otherwise (no daily step, nothing to wait for).
+ * done-day hold before any Massive request and the seal guard before sealing a range. Off otherwise
+ * (no daily step, nothing to wait for).
  */
 export function tenMinHistoryDailyStepHold(
   env: NodeJS.ProcessEnv,
   openStore: (env: NodeJS.ProcessEnv) => Pick<ReplyDustStore, "get" | "head"> = (e) => R2ObjectClient.fromEnv(e),
-): { dailyStepHold?: () => Promise<string | undefined> } {
+): {
+  dailyStepHold?: () => Promise<string | undefined>;
+  sealGuard?: (calendarFrom: string, calendarTo: string) => Promise<string | undefined>;
+} {
   if (!tenMinDailyEnabled(env) || !env.PEACESTOCKS_R2_BUCKET?.trim()) return {};
-  return { dailyStepHold: () => tenMinDailyHistoryHold(openStore(env)) };
+  return {
+    dailyStepHold: () => tenMinDailyHistoryHold(openStore(env)),
+    sealGuard: (calendarFrom, calendarTo) => tenMinRangeSealRefusal(openStore(env), calendarFrom, calendarTo),
+  };
 }
 
 export interface TenMinSecurityDayRead {

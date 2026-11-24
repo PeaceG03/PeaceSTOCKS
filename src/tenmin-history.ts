@@ -669,6 +669,8 @@ export interface TenMinHistoryRangeReport {
   fetchFrom: string;
   fetchTo: string;
   status: "SEALED" | "ALREADY_SEALED" | "PARTIAL" | "REOPENED" | "OUTAGE_STOP" | "ERROR";
+  /** Set when the seal guard refused to seal this range (status PARTIAL). */
+  sealRefused?: string;
   /** Set when status is ERROR (e.g. TENMIN_UNIVERSE_EMPTY); the run stopped at this range. */
   error?: string;
   securitiesPlanned: number;
@@ -808,6 +810,12 @@ export async function runTenMinHistory(options: {
    * undefined (see tenMinDailyHistoryHold). Checked before any Massive request.
    */
   dailyStepHold?: () => Promise<string | undefined>;
+  /**
+   * Seal guard: why the range [calendarFrom, calendarTo] must not seal yet (a day in it is still
+   * retrying in the daily step), or undefined. A refusal leaves the range PARTIAL and holds the chain
+   * on that day (dailyStepHold, outcome WAIT_DAILY_STEP) until the day is full or STUCK_SHORT.
+   */
+  sealGuard?: (calendarFrom: string, calendarTo: string) => Promise<string | undefined>;
 }): Promise<TenMinHistoryRunResult> {
   const env = options.env ?? process.env;
   // Validate the range-end cap first: an invalid value fails before any store or Massive call.
@@ -963,6 +971,7 @@ export async function runTenMinHistory(options: {
   let massiveRequests = 0;
   let yieldedForScan: string | undefined;
   let outageStop: string | undefined;
+  let sealHold: string | undefined;
   let stoppedOnError = false;
   let error: string | undefined;
   const groupedTotals = { requests: 0, stored: 0, resumed: 0 };
@@ -1148,6 +1157,7 @@ export async function runTenMinHistory(options: {
           : {}),
         delistedCoverage: TENMIN_DELISTED_COVERAGE_MISSING,
         shouldYield,
+        ...(options.sealGuard ? { sealGuard: () => options.sealGuard!(range.calendarFrom, range.calendarTo) } : {}),
         fetchPages,
         ...(options.zstdVersionProbe ? { zstdVersionProbe: options.zstdVersionProbe } : {}),
         now: stamp,
@@ -1160,7 +1170,7 @@ export async function runTenMinHistory(options: {
       warnings.push(...(result.warnings ?? []));
       const status: TenMinHistoryRangeReport["status"] = result.outageStop
         ? "OUTAGE_STOP"
-        : result.yieldedForScan
+        : result.yieldedForScan || result.sealRefused
           ? "PARTIAL"
           : result.alreadySealed
             ? "ALREADY_SEALED"
@@ -1171,6 +1181,7 @@ export async function runTenMinHistory(options: {
         ...base,
         ...(result.manifest ? { delistedCoverage: tenMinRangeDelistedCoverage(result.manifest) } : {}),
         status,
+        ...(result.sealRefused ? { sealRefused: result.sealRefused } : {}),
         ...plannedCounts,
         securitiesWritten: result.securitiesWritten.length,
         securitiesResumed: result.securitiesResumed.length,
@@ -1205,6 +1216,12 @@ export async function runTenMinHistory(options: {
       }
       if (result.yieldedForScan) {
         yieldedForScan = result.yieldedForScan;
+        break;
+      }
+      if (result.sealRefused) {
+        // Hold the chain on the retrying day (same wait as the done-day hold; no alert).
+        sealHold = /\d{4}-\d{2}-\d{2}/u.exec(result.sealRefused)?.[0] ?? result.sealRefused;
+        warnings.push(result.sealRefused);
         break;
       }
     } catch (err) {
@@ -1272,6 +1289,7 @@ export async function runTenMinHistory(options: {
     ...(plan.rangeEndCap ? { rangeEndCap: plan.rangeEndCap } : {}),
     ...(yieldedForScan ? { yieldedForScan } : {}),
     ...(outageStop ? { outageStop } : {}),
+    ...(sealHold ? { dailyStepHold: sealHold } : {}),
     stoppedOnError,
     ...(error ? { error } : {}),
     warnings: [...new Set(warnings)],

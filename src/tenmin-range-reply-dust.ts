@@ -894,6 +894,8 @@ export interface TenMinRangeWriteResult {
   massiveRequests: number;
   yieldedForScan?: string;
   outageStop?: string;
+  /** The seal guard refused to seal (a day in the range is still retrying); nothing was sealed. */
+  sealRefused?: string;
   warnings?: string[];
 }
 
@@ -1002,6 +1004,11 @@ export async function writeTenMinRangeReplyDust(options: {
    */
   authoritativeGapReasons?: readonly string[];
   shouldYield?: () => Promise<string | undefined>;
+  /**
+   * Seal guard (Peace, Nov 23): checked after the fetches, right before sealing. A reason refuses the
+   * seal (nothing sealed, stored work kept, result.sealRefused set); undefined lets it seal.
+   */
+  sealGuard?: () => Promise<string | undefined>;
   backend?: ReplyDustBackend;
   zstdVersionProbe?: ZstdVersionProbe;
   now?: () => string;
@@ -1307,7 +1314,8 @@ export async function writeTenMinRangeReplyDust(options: {
     throw withTenMinMassiveRequests(error, massiveRequests);
   }
 
-  if (yieldedForScan || outageStop) {
+  const sealRefused = !yieldedForScan && !outageStop && options.sealGuard ? await options.sealGuard() : undefined;
+  if (yieldedForScan || outageStop || sealRefused) {
     return {
       manifest: existing,
       alreadySealed: false,
@@ -1327,6 +1335,7 @@ export async function writeTenMinRangeReplyDust(options: {
       massiveRequests,
       ...(yieldedForScan ? { yieldedForScan } : {}),
       ...(outageStop ? { outageStop } : {}),
+      ...(sealRefused ? { sealRefused } : {}),
       ...(warnings.length || fallbackFiles > 0
         ? {
             warnings: [

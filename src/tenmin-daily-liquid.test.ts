@@ -861,3 +861,40 @@ test("STUCK_SHORT: after 6 failed full passes a short day is STUCK_SHORT with it
   assert.ok(index.done);
   assert.equal(index.stuckShort, undefined);
 });
+
+test("seal guard: a day the daily step tracks is not done just because its range sealed; it keeps being worked and holds", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peacestocks-seal-old-"));
+  try {
+    const store = new MemoryObjectClient();
+    const calls: string[] = [];
+    let bbbBars = 30;
+    const pages = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+      calls.push(`${sec.symbol}:${from}`);
+      return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, sec.symbol === "BBB" ? bbbBars : 39));
+    };
+    await baseRun(store, calls, { catchupSessions: 1, fetchPages: pages });
+    // A range sealed over the retrying day (as an older seal without the guard could).
+    await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: RANGE_FROM,
+      to: RANGE_TO,
+      fetches: [{ securityId: "sec_ddd", symbol: "DDD", fetchFrom: RANGE_FROM, fetchTo: RANGE_TO }],
+      zstdVersionProbe: pinnedZstd,
+      now: ISO,
+      fetchPages: async (sec, from, to) => replyPages(sec.symbol, sec.securityId, from, to, dayBars(sec.symbol, "2026-09-01")),
+    });
+    assert.ok(await readTenMinRangeManifest(store, RANGE_FROM, RANGE_TO));
+    assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-09", catchupSessions: 1 }), "2026-10-09", "sealed does not make it done");
+    calls.length = 0;
+    bbbBars = 39;
+    const run = await baseRun(store, calls, { catchupSessions: 1, fetchPages: pages });
+    assert.notEqual(run.sessions[0]!.status, "SKIPPED_RANGE_SEALED");
+    assert.deepEqual(calls, ["BBB:2026-10-09"]);
+    assert.equal(run.sessions[0]!.status, "COMPLETE");
+    assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-09", catchupSessions: 1 }), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
