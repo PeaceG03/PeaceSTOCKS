@@ -7,7 +7,8 @@ import { AppendOnlyLog } from "./append-only-log";
 import type { HarnessSession } from "./research-costs";
 import { walkForwardFolds } from "./research-folds";
 import { holmAdjusted, incompleteBeta, oneSidedTest, tUpperP } from "./research-stats";
-import { evaluateStrategy, type StrategyConfig, type VariantRecord } from "./research-variants";
+import { evaluateStrategy, foldPositive, type StrategyConfig, type VariantRecord } from "./research-variants";
+import type { SeriesMetrics } from "./research-stats";
 
 const close = (a: number, b: number, eps = 1e-6) => assert.ok(Math.abs(a - b) < eps, `${a} != ${b}`);
 
@@ -73,4 +74,25 @@ test("variant evaluation: chooses on train only, logs every variant, counts them
   // Pooled = the test windows only, in order.
   assert.equal(both.daily.length, folds.reduce((s, f) => s + f.test.end - f.test.start + 1, 0));
   assert.equal(both.daily[0]!.sessionDate, sessions[folds[0]!.test.start]!.sessionDate);
+});
+
+test("pooled p is the LARGER of the two one-sided p-values: beating the universe alone is not enough", () => {
+  // GOOD beats the universe every day, but SPY earns about as much: significant vs universe, not vs SPY.
+  const spyClose: HarnessSession[] = sessions.map((x, i) => ({ ...x, spy: 0.01 + (i % 3 ? 0.004 : -0.008) }));
+  const log = new AppendOnlyLog<VariantRecord>(join(mkdtempSync(join(tmpdir(), "var-")), "variants.jsonl"));
+  const folds = walkForwardFolds(40, strategy("x", ["GOOD"]).folds);
+  const r = evaluateStrategy(spyClose, folds, strategy("good", ["GOOD"]), log).record;
+  const { p: pu } = r.pooled.excessUniverse;
+  const { p: ps } = r.pooled.excessSpy;
+  assert.ok(pu < 0.001 && ps > 0.05, `pu=${pu} ps=${ps}`);
+  assert.equal(r.pooledP, Math.max(pu, ps));
+  assert.equal(r.pooledP, ps);
+});
+
+test("a fold is positive only when it beats BOTH the universe and SPY", () => {
+  const m = (u: number, s: number) => ({ excessUniverse: { sessions: 5, mean: u, t: 0, p: 0 }, excessSpy: { sessions: 5, mean: s, t: 0, p: 0 } }) as unknown as SeriesMetrics;
+  assert.equal(foldPositive(m(0.001, 0.001)), true);
+  assert.equal(foldPositive(m(0.001, -0.001)), false, "beats the universe, loses to SPY");
+  assert.equal(foldPositive(m(-0.001, 0.001)), false, "beats SPY, loses to the universe");
+  assert.equal(foldPositive(m(0.001, 0)), false);
 });

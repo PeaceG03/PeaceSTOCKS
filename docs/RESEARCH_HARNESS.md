@@ -18,9 +18,9 @@ always Peace's own decision.
 | Walk-forward folds | `src/research-folds.ts` | `walkForwardFolds(heldOutStart, {trainSessions, testSessions, embargoSessions, mode})` builds rolling or expanding folds. `assertFoldOrder` refuses a fold where the test window does not start strictly after train plus the embargo, where test windows overlap, or where a test outcome (2 sessions after the pick) would read a held-out price. |
 | Held-out seal | `src/research-folds.ts` (`HeldOutSeal`) | A strategy is REGISTERED with its held-out window before any price is opened. `evaluateOnce` writes an EVALUATE record and an exclusive-create marker file (`heldout-markers/<hash>.<n>.json`) **before** running, so a crash still uses up the look, and deleting log lines does not reopen the seal. A second look throws `HELD_OUT_SEALED` unless a human UNSEAL is recorded (`research-harness-cli unseal`, which needs a TTY, `--by` and `--reason`). Changing the window after registering throws `HELD_OUT_WINDOW_CHANGED`. |
 | Costs | `src/research-costs.ts` | Equal weight over the list's picks that have an outcome. turnover_t = Σ\|w_t − w_{t−1}\|, counting entry, sells and the final exit. cost_t = turnover_t × bps per side / 10⁴. Every result carries gross, cost, net and turnover. The benchmarks (equal-weight universe, SPY) carry no cost. |
-| Variant log | `src/append-only-log.ts`, `src/research-variants.ts` | `variants.jsonl` is a hash-chained, append-only JSONL file. Each line holds seq, prev, at, entry and hash. An edited, deleted, reordered or forged line (even one with a recomputed hash) is refused. Each record has the strategy's config hash, every candidate variant's hash, per-fold metrics and the pooled metrics. The pick for each fold is made **on train only**. |
-| Multiple testing | `src/research-stats.ts` | One-sided t-tests run on the pooled daily excess series, against the universe and against SPY. A strategy's p is the larger of the two (intersection-union). Holm step-down is applied over the latest record of every strategy in the log. The family size is max(distinct variants ever tried, strategies), so trying more variants makes the same evidence worth less. |
-| Verdict | `src/research-verdict.ts` | `IMPROVEMENT` only if **all** of these hold: (1) pooled net-of-cost mean beats the equal-weight universe; (2) it also beats SPY; (3) it is positive vs the universe in more than half the folds (strictly); (4) Holm-adjusted p < 0.05; (5) the held-out period was evaluated once and is positive vs both. Anything else is `NOT_PROVEN`, with every failed reason listed. |
+| Variant log | `src/append-only-log.ts`, `src/research-variants.ts` | `variants.jsonl` is a hash-chained, append-only JSONL file. Each line holds seq, prev, at, entry and hash. The chain refuses an edited or reordered line, a forged line whose own hash was recomputed, and a cut through a line. The chain alone cannot see whole lines dropped from the end or a deleted line with every later hash recomputed, so the log is anchored outside itself: a head file `<log>.head` (seq and hash of the tip) is rewritten after each append and checked on every read, and it is committed to git, where `gitCommittedHead` checks the committed head is still in the chain. A truncated tail, a deleted-and-rechained middle line, an emptied log or a missing head is refused (`LOG_TAMPERED`), and so is rewriting the log and its head file together once the head is committed. The trust root is git history; someone who can rewrite and commit git history is out of scope. The head may be one line behind the tip (a crash between the two writes); the next append repairs it. Each record has the strategy's config hash, every candidate variant's hash, per-fold metrics and the pooled metrics. The pick for each fold is made **on train only**. |
+| Multiple testing | `src/research-stats.ts` | One-sided t-tests run on the pooled daily excess series, against the universe and against SPY. A strategy's p is the larger of the two (intersection-union). Holm step-down is applied over the latest record of every strategy in the log (one definition, `holmFamily`, used by both the evaluator and the CLI). The family size is max(distinct variants ever tried, strategies), so trying more variants makes the same evidence worth less. |
+| Verdict | `src/research-verdict.ts` | `IMPROVEMENT` only if **all** of these hold: (1) pooled net-of-cost mean beats the equal-weight universe; (2) it also beats SPY; (3) more than half the folds (strictly) are positive, where a fold is positive only if its test-window net beats **both** the equal-weight universe and SPY; (4) Holm-adjusted p < 0.05; (5) the held-out period was evaluated once and is positive vs both; (6) at least 3 folds were scored (`TOO_FEW_FOLDS` otherwise: with 1 or 2 folds a majority is one or two lucky windows, and 3 is the smallest count where a majority still leaves a fold to disagree); (7) costs were at least 5 bps per side (`COST_BELOW_FLOOR`). Anything else is `NOT_PROVEN`, with every failed reason listed. |
 
 ## Running it
 
@@ -34,12 +34,19 @@ pnpm research baseline --data <local raw dir> --out <dir> \
 pnpm research unseal --out <dir> --strategy <strategyHash> --by <name> --reason "<why>"
 ```
 
+`--bps` below 5 (bps per side) or not a number is refused (`COST_BELOW_FLOOR`) before any data is read: 5 bps is a conservative floor for one-way slippage on these names, and anything lower would make turnover look nearly free.
+
 The baseline loads only bars dated before `--heldout-from`. Its bar window starts 370 days before
 `--from` so a year of eligibility history exists. Outputs in `<dir>`:
 - `baseline.json`: folds, variants tried, exclusions, per-list results and warnings
 - `<LIST>.json`
-- `variants.jsonl`
-- `heldout.jsonl`
+
+The variant log and the held-out seal are **not** in `<dir>`. There is one pinned ledger,
+`research-ledger/` in this repository (`variants.jsonl`, `heldout.jsonl`, their `.head` files and
+`heldout-markers/`), and no argument moves it (`--ledger`, `--variants`, `--seal` are refused with
+`LEDGER_IS_PINNED`). So a new `--out` folder cannot reset the Holm family or reopen the seal. Commit
+the ledger after every run; reads are anchored to its committed heads. It starts with the harness-v1
+baseline's 5 variants and 5 registrations.
 
 No command in this PR evaluates the held-out period. That is a deliberate, separate step.
 

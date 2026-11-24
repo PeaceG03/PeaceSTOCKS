@@ -100,7 +100,12 @@ test("held-out: dropping the EVALUATE lines from the log does not reopen the per
   seal.evaluateOnce(hash, WINDOW, () => 1);
   const lines = readFileSync(path, "utf8").trimEnd().split("\n");
   writeFileSync(path, `${lines[0]}\n`); // only REGISTER left: a valid chain
+  assert.throws(() => new HeldOutSeal(path).evaluateOnce(hash, WINDOW, () => 2), /LOG_TAMPERED.*head/); // the head file sees it
+  // A forger who also rewrites the head file to match: the exclusive marker still refuses.
+  const first = JSON.parse(lines[0]!) as { seq: number; hash: string };
+  writeFileSync(`${path}.head`, `${JSON.stringify({ seq: first.seq, hash: first.hash })}\n`);
   assert.throws(() => new HeldOutSeal(path).evaluateOnce(hash, WINDOW, () => 2), new RegExp(HELD_OUT_SEALED));
   rmSync(path);
+  rmSync(`${path}.head`);
   assert.throws(() => new HeldOutSeal(path).evaluateOnce(hash, WINDOW, () => 2), new RegExp(HELD_OUT_NOT_REGISTERED));
 });

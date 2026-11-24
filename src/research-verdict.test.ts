@@ -17,7 +17,7 @@ const metrics = (exU: number, exS: number, spySessions = 50): SeriesMetrics => (
   sharpeNet: 0,
 });
 
-const evaluation = (over: { exU?: number; exS?: number; positive?: number; folds?: number; adjustedP?: number }): StrategyEvaluation => {
+const evaluation = (over: { exU?: number; exS?: number; positive?: number; folds?: number; adjustedP?: number; bps?: number }): StrategyEvaluation => {
   const folds = over.folds ?? 4;
   return {
     record: {
@@ -33,6 +33,7 @@ const evaluation = (over: { exU?: number; exS?: number; positive?: number; folds
     familySize: 5,
     adjustedP: over.adjustedP ?? 0.01,
     foldsPositive: over.positive ?? 3,
+    costBpsPerSide: over.bps ?? 10,
   };
 };
 
@@ -68,6 +69,26 @@ test("each failed check alone makes it NOT_PROVEN, with its reason", () => {
   }
   // Just inside each threshold passes.
   assert.equal(verdictFor(evaluation({ positive: 3, folds: 5, adjustedP: 0.0499 }), good).verdict, "IMPROVEMENT");
-  assert.deepEqual(DEFAULT_VERDICT_THRESHOLDS, { alpha: 0.05, minPositiveFoldShare: 0.5 });
-  assert.equal(verdictFor(evaluation({ positive: 3, folds: 4 }), good, { alpha: 0.05, minPositiveFoldShare: 0.75 }).verdict, "NOT_PROVEN");
+  assert.deepEqual(DEFAULT_VERDICT_THRESHOLDS, { alpha: 0.05, minPositiveFoldShare: 0.5, minFolds: 3, minCostBpsPerSide: 5 });
+  assert.equal(verdictFor(evaluation({ positive: 3, folds: 4 }), good, { ...DEFAULT_VERDICT_THRESHOLDS, minPositiveFoldShare: 0.75 }).verdict, "NOT_PROVEN");
+});
+
+test("too few folds: one or two folds plus a positive held-out never give IMPROVEMENT; three can", () => {
+  for (const folds of [0, 1, 2]) {
+    const v = verdictFor(evaluation({ positive: folds, folds }), good);
+    assert.equal(v.verdict, "NOT_PROVEN", `${folds} folds`);
+    assert.ok(v.reasons.includes("TOO_FEW_FOLDS"), v.reasons.join(","));
+  }
+  const three = verdictFor(evaluation({ positive: 3, folds: 3 }), good);
+  assert.equal(three.verdict, "IMPROVEMENT");
+  assert.equal(three.checks.enoughFolds, true);
+});
+
+test("cost floor: below 5 bps per side is NOT_PROVEN (COST_BELOW_FLOOR); 5 bps is accepted", () => {
+  for (const bps of [0, 4.99, Number.NaN]) {
+    const v = verdictFor(evaluation({ bps }), good);
+    assert.equal(v.verdict, "NOT_PROVEN", String(bps));
+    assert.ok(v.reasons.includes("COST_BELOW_FLOOR"), v.reasons.join(","));
+  }
+  assert.equal(verdictFor(evaluation({ bps: 5 }), good).verdict, "IMPROVEMENT");
 });

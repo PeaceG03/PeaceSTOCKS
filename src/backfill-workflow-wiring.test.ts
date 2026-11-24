@@ -41,7 +41,7 @@ test("workflow: backfill mode runs `pnpm backfill` with the spacing, chunk, cap 
   assert.match(yml, /backfill_chunk_sessions:\n {8}description: [^\n]+\n {8}required: false\n {8}default: "150"\n/u);
   // The job writes Reply Dust: the pinned zstd build and PATH steps block in this job.
   for (const name of [/^name: Build pinned zstd 1\.5\.7/u, /^name: Use pinned zstd 1\.5\.7/u]) assert.doesNotMatch(step(name), /continue-on-error/u);
-  assert.match(backfillJob, /if: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.mode == 'backfill' \}\}/u);
+  assert.match(backfillJob, /if: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.mode == 'backfill' && github\.ref == 'refs\/heads\/main' \}\}/u);
 });
 
 test("`pnpm backfill` is the job CLI; the old direct entry point refuses to run", () => {
@@ -165,4 +165,13 @@ test("no key, or no object store when one is required: refused before anything r
     backfillJobMain(["--from", "2026-01-20", "--to", "2026-01-21"], { MASSIVE_API_KEY: "k", PEACESTOCKS_REQUIRE_OBJECT_STORE: "1" }, {}),
     /OBJECT_STORE_REQUIRED/u,
   );
+});
+
+test("main only: on Actions the job refuses any ref but main (even with a key); locally the guard does not apply", async () => {
+  const args = ["--from", "2026-01-20", "--to", "2026-01-21"];
+  for (const ref of ["refs/heads/builder/x", "refs/tags/v1", "", undefined])
+    await assert.rejects(backfillJobMain(args, { GITHUB_ACTIONS: "true", MASSIVE_API_KEY: "k", ...(ref === undefined ? {} : { GITHUB_REF: ref }) }, {}), /BACKFILL_MAIN_ONLY/u, String(ref));
+  // Past the guard on main (stops at the next refusal: no key).
+  await assert.rejects(backfillJobMain(args, { GITHUB_ACTIONS: "true", GITHUB_REF: "refs/heads/main" }, {}), /MASSIVE_API_KEY_REQUIRED/u);
+  await assert.rejects(backfillJobMain(args, {}, {}), /MASSIVE_API_KEY_REQUIRED/u);
 });
