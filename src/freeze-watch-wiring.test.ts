@@ -44,3 +44,16 @@ test("freeze_watch job: the :47 tick on main, R2 read and issues write, nothing 
   // The scan job never runs on the :47 tick, so the tick job is what covers a scan that never ran.
   assert.match(jobBody("scan"), /github\.event\.schedule != '47 \* \* \* \*'/u);
 });
+
+test("freeze watch never gets the Massive key: the scan job's step blanks the job-level secret, the :47 job has none", () => {
+  const scan = jobBody("scan");
+  assert.match(scan, /MASSIVE_API_KEY: \$\{\{ secrets\.MASSIVE_API_KEY \}\}/u, "the scan host itself still needs it");
+  const step = stepOf(scan, "run: pnpm -s exec tsx src/freeze-watch.ts");
+  // A step cannot unset a job env var; it overrides it with an empty value.
+  assert.match(step, /\n {10}MASSIVE_API_KEY: ""\n/u);
+  assert.doesNotMatch(step, /secrets\.MASSIVE_API_KEY/u);
+  assert.doesNotMatch(jobBody("freeze_watch"), /MASSIVE_API_KEY/u);
+  // The script itself never reads it.
+  const source = readFileSync(new URL("./freeze-watch.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /MASSIVE/u);
+});

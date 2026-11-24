@@ -71,7 +71,7 @@ function fakeR2() {
       const found = objects.get(key);
       if (!found) return new Response(null, { status: 404 });
       if (method === "HEAD") return new Response(null, { status: 200, headers: { "content-length": String(found.body.length), ...found.meta } });
-      return new Response(found.body, { status: 200 });
+      return new Response(found.body, { status: 200, headers: { etag: `"${found.body.length}"` } });
     },
   });
   return { client, objects, seen };
@@ -94,7 +94,7 @@ test("R2: the marker claim is a signed If-None-Match: * PUT; 412 is already aler
   assert.deepEqual(second.alerted, []);
   assert.equal(calls, 1);
   assert.equal(new TextDecoder().decode(objects.get(MARKER)!.body), written, "412: the marker is kept as it was");
-  assert.deepEqual(seen.filter((r) => r.key === MARKER).map((r) => `${r.method}:${r.headers.get("if-none-match")}`), ["PUT:*"]);
+  assert.deepEqual(seen.filter((r) => r.key === MARKER).map((r) => `${r.method}:${r.headers.get("if-none-match")}`), ["PUT:*", "GET:null"]); // 412, then one read: the marker is ALERTED, not an expired claim
 });
 
 test("a failed alert releases the claim, so the next run retries", async () => {
