@@ -550,3 +550,83 @@ test("late scan that lands before the open: exits first, entries added by a late
   const f = await read<PaperFills>(client, paperLedgerKey("fills", "2026-12-09"));
   assert.deepEqual(f.fills.map((x) => `${x.side} ${x.securityId} ${x.status}`), ["SELL a FILLED", "SELL b FILLED", "BUY b FILLED", "BUY c FILLED"]);
 });
+
+const bars = (m: FakeMarket, date: string, prices: Record<string, number | [number, number]>) => {
+  for (const [id, px] of Object.entries(prices)) m.bar(id, date, ...(Array.isArray(px) ? px : ([px, px] as [number, number])));
+};
+
+test("rules come from the loaded config: non-default capital, cap, slippage and loss limit all change the ledger", async () => {
+  const base = loadPaperRules();
+  const loaded: LoadedPaperRules = {
+    rulesSha256: "f".repeat(64),
+    rules: { ...base.rules, rulesVersion: "paper-rules-v9", startingCapitalUsd: 50000, maxPositionFractionOfEquity: 0.05, slippageBpsPerSide: 50, dailyLossLimitFraction: 0.5, commissionPerOrderUsd: 2 },
+  };
+  const client = new RecordingClient();
+  const m = world();
+  await run(client, m, at("2026-12-08"), ON, false, loaded);
+  day2(m, 60); // about -4% on the book: under this config's 50% limit, so entries go ahead
+  const r = await run(client, m, at("2026-12-09"), ON, false, loaded);
+  assert.equal(r.intents!.entries, 2);
+  const f = await read<PaperFills>(client, paperLedgerKey("fills", "2026-12-08"));
+  assert.equal(f.cashBefore, 50000);
+  near(f.fills[0]!.fillPrice!, 100 * 1.005, "50 bps");
+  // 5% of 50,000 = 2,500 per name, less the $2 commission, at 100.5 -> 24 shares.
+  assert.deepEqual(f.fills.map((x) => [x.securityId, x.qty, x.commissionUsd]), [["a", Math.floor(2498 / 100.5), 2], ["b", Math.floor(2498 / 50.25), 2]]);
+  assert.equal(f.rulesVersion, "paper-rules-v9");
+  assert.equal(f.rulesSha256, "f".repeat(64));
+  const i = await read<PaperIntents>(client, paperLedgerKey("intents", "2026-12-09"));
+  assert.ok(i.orders.every((o) => o.clientOrderId.startsWith("paper-rules-v9_")));
+});
+
+test("daily loss limit is measured from that day's open equity, not from the starting capital", async () => {
+  // Up a lot, then down 3%+ in a day: still above the starting capital, but the stop must fire.
+  const up = new RecordingClient();
+  const m = world();
+  await run(up, m, at("2026-12-08"));
+  bars(m, "2026-12-08", { spy: 500, a: 100, b: 50, c: 20 });
+  m.freeze("2026-12-08", "2026-12-09", ["b", "c"]);
+  await run(up, m, at("2026-12-09"));
+  bars(m, "2026-12-09", { spy: 500, a: 1000, b: [50, 30], c: [20, 12] }); // a x10 at the open; b, c -40% by the close
+  m.freeze("2026-12-09", "2026-12-10", ["c"]);
+  const r = await run(up, m, at("2026-12-10"));
+  const f9 = await read<PaperFills>(up, paperLedgerKey("fills", "2026-12-09"));
+  assert.ok(f9.equityAtOpen > 150000, `equity at the open ${f9.equityAtOpen}`);
+  let mark = f9.cashAfter;
+  for (const p of f9.positionsAfter) mark += p.qty * (p.securityId === "b" ? 30 : 12);
+  assert.ok(mark > 100000 && mark / f9.equityAtOpen - 1 <= -0.03, `mark ${mark}`);
+  assert.equal(r.intents!.entriesRefused, "DAILY_LOSS_LIMIT");
+
+  // Down a lot on an earlier day, then flat: below the starting capital, but no loss today.
+  const down = new RecordingClient();
+  const m2 = world();
+  await run(down, m2, at("2026-12-08"));
+  bars(m2, "2026-12-08", { spy: 500, a: 100, b: 50, c: 20 });
+  m2.freeze("2026-12-08", "2026-12-09", ["b", "c"]);
+  await run(down, m2, at("2026-12-09"));
+  bars(m2, "2026-12-09", { spy: 500, a: 1, b: 50, c: 20 }); // a -99% at the open; flat after
+  m2.freeze("2026-12-09", "2026-12-10", ["c"]);
+  const r2 = await run(down, m2, at("2026-12-10"));
+  const g9 = await read<PaperFills>(down, paperLedgerKey("fills", "2026-12-09"));
+  assert.ok(g9.equityAtOpen < 97000, `equity at the open ${g9.equityAtOpen}`);
+  assert.equal(r2.intents!.entriesRefused, undefined);
+  assert.equal(r2.intents!.entries, 1);
+});
+
+test("universe benchmark: only ACTIVE LEVEL_2/LEVEL_3 names count", async () => {
+  const client = new RecordingClient();
+  const m = world();
+  m.security("gone", { status: "INACTIVE" });
+  m.security("small", { eligibility: "LEVEL_1" });
+  for (const id of ["gone", "small"]) {
+    m.bar(id, "2026-12-08", 10, 10);
+    m.bar(id, "2026-12-09", 30, 30); // +200%: would move the average a lot
+  }
+  await run(client, m, at("2026-12-08"));
+  day2(m);
+  await run(client, m, at("2026-12-09"));
+  day3(m);
+  await run(client, m, at("2026-12-10"));
+  const d = await read<PaperDay>(client, paperLedgerKey("days", "2026-12-09"));
+  assert.equal(d.universeSize, 4);
+  near(d.universeReturn!, (0.1 - 0.02 + 0 + 0.02) / 4, "universe without INACTIVE / LEVEL_1");
+});

@@ -59,7 +59,7 @@ export class FakeMarket implements PaperMarketReader {
     return this.splits;
   }
 
-  security(securityId: string, options: { symbol?: string; assetType?: "STOCK" | "ETF"; eligibility?: SecurityMasterRecord["eligibility"] } = {}) {
+  security(securityId: string, options: { symbol?: string; assetType?: "STOCK" | "ETF"; eligibility?: SecurityMasterRecord["eligibility"]; status?: string } = {}) {
     this.securities.push({
       securityId,
       currentSymbol: options.symbol ?? securityId.toUpperCase(),
@@ -68,7 +68,7 @@ export class FakeMarket implements PaperMarketReader {
       country: "US",
       exchange: "XNAS",
       firstSeenAt: "2020-01-01T00:00:00.000Z",
-      status: "ACTIVE",
+      status: options.status ?? "ACTIVE",
       tradable: true,
       providerIdentities: [],
       eligibility: options.eligibility ?? "LEVEL_2",

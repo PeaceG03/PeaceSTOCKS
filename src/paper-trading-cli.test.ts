@@ -80,6 +80,9 @@ test("workflow: off by default, main only, no push/PR trigger, read-only token, 
     assert.equal(days, "1-5");
     for (const hour of hours!.split(",")) assert.ok(Number(hour) * 60 + Number(minute) < 13 * 60 + 30, cron);
   }
+  // Nothing can leak values or switches into later steps: no writes to the step-environment files.
+  assert.doesNotMatch(workflow, /GITHUB_(ENV|PATH|OUTPUT|STATE)\b/u);
+  assert.doesNotMatch(workflow, /::(set-env|add-path|set-output)\b/u);
   // No other workflow starts the paper run.
   const dir = new URL("../.github/workflows/", import.meta.url);
   const others = readdirSync(dir).filter((name) => name !== "paper-trading.yml" && readFileSync(new URL(name, dir), "utf8").includes("paper-trading"));

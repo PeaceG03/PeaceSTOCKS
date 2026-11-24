@@ -32,6 +32,20 @@ export function liveBrokerHits(text: string): string[] {
   return hits;
 }
 
+/** Broker / trading SDK package names (npm). Any dependency matching one is refused. */
+const BROKER_PACKAGE = /(^|[/@-])(alpaca|alpacahq|tradier|schwab|tdameritrade|td-ameritrade|etrade|e-trade|tastytrade|tastyworks|ibkr|interactive-?brokers|ib-tws|@stoqey\/ib|robinhood|webull|ccxt|tradestation|questrade|oanda|tradovate)([/@-]|$)/iu;
+
+/** Every dependency name of a package.json (all four dependency maps) that looks like a broker SDK. */
+export function brokerPackageHits(packageJson: string): string[] {
+  const manifest = JSON.parse(packageJson) as Record<string, unknown>;
+  const names: string[] = [];
+  for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+    const deps = manifest[field];
+    if (deps && typeof deps === "object") names.push(...Object.keys(deps));
+  }
+  return names.filter((name) => BROKER_PACKAGE.test(name));
+}
+
 function files(dir: string): string[] {
   const out: string[] = [];
   for (const name of readdirSync(dir)) {
@@ -62,4 +76,21 @@ test("the detector catches live hosts and allows only the paper host", () => {
   assert.deepEqual(liveBrokerHits(paper), []);
   assert.deepEqual(liveBrokerHits(`see ${OTHER_LIVE_HOSTS[0]}`), [OTHER_LIVE_HOSTS[0]]);
   assert.deepEqual(liveBrokerHits("no broker here"), []);
+});
+
+test("no broker SDK in package.json or the lockfile", () => {
+  assert.deepEqual(brokerPackageHits(readFileSync(join(root, "package.json"), "utf8")), []);
+  // The lockfile's package keys ("/name@version" or "name@version:") must not name one either.
+  const lock = readFileSync(join(root, "pnpm-lock.yaml"), "utf8");
+  const lockNames = [...lock.matchAll(/^ {2}'?\/?((?:@[^/@\s']+\/)?[^@\s'/]+)@/gmu)].map((m) => m[1]!);
+  assert.ok(lockNames.length > 20, "parsed the lockfile");
+  assert.deepEqual(lockNames.filter((name) => BROKER_PACKAGE.test(name)), []);
+});
+
+test("the SDK detector catches broker packages in any dependency map", () => {
+  for (const name of ["@alpacahq/alpaca-trade-api", "alpaca-ts", "@master-chief/alpaca", "tradier-client", "schwab-client-js", "@stoqey/ib", "ib-tws-api", "ccxt", "robinhood", "interactive-brokers", "oanda-node", "webull-api"]) {
+    for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"])
+      assert.deepEqual(brokerPackageHits(JSON.stringify({ [field]: { [name]: "1.0.0", tsx: "1" } })), [name], `${field} ${name}`);
+  }
+  assert.deepEqual(brokerPackageHits(JSON.stringify({ dependencies: { tsx: "1", typescript: "5", "@types/node": "24" } })), []);
 });
