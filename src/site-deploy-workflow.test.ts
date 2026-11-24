@@ -490,3 +490,54 @@ test("site deploy workflow: Worker secrets reject a leftover newline in any trim
   }
 });
 
+
+const TRIM_PREFIX = "node scripts/trim-step-env.cjs CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID -- ";
+
+test("site deploy workflow: EVERY wrangler command (deploy and secret bulk) runs through the trim wrapper, not just once per step", () => {
+  // Command lines of the workflow (comments dropped; a `run: cmd` one-liner counts as a command line).
+  const commands = workflow
+    .split("\n")
+    .map((line) => line.trim().replace(/^run: /u, ""))
+    .filter((line) => line && !line.startsWith("#"));
+  const wranglerCommands = commands.filter((line) => /\bwrangler\b/u.test(line) && !/^[A-Z_]+: /u.test(line));
+  const subcommands = wranglerCommands.map((line) => /"wrangler@\$\{WRANGLER_VERSION\}" (deploy|secret bulk)\b/u.exec(line)?.[1] ?? line);
+  assert.deepEqual(subcommands.sort(), ["deploy", "secret bulk"], "expected exactly the deploy and secret bulk wrangler commands");
+  for (const line of wranglerCommands)
+    assert.ok(line.startsWith(`${TRIM_PREFIX}npx --yes "wrangler@\${WRANGLER_VERSION}" `), `wrangler command without the trim wrapper: ${line.slice(0, 80)}`);
+  // The other commands that use the Cloudflare credentials are wrapped on their own line too.
+  for (const marker of ["pnpm exec tsx src/site-access-setup.ts", "node -e 'const e=process.env; const v={ALLOWED_EMAIL"]) {
+    const lines = commands.filter((line) => line.includes(marker));
+    assert.equal(lines.length, 1, marker);
+    assert.ok(lines[0]!.startsWith(`${TRIM_PREFIX}${marker}`), marker);
+  }
+  // Every Cloudflare-credential step's command lines: either a plain shell line with no credential use,
+  // or one wrapped command.
+  for (const name of STEPS_THAT_USE_CF) {
+    const step = steps().find((s) => s.title.startsWith(name))!;
+    const wrapped = step.text.split("\n").filter((line) => line.includes("trim-step-env.cjs")).length;
+    const expected = name === "Worker secrets" ? 2 : 1;
+    assert.equal(wrapped, expected, `${name}: wrapped command lines`);
+  }
+});
+
+test("trim-step-env: the child gets exactly the given command and argv, nothing appended (no values on argv)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "trim-argv-"));
+  try {
+    const outFile = join(dir, "argv.json");
+    const result = runTrimStepEnv(
+      { PATH: process.env.PATH ?? "/usr/bin:/bin", CLOUDFLARE_API_TOKEN: " tok_abc\n", CLOUDFLARE_ACCOUNT_ID: "acct123 " },
+      [process.execPath, "-e", "require('fs').writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(1)))", outFile, "two words", "--", "x"],
+    );
+    assert.equal(result.status, 0, result.out);
+    // process.argv for `node -e code a b ...` is [node, a, b, ...]: exactly the arguments given after the command.
+    assert.deepEqual(JSON.parse(readFileSync(outFile, "utf8")), [outFile, "two words", "--", "x"]);
+    // And with no arguments at all, the child sees none.
+    const bare = join(dir, "bare.json");
+    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", CLOUDFLARE_API_TOKEN: "tok_abc", CLOUDFLARE_ACCOUNT_ID: "acct123", OUT: bare };
+    const none = runTrimStepEnv(env, [process.execPath, "-e", "require('fs').writeFileSync(process.env.OUT, JSON.stringify(process.argv.slice(1)))"]);
+    assert.equal(none.status, 0, none.out);
+    assert.deepEqual(JSON.parse(readFileSync(bare, "utf8")), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
