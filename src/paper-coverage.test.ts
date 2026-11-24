@@ -63,8 +63,8 @@ test("paper: a hole session does not advance the miss count; a covered session w
   const lowFraction: LoadedPaperRules = { ...loaded, rules: { ...loaded.rules, coverageHoleFraction: 0.3 } };
   assert.equal(computeFills({ intents, prior: { cash: 0, positions: [position] }, bars: holeBars, splits: new Map(), loaded: lowFraction }).fills[0]!.status, "MARKED_ZERO", "3 of 8 is covered at 0.3: the fraction comes from the rules");
   // The universe's walk counts the same way: the hole session adds nothing (5 covered days before it).
-  assert.deepEqual(missedSessions(holeBars, "a", "2026-12-09", 0.5), { misses: 5, lastOpen: "2026-12-01" });
-  assert.deepEqual(missedSessions(coveredBars, "a", "2026-12-09", 0.5), { misses: 6, lastOpen: "2026-12-01" });
+  assert.deepEqual(missedSessions(holeBars, "a", "2026-12-09", { coverageHoleFraction: 0.5, dropoutSpikeMultiple: 3, dropoutSpikeMinNames: 200, dropoutFallbackSessions: 40 }), { misses: 5, lastOpen: "2026-12-01" });
+  assert.deepEqual(missedSessions(coveredBars, "a", "2026-12-09", { coverageHoleFraction: 0.5, dropoutSpikeMultiple: 3, dropoutSpikeMinNames: 200, dropoutFallbackSessions: 40 }), { misses: 6, lastOpen: "2026-12-01" });
 });
 
 // ---- end to end: a bought at 12-08, then no price; filler names make a hole visible.
@@ -153,7 +153,7 @@ test("a cash settlement corrects the universe too, like paper", async () => {
 });
 
 test("universe: a hole session right after the $0 mark does not mark it again", () => {
-  const rules = { markZeroAfterMissedExits: 5, coverageHoleFraction: 0.5 };
+  const rules = { markZeroAfterMissedExits: 5, coverageHoleFraction: 0.5, dropoutSpikeMultiple: 3, dropoutSpikeMinNames: 200, dropoutFallbackSessions: 40 };
   const dates = ["2026-12-08", "2026-12-09", "2026-12-10", "2026-12-11", "2026-12-14", "2026-12-15", "2026-12-16"];
   const bars = new PaperBars(dates.flatMap((d) => [
     ...(d === "2026-12-16" ? FILLER.slice(0, 2) : FILLER).map((id) => ({ securityId: id, sessionDate: d, open: 1, close: 1, revision: 1 })),
@@ -163,7 +163,7 @@ test("universe: a hole session right after the $0 mark does not mark it again", 
   assert.equal(universeStuckAt(bars, "a", "2026-12-16", rules), false, "12-16 is a hole");
   // Five covered misses but no open anywhere in the loaded bars: unknown, never marked.
   const never = new PaperBars(dates.slice(1, 6).flatMap((d) => FILLER.map((id) => ({ securityId: id, sessionDate: d, open: 1, close: 1, revision: 1 }))) as never);
-  assert.deepEqual(missedSessions(never, "a", "2026-12-15", 0.5), { misses: 5 });
+  assert.deepEqual(missedSessions(never, "a", "2026-12-15", { coverageHoleFraction: 0.5, dropoutSpikeMultiple: 3, dropoutSpikeMinNames: 200, dropoutFallbackSessions: 40 }), { misses: 5 });
   assert.equal(universeStuckAt(never, "a", "2026-12-15", rules), false);
 });
 

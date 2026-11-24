@@ -12,7 +12,7 @@ const date = (i: number) => `2026-12-${String(i).padStart(2, "0")}`;
 function day(i: number, patch: Record<string, unknown> = {}) {
   return {
     schemaVersion: "paper-day-v1",
-    rulesVersion: "paper-rules-v4",
+    rulesVersion: "paper-rules-v5",
     rulesSha256: "x",
     fromSessionDate: date(i - 1),
     toSessionDate: date(i),
@@ -91,4 +91,15 @@ test("percent: sign, two decimals, n/a", () => {
   assert.equal(percent(-0.0000001), "0.00%");
   assert.equal(percent(null), "n/a");
   assert.equal(percent(Number.NaN), "n/a");
+});
+
+test("paper card: a data drop-out window says how many names were not counted as missed", async () => {
+  const client = new MemoryObjectClient();
+  await client.put(`${PAPER_DAYS_PREFIX}${date(3)}.json`, enc(day(3, { universeDataDropout: 562, paperDataDropout: 2 })));
+  await client.put(`${PAPER_DAYS_PREFIX}${date(4)}.json`, enc(day(4)));
+  const data = await loadSiteData(client);
+  assert.deepEqual(data.paper!.days.map((d) => [d.to, d.dataDropout]), [[date(4), undefined], [date(3), { universe: 562, paper: 2 }]]);
+  const html = card(renderSitePage(data));
+  assert.match(html, /data gap: 562 universe names, 2 paper names not counted as missed \(DATA_<wbr>DROPOUT\)/u);
+  assert.equal((html.match(/data gap:/gu) ?? []).length, 1);
 });

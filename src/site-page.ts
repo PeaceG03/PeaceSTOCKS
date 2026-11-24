@@ -109,6 +109,10 @@ function paperCard(data: SiteData): string {
             (d) =>
               `<tr><td data-label="Day"><span class="session-date">${escapeHtml(d.to)}</span><div class="mute">open ${escapeHtml(d.from)} to open ${escapeHtml(d.to)}</div>${
                 d.entriesRefused ? `<div class="mute issues">no entries: ${wrapAtUnderscores(d.entriesRefused)}</div>` : ""
+              }${
+                d.dataDropout
+                  ? `<div class="mute issues">data gap: ${d.dataDropout.universe} universe names, ${d.dataDropout.paper} paper names not counted as missed (${wrapAtUnderscores("DATA_DROPOUT")})</div>`
+                  : ""
               }</td><td class="r" data-label="Paper">${escapeHtml(percent(d.paper))}</td><td class="r" data-label="SPY">${escapeHtml(percent(d.spy))}</td><td class="r" data-label="Universe">${escapeHtml(percent(d.universe))}</td></tr>`,
           )
           .join("")}</tbody></table></div>`

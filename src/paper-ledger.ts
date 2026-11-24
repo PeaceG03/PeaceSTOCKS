@@ -280,6 +280,10 @@ export interface PaperDay extends RulesStamp {
    * this window, carried to the next day row.
    */
   universeStuck?: PaperUniverseStuck[];
+  /** Universe names not priced this window because of a mass data drop-out (DATA_DROPOUT); left out, not marked. */
+  universeDataDropout?: number;
+  /** Paper exits not filled this window because of a mass data drop-out (fills flagged DATA_DROPOUT). */
+  paperDataDropout?: number;
   /** Universe $0 marks resolved in this window, by the same data and function as paper. */
   universeResolved?: PaperUniverseResolution[];
   /** The recovered slices as a return on the index at this window's opening open (in universeReturn). */

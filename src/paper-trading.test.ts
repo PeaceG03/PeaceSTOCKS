@@ -160,8 +160,8 @@ test("end to end: intents before the open, fills from stored opens, day row vs S
   assert.deepEqual(r1.intents, { sessionDate: "2026-12-08", outcome: "WRITTEN", entries: 2, exits: 0 });
   const i1 = await read<PaperIntents>(client, paperLedgerKey("intents", "2026-12-08"));
   assert.deepEqual(i1.orders.map((o) => [o.side, o.securityId, o.clientOrderId]), [
-    ["BUY", "a", "paper-rules-v4_2026-12-08_a_BUY"],
-    ["BUY", "b", "paper-rules-v4_2026-12-08_b_BUY"],
+    ["BUY", "a", "paper-rules-v5_2026-12-08_a_BUY"],
+    ["BUY", "b", "paper-rules-v5_2026-12-08_b_BUY"],
   ]);
   assert.equal(i1.recordedAt, "2026-12-08T11:15:00.000Z");
   assert.ok(Date.parse(i1.recordedAt) < Date.parse(i1.sessionOpen));
@@ -198,7 +198,7 @@ test("end to end: intents before the open, fills from stored opens, day row vs S
 
   // Every ledger row carries the rules version and file hash.
   const { rulesSha256 } = loadPaperRules();
-  for (const row of [i1, i2, e2, f1, f2, d, ...i1.orders, ...e2.orders, ...f1.fills, ...f2.fills]) assert.deepEqual([row.rulesVersion, row.rulesSha256], ["paper-rules-v4", rulesSha256]);
+  for (const row of [i1, i2, e2, f1, f2, d, ...i1.orders, ...e2.orders, ...f1.fills, ...f2.fills]) assert.deepEqual([row.rulesVersion, row.rulesSha256], ["paper-rules-v5", rulesSha256]);
   // Append-only: no key was ever put twice.
   assert.equal(new Set(client.puts).size, client.puts.length);
 });
@@ -211,8 +211,8 @@ test("costs: P&L is net of slippage both sides and commission", () => {
     { securityId: "a", sessionDate: "2026-12-09", open: 100, close: 100, revision: 1 },
   ] as never);
   const intent = (S: string, side: "BUY" | "SELL"): PaperIntents => ({
-    schemaVersion: "paper-intents-v1", rulesVersion: "paper-rules-v4", rulesSha256: "x", sessionDate: S, freezeSessionDate: "2026-12-07",
-    recordedAt: "", sessionOpen: "", orders: [{ rulesVersion: "paper-rules-v4", rulesSha256: "x", clientOrderId: `${S}${side}`, sessionDate: S, securityId: "a", side, purpose: side === "BUY" ? "ENTRY" : "EXIT" }],
+    schemaVersion: "paper-intents-v1", rulesVersion: "paper-rules-v5", rulesSha256: "x", sessionDate: S, freezeSessionDate: "2026-12-07",
+    recordedAt: "", sessionOpen: "", orders: [{ rulesVersion: "paper-rules-v5", rulesSha256: "x", clientOrderId: `${S}${side}`, sessionDate: S, securityId: "a", side, purpose: side === "BUY" ? "ENTRY" : "EXIT" }],
   });
   for (const [rules, commission] of [[loaded, 0], [withCommission, 1]] as const) {
     const entry = computeFills({ intents: intent("2026-12-08", "BUY"), prior: { cash: 100000, positions: [] }, bars, splits: new Map(), loaded: rules });
@@ -410,10 +410,10 @@ test("entries never spend more cash than is left, even when held names inflate e
 test("corrections: a later split record appends a correction (n, n+1), never re-corrects, never touches the fill", () => {
   const loaded = loadPaperRules();
   const fill = (status: "FILLED" | "MARKED_ZERO" | "NO_PRICE", fillPrice = 51 * 0.999) => ({
-    rulesVersion: "paper-rules-v4", rulesSha256: "x", clientOrderId: "o", securityId: "a", side: "SELL" as const, purpose: "EXIT" as const,
+    rulesVersion: "paper-rules-v5", rulesSha256: "x", clientOrderId: "o", securityId: "a", side: "SELL" as const, purpose: "EXIT" as const,
     status, qty: 100, rawPrice: 51, fillPrice, splitFactorApplied: 1, entrySessionDate: "2026-12-08", notionalUsd: 0, commissionUsd: 0, slippageUsd: 0, flags: [],
   });
-  const fills = (f: ReturnType<typeof fill>) => ({ schemaVersion: "paper-fills-v1", rulesVersion: "paper-rules-v4", rulesSha256: "x", sessionDate: "2026-12-09", cashBefore: 0, cashAfterExits: 0, equityAtOpen: 0, cashAfter: 0, positionsAfter: [], fills: [f] }) as PaperFills;
+  const fills = (f: ReturnType<typeof fill>) => ({ schemaVersion: "paper-fills-v1", rulesVersion: "paper-rules-v5", rulesSha256: "x", sessionDate: "2026-12-09", cashBefore: 0, cashAfterExits: 0, equityAtOpen: 0, cashAfter: 0, positionsAfter: [], fills: [f] }) as PaperFills;
   const half = new Map([["a", [{ effectiveDate: "2026-12-09", factor: 0.5 }]]]);
   const now = new Date("2026-12-11T11:15:00.000Z");
   assert.deepEqual(correctionsFor({ fills: fills(fill("FILLED")), latest: new Map(), splits: new Map(), loaded, now }), []);

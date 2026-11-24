@@ -42,6 +42,16 @@ export interface PaperRules {
    * a halt. A name with no open on a hole session does not count as a missed exit (paper or universe).
    */
   readonly coverageHoleFraction: number;
+  /**
+   * Mass drop-out: a session where the names that had a bar on the previous stored session but none
+   * on this one are more than dropoutSpikeMultiple x the 99th percentile of that count over the 20
+   * stored sessions before, and more than dropoutSpikeMinNames, is a data drop-out. For those names the
+   * missing sessions do not count toward the $0 mark (flag DATA_DROPOUT) for the first
+   * dropoutFallbackSessions covered sessions; after that the normal rule applies.
+   */
+  readonly dropoutSpikeMultiple: number;
+  readonly dropoutSpikeMinNames: number;
+  readonly dropoutFallbackSessions: number;
 }
 
 export interface LoadedPaperRules {
@@ -55,11 +65,13 @@ export interface LoadedPaperRules {
  * it booked real crashes at 0% and biased P&L upward) and added a write-off at the last close.
  * v3 (Nov 24, before any run): replaced that write-off with Peace's $0-then-correct rule
  * (markZeroAfterMissedExits, stuckPositionRule).
- * v4 (Nov 24, before any run): adds coverageHoleFraction (a session with far fewer names than normal
- * is a hole in our data and is not a missed exit). v1-v3 never ran; no ledger row was ever written
- * under them, so their files were removed.
+ * v4 (Nov 24, before any run): added coverageHoleFraction (a session with far fewer names than normal
+ * is a hole in our data and is not a missed exit).
+ * v5 (Nov 24, before any run): adds the mass drop-out rule (dropoutSpikeMultiple, dropoutSpikeMinNames,
+ * dropoutFallbackSessions). v1-v4 never ran; no ledger row was ever written under them, so their
+ * files were removed.
  */
-export const PAPER_RULES_CURRENT_VERSION = "paper-rules-v4";
+export const PAPER_RULES_CURRENT_VERSION = "paper-rules-v5";
 
 const KEYS = [
   "rulesVersion",
@@ -78,6 +90,9 @@ const KEYS = [
   "markZeroAfterMissedExits",
   "stuckPositionRule",
   "coverageHoleFraction",
+  "dropoutSpikeMultiple",
+  "dropoutSpikeMinNames",
+  "dropoutFallbackSessions",
 ] as const;
 
 function fail(why: string): never {
@@ -120,6 +135,11 @@ export function parsePaperRules(text: string): PaperRules {
   if (!Number.isInteger(record.markZeroAfterMissedExits)) fail("markZeroAfterMissedExits_NOT_AN_INTEGER");
   if (record.stuckPositionRule !== "MARK_ZERO_THEN_CORRECT") fail("stuckPositionRule");
   finiteIn(record.coverageHoleFraction, "coverageHoleFraction", 0, 1, true);
+  finiteIn(record.dropoutSpikeMultiple, "dropoutSpikeMultiple", 1, 100);
+  finiteIn(record.dropoutSpikeMinNames, "dropoutSpikeMinNames", 0, 1e6);
+  if (!Number.isInteger(record.dropoutSpikeMinNames)) fail("dropoutSpikeMinNames_NOT_AN_INTEGER");
+  finiteIn(record.dropoutFallbackSessions, "dropoutFallbackSessions", 1, 250);
+  if (!Number.isInteger(record.dropoutFallbackSessions)) fail("dropoutFallbackSessions_NOT_AN_INTEGER");
   return Object.freeze({ ...record }) as unknown as PaperRules;
 }
 

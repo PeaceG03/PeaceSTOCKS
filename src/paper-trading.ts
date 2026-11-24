@@ -1,6 +1,6 @@
 /**
  * Simulated paper trading of the frozen TOP_15_OVERALL picks under the pre-registered rules
- * (config/paper-rules-v4.json, docs/PAPER_TRADING.md). No broker: every order is a ledger row filled from
+ * (config/paper-rules-v5.json, docs/PAPER_TRADING.md). No broker: every order is a ledger row filled from
  * the stored daily bars. Nothing here sends an order anywhere.
  *
  * One run: (1) gates (enabled, kill switches) before anything is read or written; (1b) corrections for
@@ -158,12 +158,18 @@ export class PaperBars {
   private readonly names = new Map<string, number>();
   private sorted: string[] | undefined;
   private readonly coveredCache = new Map<string, boolean>();
+  private readonly idsOn = new Map<string, Set<string>>();
+  private readonly dropoutCount = new Map<string, number | undefined>();
+  private readonly spikeCache = new Map<string, boolean>();
   constructor(bars: Iterable<CanonicalDailyBar>) {
     for (const bar of bars) {
       let own = this.byId.get(bar.securityId);
       if (!own) this.byId.set(bar.securityId, (own = new Map()));
       const prior = own.get(bar.sessionDate);
       if (!prior) this.names.set(bar.sessionDate, (this.names.get(bar.sessionDate) ?? 0) + 1);
+      let ids = this.idsOn.get(bar.sessionDate);
+      if (!ids) this.idsOn.set(bar.sessionDate, (ids = new Set()));
+      ids.add(bar.securityId);
       if (!prior || bar.revision >= prior.revision) own.set(bar.sessionDate, bar);
       this.dates.add(bar.sessionDate);
     }
@@ -199,6 +205,57 @@ export class PaperBars {
       result = this.nameCount(date) >= fraction * median;
     }
     this.coveredCache.set(key, result);
+    return result;
+  }
+  /** Stored session right after `date` (as loaded), or undefined. */
+  nextStoredSession(date: string): string | undefined {
+    const sorted = (this.sorted ??= [...this.dates].sort());
+    return sorted.find((d) => d > date);
+  }
+  /** Does the name have any stored bar on this session? */
+  hasBar(id: string, date: string): boolean {
+    return this.idsOn.get(date)?.has(id) ?? false;
+  }
+  /**
+   * Drop-outs on a stored session: names with a bar on the stored session before it and none on this
+   * one. Undefined for the oldest stored session or a session with no bars.
+   */
+  dropouts(date: string): number | undefined {
+    if (this.dropoutCount.has(date)) return this.dropoutCount.get(date);
+    const sorted = (this.sorted ??= [...this.dates].sort());
+    const at = sorted.indexOf(date);
+    let result: number | undefined;
+    if (at > 0) {
+      const today = this.idsOn.get(date)!;
+      result = 0;
+      for (const id of this.idsOn.get(sorted[at - 1]!)!) if (!today.has(id)) result += 1;
+    }
+    this.dropoutCount.set(date, result);
+    return result;
+  }
+  /**
+   * Is this session a mass drop-out (a gap in our data, not halts)? Its drop-outs are above both
+   * dropoutSpikeMinNames and dropoutSpikeMultiple x the 99th percentile (nearest rank) of the drop-outs
+   * on the COVERAGE_TRAILING_SESSIONS stored sessions before it. False when nothing trails it.
+   */
+  dropoutSpike(date: string, rules: Pick<PaperRules, "dropoutSpikeMultiple" | "dropoutSpikeMinNames">): boolean {
+    const key = `${date}|${rules.dropoutSpikeMultiple}|${rules.dropoutSpikeMinNames}`;
+    const cached = this.spikeCache.get(key);
+    if (cached !== undefined) return cached;
+    const count = this.dropouts(date);
+    const sorted = (this.sorted ??= [...this.dates].sort());
+    const at = sorted.indexOf(date);
+    const trailing = sorted
+      .slice(Math.max(0, at - COVERAGE_TRAILING_SESSIONS), Math.max(0, at))
+      .map((d) => this.dropouts(d))
+      .filter((n): n is number => n !== undefined)
+      .sort((a, b) => a - b);
+    let result = false;
+    if (count !== undefined && trailing.length) {
+      const p99 = trailing[Math.ceil(0.99 * trailing.length) - 1]!;
+      result = count > rules.dropoutSpikeMinNames && count > rules.dropoutSpikeMultiple * p99;
+    }
+    this.spikeCache.set(key, result);
     return result;
   }
   open(id: string, date: string): number | undefined {
@@ -251,8 +308,10 @@ export function computeFills(input: {
   corrections?: { usd: number; applied: string[] };
   /** STUCK holdings whose resolution enters cash at this open (they leave the book here). */
   resolved?: readonly PaperStuckResolution[];
+  calendar?: typeof US_EQUITY_MARKET_CALENDAR;
 }): PaperFills {
   const { intents, bars, splits } = input;
+  const calendar = input.calendar ?? US_EQUITY_MARKET_CALENDAR;
   const { rules, rulesSha256 } = input.loaded;
   const stamp = { rulesVersion: rules.rulesVersion, rulesSha256 };
   const S = intents.sessionDate;
@@ -291,9 +350,11 @@ export function computeFills(input: {
       continue;
     }
     const rawOpen = bars.open(order.securityId, S);
-    if (rawOpen === undefined && !bars.covered(S, rules.coverageHoleFraction)) {
-      // Coverage hole in our data (far fewer names than normal): not a missed exit; stays held.
-      fills.push({ ...base(order), status: "NO_PRICE", ...none, flags: ["COVERAGE_HOLE"] });
+    const kind = rawOpen === undefined ? missKind(bars, order.securityId, S, rules, calendar) : undefined;
+    if (kind === "COVERAGE_HOLE" || kind === "DATA_DROPOUT") {
+      // A gap in our data (a coverage hole, or a mass drop-out inside its fallback window): not a
+      // missed exit; stays held.
+      fills.push({ ...base(order), status: "NO_PRICE", ...none, flags: [kind] });
       continue;
     }
     if (rawOpen === undefined) {
@@ -526,29 +587,50 @@ export function windowReturn(
   return b / appliedSplitFactor(splits.get(id), from, to).factor / a - 1;
 }
 
+type GapRules = Pick<PaperRules, "coverageHoleFraction" | "dropoutSpikeMultiple" | "dropoutSpikeMinNames" | "dropoutFallbackSessions">;
+
 /**
- * Missed sessions for one name up to `to`: walking back over eligible sessions until one with an open,
- * the number of covered sessions (PaperBars.covered) with no open. Coverage holes are skipped, not
- * counted, as for paper exits. `lastOpen` is the session with that open; undefined when the walk leaves
- * the loaded bars first (unknown, so never treated as missed).
+ * Missed sessions for one name up to `to`, shared by paper and the universe. Walking back over eligible
+ * sessions until one with an open (`lastOpen`), it counts the covered sessions (PaperBars.covered) with
+ * no open; coverage holes are skipped. The run is a data drop-out (`dropout`) when the stored session
+ * right after lastOpen is a mass drop-out (PaperBars.dropoutSpike) and the name has no bar there; then
+ * its first dropoutFallbackSessions covered sessions do not count. lastOpen is undefined when the walk
+ * leaves the loaded bars first (unknown, so never treated as missed).
  */
-export function missedSessions(bars: PaperBars, id: string, to: string, fraction: number, calendar = US_EQUITY_MARKET_CALENDAR): { misses: number; lastOpen?: string } {
+export function missedSessions(bars: PaperBars, id: string, to: string, rules: GapRules, calendar = US_EQUITY_MARKET_CALENDAR): { misses: number; lastOpen?: string; dropout?: boolean } {
   const first = bars.firstSession();
-  let misses = 0;
+  let covered = 0;
   for (let date: string | undefined = to; date && first && date >= first; date = previousEligibleSession(date, calendar)) {
-    if (bars.open(id, date) !== undefined) return { misses, lastOpen: date };
-    if (bars.covered(date, fraction)) misses += 1;
+    if (bars.open(id, date) !== undefined) {
+      const start = bars.nextStoredSession(date);
+      const dropout = start !== undefined && start <= to && !bars.hasBar(id, start) && bars.dropoutSpike(start, rules);
+      if (!dropout) return { misses: covered, lastOpen: date };
+      return { misses: Math.max(0, covered - rules.dropoutFallbackSessions), lastOpen: date, dropout: true };
+    }
+    if (bars.covered(date, rules.coverageHoleFraction)) covered += 1;
   }
-  return { misses };
+  return { misses: covered };
 }
 
 /**
- * The universe's side of the $0 rule, the same trigger as paper: `to` is covered, has no open for the
- * name, and is exactly its N-th covered session in a row without one, after a session with an open.
+ * What a session with no open is for one name: a COVERAGE_HOLE (not counted), a DATA_DROPOUT (inside the
+ * fallback window of a mass drop-out; not counted) or a MISS (counts toward the $0 mark). Undefined when
+ * the name has an open. One function for paper exits and the universe.
  */
-export function universeStuckAt(bars: PaperBars, id: string, to: string, rules: Pick<PaperRules, "markZeroAfterMissedExits" | "coverageHoleFraction">, calendar = US_EQUITY_MARKET_CALENDAR): boolean {
-  if (bars.open(id, to) !== undefined || !bars.covered(to, rules.coverageHoleFraction)) return false;
-  const run = missedSessions(bars, id, to, rules.coverageHoleFraction, calendar);
+export function missKind(bars: PaperBars, id: string, date: string, rules: GapRules, calendar = US_EQUITY_MARKET_CALENDAR): "COVERAGE_HOLE" | "DATA_DROPOUT" | "MISS" | undefined {
+  if (bars.open(id, date) !== undefined) return undefined;
+  if (!bars.covered(date, rules.coverageHoleFraction)) return "COVERAGE_HOLE";
+  const run = missedSessions(bars, id, date, rules, calendar);
+  return run.dropout && run.misses === 0 ? "DATA_DROPOUT" : "MISS";
+}
+
+/**
+ * The universe's side of the $0 rule, the same trigger as paper: `to` has no open for the name, is a
+ * counted miss (missKind), and is exactly its N-th counted miss in a row, after a session with an open.
+ */
+export function universeStuckAt(bars: PaperBars, id: string, to: string, rules: GapRules & Pick<PaperRules, "markZeroAfterMissedExits">, calendar = US_EQUITY_MARKET_CALENDAR): boolean {
+  if (missKind(bars, id, to, rules, calendar) !== "MISS") return false;
+  const run = missedSessions(bars, id, to, rules, calendar);
   return run.lastOpen !== undefined && run.misses === rules.markZeroAfterMissedExits;
 }
 
@@ -579,6 +661,7 @@ export function computeDay(input: {
   const levelFrom = 1 + (prev?.cumulativeUniverseReturn ?? 0);
   const universe: number[] = [];
   const newlyStuck: { securityId: string; basis: { sessionDate: string; close: number } }[] = [];
+  let universeDataDropout = 0;
   for (const security of input.securities) {
     if (security.status !== "ACTIVE" || (security.eligibility !== "LEVEL_2" && security.eligibility !== "LEVEL_3")) continue;
     const id = security.securityId;
@@ -587,7 +670,10 @@ export function computeDay(input: {
       universe.push(r);
       continue;
     }
-    if (!universeStuckAt(bars, id, to.sessionDate, rules, calendar)) continue;
+    // Not priced this window: a data gap (left out), or a counted miss that may reach the $0 mark.
+    const kind = missKind(bars, id, to.sessionDate, rules, calendar);
+    if (kind === "DATA_DROPOUT") universeDataDropout += 1;
+    if (kind !== "MISS" || !universeStuckAt(bars, id, to.sessionDate, rules, calendar)) continue;
     const basis = bars.lastCloseBefore(id, to.sessionDate);
     if (!basis) continue;
     universe.push(-1);
@@ -635,6 +721,7 @@ export function computeDay(input: {
   const correctionReturn = recoveredUnits / levelFrom;
   const universeReturn = n ? universe.reduce((sum, r) => sum + r, 0) / n + correctionReturn : resolved.length ? correctionReturn : null;
   const paperReturn = to.equityAtOpen / from.equityAtOpen - 1;
+  const paperDataDropout = to.fills.filter((f) => f.flags.includes("DATA_DROPOUT")).length;
   const cost = (fill: PaperFill) => fill.slippageUsd + fill.commissionUsd;
   const costsUsd =
     from.fills.filter((f) => f.side === "BUY").reduce((sum, f) => sum + cost(f), 0) +
@@ -652,6 +739,8 @@ export function computeDay(input: {
     universeReturn,
     universeSize: universe.length,
     ...(stillStuck.length ? { universeStuck: stillStuck.sort((a, b) => a.securityId.localeCompare(b.securityId)) } : {}),
+    ...(universeDataDropout ? { universeDataDropout } : {}),
+    ...(paperDataDropout ? { paperDataDropout } : {}),
     ...(resolved.length ? { universeResolved: resolved.sort((a, b) => a.securityId.localeCompare(b.securityId)), universeCorrectionReturn: correctionReturn } : {}),
     cumulativePaperReturn: compound(prev?.cumulativePaperReturn ?? 0, paperReturn),
     cumulativeSpyReturn: compound(prev?.cumulativeSpyReturn ?? 0, spy),
@@ -682,8 +771,10 @@ export function nextOpenSession(now: Date, calendar = US_EQUITY_MARKET_CALENDAR)
  * Calendar days of bars loaded before the earliest session a run reads: last closes, N missed sessions,
  * and the COVERAGE_TRAILING_SESSIONS stored sessions before them that define a coverage hole.
  */
-export function paperBarsLookbackDays(rules: Pick<PaperRules, "markZeroAfterMissedExits">): number {
-  return Math.max(21, Math.ceil(((rules.markZeroAfterMissedExits + COVERAGE_TRAILING_SESSIONS) * 7) / 5) + 10);
+export function paperBarsLookbackDays(rules: Pick<PaperRules, "markZeroAfterMissedExits" | "dropoutFallbackSessions">): number {
+  // The walk back to a name's last open (up to N counted misses after a drop-out's fallback window),
+  // the session before it, and the trailing sessions the hole and drop-out checks compare against.
+  return Math.max(21, Math.ceil(((rules.markZeroAfterMissedExits + rules.dropoutFallbackSessions + COVERAGE_TRAILING_SESSIONS + 1) * 7) / 5) + 10);
 }
 
 function addDays(date: string, days: number): string {
@@ -838,7 +929,7 @@ export async function runPaperTrading(options: {
       if (correction.schemaVersion === "paper-stuck-resolution-v1") resolved.push(correction);
       applied.add(key);
     }
-    const fills = computeFills({ intents, prior: state, bars, splits, loaded, corrections: { usd, applied: [...applied] }, resolved });
+    const fills = computeFills({ intents, prior: state, bars, splits, loaded, corrections: { usd, applied: [...applied] }, resolved, calendar });
     if ((await ledger.putOnce(paperLedgerKey("fills", S), fills)) === "KEPT_EXISTING") {
       // A concurrent or earlier write won: continue from what is stored.
       fillsCache.delete(S);

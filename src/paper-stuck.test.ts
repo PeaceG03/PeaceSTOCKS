@@ -16,7 +16,7 @@ const SESSIONS = ["2026-12-08", "2026-12-09", "2026-12-10", "2026-12-11", "2026-
 
 test("rules v3 state the $0-then-correct rule and N = 5 (one config value)", () => {
   const { rules } = loadPaperRules();
-  assert.equal(rules.rulesVersion, "paper-rules-v4");
+  assert.equal(rules.rulesVersion, "paper-rules-v5");
   assert.equal(rules.stuckPositionRule, "MARK_ZERO_THEN_CORRECT");
   assert.equal(rules.markZeroAfterMissedExits, 5);
 });
@@ -269,7 +269,7 @@ test("a later price is never put into cash at an open before that price existed"
 });
 
 test("universe $0 rule: N covered sessions in a row without an open, after one with an open; a coverage hole is skipped, not counted", () => {
-  const rules = { markZeroAfterMissedExits: 5, coverageHoleFraction: 0.5 };
+  const rules = { markZeroAfterMissedExits: 5, coverageHoleFraction: 0.5, dropoutSpikeMultiple: 3, dropoutSpikeMinNames: 200, dropoutFallbackSessions: 40 };
   const rows = (dates: string[], withA: string[]) => new PaperBars(dates.flatMap((d) => [{ securityId: "z", sessionDate: d, open: 1, close: 1, revision: 1 }, ...(withA.includes(d) ? [{ securityId: "a", sessionDate: d, open: 1, close: 1, revision: 1 }] : [])]) as never);
   const all = ["2026-12-08", "2026-12-09", "2026-12-10", "2026-12-11", "2026-12-14", "2026-12-15", "2026-12-16"];
   assert.equal(universeStuckAt(rows(all, ["2026-12-08"]), "a", "2026-12-15", rules), true);

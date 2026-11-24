@@ -100,6 +100,8 @@ export interface SitePaperDay {
   cumulativeSpy: number | null;
   cumulativeUniverse: number | null;
   entriesRefused?: string;
+  /** Names not priced this window because of a mass data drop-out (DATA_DROPOUT), not counted as missed. */
+  dataDropout?: { universe: number; paper: number };
 }
 
 export interface SitePaper {
@@ -370,6 +372,14 @@ export async function loadSiteData(
 
 const fraction = (value: unknown): number | null => (typeof value === "number" && Number.isFinite(value) ? value : null);
 
+const count = (value: unknown): number => (typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : 0);
+
+function dataDropout(day: PaperDay): { dataDropout?: { universe: number; paper: number } } {
+  const universe = count(day.universeDataDropout);
+  const paper = count(day.paperDataDropout);
+  return universe || paper ? { dataDropout: { universe, paper } } : {};
+}
+
 function sitePaperDay(day: PaperDay, session: string): SitePaperDay {
   return {
     from: typeof day.fromSessionDate === "string" ? clip(day.fromSessionDate) : "unknown",
@@ -381,5 +391,6 @@ function sitePaperDay(day: PaperDay, session: string): SitePaperDay {
     cumulativeSpy: fraction(day.cumulativeSpyReturn),
     cumulativeUniverse: fraction(day.cumulativeUniverseReturn),
     ...(typeof day.entriesRefused === "string" ? { entriesRefused: clip(day.entriesRefused) } : {}),
+    ...dataDropout(day),
   };
 }

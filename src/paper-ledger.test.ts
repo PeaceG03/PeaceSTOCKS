@@ -14,7 +14,7 @@ import { RecordingClient } from "./paper-fakes.test-helper";
 
 const day = (equityTo: number): PaperDay => ({
   schemaVersion: "paper-day-v1",
-  rulesVersion: "paper-rules-v4",
+  rulesVersion: "paper-rules-v5",
   rulesSha256: "x",
   fromSessionDate: "2026-12-01",
   toSessionDate: "2026-12-02",

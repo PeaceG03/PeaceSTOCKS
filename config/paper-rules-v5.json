@@ -1,5 +1,5 @@
 {
-  "rulesVersion": "paper-rules-v4",
+  "rulesVersion": "paper-rules-v5",
   "mode": "SIMULATED_ONLY",
   "list": "TOP_15_OVERALL",
   "weighting": "EQUAL",
@@ -14,5 +14,8 @@
   "wholeShares": true,
   "markZeroAfterMissedExits": 5,
   "stuckPositionRule": "MARK_ZERO_THEN_CORRECT",
-  "coverageHoleFraction": 0.5
+  "coverageHoleFraction": 0.5,
+  "dropoutSpikeMultiple": 3,
+  "dropoutSpikeMinNames": 200,
+  "dropoutFallbackSessions": 40
 }

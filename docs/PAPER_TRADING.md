@@ -9,10 +9,10 @@ anywhere. Every "order" is a row in a simulated ledger, filled from the stored d
 `src/paper-no-live-broker.test.ts` fails if a live broker endpoint appears in `src/` or the workflows.
 Going to real money is out of scope and would need Peace's own explicit yes first.
 
-## Pre-registered rules (`config/paper-rules-v4.json`, rulesVersion `paper-rules-v4`)
+## Pre-registered rules (`config/paper-rules-v5.json`, rulesVersion `paper-rules-v5`)
 
 These were committed before any paper result existed. They are not tuned. A rule change is a new file
-(`paper-rules-v5.json`) with a new version, never an edit; every ledger row records `rulesVersion` and
+(`paper-rules-v6.json`) with a new version, never an edit; every ledger row records `rulesVersion` and
 `rulesSha256` (sha256 of the exact file bytes).
 
 Version history:
@@ -26,9 +26,13 @@ Version history:
 - `paper-rules-v3` (Nov 24, never run; no ledger row was ever written under it): v2 with that write-off
   replaced by Peace's decision (Nov 24, via Auditor): "count it at $0 for now and correct it when real
   data shows up" (`stuckPositionRule` `MARK_ZERO_THEN_CORRECT`, `markZeroAfterMissedExits` 5). Removed.
-- `paper-rules-v4` (Nov 24): v3 plus `coverageHoleFraction` 0.5 (a coverage hole in our data is not a
-  missed exit), and the universe benchmark corrected by the same rule as paper (Auditor FAIL on #127 at
-  5234a50d). The config schema changed, so the version was bumped.
+- `paper-rules-v4` (Nov 24, never run; no ledger row was ever written under it): v3 plus
+  `coverageHoleFraction` 0.5 (a coverage hole in our data is not a missed exit), and the universe
+  benchmark corrected by the same rule as paper (Auditor FAIL on #127 at 5234a50d). Removed.
+- `paper-rules-v5` (Nov 24): v4 plus the mass drop-out rule (`dropoutSpikeMultiple` 3,
+  `dropoutSpikeMinNames` 200, `dropoutFallbackSessions` 40): when far more names than normal stop
+  arriving at once, it is a gap in our data and their missing sessions are not missed exits (Peace's
+  intent: data gaps never count as misses). The config schema changed, so the version was bumped.
 
 | Rule | Value |
 | --- | --- |
@@ -44,6 +48,7 @@ Version history:
 | Exit price | always at the actual open, adjusted only by split records known at fill time; no move is ever filled flat |
 | No price ($0 then correct) | a held name with no open for 5 exit attempts in a row (halted, delisted) is valued at $0 in the ledger and in performance from that open on (`markZeroAfterMissedExits`), kept as a STUCK holding, never closed for good; a real later price, buyout cash or bankruptcy payout in the stored data adds an appended correction for the actual amount (`stuckPositionRule` `MARK_ZERO_THEN_CORRECT`) |
 | Coverage hole | a session whose stored bars cover fewer than 50% of the median name count of the 20 stored sessions before it (`coverageHoleFraction`), or that has no bars at all, is a coverage hole in our data, not a halt: a name with no open there does not count as a missed exit, for paper or the universe |
+| Data drop-out | a session where the names that had a bar on the stored session before it and none on this one number more than 200 (`dropoutSpikeMinNames`) and more than 3x the 99th percentile of that count over the 20 stored sessions before it (`dropoutSpikeMultiple`) is a data drop-out. For a name that dropped out there, its missing sessions do not count toward the $0 mark (flag `DATA_DROPOUT`) for its first 40 covered sessions (`dropoutFallbackSessions`); after that the normal $0-then-correct rule applies (so a name that never comes back is marked $0 at its 45th covered session), for paper and the universe |
 
 Note on timing: the held-out eval's h1 outcome (src/holdout-eval.ts) is next open to the close h
 sessions later, so h1 is open to close of the entry day. Paper trading holds open to open, one session
@@ -127,15 +132,17 @@ Stored in the same R2 bucket the scanner uses, under `paper/v1/`, written by the
   booked as it happened.
 - A name with no open that session stays held (marked at its last stored close, or its entry open),
   its `missedExits` count goes up, and it gets a new SELL at the next open. On a coverage hole (see the
-  rules table) the count does not go up (`NO_PRICE` with flag `COVERAGE_HOLE`): only a name missing
-  on a session our data covers counts. When the count reaches 5
+  rules table) the count does not go up (`NO_PRICE` with flag `COVERAGE_HOLE`), and inside a data
+  drop-out's fallback window neither (`NO_PRICE` with flag `DATA_DROPOUT`): only a name missing on a
+  session our data covers, outside a data drop-out, counts. When the count reaches 5
   (`markZeroAfterMissedExits`) it is valued at $0 (`MARKED_ZERO` fill, flag `STUCK_AT_ZERO`, no cash),
   and the position stays on the book as a STUCK holding (`stuckSince` = that session). See below.
 - Then entries: per-name notional = min(equity at the open / number of names, 10% of equity);
   never more than the cash left. A name still held (its exit had no price) is not bought again.
 
 ### No price for 5 sessions: valued at $0, then corrected (`MARK_ZERO_THEN_CORRECT`)
-- From the open of the 5th straight covered session with no price (coverage holes are skipped), a
+- From the open of the 5th straight counted session with no price (coverage holes and a data drop-out's
+  fallback window are skipped), a
   STUCK holding is valued at $0 in
   `equityAtOpen`, in the daily-loss mark and in the day rows. The loss (its last stored close, or its
   entry open) is booked once, in the window ending at that open; later windows see it at $0 again, so it
@@ -150,16 +157,44 @@ Stored in the same R2 bucket the scanner uses, under `paper/v1/`, written by the
   Its `cashAdjustmentUsd` (shares x actual per-share amount) enters cash at the next open that is
   filled, where the holding leaves the book (`STUCK_RESOLVED`, no cash of its own). The `MARKED_ZERO`
   fill and every earlier entry are never rewritten. With no such data it stays at $0, with no correction.
-- Limits: only bars in the window a run loads (from about 45 calendar days before the sessions it reads, `paperBarsLookbackDays`) are
+- Limits: only bars in the window a run loads (from about 103 calendar days before the sessions it reads, `paperBarsLookbackDays`) are
   searched for a later price, so a late bar for an old session is not picked up; no collector stores
   settlement records yet (the storage reader is ready: `loadSettlementActions`), so until one does,
   only a later price can resolve a STUCK holding; a later price is booked as it is (no gap filter), so a
   reverse split with no stored record between the $0 mark and the later open makes the recovery too
   large, for paper and the universe alike.
 - Coverage holes are judged by name count only. On the stored bars through 2026-11-23 no session falls
-  under 50% of the trailing median (the lowest is about 96%), so the two large universe $0 days
-  (2025-10-07 and 2026-08-27, each the 5th session after about 5-6% of names stopped arriving) are not
-  holes under this rule; they are now corrected when those names trade again (see Benchmarks).
+  under 50% of the trailing median (the lowest is about 96%). The two large v4 universe $0 days
+  (2025-10-07 and 2026-08-27) were the 5th session after about 5-6% of names stopped arriving at once;
+  those are data drop-outs, handled below.
+
+### Mass data drop-outs (`DATA_DROPOUT`)
+- Each stored session's drop-outs are the names that had a bar on the stored session before it and
+  none on it. A session is a data drop-out when that count is above both 200 names
+  (`dropoutSpikeMinNames`) and 3x the 99th percentile (nearest rank) of the counts on the 20 stored
+  sessions before it (`dropoutSpikeMultiple`). One shared function decides it (`PaperBars.dropoutSpike`),
+  and one decides each missing session for a name (`missKind`, `missedSessions`), for paper exits and
+  the universe alike.
+- For a name whose run of missing sessions starts on a data drop-out (no bar there, right after its
+  last open), the first 40 covered sessions of the run (`dropoutFallbackSessions`) do not count: paper
+  fills are `NO_PRICE` with flag `DATA_DROPOUT`, the universe leaves the name out of the window, and the
+  day row counts them (`paperDataDropout`, `universeDataDropout`; the site shows a "data gap" line).
+  After 40 covered sessions the normal rule applies: 5 more counted misses mark it $0, then it is
+  corrected if real data shows up.
+- Why these values (stored bars through 2026-11-23, 534 sessions): the median day has 26 drop-outs,
+  the 90th percentile 62, the 99th 94, and the largest normal day 144. Against its own trailing
+  20-session 99th percentile, every day is at most 1.5x except two: 2025-10-01 (436 names, 11.5x) and
+  2026-08-21 (613 names, 6.8x). 3x sits with a margin of 2x or more on both sides, and the 200-name floor
+  (about 2% of the names) is above every normal day, so a quiet stretch with a tiny p99 cannot trigger
+  it. Each of the pairs tried (2x/100, 3x/100, 3x/200, 4x/200, 5x/200) picks exactly these two days.
+- Why 40 sessions: the 2025-10-01 names came back after about 20 stored sessions and the 2026-08-21
+  names after 30 (all 613; only 45 within 20). A 20-session window would still mark the 2026-08-21
+  names $0 at the 25th session and correct them at the 30th. 40 covers both with 10 sessions to spare;
+  the cost is that a name that really stops trading on a drop-out day is marked $0 about 8 weeks later
+  than usual.
+- Limits: only a run that starts on the drop-out session is excused; a name that already missed a
+  session before the drop-out counts normally. The check needs the session before the run and its 20
+  trailing sessions in the loaded bars; otherwise the session counts as a normal miss.
 
 ### Late split records: corrections, never rewrites
 Split records often arrive days after the split. A fill is never rewritten. Each run re-checks the
@@ -177,9 +212,10 @@ fact; they used the records known when their day row was written, the same as th
   `ACTIVE` with eligibility `LEVEL_2`/`LEVEL_3` (the current master, not point in time) with a positive
   open on both sessions. No costs.
 - The universe uses the same `MARK_ZERO_THEN_CORRECT` rule as paper, with the same trigger, data and
-  code (`universeStuckAt`, `missedSessions`, `PaperBars.covered`, `stuckResolutionFor`):
-  - A name with no open on its 5th covered session in a row (after a session with an open; coverage
-    holes skipped, not counted) counts at -100% once, in the window ending there. Its lost slice of the
+  code (`universeStuckAt`, `missKind`, `missedSessions`, `PaperBars.covered`, `PaperBars.dropoutSpike`,
+  `stuckResolutionFor`):
+  - A name with no open on its 5th counted session in a row (after a session with an open; coverage
+    holes and a data drop-out's fallback window skipped, not counted) counts at -100% once, in the window ending there. Its lost slice of the
     index (index level at the window's opening open / names that window) and the close it was worth (its
     last stored close) are carried in the day rows (`universeStuck`).
   - Each later window checks every carried name with `stuckResolutionFor` (no costs): the first later
@@ -189,12 +225,15 @@ fact; they used the records known when their day row was written, the same as th
     list. So paper and the universe recover the same share of the $0 loss from the same data, in the
     window that ends at the same open. With no such data it stays at $0.
   - Before and after, a name with no price is left out of the window, like any missing price.
-- Coverage holes are judged on the bars a run loads: N missed sessions plus the 20 stored sessions
-  before them (`paperBarsLookbackDays`, about 45 calendar days for N = 5).
+- Coverage holes and drop-outs are judged on the bars a run loads: N missed sessions, the 40-session
+  drop-out window, the session before and the 20 stored sessions before that (`paperBarsLookbackDays`,
+  about 103 calendar days for these values).
 - Both benchmarks treat a name exactly as paper exits do: actual opens, split-adjusted by the stored
   records, conflicting records use the raw open, and no move is dropped or flattened. Only a missing
   price leaves a name out (apart from the $0 rule above). SPY gets no $0 rule (it always trades).
 
 ## Site
 The site's **Paper trading** card shows the newest days: paper, SPY and universe returns per day and
-cumulative, with the experimental label and "Paper trading: simulated, no real money."
+cumulative, with the experimental label and "Paper trading: simulated, no real money." A window with
+data drop-out names shows a "data gap" line with how many universe and paper names were not counted as
+missed (`DATA_DROPOUT`).
