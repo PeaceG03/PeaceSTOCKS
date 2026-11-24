@@ -27,7 +27,7 @@ jobs:
     # reviewer) and deployment history. Created on first use if it does not exist.
     environment: site
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -89,13 +89,37 @@ jobs:
           node -e 'const e=process.env; require("fs").writeFileSync(process.argv[1], JSON.stringify({ALLOWED_EMAIL:e.ALLOWED_EMAIL.trim(),R2_ACCOUNT_ID:e.CLOUDFLARE_ACCOUNT_ID,R2_BUCKET:e.R2_BUCKET,R2_READ_ACCESS_KEY_ID:e.R2_READ_ACCESS_KEY_ID,R2_READ_SECRET_ACCESS_KEY:e.R2_READ_SECRET_ACCESS_KEY}))' "$file"
           npx --yes "wrangler@${WRANGLER_VERSION}" secret bulk "$file"
       - name: Confirm the site is not public
+        # A brand-new custom domain can take minutes to get DNS and a certificate, so keep trying for
+        # about 10 minutes. No answer (000), DNS or TLS errors and anything else unexpected: wait and
+        # retry. Any 2xx: hard fail at once (the site answered without a login). Passes only on a
+        # redirect to the Access login or a 401/403 refusal.
+        timeout-minutes: 12
         run: |
-          for i in $(seq 1 24); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://${SITE_HOSTNAME}/" || true)
-            loc=$(curl -s -o /dev/null -w '%{redirect_url}' --max-time 15 "https://${SITE_HOSTNAME}/" || true)
-            if [ "$code" = "200" ]; then echo "::error::https://${SITE_HOSTNAME}/ answered 200 without a login"; exit 1; fi
-            case "$loc" in *.cloudflareaccess.com/*) echo "SITE_GATED: redirects to Access login ($code)"; exit 0;; esac
-            echo "waiting for ${SITE_HOSTNAME} (got ${code:-none}); try $i/24"; sleep 10
+          deadline=$(( $(date +%s) + 600 ))
+          try=0
+          while :; do
+            try=$((try + 1))
+            out=$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' --max-time 10 "https://${SITE_HOSTNAME}/" 2>/dev/null) || true
+            code=${out%% *}
+            loc=${out#"$code"}
+            loc=${loc# }
+            case "$code" in
+              2[0-9][0-9])
+                echo "::error::https://${SITE_HOSTNAME}/ answered ${code} without a login"
+                exit 1 ;;
+              401|403)
+                echo "SITE_GATED: refused without a login (${code})"
+                exit 0 ;;
+              301|302|303|307|308)
+                if [[ "$loc" =~ ^https://[a-z0-9-]+\.cloudflareaccess\.com/cdn-cgi/access/login/ ]]; then
+                  echo "SITE_GATED: redirects to the Access login (${code})"
+                  exit 0
+                fi ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::could not confirm the Access login on https://${SITE_HOSTNAME}/ after ${try} tries (last answer ${code:-none})"
+              exit 1
+            fi
+            echo "waiting for ${SITE_HOSTNAME} (got ${code:-none}); try ${try}"
+            sleep 15
           done
-          echo "::error::could not confirm the Access login on https://${SITE_HOSTNAME}/ (the Worker still refuses requests without a valid Access JWT)"
-          exit 1

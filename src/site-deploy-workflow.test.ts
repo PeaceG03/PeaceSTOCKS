@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 const workflow = readFileSync(new URL("../.github/workflows/site-deploy.yml", import.meta.url), "utf8");
@@ -105,4 +108,110 @@ test("site deploy workflow: runs on Node >= 22.12 (wrangler 4 and miniflare requ
   const okMajor = Number(major) >= 23;
   const ok22 = Number(major) === 22 && (minor === "x" || minor === undefined || Number(minor) >= 12);
   assert.ok(okMajor || ok22, `node-version ${versions[0]} is below 22.12`);
+});
+
+/**
+ * Runs the "Confirm the site is not public" script under bash -e (as Actions does) with fake curl,
+ * date and sleep on a shared fake clock, so ten minutes pass in milliseconds and nothing touches the
+ * network. `answer(t)` gives what https://SITE_HOSTNAME/ returns at fake second t:
+ * [http_code, redirect_url, curl exit code].
+ */
+function runPostCheck(answer: string): { status: number; out: string; elapsed: number; curls: number } {
+  const step = block("Confirm the site is not public");
+  const lines = step.slice(step.indexOf("run: |\n") + "run: |\n".length).split("\n");
+  const script = lines.map((line) => line.replace(/^ {10}/u, "")).join("\n");
+  const dir = mkdtempSync(join(tmpdir(), "postcheck-"));
+  try {
+    writeFileSync(join(dir, "clock"), "1000\n");
+    writeFileSync(join(dir, "curls"), "");
+    const tick = (n: string) => `c=$(cat "$FAKE_DIR/clock"); echo $((c + ${n})) > "$FAKE_DIR/clock"`;
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "date"), `#!/bin/bash\n[ "$1" = "+%s" ] && exec cat "$FAKE_DIR/clock"\nexec /bin/date "$@"\n`, { mode: 0o755 });
+    writeFileSync(join(bin, "sleep"), `#!/bin/bash\n${tick("$1")}\n`, { mode: 0o755 });
+    // Fake curl: honours -w with %{http_code} and %{redirect_url}; each call costs 2 fake seconds.
+    writeFileSync(
+      join(bin, "curl"),
+      `#!/bin/bash
+fmt=""; while [ $# -gt 0 ]; do [ "$1" = "-w" ] && { fmt="$2"; shift; }; shift; done
+echo x >> "$FAKE_DIR/curls"
+t=$(( $(cat "$FAKE_DIR/clock") - 1000 ))
+${tick("2")}
+answer() { ${answer}; }
+read -r code loc rc <<< "$(answer "$t")"
+[ "$loc" = "-" ] && loc=""
+fmt=\${fmt//%\\{http_code\\}/$code}; fmt=\${fmt//%\\{redirect_url\\}/$loc}
+printf '%s' "$fmt"
+exit "\${rc:-0}"
+`,
+      { mode: 0o755 },
+    );
+    const result = spawnSync("bash", ["-e", "-c", script], {
+      env: { PATH: `${bin}:/usr/bin:/bin`, FAKE_DIR: dir, SITE_HOSTNAME: "stocks.example.test" },
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    return {
+      status: result.status ?? -1,
+      out: `${result.stdout}${result.stderr}`,
+      elapsed: Number(readFileSync(join(dir, "clock"), "utf8")) - 1000,
+      curls: readFileSync(join(dir, "curls"), "utf8").split("\n").filter(Boolean).length,
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const LOGIN = "https://blue-leaf-13b3.cloudflareaccess.com/cdn-cgi/access/login/stocks.example.test";
+
+test("site deploy post-check: a new custom domain gets ~10 minutes; 000/DNS/TLS errors are retried", () => {
+  // Run 45359206951: curl 000 for the first minutes while DNS and the certificate came up.
+  for (const rc of [6, 7, 28, 35, 60]) {
+    const late = runPostCheck(`if [ "$1" -lt 480 ]; then echo "000 - ${rc}"; else echo "302 ${LOGIN} 0"; fi`);
+    assert.equal(late.status, 0, `curl exit ${rc} for 8 minutes, then the Access login: ${late.out}`);
+    assert.match(late.out, /SITE_GATED: redirects to the Access login \(302\)/u);
+    assert.ok(late.elapsed >= 480, `${late.elapsed}`);
+  }
+  const never = runPostCheck(`echo "000 - 6"`);
+  assert.equal(never.status, 1, never.out);
+  assert.ok(never.elapsed >= 600 && never.elapsed <= 660, `gives up after ~10 minutes, took ${never.elapsed}s`);
+  assert.match(never.out, /::error::could not confirm the Access login/u);
+  const step = block("Confirm the site is not public");
+  const stepTimeout = Number(/\n        timeout-minutes: (\d+)\n/u.exec(step)?.[1]);
+  const jobTimeout = Number(/\n    timeout-minutes: (\d+)\n/u.exec(workflow)?.[1]);
+  assert.ok(stepTimeout >= 11, `step timeout ${stepTimeout} leaves room for the 10-minute wait`);
+  assert.ok(jobTimeout >= stepTimeout + 10, `job timeout ${jobTimeout} leaves room for the earlier steps`);
+});
+
+test("site deploy post-check: only an Access login redirect or 401/403 passes; any 2xx fails at once", () => {
+  for (const code of ["302", "301", "303", "307", "308"]) {
+    const ok = runPostCheck(`echo "${code} ${LOGIN} 0"`);
+    assert.equal(ok.status, 0, `${code}: ${ok.out}`);
+    assert.equal(ok.curls, 1);
+  }
+  for (const code of ["401", "403"]) {
+    const ok = runPostCheck(`echo "${code} - 0"`);
+    assert.equal(ok.status, 0, `${code}: ${ok.out}`);
+    assert.match(ok.out, new RegExp(`SITE_GATED: refused without a login \\(${code}\\)`, "u"));
+  }
+  for (const code of ["200", "204", "206"]) {
+    const open = runPostCheck(`if [ "$1" -lt 60 ]; then echo "000 - 7"; else echo "${code} - 0"; fi`);
+    assert.equal(open.status, 1, `${code}: ${open.out}`);
+    assert.match(open.out, new RegExp(`::error::https://stocks\\.example\\.test/ answered ${code} without a login`, "u"));
+    assert.ok(open.elapsed < 120, `${code} fails at once, not after the wait (${open.elapsed}s)`);
+  }
+  // Redirects anywhere but the Access login, and other codes, never pass: wait, then fail.
+  for (const answer of [
+    `echo "302 https://evil.example/cdn-cgi/access/login/x 0"`,
+    `echo "302 https://example.com/?r=team.cloudflareaccess.com/cdn-cgi/access/login/ 0"`,
+    `echo "302 http://blue-leaf-13b3.cloudflareaccess.com/cdn-cgi/access/login/x 0"`,
+    `echo "302 - 0"`,
+    `echo "404 ${LOGIN} 0"`,
+    `echo "500 - 0"`,
+    `echo "000 ${LOGIN} 35"`,
+  ]) {
+    const bad = runPostCheck(answer);
+    assert.equal(bad.status, 1, `${answer}: ${bad.out}`);
+    assert.match(bad.out, /::error::could not confirm the Access login/u, answer);
+  }
 });
