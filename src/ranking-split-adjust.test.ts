@@ -14,7 +14,9 @@ import * as ranking from "./ranking";
 
 const { DEFAULT_SCANNER_CONFIG } = ranking;
 // The new 6th argument (split actions) is passed loosely so this file also runs against the old code.
-const rank = ranking.rankSecurities as unknown as (
+// About split adjustment, not the eligibility floor (own tests in eligibility-floor.test.ts): the small
+// cheap fixtures rank with the floor off.
+const rank = ((s, b, m, d, c, a) => ranking.rankSecurities(s, b, m, d, c, a, null)) as (
   s: SecurityMasterRecord[], b: CanonicalDailyBar[], m: CanonicalDailyBar[], d: string, c: typeof DEFAULT_SCANNER_CONFIG, a: CorporateAction[],
 ) => ReturnType<typeof ranking.rankSecurities> & { excluded?: Array<{ securityId: string; reason: string }> };
 
@@ -136,7 +138,8 @@ test("the scan loads the stored split records: an unreconcilable split keeps the
   const record = (id: string, symbol: string, assetType: "STOCK" | "ETF" = "STOCK") =>
     ({ provider: "fixture-provider", providerSecurityId: id, symbol, assetType, country: "US", exchange: "NYSE", active: true, tradable: true });
   const ids = { a: securityId("fixture-provider", "i-a", "STOCK"), b: securityId("fixture-provider", "i-b", "STOCK"), spy: securityId("fixture-provider", "i-spy", "ETF") };
-  const mk = (id: string, d: string, close: number) => ({ ...bar(id, d, close), provenance: { provider: "fixture-provider", dataset: "daily-ohlcv", retrievalId: `r-${d}-${id.slice(0, 6)}`, ingestionVersion: "t", normalizerVersion: "t" } }) as CanonicalDailyBar;
+  // Liquid enough for the eligibility floor the scan applies (>= $5, >= $5M median dollar volume, >= 60 sessions).
+  const mk = (id: string, d: string, close: number) => ({ ...bar(id, d, close, 1_000_000), provenance: { provider: "fixture-provider", dataset: "daily-ohlcv", retrievalId: `r-${d}-${id.slice(0, 6)}`, ingestionVersion: "t", normalizerVersion: "t" } }) as CanonicalDailyBar;
   const allBars = hist.flatMap((d, k) => [mk(ids.a, d, 20 + k * 0.01), mk(ids.b, d, 30 + k * 0.02), mk(ids.spy, d, 400 + k)]);
   const run = async (actions: CorporateAction[], splitReadFails = false) => {
     const storage = new ObjectMarketStorage(new MemoryObjectClient());

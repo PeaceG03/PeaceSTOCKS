@@ -85,6 +85,70 @@ html,body{max-width:100%;overflow-x:hidden}
 export const PICKS_EXPERIMENTAL_LABEL =
   "Experimental: back-tests on held-out data show no reliable edge over random picks. Not investment advice.";
 
+const REASON_WORDS: Record<string, string> = {
+  FLOOR_PRICE: "price under $5",
+  FLOOR_DOLLAR_VOLUME: "dollar volume under $5M",
+  FLOOR_HISTORY: "under 60 sessions of history",
+  FLOOR_NO_BAR_ON_SESSION: "no bar on the session",
+  SPLIT_UNRECONCILED: "split records disagree",
+  PRICE_GAP_UNEXPLAINED: "unexplained price gap",
+  SPLIT_LIKE_MOVE_UNRECORDED: "split-like move with no record",
+};
+
+function byReason(counts: Record<string, number>): string {
+  const parts = Object.entries(counts)
+    .filter(([, n]) => n > 0)
+    .map(([reason, n]) => `${REASON_WORDS[reason] ?? reason} ${n}`);
+  return parts.length ? ` (${parts.join(", ")})` : "";
+}
+
+/** The newest nightly scan health record, inside the Health card. */
+export function scanHealthBlock(scan: SiteData["scanHealth"]): string {
+  if (!scan) return `<h2 style="margin-top:12px">Nightly scan</h2><div class="mute">No nightly scan record has been saved yet.</div>`;
+  const before =
+    scan.finishedBeforeOpen === true
+      ? `<span class="ok">Finished before the open</span>`
+      : scan.finishedBeforeOpen === false
+        ? `<span class="bad">Finished after the open</span>`
+        : `<span class="muted">Open time unknown</span>`;
+  const freeze = scan.frozenOnTime
+    ? `<span class="ok">Picks frozen on time</span>`
+    : `<span class="bad">Picks not frozen on time</span> <span class="mute">${escapeHtml(scan.freezeStatus)}${scan.freezeReason ? ` ${wrapAtUnderscores(scan.freezeReason)}` : ""}</span>`;
+  return (
+    `<h2 style="margin-top:12px">Nightly scan</h2>` +
+    `<div class="big">Session ${escapeHtml(scan.sessionDate)}</div>` +
+    `<ul>` +
+    `<li>${before} <span class="mute">finished ${escapeHtml(localTime(scan.completedAt))}, open ${escapeHtml(localTime(scan.nextSessionOpen))}</span></li>` +
+    `<li>${freeze}</li>` +
+    `<li>Names covered: ${escapeHtml(scan.namesCovered)} of ${escapeHtml(scan.namesExpected)}</li>` +
+    `<li>Left out by the eligibility floor: ${escapeHtml(scan.floorExcluded)}${escapeHtml(byReason(scan.floorByReason))}</li>` +
+    `<li>Left out by the split guard: ${escapeHtml(scan.splitExcluded)}${escapeHtml(byReason(scan.splitByReason))}</li>` +
+    `</ul>`
+  );
+}
+
+function shareText(label: string, s: { sessions: number; onTime: number; late: number; unavailable: number; noRecord: number }): string {
+  const pct = s.sessions ? Math.round((100 * s.onTime) / s.sessions) : 0;
+  const missed = [
+    s.late ? `${s.late} late` : "",
+    s.unavailable ? `${s.unavailable} unavailable` : "",
+    s.noRecord ? `${s.noRecord} with no record` : "",
+  ].filter(Boolean);
+  const cls = !s.sessions ? "muted" : pct >= 95 ? "ok" : pct >= 80 ? "warn" : "bad";
+  return `<li><span class="${cls}">${escapeHtml(label)}: ${escapeHtml(s.onTime)} of ${escapeHtml(s.sessions)} on time (${escapeHtml(pct)}%)</span>${
+    missed.length ? ` <span class="mute">${escapeHtml(missed.join(", "))}</span>` : ""
+  }</li>`;
+}
+
+/** On-time freeze share over the last 20 and 60 sessions, inside the Health card. */
+export function freezeShareBlock(r: SiteData["freezeReliability"]): string {
+  if (!r) return `<div class="mute">No freeze on-time record has been saved yet.</div>`;
+  return (
+    `<div class="mute" style="margin-top:8px">Picks frozen before the next open${r.through ? `, sessions through ${escapeHtml(r.through)}` : ""}</div>` +
+    `<ul>${shareText("Last 20 sessions", r.last20)}${shareText("Last 60 sessions", r.last60)}</ul>`
+  );
+}
+
 export function renderSitePage(data: SiteData): string {
   const parts: string[] = [];
 
@@ -97,7 +161,7 @@ export function renderSitePage(data: SiteData): string {
           `<div class="mute">Checked ${escapeHtml(localTime(health.at))}</div>` +
           (health.lines.length ? `<ul>${health.lines.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>` : "")
         : `<div class="mute">No health check has been saved yet.</div>`
-    }</section>`,
+    }${scanHealthBlock(data.scanHealth)}${freezeShareBlock(data.freezeReliability)}</section>`,
   );
 
   // Catch-up / backlog.

@@ -6,7 +6,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { CanonicalDailyBar, SecurityMasterRecord } from "./contracts";
 import { sha256, stableJson } from "./identity";
-import { rankSecurities } from "./ranking";
+import { DEFAULT_SCANNER_CONFIG, rankSecurities as rankWithFloor } from "./ranking";
+// These tests are about ranking mechanics, not the eligibility floor (own tests in eligibility-floor.test.ts):
+// their small cheap fixtures run with the floor off.
+const rankSecurities = (...a: Parameters<typeof rankWithFloor>) => rankWithFloor(a[0], a[1], a[2], a[3], a[4] ?? DEFAULT_SCANNER_CONFIG, a[5] ?? [], null);
 
 const FASTEST_IMPROVING_RECIPE = "fastest-improving-return20-delta-v1";
 const IMPROVEMENT_MIN_CLOSES = 41;

@@ -5,7 +5,10 @@ import test from "node:test";
 import type { CanonicalDailyBar, SecurityMasterRecord } from "./contracts";
 import { MemoryObjectClient } from "./object-store";
 import { ObjectMarketStorage } from "./object-storage";
-import { rankSecurities } from "./ranking";
+import { DEFAULT_SCANNER_CONFIG, rankSecurities as rankWithFloor } from "./ranking";
+// These tests are about ranking mechanics, not the eligibility floor (own tests in eligibility-floor.test.ts):
+// their small cheap fixtures run with the floor off.
+const rankSecurities = (...a: Parameters<typeof rankWithFloor>) => rankWithFloor(a[0], a[1], a[2], a[3], a[4] ?? DEFAULT_SCANNER_CONFIG, a[5] ?? [], null);
 import { SCAN_BAR_LOOKBACK_SESSIONS, scanBarWindowStart } from "./scanner";
 import { US_EQUITY_MARKET_CALENDAR as CAL } from "./us-calendar";
 
