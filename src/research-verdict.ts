@@ -1,13 +1,12 @@
 /**
  * The research harness verdict. A strategy is an IMPROVEMENT only if ALL of these hold:
  *  1. pooled test-fold net return (after costs) beats the equal-weight universe AND SPY (mean > 0);
- *  2. more than half of the folds are positive (net beats both on that fold's test window);
+ *  2. every walk-forward fold is positive (100% of folds beat BOTH the equal-weight universe and SPY);
  *  3. the pooled result is significant after the multiple-testing correction: the Holm-adjusted
  *     p-value over every variant in the log is below alpha (0.05);
  *  4. the held-out period was evaluated (once, through the seal) and its net beats both benchmarks;
- *  5. at least minFolds (3) walk-forward folds were scored. With one or two folds "more than half
- *     positive" is one or two lucky windows; three is the smallest count where a majority still
- *     leaves one fold to disagree;
+ *  5. at least minFolds (3) walk-forward folds were scored. With one or two folds consistency is
+ *     untested; three is the smallest count where every-fold consistency tests across distinct windows;
  *  6. costs were charged at no less than minCostBpsPerSide (5 bps per side). A smaller slippage
  *     assumption is unrealistic for these names and would let turnover look free.
  * Anything else is NOT_PROVEN. Either way the verdict says that a live paper run is still required:
@@ -18,7 +17,7 @@ import type { StrategyEvaluation } from "./research-variants";
 
 export interface VerdictThresholds {
   alpha: number;
-  /** Folds positive must be MORE than this share. */
+  /** Folds positive must be at least this share (default 1 = 100% of folds). */
   minPositiveFoldShare: number;
   /** Fewer scored folds than this is never an IMPROVEMENT. */
   minFolds: number;
@@ -29,7 +28,7 @@ export interface VerdictThresholds {
 export const MIN_FOLDS = 3;
 export const MIN_COST_BPS_PER_SIDE = 5;
 export const COST_BELOW_FLOOR = "COST_BELOW_FLOOR";
-export const DEFAULT_VERDICT_THRESHOLDS: VerdictThresholds = { alpha: 0.05, minPositiveFoldShare: 0.5, minFolds: MIN_FOLDS, minCostBpsPerSide: MIN_COST_BPS_PER_SIDE };
+export const DEFAULT_VERDICT_THRESHOLDS: VerdictThresholds = { alpha: 0.05, minPositiveFoldShare: 1, minFolds: MIN_FOLDS, minCostBpsPerSide: MIN_COST_BPS_PER_SIDE };
 
 /** Refuses a slippage assumption below the floor (or not a finite number). */
 export function assertCostFloor(bps: number, floor = MIN_COST_BPS_PER_SIDE): number {
@@ -63,7 +62,7 @@ export interface Verdict {
     beatsUniverseAfterCosts: boolean;
     beatsSpyAfterCosts: boolean;
     foldsPositive: string;
-    mostFoldsPositive: boolean;
+    allFoldsPositive: boolean;
     enoughFolds: boolean;
     costBpsPerSide: number;
     costAtOrAboveFloor: boolean;
@@ -85,7 +84,12 @@ export function verdictFor(
   const folds = evaluation.record.folds.length;
   const beatsUniverseAfterCosts = pooled.excessUniverse.mean > 0;
   const beatsSpyAfterCosts = pooled.excessSpy.sessions > 0 && pooled.excessSpy.mean > 0;
-  const mostFoldsPositive = folds > 0 && evaluation.foldsPositive / folds > thresholds.minPositiveFoldShare;
+  const everyFoldBeatsBoth =
+    evaluation.record.folds.length === folds &&
+    evaluation.record.folds.every(
+      (f) => f.positive && f.test.excessUniverse.mean > 0 && f.test.excessSpy.sessions > 0 && f.test.excessSpy.mean > 0,
+    );
+  const allFoldsPositive = folds > 0 && evaluation.foldsPositive / folds >= thresholds.minPositiveFoldShare && everyFoldBeatsBoth;
   const enoughFolds = folds >= thresholds.minFolds;
   const costAtOrAboveFloor = Number.isFinite(evaluation.costBpsPerSide) && evaluation.costBpsPerSide >= thresholds.minCostBpsPerSide;
   const significantAfterCorrection = evaluation.adjustedP < thresholds.alpha;
@@ -97,7 +101,7 @@ export function verdictFor(
   const reasons: string[] = [];
   if (!beatsUniverseAfterCosts) reasons.push("DOES_NOT_BEAT_EQUAL_WEIGHT_AFTER_COSTS");
   if (!beatsSpyAfterCosts) reasons.push("DOES_NOT_BEAT_SPY_AFTER_COSTS");
-  if (!mostFoldsPositive) reasons.push("NOT_POSITIVE_IN_MOST_FOLDS");
+  if (!allFoldsPositive) reasons.push("NOT_POSITIVE_IN_EVERY_FOLD");
   if (!enoughFolds) reasons.push("TOO_FEW_FOLDS");
   if (!costAtOrAboveFloor) reasons.push(COST_BELOW_FLOOR);
   if (!significantAfterCorrection) reasons.push("NOT_SIGNIFICANT_AFTER_CORRECTION");
@@ -110,7 +114,7 @@ export function verdictFor(
       beatsUniverseAfterCosts,
       beatsSpyAfterCosts,
       foldsPositive: `${evaluation.foldsPositive}/${folds}`,
-      mostFoldsPositive,
+      allFoldsPositive,
       enoughFolds,
       costBpsPerSide: evaluation.costBpsPerSide,
       costAtOrAboveFloor,
