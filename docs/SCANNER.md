@@ -205,14 +205,17 @@ The adapter currently supports:
 
 Secrets are supplied externally and must not enter evidence or Git.
 
-### Where the data secrets live: the `scanner-data` environment
+### Where the data secrets are moving: the `scanner-data` environment
 
 `MASSIVE_API_KEY`, `NET_RERUN_DISPATCH_TOKEN` and `PEACESTOCKS_R2_{ACCESS_KEY_ID,SECRET_ACCESS_KEY,ACCOUNT_ID,BUCKET}`
-live in the GitHub environment `scanner-data`, whose deployment branch policy is `main` only. Every job
+are moving to the GitHub environment `scanner-data`, whose deployment branch policy is `main` only. The
+environment holds none of them yet: they are added there, and the repository-level copies are removed
+after a scan has succeeded from the environment. Until then the repository-level copies still exist and a
+branch-edited workflow without `environment:` can read them. Every job
 that reads one (scanner.yml: scan, tenmin_daily, freeze_watch, backfill, tenmin_history; gap-refill.yml:
 refill; health.yml: check, weekly; net-rerun.yml: rerun; oct2024-tenmin.yml: run, post_seal) declares
-`environment: scanner-data`, so a workflow edited on a branch, or a run dispatched from a branch, gets
-none of them (src/workflow-secrets-environment.test.ts; no pull_request or push workflow may use the
+`environment: scanner-data`, so once the repository-level copies are removed, a workflow edited on a
+branch, or a run dispatched from a branch, gets none of them (src/workflow-secrets-environment.test.ts; no pull_request or push workflow may use the
 environment). site-deploy.yml keeps its own `site` environment; the Tests workflow has no environment
 and no secrets.
 
