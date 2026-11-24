@@ -1,5 +1,5 @@
 {
-  "rulesVersion": "paper-rules-v1",
+  "rulesVersion": "paper-rules-v2",
   "mode": "SIMULATED_ONLY",
   "list": "TOP_15_OVERALL",
   "weighting": "EQUAL",
@@ -12,5 +12,5 @@
   "commissionPerOrderUsd": 0,
   "slippageBpsPerSide": 10,
   "wholeShares": true,
-  "unexplainedGapRatio": 1.8
+  "writeOffAfterMissedExits": 5
 }

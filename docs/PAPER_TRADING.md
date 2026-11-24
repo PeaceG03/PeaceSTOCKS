@@ -9,11 +9,20 @@ anywhere. Every "order" is a row in a simulated ledger, filled from the stored d
 `src/paper-no-live-broker.test.ts` fails if a live broker endpoint appears in `src/` or the workflows.
 Going to real money is out of scope and would need Peace's own explicit yes first.
 
-## Pre-registered rules (`config/paper-rules-v1.json`, rulesVersion `paper-rules-v1`)
+## Pre-registered rules (`config/paper-rules-v2.json`, rulesVersion `paper-rules-v2`)
 
 These were committed before any paper result existed. They are not tuned. A rule change is a new file
-(`paper-rules-v2.json`) with a new version, never an edit; every ledger row records `rulesVersion` and
+(`paper-rules-v3.json`) with a new version, never an edit; every ledger row records `rulesVersion` and
 `rulesSha256` (sha256 of the exact file bytes).
+
+Version history:
+- `paper-rules-v1` (Nov 24, never run; no ledger row was ever written under it). It had an extra rule
+  not in Peace's approved list: a held name whose open-to-open move was 1.8x or more either way was
+  closed flat at its entry price. Because split records arrive days late, that rule also closed real
+  crashes at 0% and flattered paper P&L (Auditor review of #127). Removed.
+- `paper-rules-v2` (Nov 24): v1 without the gap rule, exits always at the actual open, plus the
+  write-off rule below (a rule addition, **pending Peace's confirmation**). The config file changed, so
+  the version was bumped.
 
 | Rule | Value |
 | --- | --- |
@@ -26,7 +35,8 @@ These were committed before any paper result existed. They are not tuned. A rule
 | Commission | $0 per order |
 | Slippage | 10 bps per side: buys fill at open x 1.001, sells at open x 0.999 |
 | Shares | whole shares only (rounded down); leftover stays in cash |
-| Unexplained gaps | a held name whose split-adjusted open-to-open move is 1.8x or more either way is closed flat at its entry open (minus slippage) and flagged |
+| Exit price | always at the actual open, adjusted only by split records known at fill time; no move is ever filled flat |
+| Write-off (pending Peace's confirmation) | a held name with no open for 5 exit attempts in a row (halted, delisted) is written off at its last known close, no slippage (`writeOffAfterMissedExits`) |
 
 Note on timing: the held-out eval's h1 outcome (src/holdout-eval.ts) is next open to the close h
 sessions later, so h1 is open to close of the entry day. Paper trading holds open to open, one session
@@ -88,19 +98,25 @@ Stored in the same R2 bucket the scanner uses, under `paper/v1/`, written by the
   session not yet stored), write the missing day rows, then write the intents for the next open.
 
 ### Fill rules
-- Exits first, at the session's open: a name with no bar that session stays held (marked at its last
-  stored close, or its entry open) and gets a new SELL at the next open.
-- Splits effective after entry and on or before the exit session are applied to the exit price from
-  the stored split records; conflicting split records fill flat (`SPLIT_UNRECONCILED`).
+- Exits first, at the session's actual open. Splits effective after entry and on or before the exit
+  session are applied from the split records stored at fill time. Conflicting split records use the
+  raw open (factor 1, flagged `SPLIT_UNRECONCILED`). There is no gap filter: a real crash or spike is
+  booked as it happened.
+- A name with no open that session stays held (marked at its last stored close, or its entry open),
+  its `missedExits` count goes up, and it gets a new SELL at the next open. When the count reaches 5
+  (`writeOffAfterMissedExits`) it is written off (`WRITTEN_OFF`) at its last stored close, split-adjusted
+  the same way, with no slippage or commission.
 - Then entries: per-name notional = min(equity at the open / number of names, 10% of equity);
   never more than the cash left. A name still held (its exit had no price) is not bought again.
 
 ### Benchmarks (same window, open to open)
-- **SPY**: the security-master SPY ETF, split-adjusted, no costs.
+- **SPY**: the security-master SPY ETF, no costs.
 - **Equal-weight universe**: the average open-to-open return of every security-master record that is
   `ACTIVE` with eligibility `LEVEL_2`/`LEVEL_3` (the current master, not point in time) with a positive
-  open on both sessions, split-adjusted; names with an unexplained 1.8x gap or unreconciled splits are
-  left out. No costs.
+  open on both sessions. No costs.
+- Both benchmarks treat a name exactly as paper exits do: actual opens, split-adjusted by the stored
+  records, conflicting records use the raw open, and no move is dropped or flattened. Only a missing
+  price leaves a name out.
 
 ## Site
 The site's **Paper trading** card shows the newest days: paper, SPY and universe returns per day and

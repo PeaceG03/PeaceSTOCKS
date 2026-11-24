@@ -1,15 +1,15 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 import { loadPaperRules, parsePaperRules, PAPER_RULES_CURRENT_VERSION } from "./paper-rules";
 
-const file = () => readFileSync(new URL("../config/paper-rules-v1.json", import.meta.url), "utf8");
+const file = () => readFileSync(new URL("../config/paper-rules-v2.json", import.meta.url), "utf8");
 
-test("paper rules v1: exactly the pre-registered values", () => {
+test("paper rules v2: exactly the pre-registered values", () => {
   const { rules, rulesSha256 } = loadPaperRules();
-  assert.equal(PAPER_RULES_CURRENT_VERSION, "paper-rules-v1");
+  assert.equal(PAPER_RULES_CURRENT_VERSION, "paper-rules-v2");
   assert.deepEqual({ ...rules }, {
-    rulesVersion: "paper-rules-v1",
+    rulesVersion: "paper-rules-v2",
     mode: "SIMULATED_ONLY",
     list: "TOP_15_OVERALL",
     weighting: "EQUAL",
@@ -22,7 +22,7 @@ test("paper rules v1: exactly the pre-registered values", () => {
     commissionPerOrderUsd: 0,
     slippageBpsPerSide: 10,
     wholeShares: true,
-    unexplainedGapRatio: 1.8,
+    writeOffAfterMissedExits: 5,
   });
   assert.match(rulesSha256, /^[0-9a-f]{64}$/u);
 });
@@ -39,8 +39,9 @@ test("paper rules: the doc states the same rules as the file", () => {
     "lost 3% or more",
     "$0 per order",
     "10 bps per side",
-    "1.8x or more",
-    "rulesVersion `paper-rules-v1`",
+    "rulesVersion `paper-rules-v2`",
+    "5 exit attempts in a row",
+    "at the actual open",
     "simulated, no real money",
   ])
     assert.ok(doc.includes(phrase), phrase);
@@ -66,8 +67,17 @@ test("paper rules: strict parsing rejects unknown keys, missing keys, wrong enum
   bad({ slippageBpsPerSide: -1 });
   bad({ slippageBpsPerSide: "10" });
   bad({ startingCapitalUsd: Number.NaN });
-  bad({ unexplainedGapRatio: 1 });
+  bad({ unexplainedGapRatio: 1.8 }); // v1's gap rule is gone for good
+  bad({ writeOffAfterMissedExits: 0 });
+  bad({ writeOffAfterMissedExits: 2.5 });
   bad({ rulesVersion: "v1" });
   assert.throws(() => parsePaperRules("not json"), /PAPER_RULES_INVALID:NOT_JSON/u);
   assert.throws(() => loadPaperRules("../x"), /PAPER_RULES_INVALID/u);
+});
+
+test("paper rules: only the current version's file exists, and no file carries the gap rule", () => {
+  const dir = new URL("../config/", import.meta.url);
+  const files = readdirSync(dir).filter((name) => name.startsWith("paper-rules-"));
+  assert.deepEqual(files, [`${PAPER_RULES_CURRENT_VERSION}.json`]);
+  for (const name of files) assert.equal(readFileSync(new URL(name, dir), "utf8").includes("unexplainedGapRatio"), false);
 });

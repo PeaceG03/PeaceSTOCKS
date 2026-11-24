@@ -79,7 +79,11 @@ export interface PaperIntents extends RulesStamp {
   entriesRefused?: PaperEntryRefusal;
 }
 
-export type PaperFillStatus = "FILLED" | "FILLED_FLAT" | "NO_PRICE" | "NOT_HELD" | "ALREADY_HELD" | "ZERO_QTY";
+/**
+ * WRITTEN_OFF: a held name with no open at writeOffAfterMissedExits exit attempts in a row, closed at
+ * its last known close (no slippage). There is no "fill flat": exits always fill at the actual open.
+ */
+export type PaperFillStatus = "FILLED" | "WRITTEN_OFF" | "NO_PRICE" | "NOT_HELD" | "ALREADY_HELD" | "ZERO_QTY";
 
 export interface PaperFill extends RulesStamp {
   clientOrderId: string;
@@ -92,6 +96,12 @@ export interface PaperFill extends RulesStamp {
   rawOpen?: number;
   /** Price paid / received per share after slippage (and split adjustment on exits). */
   fillPrice?: number;
+  /** Exits: the unadjusted price the exit used (the session's open, or the last close for a write-off). */
+  rawPrice?: number;
+  /** Exits: the split factor applied (product over (entry, exit] of the split records known then; 1 if none or unreconciled). */
+  splitFactorApplied?: number;
+  /** Exits: the position's entry session. */
+  entrySessionDate?: string;
   /** qty x fillPrice. */
   notionalUsd: number;
   commissionUsd: number;
@@ -106,6 +116,8 @@ export interface PaperPosition {
   entryOpen: number;
   entryFillPrice: number;
   entrySessionDate: string;
+  /** Exit attempts in a row with no open (halted / delisted); absent means 0. */
+  missedExits?: number;
 }
 
 export interface PaperFills extends RulesStamp {

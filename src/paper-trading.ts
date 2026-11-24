@@ -1,6 +1,6 @@
 /**
  * Simulated paper trading of the frozen TOP_15_OVERALL picks under the pre-registered rules
- * (config/paper-rules-v1.json, docs/PAPER_TRADING.md). No broker: every order is a ledger row filled from
+ * (config/paper-rules-v2.json, docs/PAPER_TRADING.md). No broker: every order is a ledger row filled from
  * the stored daily bars. Nothing here sends an order anywhere.
  *
  * One run: (1) gates (enabled, kill switches) before anything is read or written; (2) fill stored
@@ -121,6 +121,15 @@ export function splitFactorBetween(events: readonly SplitEvent[] | undefined, af
   return product;
 }
 
+/**
+ * The split factor paper fills and both benchmarks apply, the same way: the known records' product,
+ * or 1 (the actual, unadjusted price) when the records conflict. Nothing is dropped or filled flat.
+ */
+export function appliedSplitFactor(events: readonly SplitEvent[] | undefined, after: string, upTo: string): { factor: number; unreconciled: boolean } {
+  const factor = splitFactorBetween(events, after, upTo);
+  return Number.isFinite(factor) && factor > 0 ? { factor, unreconciled: false } : { factor: 1, unreconciled: true };
+}
+
 /** One bar per security and session (highest revision), with lookups. */
 export class PaperBars {
   private readonly byId = new Map<string, Map<string, CanonicalDailyBar>>();
@@ -191,33 +200,37 @@ export function computeFills(input: {
       continue;
     }
     const rawOpen = bars.open(order.securityId, S);
-    if (rawOpen === undefined) {
+    const missed = (position.missedExits ?? 0) + 1;
+    if (rawOpen === undefined && missed < rules.writeOffAfterMissedExits) {
+      // Halted or no bar: stays held, sold at the next open it has.
+      held.set(order.securityId, { ...position, missedExits: missed });
       fills.push({ ...base(order), status: "NO_PRICE", ...none, flags: [] });
       continue;
     }
-    const factor = splitFactorBetween(splits.get(order.securityId), position.entrySessionDate, S);
-    const flags: string[] = [];
-    let price = rawOpen / factor;
-    if (!Number.isFinite(price)) flags.push("SPLIT_UNRECONCILED");
-    else {
-      const ratio = price / position.entryOpen;
-      if (!(ratio < rules.unexplainedGapRatio && ratio > 1 / rules.unexplainedGapRatio)) flags.push("PRICE_GAP_UNEXPLAINED");
-    }
-    if (flags.length) price = position.entryOpen;
-    const fillPrice = sellFillPrice(price, bps);
+    // Exit at the actual open (split-adjusted by the records known now; later records append a
+    // correction). After writeOffAfterMissedExits misses in a row: written off at the last known close.
+    const writeOff = rawOpen === undefined;
+    const rawPrice = rawOpen ?? bars.lastClose(order.securityId, S, true) ?? position.entryOpen;
+    const split = appliedSplitFactor(splits.get(order.securityId), position.entrySessionDate, S);
+    const price = rawPrice / split.factor;
+    const fillPrice = writeOff ? price : sellFillPrice(price, bps);
     const notional = position.qty * fillPrice;
-    cash += notional - commission;
+    const orderCommission = writeOff ? 0 : commission;
+    cash += notional - orderCommission;
     held.delete(order.securityId);
     fills.push({
       ...base(order),
-      status: flags.length ? "FILLED_FLAT" : "FILLED",
+      status: writeOff ? "WRITTEN_OFF" : "FILLED",
       qty: position.qty,
-      rawOpen,
+      ...(rawOpen !== undefined ? { rawOpen } : {}),
+      rawPrice,
       fillPrice,
+      splitFactorApplied: split.factor,
+      entrySessionDate: position.entrySessionDate,
       notionalUsd: notional,
-      commissionUsd: commission,
-      slippageUsd: position.qty * price * (bps / 10_000),
-      flags,
+      commissionUsd: orderCommission,
+      slippageUsd: writeOff ? 0 : position.qty * price * (bps / 10_000),
+      flags: [...(split.unreconciled ? ["SPLIT_UNRECONCILED"] : []), ...(writeOff ? ["WRITE_OFF_LAST_CLOSE"] : [])],
     });
   }
   const cashAfterExits = cash;
@@ -274,21 +287,21 @@ export function computeFills(input: {
   };
 }
 
-/** Split-adjusted open-to-open return, or undefined (missing price, unusable split, unexplained gap). */
+/**
+ * Open-to-open return at the actual opens, split-adjusted exactly as paper exits are
+ * (appliedSplitFactor); undefined only when a price is missing. No gap filter: big moves count.
+ */
 export function windowReturn(
   bars: PaperBars,
   splits: ReadonlyMap<string, SplitEvent[]>,
   id: string,
   from: string,
   to: string,
-  gapRatio: number,
 ): number | undefined {
   const a = bars.open(id, from);
   const b = bars.open(id, to);
   if (a === undefined || b === undefined) return undefined;
-  const ratio = b / splitFactorBetween(splits.get(id), from, to) / a;
-  if (!Number.isFinite(ratio) || !(ratio < gapRatio && ratio > 1 / gapRatio)) return undefined;
-  return ratio - 1;
+  return b / appliedSplitFactor(splits.get(id), from, to).factor / a - 1;
 }
 
 const compound = (cumulative: number, r: number | null) => (r === null ? cumulative : (1 + cumulative) * (1 + r) - 1);
@@ -305,13 +318,12 @@ export function computeDay(input: {
 }): PaperDay {
   const { from, to, bars, splits } = input;
   const { rules, rulesSha256 } = input.loaded;
-  const gap = rules.unexplainedGapRatio;
   const spyId = resolveSpyBenchmarkId(input.securities);
-  const spy = spyId ? windowReturn(bars, splits, spyId, from.sessionDate, to.sessionDate, gap) ?? null : null;
+  const spy = spyId ? windowReturn(bars, splits, spyId, from.sessionDate, to.sessionDate) ?? null : null;
   const universe: number[] = [];
   for (const security of input.securities) {
     if (security.status !== "ACTIVE" || (security.eligibility !== "LEVEL_2" && security.eligibility !== "LEVEL_3")) continue;
-    const r = windowReturn(bars, splits, security.securityId, from.sessionDate, to.sessionDate, gap);
+    const r = windowReturn(bars, splits, security.securityId, from.sessionDate, to.sessionDate);
     if (r !== undefined) universe.push(r);
   }
   const universeReturn = universe.length ? universe.reduce((sum, r) => sum + r, 0) / universe.length : null;

@@ -25,8 +25,11 @@ export interface PaperRules {
   readonly commissionPerOrderUsd: number;
   readonly slippageBpsPerSide: number;
   readonly wholeShares: true;
-  /** A held name whose split-adjusted open-to-open move is this many times or more (either way) is filled flat. */
-  readonly unexplainedGapRatio: number;
+  /**
+   * A held name with no open at this many exit attempts in a row (halted, delisted) is written off at
+   * its last known close. Rule addition in v2; needs Peace's confirmation.
+   */
+  readonly writeOffAfterMissedExits: number;
 }
 
 export interface LoadedPaperRules {
@@ -35,7 +38,12 @@ export interface LoadedPaperRules {
   readonly rulesSha256: string;
 }
 
-export const PAPER_RULES_CURRENT_VERSION = "paper-rules-v1";
+/**
+ * v2 (Nov 24, before any run): drops v1's unapproved 1.8x "fill flat" gap rule (Auditor FAIL on #127:
+ * it booked real crashes at 0% and biased P&L upward) and adds the write-off rule. v1 never ran; no
+ * ledger row was ever written under it.
+ */
+export const PAPER_RULES_CURRENT_VERSION = "paper-rules-v2";
 
 const KEYS = [
   "rulesVersion",
@@ -51,7 +59,7 @@ const KEYS = [
   "commissionPerOrderUsd",
   "slippageBpsPerSide",
   "wholeShares",
-  "unexplainedGapRatio",
+  "writeOffAfterMissedExits",
 ] as const;
 
 function fail(why: string): never {
@@ -90,7 +98,8 @@ export function parsePaperRules(text: string): PaperRules {
   finiteIn(record.dailyLossLimitFraction, "dailyLossLimitFraction", 0, 1, true);
   finiteIn(record.commissionPerOrderUsd, "commissionPerOrderUsd", 0, 1000);
   finiteIn(record.slippageBpsPerSide, "slippageBpsPerSide", 0, 1000);
-  finiteIn(record.unexplainedGapRatio, "unexplainedGapRatio", 1, 100, true);
+  finiteIn(record.writeOffAfterMissedExits, "writeOffAfterMissedExits", 1, 60);
+  if (!Number.isInteger(record.writeOffAfterMissedExits)) fail("writeOffAfterMissedExits_NOT_AN_INTEGER");
   return Object.freeze({ ...record }) as unknown as PaperRules;
 }
 
