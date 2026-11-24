@@ -7,12 +7,19 @@ const HOST = "stocks.example.test";
 
 /** In-memory stand-in for the Cloudflare Access API (account-level apps, reusable policies, org). */
 function fakeCloudflare(
-  options: { extraAppPolicy?: boolean; policyReadBack?: (stored: Record<string, unknown>) => Record<string, unknown>; failPolicyPost?: string } = {},
+  options: { extraAppPolicy?: boolean | "first" | "second"; policyReadBack?: (stored: Record<string, unknown>) => Record<string, unknown>; failPolicyPost?: string } = {},
 ) {
   const apps = new Map<string, Record<string, unknown>>();
   const policies = new Map<string, Record<string, unknown>>();
   const calls: string[] = [];
   let next = 1;
+  // extraAppPolicy: a stray app-level policy stays on the app next to ours, first (true/"first") or second.
+  const keep = (body: Record<string, unknown>) => {
+    if (!options.extraAppPolicy) return {};
+    const ours = (body.policies as unknown[]) ?? [];
+    const stray = { id: "legacy-app-policy" };
+    return { policies: options.extraAppPolicy === "second" ? [...ours, stray] : [stray, ...ours] };
+  };
   const ok = (result: unknown, status = 200) => Response.json({ success: true, errors: [], result, result_info: { page: 1, total_pages: 1 } }, { status });
   const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const url = new URL(String(input));
@@ -38,8 +45,7 @@ function fakeCloudflare(
     if (path === "/apps" && method === "GET") return ok([...apps.values()]);
     if (path === "/apps" && method === "POST") {
       const id = `app-${next++}`;
-      // extraAppPolicy: the API keeps an older app-level policy next to ours (it did not replace the list).
-      const kept = options.extraAppPolicy ? { policies: [{ id: "legacy-app-policy" }, ...((body.policies as unknown[]) ?? [])] } : {};
+      const kept = keep(body);
       apps.set(id, { ...body, id, aud: `aud-${id}`, ...kept });
       return ok(apps.get(id));
     }
@@ -47,7 +53,7 @@ function fakeCloudflare(
     if (appMatch) {
       const id = appMatch[1]!;
       if (method === "PUT") {
-        const kept = options.extraAppPolicy ? { policies: [{ id: "legacy-app-policy" }, ...((body.policies as unknown[]) ?? [])] } : {};
+        const kept = keep(body);
         apps.set(id, { ...apps.get(id), ...body, id, ...kept });
       }
       return ok(apps.get(id));
@@ -91,10 +97,14 @@ test("access setup: creates one app with one single-email policy, then is idempo
 });
 
 test("access setup: an app that kept another policy next to ours is rejected on read-back (fail closed)", async () => {
-  const cf = fakeCloudflare({ extraAppPolicy: true });
-  await assert.rejects(setupSiteAccess(input(cf.fetchImpl)), /expected exactly 1 policy, found 2/u);
-  const app = [...cf.apps.values()][0]!;
-  assert.equal((app.policies as unknown[]).length, 2);
+  for (const position of ["first", "second"] as const) {
+    const cf = fakeCloudflare({ extraAppPolicy: position });
+    await assert.rejects(setupSiteAccess(input(cf.fetchImpl)), /expected exactly 1 policy, found 2/u, position);
+    const app = [...cf.apps.values()][0]!;
+    const ids = (app.policies as Array<{ id: string }>).map((p) => p.id);
+    assert.equal(ids.length, 2);
+    assert.equal(ids.indexOf("legacy-app-policy"), position === "first" ? 0 : 1, "stray policy is where the case says");
+  }
 });
 
 test("access setup: the policy read-back must be exactly one allow rule for the one email", async () => {
