@@ -11,6 +11,7 @@ import { pathToFileURL } from "node:url";
 import { dayStuck } from "./day-stuck";
 import { countErrorParts } from "./health-error-count";
 import {
+  HEALTH_CHECKIN_PREFIX,
   HEALTH_PARTS,
   type HealthCheckinStore,
   type HealthPruneStore,
@@ -48,6 +49,17 @@ export interface HealthCheckPart {
   name: string;
   /** Minutes a part may go without a check-in before it counts as silent; undefined = never silent (runs only by hand). */
   allowedSilenceMinutes?: number;
+  /** Finished-and-idle check-in messages (see HealthPartDeclaration.idle). */
+  idle?: readonly { prefix: string; allowedSilenceMinutes?: number }[];
+}
+
+/**
+ * Pure: the silence allowance for a part given its latest check-in. An OK check-in whose message marks
+ * the part finished and idle uses that idle entry's allowance (undefined = never silent).
+ */
+export function silenceAllowance(part: HealthCheckPart, latest: HealthCheckinFacts | undefined): number | undefined {
+  const idle = latest?.state === "OK" ? part.idle?.find((i) => latest.message?.startsWith(i.prefix)) : undefined;
+  return idle ? idle.allowedSilenceMinutes : part.allowedSilenceMinutes;
 }
 
 /** A check-in as written by a part. `state` is the part's own word. */
@@ -176,6 +188,12 @@ export function evaluateHealth(input: {
   previous?: ReadonlyMap<string, HealthCheckinFacts | undefined>;
   /** No-response counts from the previous check. */
   priorRequests?: Readonly<Record<string, number>>;
+  /**
+   * When health check-ins began (the oldest one stored). A part that has never checked in counts as
+   * silent only once its allowance has passed since then (e.g. gap refill before its first run after
+   * the merge); undefined = silent at once, as before.
+   */
+  monitoringSince?: string;
   now: Date;
   stuckDays?: readonly HealthStuckDay[];
 }): HealthCheckResult {
@@ -183,9 +201,12 @@ export function evaluateHealth(input: {
   const requests: Record<string, number> = {};
   for (const part of input.parts) {
     const latest = input.latest.get(part.name);
+    const allowance = silenceAllowance(part, latest);
     const silent =
-      part.allowedSilenceMinutes !== undefined &&
-      (!latest || isCheckinSilent(ageMinutes(latest.at, input.now), part.allowedSilenceMinutes));
+      allowance !== undefined &&
+      (latest
+        ? isCheckinSilent(ageMinutes(latest.at, input.now), allowance)
+        : input.monitoringSince === undefined || isCheckinSilent(ageMinutes(input.monitoringSince, input.now), allowance));
     const word = latest?.state ?? "";
     const status = partStatus({
       error: latest?.state === "ERROR",
@@ -207,7 +228,9 @@ export function evaluateHealth(input: {
             ? `${part.name}: unrecognized word ${JSON.stringify(word)}`
             : latest
               ? partOkLine(part.name)
-              : `${part.name}: OK (runs only when started; no check-in yet)`;
+              : allowance === undefined
+                ? `${part.name}: OK (runs only when started; no check-in yet)`
+                : `${part.name}: OK (no check-in yet; first run expected within its schedule)`;
     results.push({
       name: part.name,
       status,
@@ -295,6 +318,12 @@ export async function runHealthCheck(
     latest.set(part.name, newest);
     previous.set(part.name, before);
   }
+  // When check-ins began: the oldest check-in day stored (a part's newest one is never pruned).
+  const checkinDays = (await store.list(HEALTH_CHECKIN_PREFIX))
+    .map((key) => /^[a-z-]+\/(\d{4}-\d{2}-\d{2})\//u.exec(key.slice(HEALTH_CHECKIN_PREFIX.length))?.[1])
+    .filter((d): d is string => !!d && Number.isFinite(Date.parse(`${d}T00:00:00Z`)))
+    .sort();
+  const monitoringSince = checkinDays[0] ? `${checkinDays[0]}T00:00:00.000Z` : undefined;
   let priorRequests: Record<string, number> = {};
   const stateBytes = await store.get(HEALTH_CHECK_STATE_KEY);
   if (stateBytes) {
@@ -306,7 +335,12 @@ export async function runHealthCheck(
     }
   }
   const result = evaluateHealth({
-    parts: HEALTH_PARTS.map((p) => ({ name: p.name, ...(p.allowedSilenceMinutes === undefined ? {} : { allowedSilenceMinutes: p.allowedSilenceMinutes }) })),
+    parts: HEALTH_PARTS.map((p) => ({
+      name: p.name,
+      ...(p.allowedSilenceMinutes === undefined ? {} : { allowedSilenceMinutes: p.allowedSilenceMinutes }),
+      ...(p.idle ? { idle: p.idle } : {}),
+    })),
+    ...(monitoringSince ? { monitoringSince } : {}),
     latest,
     previous,
     priorRequests,

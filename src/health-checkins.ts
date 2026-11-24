@@ -30,19 +30,39 @@ export interface HealthPartDeclaration {
   schedule: HealthPartSchedule;
   /** Minutes without a check-in before the part counts as silent; undefined = runs only by hand. */
   allowedSilenceMinutes?: number;
+  /**
+   * Finished-and-idle check-ins: when the latest OK check-in's message starts with `prefix`, the part
+   * legitimately has nothing to run (it has no cron of its own), so the silence allowance is this
+   * entry's instead (undefined = never silent until it runs again).
+   */
+  idle?: readonly { prefix: string; allowedSilenceMinutes?: number }[];
 }
 
 const TUE_TO_SAT = [2, 3, 4, 5, 6] as const;
 const EVERY_DAY = [0, 1, 2, 3, 4, 5, 6] as const;
+/**
+ * Lateness margin on top of each part's longest normal gap. GitHub's scheduled runs were observed
+ * 7-8 h late (Auditor, 6bf2594 review), past the old 6 h margin, so the margin is 12 h.
+ */
+export const HEALTH_CRON_LATENESS_MINUTES = 12 * 60;
+const SCAN_SILENCE_MINUTES = 68 * 60 + HEALTH_CRON_LATENESS_MINUTES;
 
 /** Each part's own schedule (from its workflow crons). */
 export const HEALTH_PARTS: readonly HealthPartDeclaration[] = [
   // scanner.yml crons 05:30 + 09:30 UTC Tue-Sat; Sat 09:30 -> Tue 05:30 is the longest normal gap (68 h).
-  { id: "scan", name: "scan", schedule: { utcDays: TUE_TO_SAT, perDay: 2 }, allowedSilenceMinutes: 74 * 60 },
+  { id: "scan", name: "scan", schedule: { utcDays: TUE_TO_SAT, perDay: 2 }, allowedSilenceMinutes: SCAN_SILENCE_MINUTES },
   // scanner.yml crons 06:20 + 10:20 UTC Tue-Sat (only while TENMIN_DAILY_ENABLED is true).
-  { id: "tenmin-daily", name: "daily 10-minute step", schedule: { utcDays: TUE_TO_SAT, perDay: 2 }, allowedSilenceMinutes: 74 * 60 },
+  { id: "tenmin-daily", name: "daily 10-minute step", schedule: { utcDays: TUE_TO_SAT, perDay: 2 }, allowedSilenceMinutes: SCAN_SILENCE_MINUTES },
   // Dispatched chain plus the hourly restarter: at least one run a day while the chain is working.
-  { id: "history-chain", name: "history chain", schedule: { utcDays: EVERY_DAY, perDay: 1 }, allowedSilenceMinutes: 26 * 60 },
+  // It has no cron of its own: after STOP_DONE (no range left) it is idle until the next range closes,
+  // and while it waits on the daily step (WAIT_DAILY_STEP) it runs again only once that day resolves.
+  {
+    id: "history-chain",
+    name: "history chain",
+    schedule: { utcDays: EVERY_DAY, perDay: 1 },
+    allowedSilenceMinutes: 24 * 60 + HEALTH_CRON_LATENESS_MINUTES,
+    idle: [{ prefix: "STOP_DONE:" }, { prefix: "WAIT_DAILY_STEP:", allowedSilenceMinutes: SCAN_SILENCE_MINUTES }],
+  },
   // Manual dispatch only: no expected check-ins, never silent.
   { id: "backfill", name: "backfill", schedule: { utcDays: [], perDay: 0 } },
   // gap-refill.yml cron 14:40 UTC Sunday.
@@ -99,10 +119,19 @@ const CHECKIN_KEY = /^permanent\/health\/checkins\/[a-z-]+\/(\d{4}-\d{2}-\d{2})\
 export async function pruneHealthCheckins(store: Pick<HealthPruneStore, "list" | "delete">, now: Date): Promise<number> {
   const today = Date.parse(`${now.toISOString().slice(0, 10)}T00:00:00Z`);
   let deleted = 0;
-  for (const key of await store.list(HEALTH_CHECKIN_PREFIX)) {
+  const keys = await store.list(HEALTH_CHECKIN_PREFIX);
+  // A part's newest check-in is never pruned: an idle part (e.g. the history chain after STOP_DONE)
+  // keeps its "last seen", so it never turns into "no check-in at all".
+  const newest = new Map<string, string>();
+  for (const key of keys) {
+    const part = CHECKIN_KEY.test(key) ? key.slice(HEALTH_CHECKIN_PREFIX.length).split("/")[0]! : undefined;
+    if (part && (newest.get(part) ?? "") < key) newest.set(part, key);
+  }
+  const keep = new Set(newest.values());
+  for (const key of keys) {
     if (deleted >= HEALTH_PRUNE_MAX_PER_RUN) break;
     const day = CHECKIN_KEY.exec(key)?.[1];
-    if (!day) continue;
+    if (!day || keep.has(key)) continue;
     const ageDays = (today - Date.parse(`${day}T00:00:00Z`)) / 86_400_000;
     if (!Number.isFinite(ageDays) || !isCheckinExpired(ageDays)) continue;
     await store.delete(key);

@@ -15,7 +15,9 @@ test("prune: at most 2000 deletions per run; the rest go on the next run", async
     await store.put(`${HEALTH_CHECKIN_PREFIX}scan/2026-09-01/20260901000000000-${i}-n.json`, body);
   assert.equal(await pruneHealthCheckins(store, NOW), 2000);
   assert.equal((await store.list(HEALTH_CHECKIN_PREFIX)).length, 5);
-  assert.equal(await pruneHealthCheckins(store, NOW), 5);
+  // The part's newest check-in is never pruned (it keeps the part's "last seen").
+  assert.equal(await pruneHealthCheckins(store, NOW), 4);
+  assert.equal((await store.list(HEALTH_CHECKIN_PREFIX)).length, 1);
 });
 
 test("prune: only exact check-in keys; foreign keys and bad dates are kept", async () => {
