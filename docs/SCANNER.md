@@ -436,13 +436,23 @@ Only then should Scanner V0 be declared operational.
 daily bars copied to a local directory. It never reads R2 or the network and prints aggregates only.
 
 - The ranker has no fitted parameters: its weights (above) were set by hand on 2026-08-26 and have
-  not changed. Sessions after that date are out of sample; earlier sessions are reported apart.
+  not changed. Sessions after that date are the held-out window. Earlier sessions (2025-03-03 to
+  2026-08-26) are in-sample: the weights were chosen after them, so they are not evidence.
 - For each session D it rebuilds what a forward scan at D saw: bars up to D in the scan's own
   window, ACTIVE = has a bar on D, eligibility from the bar count up to D (not the all-time count),
-  then the production `rankSecurities`.
+  then the production `rankSecurities` with the stored split records.
+- It is a replay of the current code on today's stored (gap-refilled) data, not a reproduction of
+  the lists that were actually published: some bars were ingested after a past freeze, and past
+  lists used unadjusted closes and the old FASTEST_IMPROVING.
 - Outcome: enter at the next session's open (lists freeze before it), exit at the close h sessions
   after D. A name-window with a known split or reverse split after entry is dropped. Optional
   winsorizing clips picks and baselines alike to the session's universe quantiles.
 - Baselines on the same sessions and names: the equal-weight universe average (every ranked name
   with an outcome), random same-size lists from that universe (one-sided p = share of random
   averages at or above the list's), and SPY. Also the mean daily Spearman IC of the overall score.
+- Reading the numbers: the random-list p treats picks as independent draws, so it overstates
+  significance when a list's names move together (a style or beta tilt). The per-session excess
+  t-stat and the alpha after regressing on the universe mean are the stricter checks. Five lists
+  and several variants are tested at once, so expect some nominal p < 0.05 by chance (Bonferroni
+  for 5 lists: 0.01). A list whose mean return is near zero "beats" a falling universe through low
+  beta, not selection (DEFENSIVE_LOW_RISK in 2026-08-27..11-20).
