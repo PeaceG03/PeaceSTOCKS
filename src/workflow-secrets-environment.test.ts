@@ -8,7 +8,7 @@ import test from "node:test";
 
 const DIR = new URL("../.github/workflows/", import.meta.url);
 const SECRET = /secrets\.(MASSIVE_API_KEY|NET_RERUN_DISPATCH_TOKEN|PEACESTOCKS_R2_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|ACCOUNT_ID|BUCKET))\b/u;
-const ENV_FILES = ["scanner.yml", "gap-refill.yml", "health.yml", "net-rerun.yml", "oct2024-tenmin.yml"];
+const ENV_FILES = ["scanner.yml", "gap-refill.yml", "health.yml", "net-rerun.yml", "oct2024-tenmin.yml", "paper-trading.yml"];
 
 /** Top-level `jobs:` split into { name, text } by the two-space job keys. */
 function jobs(yml: string): Array<{ name: string; text: string }> {
@@ -42,7 +42,7 @@ test("every job in the scanner-data workflows that reads a data secret declares 
       assert.equal(environmentOf(job.text), "scanner-data", `${file}:${job.name}`);
     }
   }
-  assert.ok(checked >= 10, `checked ${checked} jobs`); // scanner 5, gap-refill 1, health 2, net-rerun 1, oct2024 2
+  assert.ok(checked >= 12, `checked ${checked} jobs`); // scanner 5, gap-refill 1, health 2, net-rerun 1, oct2024 2, paper 1
 });
 
 test("no other workflow reads the data secrets outside an environment, and site-deploy keeps 'site'", () => {

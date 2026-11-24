@@ -213,7 +213,8 @@ environment holds none of them yet: they are added there, and the repository-lev
 after a scan has succeeded from the environment. Until then the repository-level copies still exist and a
 branch-edited workflow without `environment:` can read them. Every job
 that reads one (scanner.yml: scan, tenmin_daily, freeze_watch, backfill, tenmin_history; gap-refill.yml:
-refill; health.yml: check, weekly; net-rerun.yml: rerun; oct2024-tenmin.yml: run, post_seal) declares
+refill; health.yml: check, weekly; net-rerun.yml: rerun; oct2024-tenmin.yml: run, post_seal;
+paper-trading.yml: paper) declares
 `environment: scanner-data`, so once the repository-level copies are removed, a workflow edited on a
 branch, or a run dispatched from a branch, gets none of them (src/workflow-secrets-environment.test.ts; no pull_request or push workflow may use the
 environment). site-deploy.yml keeps its own `site` environment; the Tests workflow has no environment
