@@ -25,7 +25,8 @@ function world(n: number, days: string[], seed: number, signal: boolean) {
     for (const day of days) {
       const open = close * (1 + (r() - 0.5) * 0.002);
       close = open * (1 + drift + (r() - 0.5) * 0.02);
-      bars.push({ securityId: id, sessionDate: day, open, close, volume: 1e5 + r() * 1e5, revision: 1 });
+      // Liquid (>= $20M a day) so the eligibility floor the replay applies keeps every name.
+      bars.push({ securityId: id, sessionDate: day, open, close, volume: 1e6 + r() * 1e5, revision: 1 });
     }
   });
   return { bars, ids };
@@ -158,4 +159,20 @@ test("as-known split knowledge: only split records observed before the next open
   assert.equal(evaluateSession(master(ids), history, 100, { ...base, splitActions: [prompt], splitKnowledge: "as-known" } as never)!.excluded, 0);
   // No usable observedAt: not known.
   assert.equal(evaluateSession(master(ids), history, 105, { ...base, splitActions: [action("")], splitKnowledge: "as-known" } as never)!.excluded, 1);
+});
+
+test("the replay applies the scan's eligibility floor by default; floor: null ranks without it", () => {
+  const days = weekdays(130);
+  const { bars, ids } = world(30, days, 7, false);
+  // One more name: the strongest riser of all, but thin (about $2k a day). Under the floor it is never picked.
+  let close = 20;
+  for (const day of days) bars.push({ securityId: "thin", sessionDate: day, open: close, close: (close *= 1.01), volume: 100, revision: 1 });
+  const history = new EvalHistory(bars);
+  const on = evaluateSession(master([...ids, "thin"]), history, 110, { horizon: 1, randomDraws: 1, seed: 1 })!;
+  const off = evaluateSession(master([...ids, "thin"]), history, 110, { horizon: 1, randomDraws: 1, seed: 1, floor: null })!;
+  assert.equal(on.floorExcluded, 1);
+  assert.equal(off.floorExcluded, 0);
+  assert.equal(on.outcome.universeSize, off.outcome.universeSize - 1);
+  assert.equal(on.predictions.some((p) => p.securityIds.includes("thin")), false);
+  assert.ok(off.predictions.find((p) => p.setType === "STRONGEST_MOMENTUM")!.securityIds.includes("thin"));
 });

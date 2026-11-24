@@ -1,6 +1,13 @@
 import type { PredictionSet, PredictionStatus, ScannerRunReport, SecurityMasterRecord } from "./contracts";
 import { HEALTH_PARTS, latestHealthCheckin, type HealthCheckin } from "./health-checkins";
 import { resolveSessionPredictionStatus } from "./prediction-status";
+import {
+  FREEZE_RELIABILITY_KEY,
+  type FreezeReliability,
+  type FreezeShare,
+  SCAN_HEALTH_LATEST_KEY,
+  type ScanHealthRecord,
+} from "./scan-health";
 import { readReason } from "./site-read-error";
 
 /** Same key as health-check.ts HEALTH_CHECK_LATEST_KEY (not imported: that module pulls in node:fs). */
@@ -25,6 +32,23 @@ export interface SiteHealth {
   errors?: number;
   missing?: number;
   lines: string[];
+}
+
+/** The newest nightly scan health record (src/scan-health.ts), as shown on the site. */
+export interface SiteScanHealth {
+  sessionDate: string;
+  completedAt: string;
+  nextSessionOpen?: string;
+  finishedBeforeOpen: boolean | null;
+  freezeStatus: string;
+  freezeReason?: string;
+  frozenOnTime: boolean;
+  namesExpected: number;
+  namesCovered: number;
+  floorExcluded: number;
+  floorByReason: Record<string, number>;
+  splitExcluded: number;
+  splitByReason: Record<string, number>;
 }
 
 export interface SiteCheckin {
@@ -67,6 +91,10 @@ export interface SitePredictions {
 export interface SiteData {
   generatedAt: string;
   health?: SiteHealth;
+  /** Newest nightly scan health record, when one has been written. */
+  scanHealth?: SiteScanHealth;
+  /** On-time freeze share over the last 20 and 60 judged sessions (src/freeze-watch.ts). */
+  freezeReliability?: { at: string; through?: string; last20: FreezeShare; last60: FreezeShare };
   checkins: SiteCheckin[];
   /** Last session the scanner considers handled (scheduler cursor). */
   caughtUpThrough?: string;
@@ -168,6 +196,61 @@ export async function loadSiteData(
       }
     : undefined;
 
+  const rawScan = await attempt("scan-health", readErrors, async () =>
+    json<ScanHealthRecord>(await reader.get(SCAN_HEALTH_LATEST_KEY)),
+  );
+  const num = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+  const reasons = (value: unknown): Record<string, number> =>
+    Object.fromEntries(
+      Object.entries(value && typeof value === "object" ? (value as Record<string, unknown>) : {})
+        .filter(([, n]) => typeof n === "number")
+        .map(([k, n]) => [clip(k), n as number]),
+    );
+  const scanHealth: SiteScanHealth | undefined =
+    rawScan && typeof rawScan.sessionDate === "string"
+      ? {
+          sessionDate: rawScan.sessionDate,
+          completedAt: String(rawScan.completedAt ?? ""),
+          ...(rawScan.nextSessionOpen ? { nextSessionOpen: rawScan.nextSessionOpen } : {}),
+          finishedBeforeOpen: typeof rawScan.finishedBeforeOpen === "boolean" ? rawScan.finishedBeforeOpen : null,
+          freezeStatus: clip(String(rawScan.freezeStatus ?? "NO_DECISION")),
+          ...(rawScan.freezeReason ? { freezeReason: clip(rawScan.freezeReason) } : {}),
+          frozenOnTime: rawScan.frozenOnTime === true,
+          namesExpected: num(rawScan.namesExpected),
+          namesCovered: num(rawScan.namesCovered),
+          floorExcluded: num(rawScan.eligibilityFloorExcluded?.total),
+          floorByReason: reasons(rawScan.eligibilityFloorExcluded?.byReason),
+          splitExcluded: num(rawScan.splitGuardExcluded?.total),
+          splitByReason: reasons(rawScan.splitGuardExcluded?.byReason),
+        }
+      : undefined;
+
+  const rawReliability = await attempt("freeze-reliability", readErrors, async () =>
+    json<FreezeReliability>(await reader.get(FREEZE_RELIABILITY_KEY)),
+  );
+  const share = (value: unknown): FreezeShare => {
+    const v = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+    const sessions = num(v.sessions);
+    const onTime = num(v.onTime);
+    return {
+      sessions,
+      onTime,
+      late: num(v.late),
+      unavailable: num(v.unavailable),
+      noRecord: num(v.noRecord),
+      share: sessions > 0 ? onTime / sessions : null,
+    };
+  };
+  const freezeReliability =
+    rawReliability && typeof rawReliability === "object"
+      ? {
+          at: String(rawReliability.at ?? ""),
+          ...(typeof rawReliability.through === "string" ? { through: clip(rawReliability.through) } : {}),
+          last20: share(rawReliability.last20),
+          last60: share(rawReliability.last60),
+        }
+      : undefined;
+
   const checkins: SiteCheckin[] = [];
   let scanCheckin: HealthCheckin | undefined;
   for (const part of HEALTH_PARTS) {
@@ -232,6 +315,8 @@ export async function loadSiteData(
   return {
     generatedAt: now().toISOString(),
     ...(health ? { health } : {}),
+    ...(scanHealth ? { scanHealth } : {}),
+    ...(freezeReliability ? { freezeReliability } : {}),
     checkins,
     ...(scheduler?.lastObservedSessionDate ? { caughtUpThrough: scheduler.lastObservedSessionDate } : {}),
     backlog: {
