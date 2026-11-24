@@ -362,8 +362,6 @@ export async function runScannerHost(
     !collectedSessions.has(due.session.sessionDate) &&
     !collected.some((report) => credentialRejected(report) || report.status === "PROVIDER_NOT_READY");
   if (dueWanted && (backlog.length > 0 || !budgetLeft())) backlog.push(due.session.sessionDate);
-  if (backlog.length > 0)
-    stageSink(scanStageLine(`${backlog[0]}..${backlog.at(-1)}`, `BACKLOG_REMAINS:${backlog.length}`, clock() - startedAt));
   if (
     backlog.length === 0 &&
     due.due &&
@@ -390,6 +388,11 @@ export async function runScannerHost(
     )
     .map((report) => report.session.sessionDate)
     .sort();
+  // Still to do: sessions not started (capped) plus sessions run but unresolved. The next run retries
+  // from the first of them (the cursor parks before it); a failed session is never counted as done.
+  const remaining = backlog.length ? [...new Set([...unresolved, ...backlog])].sort() : [];
+  if (remaining.length > 0)
+    stageSink(scanStageLine(`${remaining[0]}..${remaining.at(-1)}`, `BACKLOG_REMAINS:${remaining.length}`, clock() - startedAt));
   // Never advance past an uncollected eligible session. On failure, park before the first
   // unresolved session. Otherwise park on due.session: when READY that session was collected
   // or already complete; when CLOSED the closed day needs no collection and must not jump to
@@ -455,7 +458,7 @@ export async function runScannerHost(
                 ? "NO_MISSED_SESSION"
                 : due.reason,
           );
-  const withBacklog = backlog.length ? { ...finalBase, backlogRemaining: Object.freeze([...backlog]) } : finalBase;
+  const withBacklog = remaining.length ? { ...finalBase, backlogRemaining: Object.freeze([...remaining]) } : finalBase;
   const final = intraday ? { ...withBacklog, intraday } : withBacklog;
   await writeHostResult(root, final);
   return final;
@@ -523,7 +526,7 @@ async function main(): Promise<void> {
   process.stdout.write(
     `${JSON.stringify({ status: output.status, reason: output.reason, sessions: output.sessions, ...(packFailures.length ? { packFailures } : {}) })}\n`,
   );
-  process.exitCode = output.status === "FAILED" || output.status === "NOT_READY" ? 2 : 0;
+  process.exitCode = hostExitCode(output);
   // A capped run (BACKLOG_REMAINS) checks in as BEHIND with the remaining count (src/health-behind.ts).
   const checkin = scanCheckin(output);
   await reportPart(process.env, "scan", checkin.state, checkin.message, {}, checkin.remaining === undefined ? {} : { remaining: checkin.remaining });
@@ -558,4 +561,9 @@ export function listOncePerRun<P extends MarketProvider>(provider: P): P {
       };
     },
   });
+}
+
+/** Scan host exit code: 2 when any session failed or was not ready (a capped run included), else 0. */
+export function hostExitCode(output: { readonly status: string }): 0 | 2 {
+  return output.status === "FAILED" || output.status === "NOT_READY" ? 2 : 0;
 }
