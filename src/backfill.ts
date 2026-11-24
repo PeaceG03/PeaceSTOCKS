@@ -28,7 +28,6 @@ import {
 } from "./reply-dust-pin";
 import { MarketStorage, type MarketStore } from "./storage";
 import { refreshEligibility, refreshUniverse } from "./universe";
-import { errorMessage, reportPart } from "./health-checkins";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import { finalizeDailyPartition } from "./scanner";
 import { pointInTimeUniverse } from "./pit-universe";
@@ -457,30 +456,7 @@ export async function backfillHistoricalEvidence(options: {
   };
 }
 
-function argument(name: string): string | undefined {
-  const index = process.argv.indexOf(name);
-  return index >= 0 ? process.argv[index + 1] : undefined;
-}
-
-if (process.argv[1]?.endsWith("backfill.ts")) {
-  const root =
-    process.env.PEACEAI_MARKETS_ROOT ??
-    process.env.MARKETS_STORAGE_ROOT ??
-    "C:\\ProgramData\\PeaceAI\\Markets";
-  const from = argument("--from") ?? process.env.MARKETS_BACKFILL_FROM;
-  const to = argument("--to") ?? process.env.MARKETS_BACKFILL_TO;
-  if (!from || !to) throw new Error("BACKFILL_RANGE_REQUIRED");
-  const maxText = argument("--max-sessions");
-  const result = await backfillHistoricalEvidence({
-    root,
-    from,
-    to,
-    ...(maxText ? { maxSessions: Number(maxText) } : {}),
-  }).catch(async (error: unknown) => {
-    await reportPart(process.env, "backfill", "ERROR", errorMessage(error));
-    throw error;
-  });
-  console.log(JSON.stringify(result));
-  if (result.stoppedOnError) process.exitCode = 2;
-  await reportPart(process.env, "backfill", result.stoppedOnError ? "ERROR" : "OK", result.stoppedOnError ? "STOPPED_ON_ERROR" : undefined);
-}
+// `pnpm backfill` (the workflow's backfill mode) runs src/backfill-job-cli.ts: the resumable,
+// sha-checked backfill job. This module is the library it drives; running it directly is refused so
+// nothing can backfill without the per-session verification.
+if (process.argv[1]?.endsWith("backfill.ts")) throw new Error("BACKFILL_ENTRY_MOVED:use pnpm backfill (src/backfill-job-cli.ts)");

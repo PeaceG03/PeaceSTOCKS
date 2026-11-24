@@ -16,7 +16,7 @@
     "typecheck:worker": "tsc -p tsconfig.worker.json --noEmit",
     "test": "tsx --test src/*.test.ts",
     "scheduler": "tsx src/host.ts",
-    "backfill": "tsx src/backfill.ts",
+    "backfill": "tsx src/backfill-job-cli.ts",
     "research": "tsx src/research-harness-cli.ts",
     "backfill:dry-run": "tsx src/backfill-dry-run-cli.ts",
     "scan:reliability": "tsx src/scan-reliability-cli.ts"

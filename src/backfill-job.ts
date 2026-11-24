@@ -16,7 +16,7 @@
  * saved; the next run with the same range resumes after the last completed session.
  *
  * This module never builds a network client: the caller passes `fetchImpl`. The dry-run CLI passes
- * a fake Massive; nothing here is wired to a workflow.
+ * a fake Massive; the workflow's backfill mode reaches it through src/backfill-job-cli.ts.
  */
 import type { CanonicalDailyBar, SecurityMasterRecord } from "./contracts";
 import { backfillHistoricalEvidence, type BackfillResult, type BackfillState } from "./backfill";
@@ -30,7 +30,11 @@ import type { MarketStore } from "./storage";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 
 export type BackfillJobStatus = "COMPLETE" | "STOPPED_RESUMABLE" | "REFUSED_SHA_MISMATCH" | "REFUSED_PACK_CONFLICT";
-export type BackfillStopReason = "PLAN_WINDOW" | "NOT_AUTHORIZED" | "PROVIDER_NOT_READY" | "CREDENTIAL_REJECTED" | "SESSION_FAILED" | "MAX_SESSIONS" | "YIELDED";
+export type BackfillStopReason = "PLAN_WINDOW" | "NOT_AUTHORIZED" | "PROVIDER_NOT_READY" | "CREDENTIAL_REJECTED" | "SESSION_FAILED" | "MAX_SESSIONS" | "BUDGET" | "YIELDED";
+
+/** Yield reasons the CLI's own session/time caps return (anything else is a scan yield). */
+export const JOB_YIELD_MAX_SESSIONS = "JOB_MAX_SESSIONS_REACHED";
+export const JOB_YIELD_BUDGET = "JOB_TIME_BUDGET_REACHED";
 
 export interface BackfillJobReport {
   status: BackfillJobStatus;
@@ -76,6 +80,13 @@ export interface BackfillJobOptions {
   sleep?: (ms: number) => Promise<void>;
   now?: () => string;
   maxSessions?: number;
+  /**
+   * Asked before every session that would be fetched (not for sessions already stored); a reason
+   * stops at the session boundary. The CLI combines the scan-yield check with its caps.
+   */
+  shouldYield?: () => Promise<string | undefined>;
+  /** Passed to the backfill (object-store requirement). Default {}: injected storage only. */
+  env?: NodeJS.ProcessEnv;
   backend?: ReplyDustBackend;
   zstdVersionProbe?: ZstdVersionProbe;
 }
@@ -112,8 +123,8 @@ export async function runBackfillJob(options: BackfillJobOptions): Promise<Backf
     to: options.to,
     provider,
     storage: options.storage,
-    env: {},
-    shouldYield: async () => undefined,
+    env: options.env ?? {},
+    shouldYield: options.shouldYield ?? (async () => undefined),
     replyDust: true,
     replyDustStore: options.store,
     ...(options.backend ? { replyDustBackend: options.backend } : {}),
@@ -132,8 +143,22 @@ export async function runBackfillJob(options: BackfillJobOptions): Promise<Backf
   const packCheckFailures: Record<string, string> = {};
   let barRows = 0;
   const keys = new Set<string>();
+  // Each month file is read once (not once per session), and only one month is held at a time.
+  let rowsMonth = "";
+  let rowsBySession = new Map<string, CanonicalDailyBar[]>();
   for (const sessionDate of completed) {
-    const rows: CanonicalDailyBar[] = await options.storage.loadBars(sessionDate);
+    const month = sessionDate.slice(0, 7);
+    if (month !== rowsMonth) {
+      rowsMonth = month;
+      rowsBySession = new Map();
+      const monthSessions = completed.filter((d) => d.startsWith(month));
+      for (const row of await options.storage.loadBarsBetween(monthSessions[0]!, monthSessions.at(-1)!)) {
+        const list = rowsBySession.get(row.sessionDate);
+        if (list) list.push(row);
+        else rowsBySession.set(row.sessionDate, [row]);
+      }
+    }
+    const rows: CanonicalDailyBar[] = rowsBySession.get(sessionDate) ?? [];
     barRows += rows.length;
     for (const row of rows) keys.add(`${row.securityId}|${row.sessionDate}|${row.revision}`);
     try {
@@ -189,7 +214,11 @@ export async function runBackfillJob(options: BackfillJobOptions): Promise<Backf
   const stopReason: BackfillStopReason | undefined = result.stoppedOnError
     ? classifyStop(failedMessage ?? "")
     : result.yieldedForScan
-      ? "YIELDED"
+      ? result.yieldedForScan === JOB_YIELD_MAX_SESSIONS
+        ? "MAX_SESSIONS"
+        : result.yieldedForScan === JOB_YIELD_BUDGET
+          ? "BUDGET"
+          : "YIELDED"
       : completed.length < sessionsIn(options.from, options.to)
         ? "MAX_SESSIONS"
         : undefined;
