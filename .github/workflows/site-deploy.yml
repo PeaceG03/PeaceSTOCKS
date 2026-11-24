@@ -93,9 +93,15 @@ jobs:
         # A brand-new custom domain can take minutes to get DNS and a certificate, so keep trying for
         # about 10 minutes. No answer (000), DNS or TLS errors and anything else unexpected: wait and
         # retry. Any 2xx: hard fail at once (the site answered without a login). Passes only on a
-        # redirect to the Access login or a 401/403 refusal.
+        # redirect to this team's Access login for this host, or a 401/403 refusal (with a warning:
+        # then Access may be off and only the Worker's own JWT check is refusing).
         timeout-minutes: 12
+        env:
+          ACCESS_TEAM_DOMAIN: ${{ steps.access.outputs.team_domain }}
         run: |
+          team=${ACCESS_TEAM_DOMAIN#https://}
+          if [ -z "$team" ]; then echo "::error::no Access team domain from the Access step"; exit 1; fi
+          login_re="^https://${team//./\\.}/cdn-cgi/access/login/${SITE_HOSTNAME//./\\.}([?/]|$)"
           deadline=$(( $(date +%s) + 600 ))
           try=0
           while :; do
@@ -109,10 +115,11 @@ jobs:
                 echo "::error::https://${SITE_HOSTNAME}/ answered ${code} without a login"
                 exit 1 ;;
               401|403)
+                echo "::warning::https://${SITE_HOSTNAME}/ answered ${code}, not a redirect to the Access login: Access may be off, and only the Worker's own JWT check is refusing"
                 echo "SITE_GATED: refused without a login (${code})"
                 exit 0 ;;
               301|302|303|307|308)
-                if [[ "$loc" =~ ^https://[a-z0-9-]+\.cloudflareaccess\.com/cdn-cgi/access/login/ ]]; then
+                if [[ "$loc" =~ $login_re ]]; then
                   echo "SITE_GATED: redirects to the Access login (${code})"
                   exit 0
                 fi ;;

@@ -116,7 +116,7 @@ test("site deploy workflow: runs on Node >= 22.12 (wrangler 4 and miniflare requ
  * network. `answer(t)` gives what https://SITE_HOSTNAME/ returns at fake second t:
  * [http_code, redirect_url, curl exit code].
  */
-function runPostCheck(answer: string): { status: number; out: string; elapsed: number; curls: number } {
+function runPostCheck(answer: string, team = "https://blue-leaf-13b3.cloudflareaccess.com"): { status: number; out: string; elapsed: number; curls: number } {
   const step = block("Confirm the site is not public");
   const lines = step.slice(step.indexOf("run: |\n") + "run: |\n".length).split("\n");
   const script = lines.map((line) => line.replace(/^ {10}/u, "")).join("\n");
@@ -147,7 +147,7 @@ exit "\${rc:-0}"
       { mode: 0o755 },
     );
     const result = spawnSync("bash", ["-e", "-c", script], {
-      env: { PATH: `${bin}:/usr/bin:/bin`, FAKE_DIR: dir, SITE_HOSTNAME: "stocks.example.test" },
+      env: { PATH: `${bin}:/usr/bin:/bin`, FAKE_DIR: dir, SITE_HOSTNAME: "stocks.example.test", ACCESS_TEAM_DOMAIN: team },
       encoding: "utf8",
       timeout: 30_000,
     });
@@ -278,5 +278,47 @@ test("site deploy workflow: a secret that is missing or empty after trimming sto
       assert.match(result.out, new RegExp(`::error::${written} is missing or empty after trimming`, "u"));
       for (const secret of Object.values(SECRET_ENV)) assert.ok(!result.out.includes(secret.trim()), "no value in the output");
     }
+  }
+});
+
+test("site deploy post-check: the redirect must be to this team's login for this host (anchored, dots escaped)", () => {
+  assert.match(block("Confirm the site is not public"), /\n          ACCESS_TEAM_DOMAIN: \$\{\{ steps\.access\.outputs\.team_domain \}\}\n/u);
+  const team = "https://blue-leaf-13b3.cloudflareaccess.com";
+  for (const good of [LOGIN, `${LOGIN}?kid=abc&redirect_url=%2F`, `${LOGIN}/`]) {
+    const ok = runPostCheck(`echo "302 ${good} 0"`);
+    assert.equal(ok.status, 0, `${good}: ${ok.out}`);
+    assert.doesNotMatch(ok.out, /::warning::/u);
+  }
+  // The same login under a team domain given without the scheme also passes.
+  assert.equal(runPostCheck(`echo "302 ${LOGIN} 0"`, "blue-leaf-13b3.cloudflareaccess.com").status, 0);
+  for (const bad of [
+    // Auditor: lookalike team host, and the login URL smuggled into another site's query.
+    "https://blue-leaf-13b3.cloudflareaccess.com.evil/cdn-cgi/access/login/stocks.example.test",
+    "https://evil.test/?r=https://blue-leaf-13b3.cloudflareaccess.com/cdn-cgi/access/login/stocks.example.test",
+    // Team pin: another team, or unescaped dots.
+    "https://other-team.cloudflareaccess.com/cdn-cgi/access/login/stocks.example.test",
+    "https://blue-leaf-13b3xcloudflareaccessxcom/cdn-cgi/access/login/stocks.example.test",
+    "https://blue-leaf-13b3.cloudflareaccess.com/cdn-cgi/access/other/stocks.example.test",
+    "https://blue-leaf-13b3.cloudflareaccess.com/",
+    // Host pin: another host, a longer host, unescaped dots.
+    "https://blue-leaf-13b3.cloudflareaccess.com/cdn-cgi/access/login/other.example.test",
+    "https://blue-leaf-13b3.cloudflareaccess.com/cdn-cgi/access/login/stocks.example.test.evil",
+    "https://blue-leaf-13b3.cloudflareaccess.com/cdn-cgi/access/login/stocksxexample.test",
+  ]) {
+    const result = runPostCheck(`echo "302 ${bad} 0"`, team);
+    assert.equal(result.status, 1, `${bad}: ${result.out}`);
+    assert.match(result.out, /::error::could not confirm the Access login/u, bad);
+  }
+  const noTeam = runPostCheck(`echo "302 ${LOGIN} 0"`, "");
+  assert.equal(noTeam.status, 1);
+  assert.match(noTeam.out, /::error::no Access team domain/u);
+  assert.equal(noTeam.curls, 0);
+});
+
+test("site deploy post-check: passing on 401/403 warns that Access may be off (only the Worker JWT check refused)", () => {
+  for (const code of ["401", "403"]) {
+    const ok = runPostCheck(`echo "${code} - 0"`);
+    assert.equal(ok.status, 0, ok.out);
+    assert.match(ok.out, new RegExp(`::warning::https://stocks\\.example\\.test/ answered ${code}, not a redirect to the Access login: Access may be off, and only the Worker's own JWT check is refusing`, "u"));
   }
 });
