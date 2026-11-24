@@ -569,8 +569,9 @@ test("scanner uses the SPY security id as the market benchmark", async () => {
       freezeNow(session),
     ).run(session);
     assert.equal(report.status, "COMPLETE");
-    // 21 sessions of history: under the eligibility floor's 60, so no name reaches the lists.
-    assert.deepEqual(report.skips, ["ELIGIBILITY_FLOOR_EXCLUDED:3"]);
+    // SPY is an ETF: left out of the stock lists (still the benchmark below). 21 sessions of history
+    // is under the eligibility floor's 60, so neither stock reaches the lists either.
+    assert.deepEqual(report.skips, ["ELIGIBILITY_FLOOR_EXCLUDED:2", "NON_STOCK_EXCLUDED:1"]);
     // Beliefs are retired (never persisted); check the benchmark wiring on the in-memory ranking
     // over the same stored securities and bars the scan used.
     assert.equal(existsSync(join(root, "permanent", "beliefs")), false);
@@ -592,6 +593,9 @@ test("scanner uses the SPY security id as the market benchmark", async () => {
     assert.equal(typeof aaaScore, "number");
     assert.equal(typeof bbbScore, "number");
     assert.notEqual(aaaScore, bbbScore);
+    // The benchmark is not a candidate.
+    assert.equal(ranking.ranked.some((item) => item.securityId === spy), false);
+    assert.equal(ranking.nonStockExcluded, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

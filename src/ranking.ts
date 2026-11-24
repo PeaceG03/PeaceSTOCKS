@@ -88,7 +88,12 @@ export interface RankingResult {
   excluded?: Array<{ securityId: string; reason: SplitExclusion }>;
   /** Eligible names left out by the eligibility floor (price, dollar volume, history); absent when none or no floor. */
   floorExcluded?: Array<{ securityId: string; reason: FloorExclusion }>;
+  /** Active names left out because they are not stocks (ETFs); absent when none. */
+  nonStockExcluded?: number;
 }
+
+/** The only security-master type that may appear in a pick list. */
+export const STOCK_LIST_ASSET_TYPE = "STOCK" as const;
 
 export function rankSecurities(
   securities: SecurityMasterRecord[],
@@ -100,11 +105,15 @@ export function rankSecurities(
   /** The eligibility floor (src/eligibility-floor.ts); null turns it off (held-out eval comparison only). */
   floor: EligibilityFloor | null = ELIGIBILITY_FLOOR,
 ): RankingResult {
-  const eligible = securities.filter(
+  const active = securities.filter(
     (security) =>
       security.status === "ACTIVE" &&
       (security.eligibility === "LEVEL_2" || security.eligibility === "LEVEL_3"),
   );
+  // Stock lists hold stocks only: ETFs (and any other non-STOCK type in the security master) are left
+  // out here. They stay in the master and in the bars, so SPY is still the market benchmark.
+  const eligible = active.filter((security) => security.assetType === STOCK_LIST_ASSET_TYPE);
+  const nonStockExcluded = active.length - eligible.length;
   const bySecurity = barsBySecurityUpTo(bars, sessionDate);
   const latestById = new Map<string, CanonicalDailyBar[]>();
   const latestFor = (id: string): CanonicalDailyBar[] => {
@@ -193,7 +202,11 @@ export function rankSecurities(
     ranked.map((item, index) => [item.securityId, { item, rank: index + 1 }]),
   );
   // The floor changes the lists, so its version is part of the lists' fingerprint (and predictionId).
-  const configFingerprint = fingerprint(floor ? { ...config, eligibilityFloor: floor.version } : config);
+  // Production lists (floor on) name the floor version and the stocks-only rule. The floor-off path
+  // exists only for the held-out comparison and keeps the old fingerprint (pinned test hashes).
+  const configFingerprint = fingerprint(
+    floor ? { ...config, eligibilityFloor: floor.version, listAssetType: STOCK_LIST_ASSET_TYPE } : config,
+  );
   const beliefs: ScannerBelief[] = securities.map((security) => {
     const selected = rankById.get(security.securityId);
     const evidenceAsOfFingerprint = sha256(
@@ -275,5 +288,6 @@ export function rankSecurities(
     predictions,
     ...(excluded.length ? { excluded } : {}),
     ...(floorExcluded.length ? { floorExcluded } : {}),
+    ...(nonStockExcluded ? { nonStockExcluded } : {}),
   };
 }

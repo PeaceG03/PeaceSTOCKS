@@ -74,6 +74,16 @@ Current levels:
 
 Current scanner ranking accepts LEVEL_2 and LEVEL_3 active securities.
 
+## Stock lists hold stocks only
+
+The pick lists are stock lists: only security-master records with `assetType` STOCK are ranked
+(`STOCK_LIST_ASSET_TYPE` in src/ranking.ts). ETFs, and any other or missing type, are left out
+before split adjustment, the floor and features. They stay in the security master and the stored
+bars, so SPY (`resolveSpyBenchmarkId`, assetType ETF) is still the market benchmark for relative
+strength and the held-out eval. Funds other than ETFs never reach the master: ingestion keeps only
+the provider's common-stock (CS) and ETF types. The scan reports `NON_STOCK_EXCLUDED:<n>` in its
+skips, and production lists' configFingerprint names the rule (`listAssetType: STOCK`).
+
 ## Eligibility floor
 
 Every stock list is drawn only from names that pass a fixed floor (`config/eligibility-floor-v1.json`,
