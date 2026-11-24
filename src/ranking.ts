@@ -28,15 +28,27 @@ function normalized(values: Map<string, number | null>): Map<string, number> {
   );
 }
 
-function latestBars(
-  bars: CanonicalDailyBar[],
-  securityId: string,
-  date: string,
-): CanonicalDailyBar[] {
+/**
+ * Each security's bars up to `date`, in input order, grouped in one pass. (latestBars used to filter the
+ * whole bars array once per security: O(securities x bars), ~9 min per session at ~10.7k securities.)
+ */
+function barsBySecurityUpTo(bars: CanonicalDailyBar[], date: string): Map<string, CanonicalDailyBar[]> {
+  const grouped = new Map<string, CanonicalDailyBar[]>();
+  for (const bar of bars) {
+    if (bar.sessionDate > date) continue;
+    const list = grouped.get(bar.securityId);
+    if (list) list.push(bar);
+    else grouped.set(bar.securityId, [bar]);
+  }
+  return grouped;
+}
+
+/** One bar per session (highest revision; later input wins a tie), oldest first. */
+function latestBars(own: readonly CanonicalDailyBar[] | undefined): CanonicalDailyBar[] {
   const byDate = new Map<string, CanonicalDailyBar>();
-  for (const bar of bars
-    .filter((item) => item.securityId === securityId && item.sessionDate <= date)
-    .sort((a, b) => a.sessionDate.localeCompare(b.sessionDate) || a.revision - b.revision))
+  for (const bar of [...(own ?? [])].sort(
+    (a, b) => a.sessionDate.localeCompare(b.sessionDate) || a.revision - b.revision,
+  ))
     byDate.set(bar.sessionDate, bar);
   return [...byDate.values()].sort((a, b) => a.sessionDate.localeCompare(b.sessionDate));
 }
@@ -66,6 +78,13 @@ export function rankSecurities(
       security.status === "ACTIVE" &&
       (security.eligibility === "LEVEL_2" || security.eligibility === "LEVEL_3"),
   );
+  const bySecurity = barsBySecurityUpTo(bars, sessionDate);
+  const latestById = new Map<string, CanonicalDailyBar[]>();
+  const latestFor = (id: string): CanonicalDailyBar[] => {
+    let found = latestById.get(id);
+    if (!found) latestById.set(id, (found = latestBars(bySecurity.get(id))));
+    return found;
+  };
   const featureById = new Map<string, DerivedFeatures>();
   for (const security of eligible)
     featureById.set(
@@ -73,7 +92,7 @@ export function rankSecurities(
       reconstructFeatures(
         security.securityId,
         sessionDate,
-        latestBars(bars, security.securityId, sessionDate),
+        latestFor(security.securityId),
         benchmarkBars,
       ),
     );
@@ -142,7 +161,7 @@ export function rankSecurities(
   const beliefs: ScannerBelief[] = securities.map((security) => {
     const selected = rankById.get(security.securityId);
     const evidenceAsOfFingerprint = sha256(
-      JSON.stringify(latestBars(bars, security.securityId, sessionDate)),
+      JSON.stringify(latestFor(security.securityId)),
     );
     const meaningfulDecision = selected
       ? selected.item.overallScore >= config.selectionThreshold
