@@ -111,6 +111,15 @@ export async function refreshUniverse(
           ? { listingDate: previous.listingDate }
           : {}),
       ...(providerRecord.active ? {} : { inactiveAt: previous?.inactiveAt ?? asOf }),
+      // The provider's delisting date for an inactive record, kept so a historical backfill knows
+      // the last session the name could have traded (src/pit-universe.ts).
+      ...(providerRecord.active
+        ? {}
+        : providerRecord.delistedDate
+          ? { delistedAt: providerRecord.delistedDate }
+          : previous?.delistedAt
+            ? { delistedAt: previous.delistedAt }
+            : {}),
       status: providerRecord.active ? "ACTIVE" : "INACTIVE",
       tradable: providerRecord.tradable,
       ...(providerRecord.fractional === undefined ? {} : { fractional: providerRecord.fractional }),

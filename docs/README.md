@@ -50,8 +50,10 @@ Read these in order when starting or resuming PeaceSTOCKS work:
 7. [SCANNER.md](SCANNER.md) — scanner design, real-data history, test evidence, storage benchmarks, known failures, and production PASS definition.
 8. [STORAGE.md](STORAGE.md) — Foundation D/D.1 evidence model, permanent/cache/transient breakdown, Dust/packed storage work, benchmark results, and long-term archive rules.
 9. [STRATEGY_LAB.md](STRATEGY_LAB.md) — paper research, strategy competition, regime specialization, genealogy, and anti-overfitting rules.
+   - [RESEARCH_HARNESS.md](RESEARCH_HARNESS.md) — offline walk-forward harness: point-in-time data, sealed held-out, costs, variant log, corrected verdict, and the current baseline.
 10. [RISK_AND_CAPITAL.md](RISK_AND_CAPITAL.md) — capital model, deterministic risk governor, and live-authority boundaries.
 11. [OPERATIONS_AND_ROADMAP.md](OPERATIONS_AND_ROADMAP.md) — scanner operations, cloud/local collector direction, deployment, and product roadmap.
+   - [UPGRADE_READINESS.md](UPGRADE_READINESS.md) — Massive Starter upgrade-day runbook: commands, calls and hours, R2 size, failure/resume, verification, rollback, and scan reliability evidence.
 12. [GROK_WORKFLOW.md](GROK_WORKFLOW.md) — universal Architect → Builder → Auditor workflow for every Grok prompt.
 13. [TEAM_WORKFLOW.md](TEAM_WORKFLOW.md) — PeaceSTOCKS-specific application of the universal workflow.
 
