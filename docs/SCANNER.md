@@ -272,6 +272,12 @@ the open, names expected and covered, and the names the eligibility floor and th
 out, by reason. A failed write never fails the scan (the run report says `scanHealth: FAILED:...`).
 The site's Health card shows the newest record under "Nightly scan".
 
+The freeze time (`predictedAt`) is the scanner clock read right before the picks are written, and
+the freeze gate and the on-time figures use that same time. The host's scanner clock is live
+(`hostWallClock`, src/host-write-clock.test.ts): a run that starts before the open and writes
+after it is `UNAVAILABLE / FREEZE_AFTER_OPEN`, not frozen and not on-time. Records written before
+this fix carry the host start time instead (Nov 23: 06:20:10 UTC start, picks written 06:42:58 UTC).
+
 A session misses the freeze when the next session opens without picks frozen before that open
 (frozen late, unavailable, or no decision stored at all, e.g. the scan never ran).
 src/freeze-watch.ts checks the newest 3 judged sessions from their prediction-status records and
