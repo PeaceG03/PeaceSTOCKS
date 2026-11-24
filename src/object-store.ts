@@ -17,7 +17,7 @@ export interface ObjectClient {
   put(key: string, body: Uint8Array, metadata?: ObjectMetadata): Promise<void>;
   /**
    * Create only (S3/R2 conditional write, If-None-Match: *): true when written, false when the key
-   * already exists. Never overwrites. Optional: only the paper ledger needs it.
+   * already exists. Never overwrites. Optional: the freeze watch's alert marker and the paper ledger use it.
    */
   putIfAbsent?(key: string, body: Uint8Array): Promise<boolean>;
   /** Size and custom metadata without the body, or undefined if the key does not exist. */
