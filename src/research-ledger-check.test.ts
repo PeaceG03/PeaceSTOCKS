@@ -158,8 +158,8 @@ test("ledger check CLI: exit 0 when append-only, exit 1 with the problems when n
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("ledger check: preregistration config, doc, and preregistration.jsonl are immutable against base", () => {
-  const { createHash } = require("node:crypto");
+test("ledger check: preregistration config, doc, and preregistration.jsonl are immutable against base", async () => {
+  const { createHash } = await import("node:crypto");
   const r = repo();
   try {
     mkdirSync(join(r.dir, "config"), { recursive: true });
