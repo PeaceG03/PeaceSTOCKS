@@ -135,7 +135,10 @@ export async function writeDailyReplyDust(
   const retrievalId =
     typeof requestId === "string" && requestId.length > 0 ? requestId : `grouped-${reply.sessionDate}`;
   const replySha256 = sha256Hex(reply.body);
-  // A file here without a manifest is a leftover from a crashed attempt and is replaced.
+  // A file here without a manifest is a leftover from a crashed attempt and is replaced (Auditor B4:
+  // a re-fetch always differs by its request_id, so without the named exception the day could never
+  // be stored again). The manifest's absence is re-checked right before the write.
+  const leftoverReplace = !(await store.head(manifestKey)) ? ({ replace: "no-manifest" } as const) : {};
   const encoded = await storeVerifiedReplyDust(
     store,
     dailyReplyDustFileKey(reply.sessionDate),
@@ -155,6 +158,7 @@ export async function writeDailyReplyDust(
       "rd-reply-sha256": replySha256,
       "rd-reply-length": String(reply.body.length),
     }),
+    leftoverReplace,
   );
   const body: Omit<DailyReplyDustManifest, "checksum"> = {
     schemaVersion: DAILY_REPLY_DUST_MANIFEST_SCHEMA,

@@ -174,6 +174,9 @@ export class FileReplyDustStore implements ReplyDustStore {
 }
 
 /** Refusal: a reply-dust key already holds different bytes (stored objects are never overwritten). */
+/** Named overwrites of an existing reply object (see storeVerifiedReplyDust). */
+export type ReplyDustReplace = "shorter-reply" | "unverified" | "no-manifest";
+
 export const REPLY_DUST_OVERWRITE_REFUSED = "REPLY_DUST_OVERWRITE_REFUSED" as const;
 
 /**
@@ -187,7 +190,9 @@ export const REPLY_DUST_OVERWRITE_REFUSED = "REPLY_DUST_OVERWRITE_REFUSED" as co
  * - "shorter-reply": the daily step's done-day rule replaces its own short reply with one that holds
  *   more bars (the caller compares the bars);
  * - "unverified": a resume found the stored object failed verification (corrupt or no metadata) and
- *   fetched it again (the caller ran the verification).
+ *   fetched it again (the caller ran the verification);
+ * - "no-manifest": a grouped-daily file whose day has no manifest is a leftover of a crashed attempt
+ *   (the file was written, the manifest was not); the caller checked the manifest is absent.
  */
 export async function storeVerifiedReplyDust(
   store: ReplyDustStore,
@@ -196,7 +201,7 @@ export async function storeVerifiedReplyDust(
   label: string,
   backend: ReplyDustBackend = nodeReplyDustBackend,
   metadataFor?: (encoded: Uint8Array) => ObjectMetadata,
-  options: { replace?: "shorter-reply" | "unverified" } = {},
+  options: { replace?: ReplyDustReplace } = {},
 ): Promise<Uint8Array> {
   const encoded = encodeReplyDust(body, backend);
   const metadata = metadataFor ? metadataFor(encoded) : {};
