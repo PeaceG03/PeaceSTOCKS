@@ -325,6 +325,16 @@ export const TENMIN_DAILY_DONE_RULE = "done-day-v1" as const;
 /** The daily step's first session (Sep 29, 2026) is in this two-month range; no daily index is older. */
 export const TENMIN_DAILY_FIRST_RANGE_FROM = "2026-09-01" as const;
 
+/**
+ * NO_SELECTION marker (Auditor, early review c): a day the daily step tried but could select no stock
+ * for (no ranked names) writes no index, so the seal guard would wait on it as "not tried" for its
+ * whole window life. The step writes this small marker instead; the guard accepts the day (the daily
+ * step has nothing of its own in it). A later run that does select names writes the index, which wins.
+ */
+export function tenMinDailyNoSelectionKey(sessionDate: string): string {
+  return tenMinDailyIndexKey(sessionDate).replace(/\.json$/u, ".no-selection.json");
+}
+
 /** Pure: true for an index written before the done-day rule (no doneRule marker). */
 export function isPreRuleIndex(index: Pick<TenMinDailyIndex, "doneRule">): boolean {
   return index.doneRule !== TENMIN_DAILY_DONE_RULE;
@@ -658,6 +668,10 @@ export async function runTenMinDailyLiquid(options: {
       if (!selected.length) {
         sessionReport.status = "NO_SELECTION";
         report.warnings.push(`TENMIN_DAILY_NO_SELECTION:${sessionDate}`);
+        await store.put(
+          tenMinDailyNoSelectionKey(sessionDate),
+          new TextEncoder().encode(`${JSON.stringify({ schemaVersion: "tenmin-daily-no-selection-v1", sessionDate, at: stamp() })}\n`),
+        );
         report.sessions.push(sessionReport);
         continue;
       }
@@ -943,7 +957,11 @@ export async function tenMinRangeSealRefusal(
       const counts = tenMinDailyIndexCounts(index, expectedTenMinBars(sessionDate, calendar));
       return `${TENMIN_SEAL_REFUSED_DAY_RETRYING}:${sessionDate}:${counts.dayBars}`;
     }
-    if (window.has(sessionDate)) return `${TENMIN_SEAL_REFUSED_DAY_RETRYING}:${sessionDate}:not-tried`;
+    if (window.has(sessionDate)) {
+      // The daily step tried the day and had no stock to select: nothing of its own to wait for.
+      if (await store.get(tenMinDailyNoSelectionKey(sessionDate))) continue;
+      return `${TENMIN_SEAL_REFUSED_DAY_RETRYING}:${sessionDate}:not-tried`;
+    }
   }
   return undefined;
 }

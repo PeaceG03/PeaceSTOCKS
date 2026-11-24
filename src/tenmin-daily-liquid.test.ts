@@ -830,6 +830,20 @@ test("B1: every tracked unfinished day older than the window is stamped LEFT_WIN
   assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.stuckShort?.reason, "LEFT_WINDOW");
 });
 
+test("NO_SELECTION: a day with no stock to select writes a marker, and the seal guard does not wait on it", async () => {
+  const { tenMinRangeSealRefusal } = await import("./tenmin-daily-liquid");
+  const store = new MemoryObjectClient();
+  const opts = { lastCompletedSession: "2026-10-09", catchupSessions: 1 };
+  assert.equal(await tenMinRangeSealRefusal(store, "2026-09-01", "2026-10-31", opts), "TENMIN_SEAL_REFUSED_DAY_RETRYING:2026-10-09:not-tried");
+  const run = await baseRun(store, [], { ...opts, loadBars: async () => [] });
+  assert.equal(run.sessions[0]!.status, "NO_SELECTION");
+  assert.equal(await readTenMinDailyIndex(store, "2026-10-09"), undefined, "no index: the selection is not frozen empty");
+  assert.equal(await tenMinRangeSealRefusal(store, "2026-09-01", "2026-10-31", opts), undefined, "nothing of the daily step's own to wait for");
+  // A later run that can select names writes the index, which then decides.
+  await baseRun(store, [], { ...opts, fetchPages: async (sec, from, to) => replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, 12)) });
+  assert.match((await tenMinRangeSealRefusal(store, "2026-09-01", "2026-10-31", opts))!, /^TENMIN_SEAL_REFUSED_DAY_RETRYING:2026-10-09:\d+\/117$/u);
+});
+
 test("counts: every day and stock status shows bars stored vs. needed (38/39; 20/21 on a half day)", async () => {
   const store = new MemoryObjectClient();
   const calls: string[] = [];
