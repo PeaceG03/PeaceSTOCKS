@@ -28,22 +28,60 @@ A read-only status page for the scanner, for one person, on phone or computer.
    The client refuses every method except GET and HEAD.
 
 ## Deploy
-Actions → **Site deploy** → Run workflow (`.github/workflows/site-deploy.yml`, manual only).
-Input `team_domain` (optional): the Zero Trust team domain, e.g. `myteam.cloudflareaccess.com`.
-When blank, it is read from the Access organization (that lookup needs the token permission
-Access: Organizations, Identity Providers, and Groups → Read; without it, pass the input).
+Actions → **Site deploy** → Run workflow on **main** (`.github/workflows/site-deploy.yml`, manual only).
+- The deploy job runs only when `github.ref` is `refs/heads/main`; from any other branch it is skipped.
+- It runs in the GitHub environment **`site`**. GitHub creates the environment on the first run if it
+  does not exist yet, with no protection rules ("Running a workflow that references an environment
+  that does not exist will create an environment with the referenced name", GitHub Docs, *Managing
+  environments for deployment*). To require an approval or limit it to main, add those rules in
+  Settings → Environments → site (repository admin).
+- Input `team_domain` (required, not secret): defaults to `blue-leaf-13b3.cloudflareaccess.com`. The team
+  domain is always passed in, never looked up, so the token needs no Access: Organizations permission.
 
-Repository secrets it needs:
+### Cloudflare API token (`CLOUDFLARE_API_TOKEN`)
+Needed:
+| Scope | Permission | Why |
+| --- | --- | --- |
+| Account | Workers Scripts: Edit | upload and deploy the Worker, set its secrets |
+| Account | Access: Apps and Policies: Edit | create/update the Access app and its policy |
+| Zone jjpeace.com | Workers Routes: Edit | attach the `stocks.jjpeace.com` custom domain |
+
+- **Access: Apps and Policies: Edit is account-wide Zero Trust write.** It can create, change or delete
+  *any* Access application and policy on the account, not just this site's. The setup needs it because
+  the protection is itself an Access application plus an allow policy, and the deploy creates or
+  updates them and reads them back before the Worker is deployed. Treat the token accordingly: it
+  lives only in this repository secret and is used only by this manual job on main.
+- **DNS: Edit is not needed.** Cloudflare's Workers docs say adding or changing a Custom Domain needs
+  Editor on the Worker plus Zone → Workers Routes → Write for the zone ("API tokens need Zone >
+  Workers Routes > Write, scoped to each affected zone", *Workers roles and permissions*, Routes and
+  Custom Domains), and that Cloudflare creates the DNS record for the custom domain itself
+  (*Custom Domains*: "After you have added the domain or subdomain, Cloudflare will create a new DNS
+  record for you"). The token in use today also has DNS Edit on jjpeace.com; it can be removed.
+- **Creating the Worker the first time** may need more than Edit: the same page says creating a new
+  Worker needs product-level Workers Admin, while Editor (what Workers Scripts Edit maps to) "cannot
+  create or delete Workers". Legacy Workers Scripts Edit tokens are documented as still working as
+  before. If the first deploy fails creating `peacestocks-read`, give the token Workers Admin (or
+  create the Worker once in the dashboard), then run again.
+
+### Read-only R2 key (`PEACESTOCKS_R2_READ_ACCESS_KEY_ID` / `PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY`)
+Use a **dedicated R2 API token with Object Read only, scoped to the `peacestocks` bucket**. Never the
+scanner's writer key (`PEACESTOCKS_R2_ACCESS_KEY_ID` / `PEACESTOCKS_R2_SECRET_ACCESS_KEY`).
+Right now these two repository secrets hold the box's `R2_READ_*` pair, **whose scope has not been
+verified** (it may be broader than one bucket or not read-only). Before relying on it, check it in R2 →
+Manage API tokens, or replace it with a new Object Read token for the bucket. The Worker also refuses
+to send anything but GET/HEAD, but the key's own scope is the real limit.
+
+### All repository secrets it needs
 | Secret | What |
 | --- | --- |
-| `CLOUDFLARE_API_TOKEN` | Account: Workers Scripts Edit, Access: Apps and Policies Edit. Zone jjpeace.com: Workers Routes Edit, DNS Edit |
+| `CLOUDFLARE_API_TOKEN` | the token above |
 | `PEACESTOCKS_R2_ACCOUNT_ID` | Cloudflare account id (already used by the scanner) |
-| `PEACESTOCKS_R2_BUCKET` | Bucket name (already used by the scanner) |
-| `PEACESTOCKS_R2_READ_ACCESS_KEY_ID` | Read-only R2 key (R2 API token with Object Read only) |
-| `PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY` | Its secret |
-| `PEACESTOCKS_SITE_ALLOWED_EMAIL` | The one email allowed to sign in |
+| `PEACESTOCKS_R2_BUCKET` | bucket name (already used by the scanner) |
+| `PEACESTOCKS_R2_READ_ACCESS_KEY_ID` | read-only R2 key, see above |
+| `PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY` | its secret |
+| `PEACESTOCKS_SITE_ALLOWED_EMAIL` | the one email allowed to sign in |
 
-Before the first run, Zero Trust must be set up on the account (a team name), with the
+Before the first run, Zero Trust must be set up on the account (team `blue-leaf-13b3`), with the
 **One-time PIN** login method enabled.
 
 Steps, in order: secret check → site tests → Access app + policy (read back) → `wrangler deploy`
