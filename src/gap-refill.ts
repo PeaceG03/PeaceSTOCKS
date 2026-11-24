@@ -37,11 +37,47 @@ export function inRefillGuard(d: Date): boolean {
   return (m >= 312 && m < 375) || (m >= 552 && m < 615);
 }
 
-/** Pure: the reason to pause before a Massive request / write, or undefined. */
-export function refillPauseReason(now: Date, runs: readonly { status: string; display_title?: string }[] | { error: string }): string | undefined {
-  if (inRefillGuard(now)) return "GUARD_WINDOW";
+/**
+ * Pure: the reason to pause before a Massive request / write, or undefined. After a scan (--after-scan)
+ * the refill runs inside that scan's own job: its own run is not "another active scanner run", and the
+ * guard windows (which protect that very scan's key slot) do not apply.
+ */
+export function refillPauseReason(
+  now: Date,
+  runs: readonly { id?: number; status: string; display_title?: string }[] | { error: string },
+  afterScan?: { readonly ownRunId: number },
+): string | undefined {
+  if (!afterScan && inRefillGuard(now)) return "GUARD_WINDOW";
   if ("error" in runs) return "RUNS_CHECK_FAILED";
-  return runs.some((r) => r.status !== "completed" && !isIdleScannerRun(r)) ? "ACTIVE_SCANNER_RUN" : undefined;
+  // After a scan only runs actually in progress count: runs queued behind this scan's own job (the
+  // peacestocks-r2-writer concurrency group) cannot start until it ends, so waiting on them never ends.
+  const active = (r: { status: string }) => (afterScan ? r.status === "in_progress" : r.status !== "completed");
+  return runs.some((r) => active(r) && !isIdleScannerRun(r) && !(afterScan && r.id === afterScan.ownRunId)) ? "ACTIVE_SCANNER_RUN" : undefined;
+}
+
+/**
+ * Exit for a refill that stopped early. After a scan, the budget stop (DEADLINE) is the planned cap:
+ * the rest is filled by the next run, so it exits 0 with a BACKLOG_REMAINS line. It is not a failure,
+ * and the shared tail must not open the "needs a person" issue for it. Any other stop, and the weekly
+ * refill's budget stop, still exit 4.
+ */
+export function refillStopExit(
+  stopped: string,
+  afterScan: boolean,
+  progress: { fetched: number; sessions: number },
+): { code: number; line: string } {
+  const safe = stopped.replace(/[^A-Z0-9_]/gu, "").slice(0, 40) || "UNKNOWN";
+  if (afterScan && stopped === "DEADLINE")
+    return { code: 0, line: `gap-refill: BACKLOG_REMAINS stopped=DEADLINE fetched=${progress.fetched}/${progress.sessions}` };
+  return { code: 4, line: `gap-refill: STOPPED ${safe} fetched=${progress.fetched}/${progress.sessions}` };
+}
+
+/** --after-scan needs the scan's own run id (GITHUB_RUN_ID); anything else fails closed. */
+export function afterScanRunId(argv: readonly string[], runId: string | undefined): { readonly ownRunId: number } | undefined {
+  if (!argv.includes("--after-scan")) return undefined;
+  const s = runId?.trim() ?? "";
+  if (!/^\d{1,20}$/u.test(s)) throw new Error("AFTER_SCAN_RUN_ID_INVALID");
+  return { ownRunId: Number(s) };
 }
 
 const api = (path: string, token: string | undefined) =>
@@ -59,11 +95,11 @@ async function netFreeze(): Promise<NetFreeze> {
   } catch { return { ok: false, reason: "NET_FREEZE_CHECK_FAILED:network" }; }
 }
 
-async function scannerRuns(): Promise<{ status: string; display_title?: string }[] | { error: string }> {
+async function scannerRuns(): Promise<{ id?: number; status: string; display_title?: string }[] | { error: string }> {
   try {
     const r = await api(`repos/${process.env.GITHUB_REPOSITORY}/actions/workflows/scanner.yml/runs?per_page=30`, process.env.GITHUB_TOKEN);
     if (!r.ok) return { error: `http-${r.status}` };
-    return ((await r.json()) as { workflow_runs: { status: string; display_title?: string }[] }).workflow_runs;
+    return ((await r.json()) as { workflow_runs: { id?: number; status: string; display_title?: string }[] }).workflow_runs;
   } catch { return { error: "network" }; }
 }
 
@@ -99,6 +135,8 @@ async function main(): Promise<number> {
     console.log(`coverage: ${c.ok && ca === 0 ? "PASS" : "FAIL"} missing=${c.missingSessions.length} corporate-action gaps=${ca}`);
     return c.ok && ca === 0 ? 0 : 2;
   }
+  const afterScan = afterScanRunId(process.argv.slice(2), process.env.GITHUB_RUN_ID);
+  if (afterScan) console.log("gap-refill: after-scan");
   const deadline = Date.now() + (strictRefillBudgetMs(process.env.REFILL_BUDGET_MS));
   const client = noDelete(r2());
   const cov = await checkDailyBarsCoverage(client);
@@ -120,7 +158,7 @@ async function main(): Promise<number> {
     counters.gate++;
     for (;;) {
       if (Date.now() >= deadline) return "DEADLINE";
-      const why = refillPauseReason(new Date(), await scannerRuns());
+      const why = refillPauseReason(new Date(), await scannerRuns(), afterScan);
       if (!why) return undefined;
       if (!seen.has(`pause:${why}`)) { seen.add(`pause:${why}`); console.log(`gap-refill: pause ${why}`); }
       await new Promise((r) => setTimeout(r, 60_000));
@@ -143,7 +181,11 @@ async function main(): Promise<number> {
     backup: (key, body) => { writeFileSync(`refill-backup/${key.replace(/\//g, "__")}.${Date.now()}`, body); backups++; },
   });
   console.log(`gap-refill: massiveRequests=${res.massiveRequests} dust=${res.dustWritten.length} packs=${res.packsWritten.length} puts=${res.puts} backups=${backups} stopped=${res.stopped ?? "no"}`);
-  if (res.stopped) return 4;
+  if (res.stopped) {
+    const stop = refillStopExit(res.stopped, Boolean(afterScan), { fetched, sessions: sessions.length });
+    console.log(stop.line);
+    return stop.code;
+  }
   const rows = await verifySessions(client, sessions);
   const ok = rows.filter((r) => r.ok).length;
   const after = await checkDailyBarsCoverage(client);
