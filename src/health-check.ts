@@ -287,7 +287,7 @@ export async function readStuckDays(
 export async function runHealthCheck(
   store: HealthPruneStore,
   now: Date = new Date(),
-): Promise<HealthCheckResult & { prunedCheckins: number }> {
+): Promise<HealthCheckResult & { prunedCheckins: number; pruneError?: string }> {
   const latest = new Map<string, HealthCheckinFacts | undefined>();
   const previous = new Map<string, HealthCheckinFacts | undefined>();
   for (const part of HEALTH_PARTS) {
@@ -314,11 +314,19 @@ export async function runHealthCheck(
     stuckDays: await readStuckDays(store, now),
   });
   const at = now.toISOString();
-  // Retention: check-ins older than one month are pruned (after the latest ones were read).
-  const prunedCheckins = await pruneHealthCheckins(store, now);
+  // Retention: check-ins older than one month are pruned (after the latest ones were read). A prune
+  // failure never stops the check: latest.json and the state are still written, with the error.
+  let prunedCheckins = 0;
+  let pruneError: string | undefined;
+  try {
+    prunedCheckins = await pruneHealthCheckins(store, now);
+  } catch (error) {
+    pruneError = redactHealthMessage(errorMessage(error))?.slice(0, 120) ?? "error";
+    result.lines.push(`pruning old check-ins failed (kept for the next check): ${pruneError}`);
+  }
   await writeVerifiedHealthJson(store, HEALTH_CHECK_STATE_KEY, { schemaVersion: HEALTH_CHECK_SCHEMA, requests: result.requests, updatedAt: at });
-  await writeVerifiedHealthJson(store, HEALTH_CHECK_LATEST_KEY, { schemaVersion: HEALTH_CHECK_SCHEMA, at, ...result, prunedCheckins });
-  return { ...result, prunedCheckins };
+  await writeVerifiedHealthJson(store, HEALTH_CHECK_LATEST_KEY, { schemaVersion: HEALTH_CHECK_SCHEMA, at, ...result, prunedCheckins, ...(pruneError ? { pruneError } : {}) });
+  return { ...result, prunedCheckins, ...(pruneError ? { pruneError } : {}) };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
