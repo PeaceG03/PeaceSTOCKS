@@ -31,7 +31,7 @@ import { MarketStorage, type MarketStore } from "./storage";
 import { refreshEligibility, refreshUniverse } from "./universe";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import { finalizeDailyPartition } from "./scanner";
-import { pointInTimeUniverse } from "./pit-universe";
+import { pointInTimeUniverse, symbolOn } from "./pit-universe";
 import { ScanYieldError, createScanYieldCheck } from "./scan-yield";
 
 const STATE_VERSION = "markets-scanner-backfill-v1" as const;
@@ -260,6 +260,52 @@ function requireObjectStore(env: NodeJS.ProcessEnv): void {
   }
 }
 
+export function filterReopenBars(
+  bars: readonly CanonicalDailyBar[],
+  existing: readonly CanonicalDailyBar[],
+  securities: readonly SecurityMasterRecord[],
+  sessionDate: string,
+): {
+  newBars: CanonicalDailyBar[];
+  addedByStatus: Record<string, number>;
+  skippedCollisionByStatus: Record<string, number>;
+  skippedNonInactiveByStatus: Record<string, number>;
+} {
+  const byId = new Map(securities.map((s) => [s.securityId, s]));
+  const existingKeys = new Set(existing.map((b) => `${b.securityId}|${b.sessionDate}|${b.revision}`));
+  const existingTickersOnDate = new Set<string>();
+  for (const row of existing) {
+    const sec = byId.get(row.securityId);
+    const ticker = sec ? (symbolOn(sec, sessionDate) ?? sec.currentSymbol) : undefined;
+    if (ticker) existingTickersOnDate.add(ticker);
+  }
+  const newBars: CanonicalDailyBar[] = [];
+  const addedByStatus: Record<string, number> = {};
+  const skippedCollisionByStatus: Record<string, number> = {};
+  const skippedNonInactiveByStatus: Record<string, number> = {};
+  for (const bar of bars) {
+    if (existingKeys.has(`${bar.securityId}|${bar.sessionDate}|${bar.revision}`)) continue;
+    const sec = byId.get(bar.securityId);
+    const status = sec?.status ?? "UNKNOWN";
+    const ticker = sec ? (symbolOn(sec, sessionDate) ?? sec.currentSymbol) : undefined;
+    if (ticker && existingTickersOnDate.has(ticker)) {
+      skippedCollisionByStatus[status] = (skippedCollisionByStatus[status] ?? 0) + 1;
+      continue;
+    }
+    if (status !== "INACTIVE") {
+      skippedNonInactiveByStatus[status] = (skippedNonInactiveByStatus[status] ?? 0) + 1;
+      continue;
+    }
+    newBars.push(bar);
+    addedByStatus[status] = (addedByStatus[status] ?? 0) + 1;
+  }
+  return { newBars, addedByStatus, skippedCollisionByStatus, skippedNonInactiveByStatus };
+}
+
+function addCounts(target: Record<string, number>, delta: Record<string, number>): void {
+  for (const [k, v] of Object.entries(delta)) target[k] = (target[k] ?? 0) + v;
+}
+
 export async function backfillHistoricalEvidence(options: {
   root: string;
   from: string;
@@ -322,6 +368,9 @@ export async function backfillHistoricalEvidence(options: {
       actionsStored: 0,
       stoppedOnError: false,
       eligibility: {},
+      reopenAddedByStatus: {},
+      reopenSkippedCollisionByStatus: {},
+      reopenSkippedNonInactiveByStatus: {},
     };
   }
   // On Actions the scan always wins the Massive budget; local/test runs opt in via shouldYield.
@@ -376,6 +425,9 @@ export async function backfillHistoricalEvidence(options: {
   // the ticker each held then), not to today's ACTIVE names. See src/pit-universe.ts.
   let inactiveNameSessions = 0,
     ambiguousSymbolSessions = 0;
+  const reopenAddedByStatus: Record<string, number> = {};
+  const reopenSkippedCollisionByStatus: Record<string, number> = {};
+  const reopenSkippedNonInactiveByStatus: Record<string, number> = {};
   const membersOn = (sessionDate: string) => {
     const pit = pointInTimeUniverse(securities, sessionDate, provider.providerName);
     inactiveNameSessions += pit.inactiveMembers;
@@ -479,12 +531,14 @@ export async function backfillHistoricalEvidence(options: {
         : await provider.getDailyBars(sessionDate, memberIds);
       let rowsWritten = bars.length;
       if (reopenInactiveTails) {
-        const existingKeys = new Set(existing.map((b) => `${b.securityId}|${b.sessionDate}|${b.revision}`));
-        const newBars = bars.filter((b) => !existingKeys.has(`${b.securityId}|${b.sessionDate}|${b.revision}`));
-        rowsWritten = newBars.length;
-        if (newBars.length > 0) {
-          await storage.appendBars(newBars);
-          barsStored += newBars.length;
+        const filtered = filterReopenBars(bars, existing, securities, sessionDate);
+        addCounts(reopenAddedByStatus, filtered.addedByStatus);
+        addCounts(reopenSkippedCollisionByStatus, filtered.skippedCollisionByStatus);
+        addCounts(reopenSkippedNonInactiveByStatus, filtered.skippedNonInactiveByStatus);
+        rowsWritten = filtered.newBars.length;
+        if (filtered.newBars.length > 0) {
+          await storage.appendBars(filtered.newBars);
+          barsStored += filtered.newBars.length;
         }
       } else {
         await storage.appendBars(bars);
@@ -560,6 +614,9 @@ export async function backfillHistoricalEvidence(options: {
       : {}),
     ...(inactiveNameSessions || ambiguousSymbolSessions
       ? { survivorship: { inactiveNameSessions, ambiguousSymbolSessions } }
+      : {}),
+    ...(reopenInactiveTails
+      ? { reopenAddedByStatus, reopenSkippedCollisionByStatus, reopenSkippedNonInactiveByStatus }
       : {}),
   };
 }

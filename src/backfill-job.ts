@@ -63,7 +63,7 @@ export interface BackfillJobReport {
   /** First request to last, by the job clock (ms). */
   elapsedMs: number;
   failedSessions: Record<string, string>;
-  backfill: Pick<BackfillResult, "barsStored" | "actionsStored" | "survivorship" | "warnings">;
+  backfill: Pick<BackfillResult, "barsStored" | "actionsStored" | "survivorship" | "warnings" | "reopenAddedByStatus" | "reopenSkippedCollisionByStatus" | "reopenSkippedNonInactiveByStatus">;
 }
 
 export interface BackfillJobOptions {
@@ -268,6 +268,9 @@ export async function runBackfillJob(options: BackfillJobOptions): Promise<Backf
       actionsStored: result.actionsStored,
       ...(result.survivorship ? { survivorship: result.survivorship } : {}),
       ...(result.warnings ? { warnings: result.warnings } : {}),
+      ...(result.reopenAddedByStatus ? { reopenAddedByStatus: result.reopenAddedByStatus } : {}),
+      ...(result.reopenSkippedCollisionByStatus ? { reopenSkippedCollisionByStatus: result.reopenSkippedCollisionByStatus } : {}),
+      ...(result.reopenSkippedNonInactiveByStatus ? { reopenSkippedNonInactiveByStatus: result.reopenSkippedNonInactiveByStatus } : {}),
     },
   };
 }

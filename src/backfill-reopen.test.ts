@@ -7,6 +7,7 @@ import { FAKE_MASSIVE_BASE_URL, fakeMassive, type FakeMassiveOptions } from "./f
 import { securityId } from "./identity";
 import { MemoryObjectClient } from "./object-store";
 import { ObjectMarketStorage } from "./object-storage";
+import { MassiveMarketProvider } from "./massive-provider";
 import { refreshUniverse } from "./universe";
 
 const pinnedZstd = () => "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***";
@@ -306,4 +307,234 @@ test("multi-chunk resume via backfill-reopen-state.json skips finished chunk bef
   for (const d of DAYS) {
     assert.deepEqual((await storage.loadBars(d)).map((b) => b.securityId).sort(), [ACTIVE_ID, INACTIVE_ID].sort());
   }
+});
+
+async function seedRawDustAndBars(options: {
+  client: MemoryObjectClient;
+  storage: ObjectMarketStorage;
+  day: string;
+  tickers: Array<{ ticker: string; figi: string; active: boolean; delistedDate?: string }>;
+  seedBarsForIds: string[];
+  groupedTickers: string[];
+}) {
+  const grouped = () => options.groupedTickers.map((T) => ({ T, o: 10, h: 11, l: 9, c: 10.5, v: 1000 }));
+  const fake = fakeMassive({ tickers: options.tickers, grouped });
+  const provider = new MassiveMarketProvider({
+    apiKey: "fake-key-not-real",
+    baseUrl: FAKE_MASSIVE_BASE_URL,
+    fetchImpl: fake.fetchImpl,
+    minRequestIntervalMs: 0,
+    retryBackoffMs: 0,
+    keepRawReplies: true,
+    now: () => "2026-01-21T00:00:00.000Z",
+  });
+  const securities = await options.storage.loadSecurities();
+  const records = securities.map((s) => ({
+    provider: "massive-stocks",
+    providerSecurityId: s.providerIdentities[0]!.providerSecurityId,
+    symbol: s.currentSymbol,
+    assetType: s.assetType,
+    country: s.country,
+    exchange: s.exchange,
+    active: s.status === "ACTIVE",
+    tradable: s.tradable,
+  }));
+  (provider as unknown as { bindUniverse: (r: unknown[]) => void }).bindUniverse(records);
+  const bars = await provider.getDailyBars(options.day, options.seedBarsForIds);
+  const raw = provider.takeRawReplies()[0]!;
+  await writeDailyReplyDust(options.client, raw, { provider: provider.providerName, observedAt: bars[0]!.observedAt });
+  if (bars.length) await options.storage.appendBars(bars);
+}
+
+test("B1 re-FIGI collision: old INACTIVE stored row + new ACTIVE id with later historicalSymbols adds 0 rows and logs collision by status", async () => {
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
+  const oldFigi = "FIGI000OLD01";
+  const newFigi = "FIGI000NEW01";
+  const oldId = securityId("massive-stocks", oldFigi, "STOCK");
+  const newId = securityId("massive-stocks", newFigi, "STOCK");
+  const day = DAYS[0]!;
+  await storage.saveSecurities([
+    {
+      securityId: oldId,
+      providerIdentities: [{ provider: "massive-stocks", providerSecurityId: oldFigi }],
+      currentSymbol: "SYNA",
+      historicalSymbols: [{ symbol: "SYNA", effectiveFrom: "2024-01-01" }],
+      assetType: "STOCK",
+      country: "US",
+      exchange: "XNYS",
+      status: "INACTIVE",
+      inactiveAt: "2026-10-02",
+      tradable: true,
+      barCount: 1,
+      eligibility: "NONE",
+    },
+    {
+      securityId: newId,
+      providerIdentities: [{ provider: "massive-stocks", providerSecurityId: newFigi }],
+      currentSymbol: "SYNA",
+      historicalSymbols: [{ symbol: "SYNA", effectiveFrom: "2026-10-05" }],
+      assetType: "STOCK",
+      country: "US",
+      exchange: "XNYS",
+      status: "ACTIVE",
+      tradable: true,
+      barCount: 0,
+      eligibility: "NONE",
+    },
+  ]);
+  await seedRawDustAndBars({
+    client,
+    storage,
+    day,
+    tickers: [{ ticker: "SYNA", figi: oldFigi, active: false }],
+    seedBarsForIds: [oldId],
+    groupedTickers: ["SYNA"],
+  });
+  const base = fakeMassive({ tickers: [], grouped: () => [{ T: "SYNA", o: 10, h: 11, l: 9, c: 10.5, v: 1000 }] });
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/v3/reference/tickers") {
+      const active = url.searchParams.get("active") !== "false";
+      return new Response(
+        JSON.stringify({
+          status: "OK",
+          results: active
+            ? [{ ticker: "SYNA", share_class_figi: newFigi, type: "CS", market: "stocks", locale: "us", primary_exchange: "XNYS", active: true }]
+            : [{ ticker: "SYNA", share_class_figi: oldFigi, type: "CS", market: "stocks", locale: "us", primary_exchange: "XNYS", active: false }],
+        }),
+        { status: 200 },
+      );
+    }
+    return base.fetchImpl(input, init);
+  };
+  const fake = { ...base, fetchImpl, splitCalls: [] as string[], divCalls: [] as string[] };
+  const monthKey = "permanent/daily-bars/2026-01.jsonl";
+  let monthWrites = 0;
+  const origPut = client.put.bind(client);
+  const origPutIfMatch = client.putIfMatch.bind(client);
+  client.put = async (k, b, m) => {
+    if (k === monthKey) monthWrites += 1;
+    return origPut(k, b, m);
+  };
+  client.putIfMatch = async (k, b, e) => {
+    if (k === monthKey) monthWrites += 1;
+    return origPutIfMatch(k, b, e);
+  };
+  const report = await runBackfillJob(
+    jobOpts(client, storage, fake, day, day, { reopenInactiveTails: true }),
+  );
+  assert.equal(report.status, "COMPLETE");
+  assert.equal(report.backfill.barsStored, 0, "0 duplicate rows added on re-FIGI collision");
+  assert.equal(monthWrites, 0, "month file untouched");
+  assert.deepEqual((await storage.loadBars(day)).map((b) => b.securityId), [oldId]);
+  assert.deepEqual(report.backfill.reopenAddedByStatus, {});
+  assert.deepEqual(report.backfill.reopenSkippedCollisionByStatus, { ACTIVE: 1 });
+});
+
+test("B1 reopen appends INACTIVE-only: skips non-colliding ACTIVE missing rows and INACTIVE symbol collisions", async () => {
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
+  const day = DAYS[0]!;
+  const oldInactFigi = "FIGI000OLD02";
+  const newInactFigi = "FIGI000NEW02";
+  const actFigi = "FIGI000ACT03";
+  const delFigi = "FIGI000DEL03";
+  const oldInactId = securityId("massive-stocks", oldInactFigi, "STOCK");
+  const newInactId = securityId("massive-stocks", newInactFigi, "STOCK");
+  const actId = securityId("massive-stocks", actFigi, "STOCK");
+  const delId = securityId("massive-stocks", delFigi, "STOCK");
+  await storage.saveSecurities([
+    {
+      securityId: oldInactId,
+      providerIdentities: [{ provider: "massive-stocks", providerSecurityId: oldInactFigi }],
+      currentSymbol: "SYNB",
+      historicalSymbols: [{ symbol: "SYNB", effectiveFrom: "2024-01-01" }],
+      assetType: "STOCK",
+      country: "US",
+      exchange: "XNYS",
+      status: "INACTIVE",
+      inactiveAt: "2026-01-19",
+      tradable: true,
+      barCount: 1,
+      eligibility: "NONE",
+    },
+    {
+      securityId: newInactId,
+      providerIdentities: [{ provider: "massive-stocks", providerSecurityId: newInactFigi }],
+      currentSymbol: "SYNB",
+      historicalSymbols: [{ symbol: "SYNB", effectiveFrom: "2026-01-20" }],
+      assetType: "STOCK",
+      country: "US",
+      exchange: "XNYS",
+      status: "INACTIVE",
+      inactiveAt: "2026-10-02",
+      tradable: true,
+      barCount: 0,
+      eligibility: "NONE",
+    },
+    {
+      securityId: actId,
+      providerIdentities: [{ provider: "massive-stocks", providerSecurityId: actFigi }],
+      currentSymbol: "SYNC",
+      assetType: "STOCK",
+      country: "US",
+      exchange: "XNYS",
+      status: "ACTIVE",
+      tradable: true,
+      barCount: 0,
+      eligibility: "NONE",
+    },
+    {
+      securityId: delId,
+      providerIdentities: [{ provider: "massive-stocks", providerSecurityId: delFigi }],
+      currentSymbol: "SYND",
+      assetType: "STOCK",
+      country: "US",
+      exchange: "XNYS",
+      status: "INACTIVE",
+      inactiveAt: "2026-10-02",
+      tradable: true,
+      barCount: 0,
+      eligibility: "NONE",
+    },
+  ]);
+  await seedRawDustAndBars({
+    client,
+    storage,
+    day,
+    tickers: [{ ticker: "SYNB", figi: oldInactFigi, active: false }],
+    seedBarsForIds: [oldInactId],
+    groupedTickers: ["SYNB", "SYNC", "SYND"],
+  });
+  const base = fakeMassive({ tickers: [], grouped: () => [] });
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/v3/reference/tickers") {
+      const active = url.searchParams.get("active") !== "false";
+      return new Response(
+        JSON.stringify({
+          status: "OK",
+          results: active
+            ? [{ ticker: "SYNC", share_class_figi: actFigi, type: "CS", market: "stocks", locale: "us", primary_exchange: "XNYS", active: true }]
+            : [
+                { ticker: "SYNB", share_class_figi: newInactFigi, type: "CS", market: "stocks", locale: "us", primary_exchange: "XNYS", active: false },
+                { ticker: "SYND", share_class_figi: delFigi, type: "CS", market: "stocks", locale: "us", primary_exchange: "XNYS", active: false },
+              ],
+        }),
+        { status: 200 },
+      );
+    }
+    return base.fetchImpl(input, init);
+  };
+  const fake = { ...base, fetchImpl, splitCalls: [] as string[], divCalls: [] as string[] };
+  const report = await runBackfillJob(
+    jobOpts(client, storage, fake, day, day, { reopenInactiveTails: true }),
+  );
+  assert.equal(report.status, "COMPLETE");
+  assert.equal(report.backfill.barsStored, 1);
+  assert.deepEqual((await storage.loadBars(day)).map((b) => b.securityId).sort(), [oldInactId, delId].sort());
+  assert.deepEqual(report.backfill.reopenAddedByStatus, { INACTIVE: 1 });
+  assert.deepEqual(report.backfill.reopenSkippedCollisionByStatus, { INACTIVE: 1 });
+  assert.deepEqual(report.backfill.reopenSkippedNonInactiveByStatus, { ACTIVE: 1 });
 });

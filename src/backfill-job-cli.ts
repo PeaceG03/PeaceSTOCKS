@@ -210,6 +210,11 @@ export async function backfillJobMain(args: readonly string[], env: NodeJS.Proce
         shaMismatches: r.shaMismatches, packConflicts: r.packConflicts, packCheckFailures: r.packCheckFailures,
         failedSessions: Object.fromEntries(Object.entries(r.failedSessions).map(([d, m]) => [d, classifyStop(m)])),
         requests: r.requests, minRequestGapMs: r.minRequestGapMs, survivorship: r.backfill.survivorship,
+        ...(r.backfill.reopenAddedByStatus ? {
+          reopenAddedByStatus: r.backfill.reopenAddedByStatus,
+          reopenSkippedCollisionByStatus: r.backfill.reopenSkippedCollisionByStatus,
+          reopenSkippedNonInactiveByStatus: r.backfill.reopenSkippedNonInactiveByStatus,
+        } : {}),
       }));
       if (r.status === "REFUSED_SHA_MISMATCH" || r.status === "REFUSED_PACK_CONFLICT") {
         exitCode = 3;
