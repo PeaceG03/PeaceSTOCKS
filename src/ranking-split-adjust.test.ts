@@ -299,3 +299,16 @@ test("same-date conflict is excluded even when one of the two factors alone woul
   // Control: the 1-for-10 record on its own is used and the name is ranked.
   assert.ok(rank(securities, bars, [], D, DEFAULT_SCANNER_CONFIG, [reverse]).ranked.some((r) => r.securityId === "rs"));
 });
+
+test("two split dates on one bar are excluded even when either factor alone would reconcile (either order)", async () => {
+  const { splitAdjustedBars } = await import("./split-adjust");
+  const ds = sessions(40);
+  // No bar on ds[5]; records on ds[5] and ds[6] both land on bar ds[6]. Raw prices jump exactly 10x there.
+  const b = ds.filter((_, k) => k !== 5).map((d) => bar("z", d, d < ds[5]! ? 1 : 10));
+  const reconciles = { effectiveDate: ds[6]!, factor: 10 };
+  const other = { effectiveDate: ds[5]!, factor: 0.5 };
+  for (const events of [[other, reconciles], [reconciles, other], [{ ...reconciles, effectiveDate: ds[5]! }, { ...other, effectiveDate: ds[6]! }]])
+    assert.deepEqual(splitAdjustedBars(b, events, ds.at(-1)!), { excluded: "SPLIT_UNRECONCILED" }, JSON.stringify(events));
+  // Control: the reconciling record alone is used.
+  assert.ok("bars" in splitAdjustedBars(b, [reconciles], ds.at(-1)!));
+});
