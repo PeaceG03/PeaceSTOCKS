@@ -138,3 +138,25 @@ test("the other four lists, beliefs and rankings are unchanged by the FASTEST_IM
   const other = { ...result, predictions: result.predictions.filter((p) => p.setType !== "FASTEST_IMPROVING") };
   assert.equal(sha256(stableJson(other)), "786c59c31117d8b467c226e0a81ab4829eefd8ec698156914ea7abfd07cd95dc");
 });
+
+test("exactly 41 closes is enough for FASTEST_IMPROVING; 40 is not", () => {
+  const forty1 = divergent(IMPROVEMENT_MIN_CLOSES);
+  const got = set(rankSecurities(forty1.securities, forty1.bars, [], forty1.D), "FASTEST_IMPROVING");
+  assert.equal(got.securityIds.length, 15);
+  assert.equal(got.unavailableReason, undefined);
+  const forty = divergent(IMPROVEMENT_MIN_CLOSES - 1);
+  assert.deepEqual(set(rankSecurities(forty.securities, forty.bars, [], forty.D), "FASTEST_IMPROVING").securityIds, []);
+});
+
+test("equal improvement values are ordered by security id ascending", () => {
+  const days = sessions(50);
+  const securities: SecurityMasterRecord[] = [];
+  const bars: CanonicalDailyBar[] = [];
+  // Identical price paths: every name has the same improvement value.
+  for (const id of ["tie_d", "tie_b", "tie_e", "tie_a", "tie_c"]) {
+    securities.push(security(id));
+    days.forEach((day, k) => bars.push(bar(id, day, 10 + (k % 7) * 0.1 + (k > 30 ? k * 0.05 : 0))));
+  }
+  const got = set(rankSecurities(securities, bars, [], days.at(-1)!), "FASTEST_IMPROVING");
+  assert.deepEqual(got.securityIds, ["tie_a", "tie_b", "tie_c", "tie_d", "tie_e"]);
+});

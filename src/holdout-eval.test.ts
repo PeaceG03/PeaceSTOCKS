@@ -121,3 +121,18 @@ test("the replay passes stored split records to the ranking, as the scan does", 
   assert.equal(withSplit.excluded, 0); // adjusted: ranked again
   assert.equal(withSplit.outcome.universeSize, without.outcome.universeSize + 1);
 });
+
+test("summarize: excess is the list mean minus the same session's universe mean", () => {
+  const o = (sessionDate: string, universeMean: number, mean: number) => ({
+    sessionDate, universeSize: 100, universeMean, ic: 0, lists: { L: { size: 15, mean, random: [universeMean, universeMean] } },
+  });
+  const s = summarize([o("d1", 0.01, 0.03), o("d2", -0.02, -0.01), o("d3", 0.05, 0.02)]).lists.L!;
+  // Per-session excess: +0.02, +0.01, -0.03.
+  assert.ok(Math.abs(s.meanReturn - 0.04 / 3) < 1e-12);
+  assert.ok(Math.abs(s.universeMean - 0.04 / 3) < 1e-12);
+  assert.ok(Math.abs(s.meanExcess - 0) < 1e-12);
+  assert.ok(Math.abs(s.hitRate - 2 / 3) < 1e-12);
+  const t = summarize([o("d1", 0.01, 0.03), o("d2", -0.02, -0.01)]).lists.L!;
+  assert.ok(Math.abs(t.meanExcess - 0.015) < 1e-12); // a raw-mean "excess" would be 0.01
+  assert.ok(Math.abs(t.excessTStat - 0.015 / (Math.sqrt(0.00005) / Math.sqrt(2))) < 1e-9);
+});
