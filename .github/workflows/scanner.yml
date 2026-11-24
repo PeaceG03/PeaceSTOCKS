@@ -218,6 +218,14 @@ jobs:
       - name: Daily-bars coverage check
         if: ${{ always() }}
         run: pnpm exec tsx src/daily-bars-coverage.ts
+      # Missed-freeze alert (src/freeze-watch.ts): a session whose next open passed without picks frozen
+      # before it (late, unavailable, or never decided) opens or comments on the one health issue
+      # (label scanner-alert, src/health-alert.ts), once per session. Reads prediction-status only.
+      - name: Freeze watch (missed-freeze alert)
+        if: ${{ always() && github.ref == 'refs/heads/main' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: pnpm -s exec tsx src/freeze-watch.ts
 
   # Daily liquid 10-minute step: the just-closed session(s) for the top TENMIN_DAILY_LIQUID_N names
   # (default 500, cap 1000) by trailing dollar volume from sessions strictly before each session.
@@ -356,6 +364,34 @@ jobs:
           TENMIN_AUTO_REDISPATCH: ${{ vars.TENMIN_AUTO_REDISPATCH }}
           TENMIN_ONEOFF_WORKFLOWS: oct2024-tenmin.yml
         run: pnpm -s exec tsx src/tenmin-gate.ts guard
+
+  # Freeze watch on the :47 tick too, so a session whose scan never ran (no scan job at all) still raises
+  # the missed-freeze alert within the hour after the open. Same script and marker as the scan job's step.
+  freeze_watch:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '47 * * * *' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Freeze watch (missed-freeze alert)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+          PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+          PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+          PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+        run: pnpm -s exec tsx src/freeze-watch.ts
 
   # Missed-scheduled-scan backstop (same reliable :47 cron): if the 05:30/09:30 UTC scheduled scan never
   # started, dispatch one mode=scan run. Harmless when redundant (collectionDue). Logic: src/scan-backstop.ts.

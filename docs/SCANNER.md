@@ -251,6 +251,27 @@ GitHub has not been firing those two crons: in the week to Nov 24, 2026 no sched
 either slot. In practice the scan runs through the hourly :47 restarter's `scan_backstop` and the
 chain follow-ups (scan dispatched after a history run), so it arrives late but is not skipped.
 
+### Nightly scan health record and missed-freeze alert
+
+Every forward scan of a trading session (not the NOT_DUE or ALREADY_FROZEN no-ops, not evidence-only
+backfills) writes `permanent/health/scan/<D>.json` and `permanent/health/scan/latest.json`
+(src/scan-health.ts), with the same size + checksum read-back as the health check's reports. The
+record says whether the scan finished strictly before the next session's 09:30 New York open, the
+freeze decision (FROZEN / UNAVAILABLE + reason / NO_DECISION) and whether picks were frozen before
+the open, names expected and covered, and the names the eligibility floor and the split guard left
+out, by reason. A failed write never fails the scan (the run report says `scanHealth: FAILED:...`).
+The site's Health card shows the newest record under "Nightly scan".
+
+A session misses the freeze when the next session opens without picks frozen before that open
+(frozen late, unavailable, or no decision stored at all, e.g. the scan never ran).
+src/freeze-watch.ts checks the newest 3 judged sessions from their prediction-status records and
+raises the existing alert: the one "PeaceSTOCKS health needs attention" issue (label
+`scanner-alert`, src/health-alert.ts), opened or commented on. A marker under
+`permanent/health/scan/missed-freeze-alerts/<D>.json`, written only after the alert went out, keeps
+it to once per session. It runs as the last step of every scan job and on the hourly :47 tick
+(`freeze_watch` job), so a session whose scan never ran is still reported within the hour after the
+open. No Massive request and no tickers in the alert.
+
 ### Forward prediction integrity
 
 Historical evidence can be backfilled.
