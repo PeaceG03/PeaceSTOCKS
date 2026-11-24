@@ -52,6 +52,9 @@ const EVERY_DAY = [0, 1, 2, 3, 4, 5, 6] as const;
 export const HEALTH_CRON_LATENESS_MINUTES = 12 * 60;
 const SCAN_SILENCE_MINUTES = 68 * 60 + HEALTH_CRON_LATENESS_MINUTES;
 
+/** Longest silence for a finished (STOP_DONE) history chain before it is flagged: 8 days. */
+export const HISTORY_CHAIN_DONE_SILENCE_MINUTES = 8 * 24 * 60;
+
 /** Each part's own schedule (from its workflow crons). */
 export const HEALTH_PARTS: readonly HealthPartDeclaration[] = [
   // scanner.yml crons 05:30 + 09:30 UTC Tue-Sat; Sat 09:30 -> Tue 05:30 is the longest normal gap (68 h).
@@ -66,7 +69,9 @@ export const HEALTH_PARTS: readonly HealthPartDeclaration[] = [
     name: "history chain",
     schedule: { utcDays: EVERY_DAY, perDay: 1 },
     allowedSilenceMinutes: 24 * 60 + HEALTH_CRON_LATENESS_MINUTES,
-    idle: [{ prefix: "STOP_DONE:" }, { prefix: "WAIT_DAILY_STEP:", allowedSilenceMinutes: SCAN_SILENCE_MINUTES }],
+    // STOP_DONE is bounded too (Auditor, final review): a finished chain that is silent for 8 days means
+    // ranges have kept closing without it being restarted.
+    idle: [{ prefix: "STOP_DONE:", allowedSilenceMinutes: HISTORY_CHAIN_DONE_SILENCE_MINUTES }, { prefix: "WAIT_DAILY_STEP:", allowedSilenceMinutes: SCAN_SILENCE_MINUTES }],
   },
   // Manual dispatch only: no expected check-ins, never silent.
   { id: "backfill", name: "backfill", schedule: { utcDays: [], perDay: 0 } },
