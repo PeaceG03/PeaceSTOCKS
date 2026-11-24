@@ -31,6 +31,7 @@ import { refreshEligibility, refreshUniverse } from "./universe";
 import { errorMessage, reportPart } from "./health-checkins";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import { finalizeDailyPartition } from "./scanner";
+import { pointInTimeUniverse } from "./pit-universe";
 import { ScanYieldError, createScanYieldCheck } from "./scan-yield";
 
 const STATE_VERSION = "markets-scanner-backfill-v1" as const;
@@ -68,6 +69,11 @@ export interface BackfillResult {
   replyDustZstdVersion?: string;
   /** Run warnings (not failures), e.g. REPLY_DUST_FALLBACK_FILES:<n> when fallback files > 0. */
   warnings?: string[];
+  /**
+   * Point-in-time membership counts over the attempted sessions (absent when both are 0):
+   * name-sessions bound for names INACTIVE in today's master, and tickers dropped as ambiguous.
+   */
+  survivorship?: { inactiveNameSessions: number; ambiguousSymbolSessions: number };
 }
 
 function parseDate(value: string): Date {
@@ -303,24 +309,33 @@ export async function backfillHistoricalEvidence(options: {
     actionsStored = 0,
     stoppedOnError = false,
     yieldedForScan: string | undefined;
-  const activeIds = securities
-    .filter((security) => security.status === "ACTIVE")
-    .map((security) => security.securityId);
+  // Survivorship: each session is bound to the names listed ON THAT DATE (ACTIVE and INACTIVE, with
+  // the ticker each held then), not to today's ACTIVE names. See src/pit-universe.ts.
+  let inactiveNameSessions = 0,
+    ambiguousSymbolSessions = 0;
+  const membersOn = (sessionDate: string) => {
+    const pit = pointInTimeUniverse(securities, sessionDate, provider.providerName);
+    inactiveNameSessions += pit.inactiveMembers;
+    ambiguousSymbolSessions += pit.ambiguousSymbols;
+    if (bind) bind.call(provider, pit.records);
+    return pit;
+  };
 
   // Reply Dust: the grouped reply is taken right after its one fetch and stored (encode, decode,
   // compare, put, read back) before any bar of that session is stored or progress advances. A
   // day already sealed in Reply Dust is rebuilt from the stored reply instead of fetched again.
-  const dailyBarsWithReplyDust = async (sessionDate: string): Promise<CanonicalDailyBar[]> => {
+  const dailyBarsWithReplyDust = async (
+    sessionDate: string,
+    memberIds: string[],
+    records: ProviderSecurityRecord[],
+  ): Promise<CanonicalDailyBar[]> => {
     const store = replyStore!;
-    const bySymbol = groupedDailySymbolIndex(
-      symbolBySecurityIdFor(providerRecords(securities, provider.providerName)),
-      activeIds,
-    );
+    const bySymbol = groupedDailySymbolIndex(symbolBySecurityIdFor(records), memberIds);
     if (await readDailyReplyDustManifest(store, sessionDate))
       return readDailyReplyDustBars(store, sessionDate, bySymbol, options.replyDustBackend);
     const takeRawReplies = provider.takeRawReplies!.bind(provider);
     if (takeRawReplies().length) throw new Error("REPLY_DUST_UNEXPECTED_HELD_REPLIES");
-    const bars = await provider.getDailyBars(sessionDate, activeIds);
+    const bars = await provider.getDailyBars(sessionDate, memberIds);
     const replies = takeRawReplies();
     const reply = replies[0];
     if (
@@ -368,13 +383,15 @@ export async function backfillHistoricalEvidence(options: {
     if (yieldedForScan) break;
     attemptedSessions.push(sessionDate);
     try {
+      const members = membersOn(sessionDate);
+      const memberIds = members.memberIds;
       const bars = replyDust
-        ? await dailyBarsWithReplyDust(sessionDate)
-        : await provider.getDailyBars(sessionDate, activeIds);
+        ? await dailyBarsWithReplyDust(sessionDate, memberIds, members.records)
+        : await provider.getDailyBars(sessionDate, memberIds);
       await storage.appendBars(bars);
       barsStored += bars.length;
       try {
-        const actions = await provider.getCorporateActions(sessionDate, activeIds);
+        const actions = await provider.getCorporateActions(sessionDate, memberIds);
         await storage.appendActions(actions);
         actionsStored += actions.length;
         await storage
@@ -433,6 +450,9 @@ export async function backfillHistoricalEvidence(options: {
     eligibility,
     ...(replyDustZstdVersion
       ? replyDustRunReport(replyDustFilesWritten, replyDustFallbackFiles, replyDustZstdVersion)
+      : {}),
+    ...(inactiveNameSessions || ambiguousSymbolSessions
+      ? { survivorship: { inactiveNameSessions, ambiguousSymbolSessions } }
       : {}),
   };
 }
