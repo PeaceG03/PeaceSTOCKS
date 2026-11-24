@@ -29,7 +29,15 @@ import { isCheckinSilent } from "./health-silent";
 import { silentParts } from "./health-silent-parts";
 import { R2ObjectClient } from "./object-store";
 import { expectedTenMinBars } from "./tenmin-day-done";
-import { TENMIN_DAILY_CATCHUP_SESSIONS, type TenMinDailyStuckShort, readTenMinDailyIndex, tenMinDailyCatchupSessions, tenMinDailyIndexCounts } from "./tenmin-daily-liquid";
+import {
+  TENMIN_DAILY_CATCHUP_SESSIONS,
+  type TenMinDailyStuckShort,
+  isPreRuleIndex,
+  listTenMinDailyIndexDays,
+  readTenMinDailyIndex,
+  tenMinDailyCatchupSessions,
+  tenMinDailyIndexCounts,
+} from "./tenmin-daily-liquid";
 import { lastCompletedSessionDate } from "./tenmin-history";
 
 export const HEALTHY = "Healthy" as const;
@@ -80,6 +88,20 @@ export interface HealthStuckDay {
   shortStocks: { securityId: string; bars: string }[];
   /** The STUCK_SHORT record (counts when the day was marked); absent on indexes written before it. */
   stuckShort?: TenMinDailyStuckShort;
+  /**
+   * The day is older than the daily step's window (no longer retried): STUCK_SHORT LEFT_WINDOW, or not
+   * stamped yet while the step is paused. Listed for 31 days; it needs a person when it left with
+   * fewer than 6 failed passes (it skipped the usual STUCK_SHORT route, Auditor B2).
+   */
+  leftWindow?: boolean;
+}
+
+/** Days a left-window STUCK_SHORT day stays listed in health. */
+export const HEALTH_LEFT_WINDOW_DAYS = 31;
+
+/** Pure: a stuck day that needs a person (in the window, or left it with fewer than 6 failed passes). */
+export function stuckDayNeedsAttention(day: Pick<HealthStuckDay, "leftWindow" | "reRuns" | "stuckShort">): boolean {
+  return !day.leftWindow || !dayStuck(day.stuckShort?.passes ?? day.reRuns);
 }
 
 /** Pure: "2 at 38/39, 1 at 0/39" from short stocks (no stock names), fewest bars first. */
@@ -139,6 +161,11 @@ export function stuckDayLine(day: HealthStuckDay): string {
     day.shortNames > 0
       ? `STUCK_SHORT, short of ${day.expectedBars} bars: ${day.bars} bars, ${day.shortNames} stock/s short (${shortStocksLine(day.shortStocks)})`
       : `STUCK_SHORT, waiting for daily bars: ${day.bars} bars`;
+  if (day.leftWindow) {
+    const passes = day.stuckShort?.passes ?? day.reRuns;
+    const fewer = dayStuck(passes) ? "" : ", fewer than 6 failed passes";
+    return `daily 10-minute step: ${day.sessionDate} ${what}, daily bars ${day.dailyBars}, left the window after ${passes} failed pass/es${fewer} (not done, no longer retried)`;
+  }
   return `daily 10-minute step: ${day.sessionDate} ${what}, daily bars ${day.dailyBars}, after ${day.reRuns} re-run/s (not done, still retried)`;
 }
 
@@ -200,7 +227,8 @@ export function evaluateHealth(input: {
   const anyReported = results.some((r) => r.lastCheckinAt !== undefined);
   const attention = results.filter((r) => r.status === "error" || r.status === "no response").map((r) => `${r.name} (${r.status})`);
   for (const r of results.filter((x) => x.stalled)) attention.push(`${r.name} (behind, not shrinking)`);
-  if (stuckDays.length) attention.push(`daily 10-minute step (${stuckDays.length} stuck day/s)`);
+  const stuckAttention = stuckDays.filter(stuckDayNeedsAttention);
+  if (stuckAttention.length) attention.push(`daily 10-minute step (${stuckAttention.length} stuck day/s)`);
   const behind = results.filter((r) => r.status === "behind" && !r.stalled).map((r) => `${r.name} (${r.remaining ?? "?"} remaining)`);
   const headline = !input.parts.length || !anyReported
     ? NO_PARTS_REPORTING
@@ -220,17 +248,26 @@ export const HEALTH_CHECK_SCHEMA = "health-check-v1" as const;
 export const HEALTH_CHECK_LATEST_KEY = "permanent/health/check/latest.json" as const;
 export const HEALTH_CHECK_STATE_KEY = "permanent/health/check/state.json" as const;
 
-/** Days in the daily step's catch-up window it keeps re-running without finishing (dayStuck). */
+/**
+ * Days in the daily step's catch-up window it keeps re-running without finishing (dayStuck), and
+ * (Auditor B2) tracked days that left the window not done in the last 31 days.
+ */
 export async function readStuckDays(
-  store: Pick<HealthCheckinStore, "get">,
+  store: Pick<HealthCheckinStore, "get" | "list">,
   now: Date,
   catchupSessions: number = TENMIN_DAILY_CATCHUP_SESSIONS,
 ): Promise<HealthStuckDay[]> {
   const output: HealthStuckDay[] = [];
-  for (const sessionDate of tenMinDailyCatchupSessions(lastCompletedSessionDate(now), catchupSessions)) {
+  const window = tenMinDailyCatchupSessions(lastCompletedSessionDate(now), catchupSessions);
+  const since = new Date(now.getTime() - HEALTH_LEFT_WINDOW_DAYS * 86_400_000).toISOString().slice(0, 10);
+  const windowStart = window[0] ?? lastCompletedSessionDate(now);
+  const leftDays = (await listTenMinDailyIndexDays(store, windowStart).catch(() => [] as string[])).filter((d) => d < windowStart && d >= since);
+  for (const sessionDate of [...leftDays, ...window]) {
+    const leftWindow = sessionDate < windowStart;
     const index = await readTenMinDailyIndex(store, sessionDate).catch(() => undefined);
     // STUCK_SHORT days (and older indexes past 6 failed passes) are flagged; they are never done.
-    if (!index || index.done || !(index.stuckShort || dayStuck(index.notDoneRuns ?? 0))) continue;
+    if (!index || index.done) continue;
+    if (leftWindow ? isPreRuleIndex(index) : !(index.stuckShort || dayStuck(index.notDoneRuns ?? 0))) continue;
     const expectedBars = expectedTenMinBars(sessionDate);
     output.push({
       sessionDate,
@@ -240,6 +277,7 @@ export async function readStuckDays(
       reRuns: index.notDoneRuns ?? 0,
       ...(({ dayBars, ...rest }) => ({ bars: dayBars, ...rest }))(tenMinDailyIndexCounts(index, expectedBars)),
       ...(index.stuckShort ? { stuckShort: index.stuckShort } : {}),
+      ...(leftWindow ? { leftWindow: true } : {}),
     });
   }
   return output;
