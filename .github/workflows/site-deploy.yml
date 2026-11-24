@@ -54,7 +54,7 @@ jobs:
       - name: Worker typecheck and site tests
         run: |
           pnpm run typecheck:worker
-          pnpm exec tsx --test src/access-jwt.test.ts src/read-worker-site.test.ts src/site-page.test.ts src/r2-read-client.test.ts src/site-access-setup.test.ts
+          pnpm exec tsx --test src/access-jwt.test.ts src/read-worker-site.test.ts src/site-page.test.ts src/site-paper.test.ts src/r2-read-client.test.ts src/site-access-setup.test.ts
       - name: Cloudflare Access app and single-email policy (deploy stops here on failure)
         id: access
         env:

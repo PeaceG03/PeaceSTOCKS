@@ -14,6 +14,11 @@ A read-only status page for the scanner, for one person, on phone or computer.
   When picks are shown, a note above them and an "experimental" tag on each list say: "Experimental:
   back-tests on held-out data show no reliable edge over random picks. Not investment advice."
   (held-out evaluation in PR #124; see docs/SCANNER.md).
+- **Paper trading**: always says "Paper trading: simulated, no real money." Once the simulated ledger
+  (docs/PAPER_TRADING.md) has finished a day, it also shows the picks' experimental label, the
+  cumulative paper return (after costs) against SPY and the equal-weight universe, and the newest 10
+  open-to-open days, each with paper, SPY and universe returns (stacked cards on a phone). Until then
+  it says "No paper results yet". It reads only `paper/v1/days/` (one listing, at most 10 gets).
 - **Recent sessions**: the newest 20 run reports: session, status, valid/expected, and the first
   few issues.
 

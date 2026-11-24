@@ -85,6 +85,38 @@ html,body{max-width:100%;overflow-x:hidden}
 export const PICKS_EXPERIMENTAL_LABEL =
   "Experimental: back-tests on held-out data show no reliable edge over random picks. Not investment advice.";
 
+export const PAPER_TRADING_LABEL = "Paper trading: simulated, no real money.";
+
+/** Signed percent with two decimals, or "n/a". */
+export function percent(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "n/a";
+  const text = (value * 100).toFixed(2);
+  return `${value > 0 ? "+" : ""}${text === "-0.00" ? "0.00" : text}%`;
+}
+
+function paperCard(data: SiteData): string {
+  const days = data.paper?.days ?? [];
+  const latest = days[0];
+  return (
+    `<section class="card"><h2>Paper trading</h2>` +
+    `<div class="exp" role="note">${escapeHtml(PAPER_TRADING_LABEL)}</div>` +
+    (latest
+      ? `<div class="exp" role="note">${escapeHtml(PICKS_EXPERIMENTAL_LABEL)}</div>` +
+        `<div class="big">Since start: paper ${escapeHtml(percent(latest.cumulativePaper))}</div>` +
+        `<div class="mute">SPY ${escapeHtml(percent(latest.cumulativeSpy))} · equal-weight universe ${escapeHtml(percent(latest.cumulativeUniverse))} · paper is after costs</div>` +
+        `<div class="table-wrap"><table class="stack"><thead><tr><th>Day</th><th class="r">Paper</th><th class="r">SPY</th><th class="r">Universe</th></tr></thead><tbody>${days
+          .map(
+            (d) =>
+              `<tr><td data-label="Day"><span class="session-date">${escapeHtml(d.to)}</span><div class="mute">open ${escapeHtml(d.from)} to open ${escapeHtml(d.to)}</div>${
+                d.entriesRefused ? `<div class="mute issues">no entries: ${wrapAtUnderscores(d.entriesRefused)}</div>` : ""
+              }</td><td class="r" data-label="Paper">${escapeHtml(percent(d.paper))}</td><td class="r" data-label="SPY">${escapeHtml(percent(d.spy))}</td><td class="r" data-label="Universe">${escapeHtml(percent(d.universe))}</td></tr>`,
+          )
+          .join("")}</tbody></table></div>`
+      : `<div class="big muted">No paper results yet</div><div class="mute">Paper trading is off or has not finished a day.</div>`) +
+    `</section>`
+  );
+}
+
 export function renderSitePage(data: SiteData): string {
   const parts: string[] = [];
 
@@ -153,6 +185,8 @@ export function renderSitePage(data: SiteData): string {
             .join("")}`
     }</section>`,
   );
+
+  parts.push(paperCard(data));
 
   // Per-session reports.
   parts.push(
