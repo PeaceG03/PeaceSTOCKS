@@ -40,8 +40,6 @@ export function isTenMinRestarterRun(run: { display_title?: string | null }): bo
  * When on, the run is named "Scanner tenmin daily" and counts as a working run.
  */
 export const TENMIN_DAILY_OFF_RUN_NAME = "Scanner tenmin daily (off)" as const;
-/** scanner.yml run-name for a daily liquid 10-minute tick with its kill switch on. */
-export const TENMIN_DAILY_RUN_NAME = "Scanner tenmin daily" as const;
 
 /** Pure: a scanner.yml run that never calls Massive or writes R2 (restarter, or daily tick switched off). */
 export function isIdleScannerRun(run: { display_title?: string | null }): boolean {

@@ -8,11 +8,12 @@ import { tenMinHistoryDailyStepHold } from "./tenmin-daily-liquid";
 import { runTenMinHistory } from "./tenmin-history";
 import { planTenMinAlert } from "./tenmin-alert";
 import {
-  TENMIN_CONTINUE_DAILY_STEP_RAN,
+  TENMIN_CONTINUE_HELD_DAY_RESOLVED,
+  TENMIN_HELD_DAY_LEFT_WINDOW,
   TENMIN_WAIT_DAILY_STEP,
   type TenMinRedispatchInput,
   decideTenMinRedispatch,
-  tenMinDailyRunSince,
+  heldDayResolution,
   tenMinRunOutcome,
 } from "./tenmin-redispatch";
 
@@ -87,29 +88,41 @@ function input(extra: Partial<TenMinRedispatchInput>): TenMinRedispatchInput {
   };
 }
 
-test("decision: a held chain waits (no alert); the fallback restarts it only after a daily step ran", () => {
+test("decision: a held chain waits (no alert); the fallback restarts it only once the held day itself is resolved", () => {
   const chain = decideTenMinRedispatch(input({}));
   assert.deepEqual([chain.dispatch, chain.nextAction, chain.reason], [false, "wait", `${TENMIN_WAIT_DAILY_STEP}:2026-10-08`]);
   assert.equal(planTenMinAlert({ trigger: "chain", record: undefined, historyStep: "success", redispatchStep: "success", nextAction: chain.nextAction, reason: chain.reason, killSwitch: "true" }).action, "none");
   const idle = decideTenMinRedispatch(input({ trigger: "fallback" }));
-  assert.deepEqual([idle.dispatch, idle.nextAction], [false, "wait"]);
-  const after = decideTenMinRedispatch(input({ trigger: "fallback", dailyStepRanSince: "777" }));
-  assert.deepEqual([after.dispatch, after.nextAction, after.reason], [true, "continue", `${TENMIN_CONTINUE_DAILY_STEP_RAN}:777`]);
-  const guard = decideTenMinRedispatch(input({ trigger: "fallback", dailyStepRanSince: "777", nowUtc: new Date("2026-10-13T05:30:00Z") }));
+  assert.deepEqual([idle.dispatch, idle.nextAction], [false, "wait"], "a daily step having run is not enough");
+  const after = decideTenMinRedispatch(input({ trigger: "fallback", heldDayResolved: "2026-10-08:COMPLETE" }));
+  assert.deepEqual([after.dispatch, after.nextAction, after.reason], [true, "continue", `${TENMIN_CONTINUE_HELD_DAY_RESOLVED}:2026-10-08:COMPLETE`]);
+  const guard = decideTenMinRedispatch(input({ trigger: "fallback", heldDayResolved: "2026-10-08:COMPLETE", nowUtc: new Date("2026-10-13T05:30:00Z") }));
   assert.equal(guard.dispatch, false, "guard windows still win");
-  assert.equal(decideTenMinRedispatch(input({ trigger: "fallback", dailyStepRanSince: "777", killSwitch: "false" })).nextAction, "stop");
+  assert.equal(decideTenMinRedispatch(input({ trigger: "fallback", heldDayResolved: "2026-10-08:COMPLETE", killSwitch: "false" })).nextAction, "stop");
 });
 
-test("fallback: only a completed 'Scanner tenmin daily' run created after the held run counts", () => {
+test("fallback: only the held day itself unblocks (full or STUCK_SHORT); a different later done day does not", () => {
+  const held = `${TENMIN_WAIT_DAILY_STEP}:2026-10-08`;
   const since = "2026-10-13T03:00:00Z";
-  const runs = [
-    { id: 1, status: "completed", created_at: "2026-10-13T02:00:00Z", display_title: "Scanner tenmin daily" },
-    { id: 2, status: "in_progress", created_at: "2026-10-13T06:20:00Z", display_title: "Scanner tenmin daily" },
-    { id: 3, status: "completed", created_at: "2026-10-13T06:21:00Z", display_title: "Scanner tenmin daily (off)" },
-    { id: 4, status: "completed", created_at: "2026-10-13T05:30:00Z", display_title: "Scanner" },
-  ];
-  assert.equal(tenMinDailyRunSince(runs, since), undefined);
-  assert.equal(tenMinDailyRunSince([...runs, { id: 5, status: "completed", created_at: "2026-10-13T10:20:00Z", display_title: "Scanner tenmin daily" }], since)?.id, 5);
+  const report = (statuses: Record<string, string>, finishedAt = "2026-10-13T08:00:00Z") => ({
+    status: "RAN",
+    finishedAt,
+    sessions: Object.entries(statuses).map(([sessionDate, status]) => ({ sessionDate, status })),
+  });
+  assert.equal(heldDayResolution(held, report({ "2026-10-08": "PARTIAL", "2026-10-09": "COMPLETE" }), since), undefined, "a later done day no longer unblocks");
+  assert.equal(heldDayResolution(held, report({ "2026-10-08": "WAITING_DAILY_BARS" }), since), undefined);
+  assert.equal(heldDayResolution(held, report({ "2026-10-08": "COMPLETE" }), since), "2026-10-08:COMPLETE");
+  assert.equal(heldDayResolution(held, report({ "2026-10-08": "STUCK_SHORT" }), since), "2026-10-08:STUCK_SHORT");
+  assert.equal(heldDayResolution(held, report({ "2026-10-08": "COMPLETE" }, "2026-10-13T02:00:00Z"), since), undefined, "a report from before the hold does not count");
+  assert.equal(heldDayResolution(held, { status: "SKIPPED" }, since), undefined);
+  assert.equal(heldDayResolution(held, report({ "2026-10-09": "PARTIAL", "2026-10-10": "COMPLETE" }), since), `2026-10-08:${TENMIN_HELD_DAY_LEFT_WINDOW}`);
+  assert.equal(heldDayResolution("STOP_DONE:no-range-left", report({ "2026-10-08": "COMPLETE" }), since), undefined);
+});
+
+test("fallback workflow: reads the newest daily 10-minute report for the decide step", async () => {
+  const yml = await readFile(new URL("../.github/workflows/tenmin-history-fallback.yml", import.meta.url), "utf8");
+  assert.match(yml, /artifacts\?name=tenmin-daily-report/u);
+  assert.match(yml, /TENMIN_DAILY_REPORT_FILE: \$\{\{ runner\.temp \}\}\/daily\/tenmin-daily-report\.json/u);
 });
 
 test("host wiring: the hold is on only with the daily step on and R2 configured", async () => {

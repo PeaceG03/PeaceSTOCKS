@@ -13,12 +13,15 @@ test("history hold: a failed day inside the window with no later done session bl
   assert.equal(historyBlockingDay([day("2026-10-08", "done"), day("2026-10-09", "failed")], W), "2026-10-09");
 });
 
-test("history hold: a later done session unblocks the chain", () => {
-  assert.equal(historyBlockingDay([day("2026-10-08", "failed"), day("2026-10-09", "done")], W), undefined);
+test("history hold: a different later done day does not unblock; only the short day itself does", () => {
+  assert.equal(historyBlockingDay([day("2026-10-08", "failed"), day("2026-10-09", "done")], W), "2026-10-08");
   assert.equal(
     historyBlockingDay([day("2026-10-07", "failed"), day("2026-10-08", "failed"), day("2026-10-09", "done")], W),
-    undefined,
+    "2026-10-07",
   );
+  // The short day itself gets fully stored (or reaches STUCK_SHORT): unblocked.
+  assert.equal(historyBlockingDay([day("2026-10-08", "done"), day("2026-10-09", "done")], W), undefined);
+  assert.equal(historyBlockingDay([{ ...day("2026-10-08", "failed"), stuckShort: true }, day("2026-10-09", "done")], W), undefined);
 });
 
 test("history hold: only days still inside the 10-session window block", () => {

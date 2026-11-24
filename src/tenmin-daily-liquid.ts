@@ -318,6 +318,8 @@ export const TENMIN_DAILY_STUCK_SHORT = "STUCK_SHORT" as const;
 
 export interface TenMinDailyStuckShort {
   status: typeof TENMIN_DAILY_STUCK_SHORT;
+  /** FAILED_PASSES: 6 full passes failed. LEFT_WINDOW: the day left the 10-session window not done (no longer retried). */
+  reason?: "FAILED_PASSES" | "LEFT_WINDOW";
   at: string;
   /** Full catch-up passes that had failed when the day became STUCK_SHORT. */
   passes: number;
@@ -531,6 +533,31 @@ export async function runTenMinDailyLiquid(options: {
   };
   let outageStreak = 0;
   let stop = false;
+  // A day that left the window not done is no longer retried: record it STUCK_SHORT with its counts
+  // (it can then never hold a seal or the chain forever, and is never treated as full).
+  for (const sessionDate of tradingSessionsBefore(sessions[0] ?? lastCompleted, options.catchupSessions ?? TENMIN_DAILY_CATCHUP_SESSIONS, calendar)) {
+    const old = await readTenMinDailyIndex(store, sessionDate);
+    if (!old || old.done || old.stuckShort) continue;
+    const counts = tenMinDailyIndexCounts(old, expectedTenMinBars(sessionDate, calendar));
+    await writeTenMinDailyIndex(
+      store,
+      finalizeIndex({
+        ...old,
+        stuckShort: {
+          status: TENMIN_DAILY_STUCK_SHORT,
+          reason: "LEFT_WINDOW",
+          at: stamp(),
+          passes: old.notDoneRuns ?? 0,
+          dayBars: counts.dayBars,
+          dailyBars: counts.dailyBars,
+          shortNames: old.shortNames ?? counts.shortStocks.length,
+          missingDailyBars: old.missingDailyBars ?? 0,
+        },
+        updatedAt: stamp(),
+      }),
+    );
+    report.warnings.push(`TENMIN_DAILY_STUCK_SHORT_LEFT_WINDOW:${sessionDate}:${counts.dayBars}`);
+  }
   // STUCK_SHORT days are still retried, but after every other day, so they never starve a newer one.
   const stuckFirst = await Promise.all(sessions.map(async (d) => !!(await readTenMinDailyIndex(store, d))?.stuckShort));
   const ordered = [...sessions.filter((_, i) => !stuckFirst[i]), ...sessions.filter((_, i) => stuckFirst[i])];
@@ -765,6 +792,7 @@ export async function runTenMinDailyLiquid(options: {
         (dayStuck(notDoneRuns)
           ? {
               status: TENMIN_DAILY_STUCK_SHORT,
+              reason: "FAILED_PASSES" as const,
               at: stamp(),
               passes: notDoneRuns,
               dayBars,
@@ -1051,7 +1079,18 @@ export async function runTenMinDailyFromEnv(env: NodeJS.ProcessEnv = process.env
     },
     fetchPages: (security, from, to) => massive.getTenMinuteRangeReplies(security, from, to),
   });
-  return { mode: "tenmin-daily", status: "RAN", ...report, rateLimitedResponses: massive.rateLimitedResponses };
+  // After the run: the day (if any) that now holds the history chain, and when this report was written.
+  // The fallback reads this report (artifact tenmin-daily-report) to restart a held chain only once
+  // the held day itself is full or STUCK_SHORT.
+  const historyHold = await tenMinDailyHistoryHold(store).catch(() => undefined);
+  return {
+    mode: "tenmin-daily",
+    status: "RAN",
+    ...report,
+    rateLimitedResponses: massive.rateLimitedResponses,
+    historyHold: historyHold ?? null,
+    finishedAt: new Date().toISOString(),
+  };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {

@@ -16,18 +16,16 @@ export interface HistoryHoldDay {
 /**
  * Pure: the session that blocks the history chain, or undefined.
  * - Only a failed day still inside the 10-session catch-up window can block (rule A3).
- * - A later session that is done unblocks it (rule A5): the stuck day stays flagged by the
- *   health check instead of holding the chain forever.
+ * - Only the short day itself unblocks (Peace, Nov 23): by getting fully stored or by reaching
+ *   STUCK_SHORT. A different later done day no longer unblocks it.
  * A day the daily step has not tried yet does not block, and neither does a STUCK_SHORT day.
  */
 export function historyBlockingDay(days: readonly HistoryHoldDay[], windowSessions: readonly string[]): string | undefined {
   const window = new Set(windowSessions);
   const sorted = [...days].sort((a, b) => (a.sessionDate < b.sessionDate ? -1 : a.sessionDate > b.sessionDate ? 1 : 0));
-  for (let i = 0; i < sorted.length; i += 1) {
-    const day = sorted[i]!;
+  for (const day of sorted) {
     if (!day.failed || day.stuckShort) continue;
-    const laterDone = sorted.slice(i + 1).some((later) => later.done);
-    if (historyBlocked(!laterDone, day.done, window.has(day.sessionDate))) return day.sessionDate;
+    if (historyBlocked(true, day.done, window.has(day.sessionDate))) return day.sessionDate;
   }
   return undefined;
 }

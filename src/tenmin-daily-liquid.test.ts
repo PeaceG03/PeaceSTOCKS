@@ -761,23 +761,42 @@ test("done-day: a half day is done at 21 bars", async () => {
   assert.equal(run.sessions[0]!.status, "COMPLETE");
 });
 
-test("history hold: a failed day in the catch-up window holds the chain until a later session is done", async () => {
+test("history hold: a failed day holds the chain until that day itself is stored or STUCK_SHORT, not when a later day is done", async () => {
   const store = new MemoryObjectClient();
   const calls: string[] = [];
+  let shortBars = 12;
   const short = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
     calls.push(`${sec.symbol}:${from}`);
-    return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, from === "2026-10-08" ? 12 : 39));
+    return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, from === "2026-10-08" ? shortBars : 39));
   };
   assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-08", catchupSessions: 2 }), undefined, "nothing tried yet");
   await baseRun(store, calls, { lastCompletedSession: "2026-10-08", catchupSessions: 1, fetchPages: short });
   assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-08", catchupSessions: 2 }), "2026-10-08");
-  // 10-09 is a later session and gets done: the chain is unblocked even though 10-08 is still short.
+  // 10-09 is a later session and gets done: the chain stays held on 10-08.
   await baseRun(store, calls, { lastCompletedSession: "2026-10-09", catchupSessions: 2, fetchPages: short });
   assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.done, undefined);
   assert.ok((await readTenMinDailyIndex(store, "2026-10-09"))!.done);
+  assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-09", catchupSessions: 2 }), "2026-10-08");
+  // 10-08 itself gets every bar: unblocked.
+  shortBars = 39;
+  const run = await baseRun(store, calls, { lastCompletedSession: "2026-10-09", catchupSessions: 2, fetchPages: short });
+  assert.equal(run.sessions.find((s) => s.sessionDate === "2026-10-08")!.status, "COMPLETE");
   assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-09", catchupSessions: 2 }), undefined);
   // Outside the window it never blocks.
   assert.equal(await tenMinDailyHistoryHold(new MemoryObjectClient(), { lastCompletedSession: "2026-10-09", catchupSessions: 2 }), undefined);
+});
+
+test("history hold: a day that leaves the window not done is recorded STUCK_SHORT (no longer retried, never full)", async () => {
+  const store = new MemoryObjectClient();
+  const short = async (sec: { securityId: string; symbol: string }, from: string, to: string) =>
+    replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, from === "2026-10-08" ? 12 : 39));
+  await baseRun(store, [], { lastCompletedSession: "2026-10-08", catchupSessions: 1, fetchPages: short });
+  // Next run's window is only 10-09: 10-08 left it after 1 failed pass.
+  const next = await baseRun(store, [], { lastCompletedSession: "2026-10-09", catchupSessions: 1, fetchPages: short });
+  assert.deepEqual(next.warnings.filter((w) => w.startsWith("TENMIN_DAILY_STUCK_SHORT")), ["TENMIN_DAILY_STUCK_SHORT_LEFT_WINDOW:2026-10-08:36/117"]);
+  const index = (await readTenMinDailyIndex(store, "2026-10-08"))!;
+  assert.equal(index.done, undefined);
+  assert.deepEqual([index.stuckShort?.status, index.stuckShort?.reason, index.stuckShort?.passes, index.stuckShort?.dayBars], ["STUCK_SHORT", "LEFT_WINDOW", 1, "36/117"]);
 });
 
 test("counts: every day and stock status shows bars stored vs. needed (38/39; 20/21 on a half day)", async () => {
@@ -841,7 +860,7 @@ test("STUCK_SHORT: after 6 failed full passes a short day is STUCK_SHORT with it
   assert.equal(index.done, undefined, "never treated as a full 39-bar day");
   assert.deepEqual(
     { ...index.stuckShort, at: "t" },
-    { status: "STUCK_SHORT", at: "t", passes: 6, dayBars: "116/117", dailyBars: "3/3", shortNames: 1, missingDailyBars: 0 },
+    { status: "STUCK_SHORT", reason: "FAILED_PASSES", at: "t", passes: 6, dayBars: "116/117", dailyBars: "3/3", shortNames: 1, missingDailyBars: 0 },
   );
   assert.equal(await hold(), undefined, "STUCK_SHORT no longer blocks");
 
