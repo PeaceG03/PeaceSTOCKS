@@ -10,7 +10,7 @@ test("baseline refuses --bps below the 5 bps per side floor (or not a number) be
   try {
     for (const bps of ["0", "4.9", "abc", "-10"])
       await assert.rejects(
-        researchMain(["baseline", "--data", join(out, "does-not-exist"), "--out", out, "--bps", bps, "--scanner", "test"]),
+        researchMain(["baseline", "--data", join(out, "does-not-exist"), "--out", out, "--bps", bps, "--scanner", "test"], { ledgerDir: join(out, "ledger") }),
         /COST_BELOW_FLOOR/u,
         bps,
       );

@@ -2,9 +2,9 @@
 import { createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { CorporateAction, SecurityMasterRecord } from "./contracts";
-import { AppendOnlyLog } from "./append-only-log";
+import { AppendOnlyLog, gitCommittedHead } from "./append-only-log";
 import { EvalHistory, type EvalBar } from "./holdout-eval";
 import { buildHarnessSession, splitDatesById } from "./research-harness-data";
 import type { HarnessSession } from "./research-costs";
@@ -56,10 +56,29 @@ export async function loadResearchData(root: string, from: string, before: strin
   return { history, master, actions };
 }
 
-export async function researchMain(args: string[]): Promise<void> {
+/**
+ * The one variant log and held-out seal for this repository (committed, with their .head files).
+ * --out holds results only, so a fresh output folder can neither reset the Holm family (variants
+ * tried) nor re-open or re-register the held-out seal. Reads are anchored to the committed heads.
+ */
+export const RESEARCH_LEDGER_DIR = fileURLToPath(new URL("../research-ledger", import.meta.url));
+
+export interface ResearchMainDeps {
+  /** Tests only: a ledger in a temp folder. The CLI always uses RESEARCH_LEDGER_DIR. */
+  ledgerDir?: string;
+}
+
+export async function researchMain(args: string[], deps: ResearchMainDeps = {}): Promise<void> {
+  for (const flag of ["--ledger", "--variants", "--seal", "--heldout-log", "--variants-log"])
+    if (args.includes(flag)) throw new Error(`LEDGER_IS_PINNED:${flag}`);
   const out = arg(args, "out");
   mkdirSync(out, { recursive: true });
-  const seal = new HeldOutSeal(join(out, "heldout.jsonl"));
+  const ledgerDir = deps.ledgerDir ?? RESEARCH_LEDGER_DIR;
+  mkdirSync(ledgerDir, { recursive: true });
+  const anchored = (path: string) => ({ anchor: () => gitCommittedHead(path) });
+  const sealPath = join(ledgerDir, "heldout.jsonl");
+  const variantsPath = join(ledgerDir, "variants.jsonl");
+  const seal = new HeldOutSeal(sealPath, undefined, anchored(sealPath));
   if (args[0] === "unseal") {
     // Deliberately unavailable to automated jobs. No unseal is performed by the baseline command.
     if (!process.stdin.isTTY) throw new Error("HUMAN_TTY_REQUIRED");
@@ -86,7 +105,9 @@ export async function researchMain(args: string[]): Promise<void> {
   // REGISTER before opening prices. Baseline never calls evaluateOnce; the period stays sealed.
   for (const strategy of strategies) seal.register(strategy, heldOut);
   console.log(`loading development data before ${heldOut.from}; held-out reserved, not evaluated`);
-  const { history, master, actions } = await loadResearchData(root, from, heldOut.from);
+  const minBars = Number(arg(args, "min-bars", "1000"));
+  if (!(Number.isInteger(minBars) && minBars >= 1)) throw new Error("INVALID_MIN_BARS");
+  const { history, master, actions } = await loadResearchData(root, from, heldOut.from, minBars);
   const indexes = history.sessions.map((d, i) => [d, i] as const).filter(([d]) => d >= from);
   if (indexes.length < 3) throw new Error("INSUFFICIENT_DEVELOPMENT_DATA");
   const splitDates = splitDatesById(actions);
@@ -100,7 +121,7 @@ export async function researchMain(args: string[]): Promise<void> {
     if (k % 25 === 0) console.log(`development progress ${k + 1}/${indexes.length}; aggregate only`);
   }
   const folds = walkForwardFolds(sessions.length, foldsConfig);
-  const log = new AppendOnlyLog<VariantRecord>(join(out, "variants.jsonl"));
+  const log = new AppendOnlyLog<VariantRecord>(variantsPath, undefined, anchored(variantsPath));
   const evaluations = strategies.map((s) => evaluateStrategy(sessions, folds, s, log));
   // Recompute the correction AFTER all five variants were registered/evaluated, not incrementally.
   const all = log.entries();
@@ -126,6 +147,7 @@ export async function researchMain(args: string[]): Promise<void> {
     contaminationWarning: "Reserved for this harness only. These dates were examined by earlier holdout-eval work; they are NOT a pristine final holdout. A genuinely untouched future period is required before improvement claims.",
     dataWarning: "Local bars were collected by the pre-fix ACTIVE-only backfill. Missing historical inactive bars cannot be recovered offline. This is a diagnostic baseline, not survivorship-free performance proof. No backfill was run.",
     splitKnowledge: "as-known", revisions: "latest stored revisions (not original publication vintages)",
+    ledger: { dir: ledgerDir === RESEARCH_LEDGER_DIR ? "research-ledger" : "test-ledger", variants: log.read().at(-1)?.hash, variantRecords: all.length },
     variantsTried, foldsConfig, folds, excludedBySplitAdjust: excluded, results,
   };
   writeFileSync(join(out, "baseline.json"), `${JSON.stringify(report, null, 2)}\n`);

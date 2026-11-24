@@ -13,7 +13,7 @@
  */
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { AppendOnlyLog, configHash } from "./append-only-log";
+import { AppendOnlyLog, configHash, type AppendOnlyLogOptions } from "./append-only-log";
 
 export interface SessionRange {
   /** First session index (inclusive). */
@@ -103,9 +103,10 @@ export class HeldOutSeal {
   constructor(
     readonly path: string,
     now?: () => string,
+    options?: AppendOnlyLogOptions,
   ) {
     mkdirSync(dirname(path), { recursive: true });
-    this.log = new AppendOnlyLog<SealEntry>(path, now);
+    this.log = new AppendOnlyLog<SealEntry>(path, now, options);
   }
 
   private markerPath(strategyHash: string, evaluation: number): string {

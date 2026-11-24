@@ -40,8 +40,13 @@ The baseline loads only bars dated before `--heldout-from`. Its bar window start
 `--from` so a year of eligibility history exists. Outputs in `<dir>`:
 - `baseline.json`: folds, variants tried, exclusions, per-list results and warnings
 - `<LIST>.json`
-- `variants.jsonl`
-- `heldout.jsonl`
+
+The variant log and the held-out seal are **not** in `<dir>`. There is one pinned ledger,
+`research-ledger/` in this repository (`variants.jsonl`, `heldout.jsonl`, their `.head` files and
+`heldout-markers/`), and no argument moves it (`--ledger`, `--variants`, `--seal` are refused with
+`LEDGER_IS_PINNED`). So a new `--out` folder cannot reset the Holm family or reopen the seal. Commit
+the ledger after every run; reads are anchored to its committed heads. It starts with the harness-v1
+baseline's 5 variants and 5 registrations.
 
 No command in this PR evaluates the held-out period. That is a deliberate, separate step.
 
