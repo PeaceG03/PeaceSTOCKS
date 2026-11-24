@@ -54,6 +54,23 @@ export function refillPauseReason(
   return runs.some((r) => active(r) && !isIdleScannerRun(r) && !(afterScan && r.id === afterScan.ownRunId)) ? "ACTIVE_SCANNER_RUN" : undefined;
 }
 
+/**
+ * Exit for a refill that stopped early. After a scan, the budget stop (DEADLINE) is the planned cap:
+ * the rest is filled by the next run, so it exits 0 with a BACKLOG_REMAINS line. It is not a failure,
+ * and the shared tail must not open the "needs a person" issue for it. Any other stop, and the weekly
+ * refill's budget stop, still exit 4.
+ */
+export function refillStopExit(
+  stopped: string,
+  afterScan: boolean,
+  progress: { fetched: number; sessions: number },
+): { code: number; line: string } {
+  const safe = stopped.replace(/[^A-Z0-9_]/gu, "").slice(0, 40) || "UNKNOWN";
+  if (afterScan && stopped === "DEADLINE")
+    return { code: 0, line: `gap-refill: BACKLOG_REMAINS stopped=DEADLINE fetched=${progress.fetched}/${progress.sessions}` };
+  return { code: 4, line: `gap-refill: STOPPED ${safe} fetched=${progress.fetched}/${progress.sessions}` };
+}
+
 /** --after-scan needs the scan's own run id (GITHUB_RUN_ID); anything else fails closed. */
 export function afterScanRunId(argv: readonly string[], runId: string | undefined): { readonly ownRunId: number } | undefined {
   if (!argv.includes("--after-scan")) return undefined;
@@ -163,7 +180,11 @@ async function main(): Promise<number> {
     backup: (key, body) => { writeFileSync(`refill-backup/${key.replace(/\//g, "__")}.${Date.now()}`, body); backups++; },
   });
   console.log(`gap-refill: massiveRequests=${res.massiveRequests} dust=${res.dustWritten.length} packs=${res.packsWritten.length} puts=${res.puts} backups=${backups} stopped=${res.stopped ?? "no"}`);
-  if (res.stopped) return 4;
+  if (res.stopped) {
+    const stop = refillStopExit(res.stopped, Boolean(afterScan), { fetched, sessions: sessions.length });
+    console.log(stop.line);
+    return stop.code;
+  }
   const rows = await verifySessions(client, sessions);
   const ok = rows.filter((r) => r.ok).length;
   const after = await checkDailyBarsCoverage(client);
