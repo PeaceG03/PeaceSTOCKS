@@ -271,3 +271,17 @@ test("a recent split-sized move with no split record yet (late record) excludes 
   const result = rank(securities, bars, [], D, DEFAULT_SCANNER_CONFIG, []);
   assert.deepEqual(result.excluded, [{ securityId: "rs", reason: "SPLIT_LIKE_MOVE_UNRECORDED" }]);
 });
+
+test("reconcile band is [1/1.5, 1.5]: a split record that leaves a ~90% move is not accepted", async () => {
+  const { splitAdjustedBars } = await import("./split-adjust");
+  const ds = sessions(40);
+  const asOf = ds.at(-1)!;
+  const at = (raw: number, factor: number) => splitAdjustedBars(flatBars(40, 5, raw), [{ effectiveDate: ds[5]!, factor }], asOf);
+  // Synthetic version of a real case: factor 2.8 recorded, raw prices moved 5.3x -> adjusted +89%.
+  assert.deepEqual(at(5.3, 2.8), { excluded: "SPLIT_UNRECONCILED" });
+  // Adjusted moves of 1.6x / 1/1.6 are outside the band; 1.45x / 1/1.45 are inside.
+  assert.deepEqual(at(10 * 1.6, 10), { excluded: "SPLIT_UNRECONCILED" });
+  assert.deepEqual(at(10 / 1.6, 10), { excluded: "SPLIT_UNRECONCILED" });
+  assert.ok("bars" in at(10 * 1.45, 10));
+  assert.ok("bars" in at(10 / 1.45, 10));
+});

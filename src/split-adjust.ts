@@ -5,7 +5,7 @@
  * A recorded SPLIT / REVERSE_SPLIT (details.split_from -> split_to) effective on E rescales every
  * bar before E: prices x (split_from / split_to), volume / the same factor (dollar volume unchanged).
  * The adjustment is used only when the prices agree with it: the adjusted move from the last close
- * before E to the first close on/after E must be within [1/2, 2]. Otherwise, or when the record has
+ * before E to the first close on/after E must be within [1/1.5, 1.5]. Otherwise, or when the record has
  * no usable factor (including two different factors recorded for one date), the name is dropped for
  * that session (SPLIT_UNRECONCILED). After adjusting, any
  * session-to-session close move of 3x or more either way (no recorded split explains it, or the
@@ -16,7 +16,8 @@
  */
 import type { CanonicalDailyBar, CorporateAction } from "./contracts";
 
-export const SPLIT_RECONCILE_MAX_MOVE = 2;
+/** Chosen from the real splits (build log): 95.7% of them reconcile within it. */
+export const SPLIT_RECONCILE_MAX_MOVE = 1.5;
 export const UNEXPLAINED_GAP_RATIO = 3;
 /**
  * Split records can arrive days after the split (1-9 days seen). Until then a 2-for-1 or 1-for-2 looks
