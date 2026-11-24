@@ -196,9 +196,19 @@ export async function latestHealthCheckin(
   store: Pick<HealthCheckinStore, "get" | "list">,
   part: HealthPartId,
 ): Promise<(HealthCheckin & { key: string }) | undefined> {
-  const keys = (await store.list(`${HEALTH_CHECKIN_PREFIX}${part}/`)).sort();
-  const key = keys.at(-1);
-  return key ? parseCheckin(key, await store.get(key), part) : undefined;
+  return (await recentHealthCheckins(store, part, 1))[0];
+}
+
+/** The newest `count` check-ins for one part, newest first (keys sort by day, then time stamp). */
+export async function recentHealthCheckins(
+  store: Pick<HealthCheckinStore, "get" | "list">,
+  part: HealthPartId,
+  count: number,
+): Promise<Array<HealthCheckin & { key: string }>> {
+  const keys = (await store.list(`${HEALTH_CHECKIN_PREFIX}${part}/`)).sort().slice(-count).reverse();
+  const output: Array<HealthCheckin & { key: string }> = [];
+  for (const key of keys) output.push(parseCheckin(key, await store.get(key), part));
+  return output;
 }
 
 /** Write one JSON report with the same read-back check as a check-in (size + checksum metadata). */

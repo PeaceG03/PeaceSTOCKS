@@ -15,8 +15,8 @@ import {
   type HealthCheckinStore,
   type HealthPruneStore,
   errorMessage,
-  latestHealthCheckin,
   pruneHealthCheckins,
+  recentHealthCheckins,
   redactHealthMessage,
   writeVerifiedHealthJson,
 } from "./health-checkins";
@@ -61,6 +61,8 @@ export interface HealthPartResult {
   lastCheckinAt?: string;
   /** Behind parts: the remaining count from the latest check-in. */
   remaining?: number;
+  /** Behind and the remaining count did not shrink since the previous capped run (stall rule). */
+  stalled?: boolean;
 }
 
 /** A day the daily 10-minute step keeps re-running without finishing it. */
@@ -111,9 +113,24 @@ function ageMinutes(atIso: string, now: Date): number {
 }
 
 /** Plain line for a behind part: "scan: behind, 12 remaining (CATCH_UP_COMPLETED:BACKLOG_REMAINS remaining=12)". */
-export function behindLine(name: string, latest: HealthCheckinFacts | undefined): string {
+export function behindLine(name: string, latest: HealthCheckinFacts | undefined, stalledSince?: HealthCheckinFacts): string {
   const remaining = latest?.remaining === undefined ? "unknown count" : `${latest.remaining} remaining`;
-  return `${name}: behind, ${remaining}${latest?.message?.trim() ? ` (${latest.message.trim()})` : ""}`;
+  const what = stalledSince ? `behind and not shrinking, ${remaining} (was ${stalledSince.remaining} on the previous capped run)` : `behind, ${remaining}`;
+  return `${name}: ${what}${latest?.message?.trim() ? ` (${latest.message.trim()})` : ""}`;
+}
+
+/**
+ * Pure stall rule (Peace, Nov 23): the latest and the previous check-in are both capped runs (BEHIND,
+ * with counts) and the remaining count did not shrink. Then the health issue opens or gets a comment.
+ */
+export function backlogStalled(latest: HealthCheckinFacts | undefined, previous: HealthCheckinFacts | undefined): boolean {
+  return (
+    latest?.state === "BEHIND" &&
+    previous?.state === "BEHIND" &&
+    latest.remaining !== undefined &&
+    previous.remaining !== undefined &&
+    latest.remaining >= previous.remaining
+  );
 }
 
 /** Plain line for a stuck day (the health check flags days stuck short of 39 bars, 21 on half days). */
@@ -128,6 +145,8 @@ export function stuckDayLine(day: HealthStuckDay): string {
 export function evaluateHealth(input: {
   parts: readonly HealthCheckPart[];
   latest: ReadonlyMap<string, HealthCheckinFacts | undefined>;
+  /** Each part's check-in before the latest one (the stall rule compares two consecutive capped runs). */
+  previous?: ReadonlyMap<string, HealthCheckinFacts | undefined>;
   /** No-response counts from the previous check. */
   priorRequests?: Readonly<Record<string, number>>;
   now: Date;
@@ -147,6 +166,7 @@ export function evaluateHealth(input: {
       unrecognized: !!latest && !isRecognizedStateWord(word),
       behind: latest?.state === "BEHIND",
     });
+    const stalled = status === "behind" && backlogStalled(latest, input.previous?.get(part.name));
     const asked = silent ? (input.priorRequests?.[part.name] ?? 0) + 1 : 0;
     requests[part.name] = asked;
     const line =
@@ -155,7 +175,7 @@ export function evaluateHealth(input: {
         : status === "no response"
           ? noResponseLine(part.name, asked)
           : status === "behind"
-            ? behindLine(part.name, latest)
+            ? behindLine(part.name, latest, stalled ? input.previous?.get(part.name) : undefined)
           : status === "unrecognized word"
             ? `${part.name}: unrecognized word ${JSON.stringify(word)}`
             : latest
@@ -168,6 +188,7 @@ export function evaluateHealth(input: {
       requests: asked,
       ...(latest ? { lastCheckinAt: latest.at } : {}),
       ...(status === "behind" && latest?.remaining !== undefined ? { remaining: latest.remaining } : {}),
+      ...(stalled ? { stalled: true } : {}),
     });
   }
   const states = results.map((r) => (r.status === "error" ? "ERROR" : r.status === "no response" ? "SILENT" : "OK"));
@@ -178,8 +199,9 @@ export function evaluateHealth(input: {
   const stuckDays = [...(input.stuckDays ?? [])];
   const anyReported = results.some((r) => r.lastCheckinAt !== undefined);
   const attention = results.filter((r) => r.status === "error" || r.status === "no response").map((r) => `${r.name} (${r.status})`);
+  for (const r of results.filter((x) => x.stalled)) attention.push(`${r.name} (behind, not shrinking)`);
   if (stuckDays.length) attention.push(`daily 10-minute step (${stuckDays.length} stuck day/s)`);
-  const behind = results.filter((r) => r.status === "behind").map((r) => `${r.name} (${r.remaining ?? "?"} remaining)`);
+  const behind = results.filter((r) => r.status === "behind" && !r.stalled).map((r) => `${r.name} (${r.remaining ?? "?"} remaining)`);
   const headline = !input.parts.length || !anyReported
     ? NO_PARTS_REPORTING
     : attention.length
@@ -229,7 +251,12 @@ export async function runHealthCheck(
   now: Date = new Date(),
 ): Promise<HealthCheckResult & { prunedCheckins: number }> {
   const latest = new Map<string, HealthCheckinFacts | undefined>();
-  for (const part of HEALTH_PARTS) latest.set(part.name, await latestHealthCheckin(store, part.id));
+  const previous = new Map<string, HealthCheckinFacts | undefined>();
+  for (const part of HEALTH_PARTS) {
+    const [newest, before] = await recentHealthCheckins(store, part.id, 2);
+    latest.set(part.name, newest);
+    previous.set(part.name, before);
+  }
   let priorRequests: Record<string, number> = {};
   const stateBytes = await store.get(HEALTH_CHECK_STATE_KEY);
   if (stateBytes) {
@@ -243,6 +270,7 @@ export async function runHealthCheck(
   const result = evaluateHealth({
     parts: HEALTH_PARTS.map((p) => ({ name: p.name, ...(p.allowedSilenceMinutes === undefined ? {} : { allowedSilenceMinutes: p.allowedSilenceMinutes }) })),
     latest,
+    previous,
     priorRequests,
     now,
     stuckDays: await readStuckDays(store, now),
