@@ -186,3 +186,56 @@ test("two different split factors recorded for one name on the same date: exclud
   const dup = rank(securities, world(10).bars, [], D, DEFAULT_SCANNER_CONFIG, [split("rs", SPLIT_DAY, 10, 1), { ...split("rs", SPLIT_DAY, 10, 1), actionId: "dup" }]);
   assert.ok(dup.ranked.some((r) => r.securityId === "rs"));
 });
+
+/** n flat daily bars for "z" (close 10), with the close multiplied by `ratio` from bar `at` on (held). */
+function flatBars(n: number, at: number, ratio: number): CanonicalDailyBar[] {
+  const ds = sessions(n);
+  return ds.map((d, k) => bar("z", d, k >= at ? 10 * ratio : 10));
+}
+
+test("two splits in one window are both applied (each to the bars before its own date)", async () => {
+  const { splitAdjustedBars } = await import("./split-adjust");
+  const ds = sessions(30);
+  // 1-for-10 reverse at bar 5, then 2-for-1 forward at bar 9: raw 1 -> 10 -> 5.
+  const b = ds.map((d, k) => bar("z", d, k < 5 ? 1 : k < 9 ? 10 : 5));
+  const got = splitAdjustedBars(b, [{ effectiveDate: ds[5]!, factor: 10 }, { effectiveDate: ds[9]!, factor: 0.5 }], ds.at(-1)!);
+  assert.ok("bars" in got, JSON.stringify(got));
+  // Fully adjusted to today's share basis: every close is 5.
+  for (const x of got.bars) assert.ok(Math.abs(x.close - 5) < 1e-9, String(x.close));
+  assert.ok(Math.abs(got.bars[0]!.volume - 100_000 / 5) < 1e-6);
+});
+
+test("a split record with no usable factor excludes the name (not ignored)", () => {
+  const { securities, bars } = world(1); // prices never moved, so ignoring the record would rank the name
+  for (const bad of [split("rs", SPLIT_DAY, 10, 0), { ...split("rs", SPLIT_DAY, 1, 1), details: {} } as CorporateAction]) {
+    const result = rank(securities, bars, [], D, DEFAULT_SCANNER_CONFIG, [bad]);
+    assert.equal(result.ranked.some((r) => r.securityId === "rs"), false);
+    assert.deepEqual(result.excluded, [{ securityId: "rs", reason: "SPLIT_UNRECONCILED" }]);
+  }
+});
+
+test("the unexplained-gap rule fires downward too (a drop to 1/3 or below)", () => {
+  const { securities, bars } = world(0.25); // a 4-for-1-sized drop with no split recorded
+  const result = rank(securities, bars, [], D, DEFAULT_SCANNER_CONFIG, []);
+  assert.equal(result.ranked.some((r) => r.securityId === "rs"), false);
+  assert.deepEqual(result.excluded, [{ securityId: "rs", reason: "PRICE_GAP_UNEXPLAINED" }]);
+});
+
+test("the unexplained-gap boundary is 3x: 3x and 3.5x either way are excluded", async () => {
+  const { splitAdjustedBars } = await import("./split-adjust");
+  for (const ratio of [3, 3.5, 1 / 3, 1 / 3.5]) {
+    const got = splitAdjustedBars(flatBars(40, 5, ratio), [], sessions(40).at(-1)!);
+    assert.deepEqual(got, { excluded: "PRICE_GAP_UNEXPLAINED" }, `ratio ${ratio}`);
+  }
+  // Just inside the boundary (an old move, outside any recent-session check) is kept.
+  assert.ok("bars" in splitAdjustedBars(flatBars(40, 5, 2.9), [], sessions(40).at(-1)!));
+});
+
+test("two split dates with no bar between them are excluded, not combined", async () => {
+  const { splitAdjustedBars } = await import("./split-adjust");
+  const ds = sessions(30);
+  // The name has no bar on ds[5]; records on ds[5] (1-for-10) and ds[6] (2-for-1) both land on bar ds[6].
+  const b = ds.filter((_, k) => k !== 5).map((d) => bar("z", d, d < ds[5]! ? 1 : 5));
+  const got = splitAdjustedBars(b, [{ effectiveDate: ds[5]!, factor: 10 }, { effectiveDate: ds[6]!, factor: 0.5 }], ds.at(-1)!);
+  assert.deepEqual(got, { excluded: "SPLIT_UNRECONCILED" });
+});
