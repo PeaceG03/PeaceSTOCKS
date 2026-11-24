@@ -323,3 +323,26 @@ test("exits: missing price keeps the name held (no rebuy); splits adjust; unexpl
   assert.equal(up.fills[0]!.status, "FILLED");
   assert.equal(fills(180).fills[0]!.status, "FILLED_FLAT"); // exactly 1.8x
 });
+
+test("daily loss limit: exactly the limit counts as hit (<=, not <)", () => {
+  // 50 / 100 - 1 is exactly -0.5 in floating point, so this pins the boundary.
+  assert.equal(dailyLossBreached(100, 50, 0.5), true);
+  assert.equal(dailyLossBreached(100, 50.000001, 0.5), false);
+});
+
+test("entries never spend more cash than is left, even when held names inflate equity", () => {
+  const loaded = loadPaperRules();
+  const held = { securityId: "h", qty: 90, entryOpen: 100, entryFillPrice: 100.1, entrySessionDate: "2026-12-07" };
+  const buy = (id: string) => ({ rulesVersion: "v", rulesSha256: "x", clientOrderId: id, sessionDate: "2026-12-09", securityId: id, side: "BUY" as const, purpose: "ENTRY" as const });
+  const intents: PaperIntents = { schemaVersion: "paper-intents-v1", rulesVersion: "v", rulesSha256: "x", sessionDate: "2026-12-09", freezeSessionDate: "2026-12-08", recordedAt: "", sessionOpen: "", orders: [buy("x"), buy("y")] };
+  const bars = new PaperBars([
+    { securityId: "h", sessionDate: "2026-12-08", open: 100, close: 100, revision: 1 },
+    { securityId: "x", sessionDate: "2026-12-09", open: 10, close: 10, revision: 1 },
+    { securityId: "y", sessionDate: "2026-12-09", open: 10, close: 10, revision: 1 },
+  ] as never);
+  // Equity 1,000 cash + 9,000 held (no exit order) = 10,000; 10% cap = 1,000 each, but only 1,000 cash.
+  const fills = computeFills({ intents, prior: { cash: 1000, positions: [held] }, bars, splits: new Map(), loaded });
+  near(fills.equityAtOpen, 10000);
+  assert.deepEqual(fills.fills.map((f) => [f.securityId, f.status, f.qty]), [["x", "FILLED", Math.floor(1000 / 10.01)], ["y", "ZERO_QTY", 0]]);
+  assert.ok(fills.cashAfter >= 0);
+});
