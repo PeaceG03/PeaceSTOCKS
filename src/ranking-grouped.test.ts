@@ -98,6 +98,7 @@ test("rankSecurities reads each bar's securityId a constant number of times (not
   assert.ok(reads <= 3 * counted.length, `securityId reads=${reads} bars=${counted.length} securities=${securities.length}`);
 });
 
+// Prices stay within 10..13.2 so no session-to-session move reaches the split-sized 3x gap rule.
 test("10.7k securities x 100 sessions ranks in seconds", (t) => {
   const days = sessions(100);
   const D = days.at(-1)!;
@@ -107,7 +108,7 @@ test("10.7k securities x 100 sessions ranks in seconds", (t) => {
     const id = `sec_${String(i).padStart(6, "0")}`;
     securities.push(security(id, "ACTIVE", "LEVEL_2"));
     for (let d = 0; d < days.length; d++)
-      bars.push({ securityId: id, sessionDate: days[d]!, close: 10 + ((i * 7 + d * 13) % 97) / 3, volume: 1000 + d, revision: 1 } as unknown as CanonicalDailyBar);
+      bars.push({ securityId: id, sessionDate: days[d]!, close: 10 + ((i * 7 + d * 13) % 97) / 30, volume: 1000 + d, revision: 1 } as unknown as CanonicalDailyBar);
   }
   const started = performance.now();
   const result = rankSecurities(securities, bars, bars.filter((b) => b.securityId === "sec_000000"), D);

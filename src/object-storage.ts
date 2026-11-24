@@ -1,5 +1,6 @@
 import { CORPORATE_ACTION_COVERAGE_KEY, type CorporateActionCoverageRecord } from "./corporate-action-coverage";
 import { createHash } from "node:crypto";
+import { isSplitAction } from "./split-adjust";
 import type {
   CanonicalDailyBar,
   CorporateAction,
@@ -196,6 +197,10 @@ export class ObjectMarketStorage implements MarketStore {
 
   async appendActions(records: CorporateAction[]): Promise<void> {
     await this.appendUnique("permanent/corporate-actions.jsonl", records, (record) => record.actionId);
+  }
+
+  async loadSplitActions(): Promise<CorporateAction[]> {
+    return lines<CorporateAction>(await this.readText("permanent/corporate-actions.jsonl")).filter(isSplitAction);
   }
 
   /** One line per session whose splits + dividends were fetched and stored (see corporate-action-coverage.ts). */

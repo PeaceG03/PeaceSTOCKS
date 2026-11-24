@@ -124,6 +124,17 @@ Scanner currently defines:
 
 These are candidate sets, not orders.
 
+### Split adjustment
+
+Stored daily bars are unadjusted. Before features and ranking, `src/split-adjust.ts` rescales each
+name's bars before a recorded SPLIT / REVERSE_SPLIT (prices x split_from/split_to, volume divided by
+it) using `permanent/corporate-actions.jsonl` (only splits effective on or before the scanned
+session). A split whose adjusted close-to-close move is outside [1/2, 2], or a record without a
+usable factor, drops the name for that session (SPLIT_UNRECONCILED). Any remaining session-to-session
+close move of 3x or more either way drops it too (PRICE_GAP_UNEXPLAINED): that covers splits missing
+from the data. Nothing is guessed. The run report lists the count in `skips` as
+`SPLIT_ADJUST_EXCLUDED:<n>`. Lists frozen through 2026-11-23 used unadjusted closes.
+
 ## Provider baseline
 
 Massive is the current production provider adapter.

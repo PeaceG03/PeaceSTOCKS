@@ -9,8 +9,8 @@
  * after D. Baselines on the same names and sessions: the equal-weight average of every ranked
  * name with an outcome ("universe"), random lists of the same size from that universe, and SPY.
  */
-import type { CanonicalDailyBar, PredictionSet, SecurityMasterRecord } from "./contracts";
-import { rankSecurities } from "./ranking";
+import type { CanonicalDailyBar, CorporateAction, PredictionSet, SecurityMasterRecord } from "./contracts";
+import { DEFAULT_SCANNER_CONFIG, rankSecurities } from "./ranking";
 import { resolveSpyBenchmarkId, scanBarWindowStart, type SessionCalendar } from "./scanner";
 import { eligibilityForBarCount } from "./universe";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
@@ -126,6 +126,8 @@ export interface EvalOptions {
   /** Clip every return to the universe's [p, 1-p] quantiles of that session (same for picks and baselines). */
   winsorize?: number;
   calendar?: SessionCalendar;
+  /** Stored split records, passed to rankSecurities as the scan does (only those effective <= D are used). */
+  splitActions?: readonly CorporateAction[];
 }
 
 export function rng(seed: number): () => number {
@@ -174,14 +176,14 @@ export function evaluateSession(
   history: EvalHistory,
   i: number,
   options: EvalOptions,
-): { predictions: PredictionSet[]; outcome: SessionOutcome } | undefined {
+): { predictions: PredictionSet[]; excluded: number; outcome: SessionOutcome } | undefined {
   const D = history.sessions[i]!;
   if (!history.sessions[i + options.horizon]) return undefined;
   const securities = pointInTimeSecurities(master, history, i);
   const bars = scanInputBars(history, i, options.calendar);
   const spyId = resolveSpyBenchmarkId(securities);
   const benchmark = spyId ? bars.filter((bar) => bar.securityId === spyId) : [];
-  const result = rankSecurities(securities, bars, benchmark, D);
+  const result = rankSecurities(securities, bars, benchmark, D, DEFAULT_SCANNER_CONFIG, options.splitActions ?? []);
   const h = options.horizon;
   const raw = new Map<string, number>();
   for (const item of result.ranked) {
@@ -220,6 +222,7 @@ export function evaluateSession(
   const spy = spyId ? forwardReturn(history, spyId, i, h) : undefined;
   return {
     predictions: result.predictions,
+    excluded: result.excluded?.length ?? 0,
     outcome: { sessionDate: D, universeSize: universe.length, universeMean, ...(spy !== undefined ? { spy } : {}), ic, lists },
   };
 }

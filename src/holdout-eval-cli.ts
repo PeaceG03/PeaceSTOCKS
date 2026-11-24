@@ -10,7 +10,7 @@
  */
 import { createReadStream, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-import type { SecurityMasterRecord } from "./contracts";
+import type { CorporateAction, SecurityMasterRecord } from "./contracts";
 import { EvalHistory, evaluateSession, summarize, type EvalBar, type SessionOutcome } from "./holdout-eval";
 
 function arg(name: string, fallback?: string): string {
@@ -76,12 +76,14 @@ async function main(): Promise<void> {
 
   // Known splits / reverse splits inside (entry, exit] make an unadjusted return meaningless: drop that name-window.
   const splits = new Map<string, Set<string>>();
+  const splitActions: CorporateAction[] = [];
   const actionsPath = `${dir}/permanent/corporate-actions.jsonl`;
   if (existsSync(actionsPath))
     for (const line of readFileSync(actionsPath, "utf8").split("\n")) {
       if (!line) continue;
-      const a = JSON.parse(line) as { securityId: string; actionType: string; effectiveDate: string };
+      const a = JSON.parse(line) as CorporateAction;
       if (a.actionType !== "SPLIT" && a.actionType !== "REVERSE_SPLIT") continue;
+      splitActions.push(a);
       let set = splits.get(a.securityId);
       if (!set) splits.set(a.securityId, (set = new Set()));
       set.add(a.effectiveDate);
@@ -96,17 +98,19 @@ async function main(): Promise<void> {
   };
 
   const outcomes: SessionOutcome[] = [];
+  let splitExcluded = 0;
   const indexes = history.sessions.map((d, i) => [d, i] as const).filter(([d]) => d >= from && d <= to);
   log(`sessions stored ${history.sessions.length} (${history.sessions[0]}..${history.sessions.at(-1)}), evaluated candidates ${indexes.length}`);
   for (const [k, [D, i]] of indexes.entries()) {
     if (k % step !== 0) continue;
     const started = Date.now();
-    const got = evaluateSession(master, history, i, { horizon, randomDraws: draws, seed: 20261124, excluded, ...(winsorize ? { winsorize } : {}) });
+    const got = evaluateSession(master, history, i, { horizon, randomDraws: draws, seed: 20261124, excluded, splitActions, ...(winsorize ? { winsorize } : {}) });
     if (!got) {
       log(`${D}: no outcome window (needs ${horizon} later sessions)`);
       continue;
     }
     outcomes.push(got.outcome);
+    splitExcluded += got.excluded;
     const o = got.outcome;
     const fmt = (x: number | undefined) => (x === undefined ? "n/a" : (x * 100).toFixed(3) + "%");
     log(`${D}: universe ${o.universeSize} mean ${fmt(o.universeMean)} spy ${fmt(o.spy)} ic ${o.ic.toFixed(4)} | ${Object.entries(o.lists)
@@ -115,11 +119,12 @@ async function main(): Promise<void> {
   }
   const summary = summarize(outcomes);
   log(`split-dropped name-windows ${droppedForSplit}`);
+  log(`names left out of ranking by split adjustment (name-sessions) ${splitExcluded}`);
   log(`SUMMARY sessions ${summary.sessions} meanIC ${summary.meanIC.toFixed(4)} icT ${summary.icTStat.toFixed(2)}`);
   for (const [type, s] of Object.entries(summary.lists))
     log(`SUMMARY ${type}: sessions ${s.sessions} mean ${(s.meanReturn * 100).toFixed(3)}% universe ${(s.universeMean * 100).toFixed(3)}% random ${(s.randomMean * 100).toFixed(3)}% spy ${s.spyMean === undefined ? "n/a" : (s.spyMean * 100).toFixed(3) + "%"} excess ${(s.meanExcess * 100).toFixed(3)}% t ${s.excessTStat.toFixed(2)} hit ${(s.hitRate * 100).toFixed(1)}% randomP ${s.randomP.toFixed(3)}`);
   if (out)
-    writeFileSync(out, JSON.stringify({ from, to, horizon, draws, step, winsorize, sessionsEvaluated: outcomes.map((o) => o.sessionDate), droppedForSplit, summary }, null, 2) + "\n");
+    writeFileSync(out, JSON.stringify({ from, to, horizon, draws, step, winsorize, sessionsEvaluated: outcomes.map((o) => o.sessionDate), droppedForSplit, splitExcluded, summary }, null, 2) + "\n");
 }
 
 await main();

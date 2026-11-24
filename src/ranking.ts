@@ -1,5 +1,6 @@
 import type {
   CanonicalDailyBar,
+  CorporateAction,
   DerivedFeatures,
   PredictionSet,
   ScannerBelief,
@@ -9,6 +10,7 @@ import type {
 import { SCANNER_VERSION } from "./contracts";
 import { reconstructFeatures } from "./features";
 import { fingerprint, sha256 } from "./identity";
+import { splitAdjustedBars, splitEventsBySecurity, type SplitExclusion } from "./split-adjust";
 
 export const DEFAULT_SCANNER_CONFIG: ScannerConfig = {
   version: "scanner-config-v0.1",
@@ -81,6 +83,8 @@ export interface RankingResult {
   beliefs: ScannerBelief[];
   ranked: RankedSecurity[];
   predictions: PredictionSet[];
+  /** Eligible names left out because their splits could not be adjusted honestly (absent when none). */
+  excluded?: Array<{ securityId: string; reason: SplitExclusion }>;
 }
 
 export function rankSecurities(
@@ -89,6 +93,7 @@ export function rankSecurities(
   benchmarkBars: CanonicalDailyBar[],
   sessionDate: string,
   config: ScannerConfig = DEFAULT_SCANNER_CONFIG,
+  splitActions: readonly CorporateAction[] = [],
 ): RankingResult {
   const eligible = securities.filter(
     (security) =>
@@ -102,17 +107,19 @@ export function rankSecurities(
     if (!found) latestById.set(id, (found = latestBars(bySecurity.get(id))));
     return found;
   };
+  // Features use split-adjusted closes (stored bars are unadjusted); names whose splits cannot be
+  // reconciled are left out. The evidence fingerprint below still hashes the raw bars.
+  const splits = splitEventsBySecurity(splitActions);
+  const adjustedById = new Map<string, CanonicalDailyBar[]>();
+  const excluded: Array<{ securityId: string; reason: SplitExclusion }> = [];
+  for (const security of eligible) {
+    const adjusted = splitAdjustedBars(latestFor(security.securityId), splits.get(security.securityId), sessionDate);
+    if ("excluded" in adjusted) excluded.push({ securityId: security.securityId, reason: adjusted.excluded });
+    else adjustedById.set(security.securityId, adjusted.bars);
+  }
   const featureById = new Map<string, DerivedFeatures>();
-  for (const security of eligible)
-    featureById.set(
-      security.securityId,
-      reconstructFeatures(
-        security.securityId,
-        sessionDate,
-        latestFor(security.securityId),
-        benchmarkBars,
-      ),
-    );
+  for (const [securityId, adjusted] of adjustedById)
+    featureById.set(securityId, reconstructFeatures(securityId, sessionDate, adjusted, benchmarkBars));
   const momentum = normalized(
     new Map(
       [...featureById].map(([id, features]): [string, number | null] => [
@@ -220,7 +227,7 @@ export function rankSecurities(
   // Its own list (it used to copy TOP_15_OVERALL): ranked names with an improvement value, largest
   // first, ties by id. None has enough history: empty and marked unavailable, never filled from overall.
   const improving = ranked
-    .map((item) => ({ id: item.securityId, value: improvementValue(latestFor(item.securityId).map((bar) => bar.close)) }))
+    .map((item) => ({ id: item.securityId, value: improvementValue(adjustedById.get(item.securityId)!.map((bar) => bar.close)) }))
     .filter((entry): entry is { id: string; value: number } => entry.value !== null)
     .sort((a, b) => b.value - a.value || a.id.localeCompare(b.id))
     .map((entry) => entry.id);
@@ -250,5 +257,5 @@ export function rankSecurities(
         : {}),
     };
   });
-  return { beliefs, ranked, predictions };
+  return { beliefs, ranked, predictions, ...(excluded.length ? { excluded } : {}) };
 }

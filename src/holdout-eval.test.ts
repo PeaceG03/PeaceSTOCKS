@@ -108,3 +108,16 @@ test("excluded names and winsorizing apply to picks and baselines alike; spearma
   assert.equal(spearman([1, 2, 3, 4], [4, 3, 2, 1]), -1);
   assert.deepEqual(summarize([all.outcome, some.outcome, clipped.outcome], 2).sessions, 2);
 });
+
+test("the replay passes stored split records to the ranking, as the scan does", () => {
+  const days = weekdays(130);
+  const { bars, ids } = world(30, days, 8, false);
+  const jumped = bars.map((b) => (b.securityId === "s001" && b.sessionDate >= days[100]! ? { ...b, open: b.open * 10, close: b.close * 10 } : b));
+  const history = new EvalHistory(jumped);
+  const action = { actionId: "x", securityId: "s001", actionType: "REVERSE_SPLIT", effectiveDate: days[100]!, details: { split_from: 10, split_to: 1 } } as never;
+  const without = evaluateSession(master(ids), history, 110, { horizon: 1, randomDraws: 1, seed: 1 })!;
+  const withSplit = evaluateSession(master(ids), history, 110, { horizon: 1, randomDraws: 1, seed: 1, splitActions: [action] })!;
+  assert.equal(without.excluded, 1); // unexplained 10x jump: left out
+  assert.equal(withSplit.excluded, 0); // adjusted: ranked again
+  assert.equal(withSplit.outcome.universeSize, without.outcome.universeSize + 1);
+});
