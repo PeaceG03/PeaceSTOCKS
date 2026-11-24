@@ -28,6 +28,7 @@ import {
 } from "./reply-dust-pin";
 import { MarketStorage, type MarketStore } from "./storage";
 import { refreshEligibility, refreshUniverse } from "./universe";
+import { errorMessage, reportPart } from "./health-checkins";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import { finalizeDailyPartition } from "./scanner";
 import { ScanYieldError, createScanYieldCheck } from "./scan-yield";
@@ -455,7 +456,11 @@ if (process.argv[1]?.endsWith("backfill.ts")) {
     from,
     to,
     ...(maxText ? { maxSessions: Number(maxText) } : {}),
+  }).catch(async (error: unknown) => {
+    await reportPart(process.env, "backfill", "ERROR", errorMessage(error));
+    throw error;
   });
   console.log(JSON.stringify(result));
   if (result.stoppedOnError) process.exitCode = 2;
+  await reportPart(process.env, "backfill", result.stoppedOnError ? "ERROR" : "OK", result.stoppedOnError ? "STOPPED_ON_ERROR" : undefined);
 }

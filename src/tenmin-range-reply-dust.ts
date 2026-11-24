@@ -455,11 +455,17 @@ export async function writeTenMinRangeFetch(
     link?: string;
     /** rd-origin (see tenMinRangeObjectMetadata). */
     origin?: string;
+    /** Named overwrite of an existing object at the same key (see storeVerifiedReplyDust); refused once the range is sealed. */
+    replace?: "shorter-reply" | "unverified";
   },
 ): Promise<{ securityId: string; fetch: TenMinRangeTickerFetch }> {
   const { calendarFrom, calendarTo, fetchFrom, fetchTo, provider } = options;
   requireRange(calendarFrom, calendarTo);
   requireRange(fetchFrom, fetchTo);
+  // Under a sealed range no existing object is ever replaced (Auditor B3): the named overwrite is
+  // dropped, so a different object at an existing key is refused; new keys (a manual reopen) still write.
+  const replace =
+    options.replace && !(await store.head(tenMinRangeManifestKey(calendarFrom, calendarTo))) ? options.replace : undefined;
   const first = pages[0];
   if (!first) throw new Error("TENMIN_RANGE_NO_PAGES");
   if (pages.length > TENMIN_RANGE_PAGE_CAP)
@@ -521,6 +527,7 @@ export async function writeTenMinRangeFetch(
           ...(options.link !== undefined ? { link: options.link } : {}),
           ...(options.origin !== undefined ? { origin: options.origin } : {}),
         }),
+      replace ? { replace } : {},
     );
     files.push(entryFor(encoded));
   }
@@ -894,6 +901,8 @@ export interface TenMinRangeWriteResult {
   massiveRequests: number;
   yieldedForScan?: string;
   outageStop?: string;
+  /** The seal guard refused to seal (a day in the range is still retrying); nothing was sealed. */
+  sealRefused?: string;
   warnings?: string[];
 }
 
@@ -1002,6 +1011,11 @@ export async function writeTenMinRangeReplyDust(options: {
    */
   authoritativeGapReasons?: readonly string[];
   shouldYield?: () => Promise<string | undefined>;
+  /**
+   * Seal guard (Peace, Nov 23): checked after the fetches, right before sealing. A reason refuses the
+   * seal (nothing sealed, stored work kept, result.sealRefused set); undefined lets it seal.
+   */
+  sealGuard?: () => Promise<string | undefined>;
   backend?: ReplyDustBackend;
   zstdVersionProbe?: ZstdVersionProbe;
   now?: () => string;
@@ -1250,6 +1264,8 @@ export async function writeTenMinRangeReplyDust(options: {
           fetchFrom: planned.fetchFrom,
           fetchTo: planned.fetchTo,
           backend,
+          // Reached only after resume found no stored copy of this fetch that verifies.
+          replace: "unverified",
           ...(options.securityLink ? { link: options.securityLink.source } : {}),
         });
         filesWritten += fetch.files.length;
@@ -1307,7 +1323,8 @@ export async function writeTenMinRangeReplyDust(options: {
     throw withTenMinMassiveRequests(error, massiveRequests);
   }
 
-  if (yieldedForScan || outageStop) {
+  const sealRefused = !yieldedForScan && !outageStop && options.sealGuard ? await options.sealGuard() : undefined;
+  if (yieldedForScan || outageStop || sealRefused) {
     return {
       manifest: existing,
       alreadySealed: false,
@@ -1327,6 +1344,7 @@ export async function writeTenMinRangeReplyDust(options: {
       massiveRequests,
       ...(yieldedForScan ? { yieldedForScan } : {}),
       ...(outageStop ? { outageStop } : {}),
+      ...(sealRefused ? { sealRefused } : {}),
       ...(warnings.length || fallbackFiles > 0
         ? {
             warnings: [

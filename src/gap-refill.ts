@@ -13,6 +13,7 @@ import { isIdleScannerRun } from "./scan-yield";
 import { refill, verifySessions } from "./gap-refill-lib";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import { timedFetch } from "./oct2024-tenmin-oneoff";
+import { reportPart } from "./health-checkins";
 
 export type NetFreeze = { ok: true; commit: string } | { ok: false; reason: string };
 
@@ -64,11 +65,37 @@ export function refillStopExit(
   stopped: string,
   afterScan: boolean,
   progress: { fetched: number; sessions: number },
-): { code: number; line: string } {
+): { code: number; line: string; behind?: { remaining: number }; runsCheckFailed?: true } {
   const safe = stopped.replace(/[^A-Z0-9_]/gu, "").slice(0, 40) || "UNKNOWN";
+  // Behind, not OK: health shows the remaining count (missing sessions this run did not fetch).
   if (afterScan && stopped === "DEADLINE")
-    return { code: 0, line: `gap-refill: BACKLOG_REMAINS stopped=DEADLINE fetched=${progress.fetched}/${progress.sessions}` };
+    return {
+      code: 0,
+      line: `gap-refill: BACKLOG_REMAINS stopped=DEADLINE fetched=${progress.fetched}/${progress.sessions}`,
+      behind: { remaining: Math.max(0, progress.sessions - progress.fetched) },
+    };
+  // After a scan the step stays green (the scan itself finished; the shared tail must not open the
+  // "needs a person" issue twice); the ERROR check-in makes health raise its one issue.
+  if (afterScan && stopped === DEADLINE_RUNS_CHECK_FAILED)
+    return {
+      code: 0,
+      line: `gap-refill: STOPPED ${DEADLINE_RUNS_CHECK_FAILED} fetched=${progress.fetched}/${progress.sessions}\n::warning title=Gap refill after scan::the runs API kept failing until the budget ran out (RUNS_CHECK_FAILED); health raises the issue`,
+      runsCheckFailed: true,
+    };
   return { code: 4, line: `gap-refill: STOPPED ${safe} fetched=${progress.fetched}/${progress.sessions}` };
+}
+
+/** Consecutive RUNS_CHECK_FAILED pauses (the runs API kept failing) that make a budget stop non-OK. */
+export const RUNS_CHECK_FAILED_REPEATED = 2;
+export const DEADLINE_RUNS_CHECK_FAILED = "DEADLINE_RUNS_CHECK_FAILED" as const;
+
+/**
+ * Pure: the stop word when the budget runs out. After repeated RUNS_CHECK_FAILED pauses (Auditor, #114
+ * PASS note) it is DEADLINE_RUNS_CHECK_FAILED, not the planned cap: the run waited on a broken check, so
+ * it checks in as ERROR and health raises the issue, instead of a quiet BACKLOG_REMAINS exit 0.
+ */
+export function deadlineStopReason(runsCheckFailedStreak: number): "DEADLINE" | typeof DEADLINE_RUNS_CHECK_FAILED {
+  return runsCheckFailedStreak >= RUNS_CHECK_FAILED_REPEATED ? DEADLINE_RUNS_CHECK_FAILED : "DEADLINE";
 }
 
 /** --after-scan needs the scan's own run id (GITHUB_RUN_ID); anything else fails closed. */
@@ -120,6 +147,11 @@ function noDelete(c: ObjectClient): ObjectClient {
   return { get: wrap(c.get.bind(c)), put: wrap(c.put.bind(c)), head: wrap(c.head.bind(c)), list: wrap(c.list.bind(c)), delete: async () => { throw new Error("NO_DELETE"); } };
 }
 
+/** Set by main when an after-scan refill stopped on its budget (BACKLOG_REMAINS): the check-in is BEHIND. */
+let behindRemaining: number | undefined;
+/** Set by main when an after-scan refill ran out of budget waiting on a failing runs API: the check-in is ERROR. */
+let runsCheckFailedUntilDeadline = false;
+
 async function main(): Promise<number> {
   if (process.argv[2] === "--check-asof") {
     // Runner computes as of UTC yesterday: that session must already be stored (the scan lands it after 05:30Z).
@@ -153,11 +185,13 @@ async function main(): Promise<number> {
   const seen = new Set<string>();
   const beat = setInterval(() => console.log(`gap-refill: heartbeat ${JSON.stringify(counters)} fetched=${fetched}`), 60_000);
   beat.unref();
+  let runsCheckFailedStreak = 0;
   const gate = async (): Promise<string | undefined> => {
     counters.gate++;
     for (;;) {
-      if (Date.now() >= deadline) return "DEADLINE";
+      if (Date.now() >= deadline) return deadlineStopReason(runsCheckFailedStreak);
       const why = refillPauseReason(new Date(), await scannerRuns(), afterScan);
+      runsCheckFailedStreak = why === "RUNS_CHECK_FAILED" ? runsCheckFailedStreak + 1 : 0;
       if (!why) return undefined;
       if (!seen.has(`pause:${why}`)) { seen.add(`pause:${why}`); console.log(`gap-refill: pause ${why}`); }
       await new Promise((r) => setTimeout(r, 60_000));
@@ -183,6 +217,8 @@ async function main(): Promise<number> {
   if (res.stopped) {
     const stop = refillStopExit(res.stopped, Boolean(afterScan), { fetched, sessions: sessions.length });
     console.log(stop.line);
+    if (stop.behind) behindRemaining = stop.behind.remaining;
+    if (stop.runsCheckFailed) runsCheckFailedUntilDeadline = true;
     return stop.code;
   }
   const rows = await verifySessions(client, sessions);
@@ -192,8 +228,49 @@ async function main(): Promise<number> {
   return ok === sessions.length && after.ok ? 0 : 2;
 }
 
+/**
+ * Pure: the health check-in a gap-refill run writes, or undefined for the read-only probes (--check,
+ * --check-asof check coverage for other jobs and never check in). The refill itself checks in both as
+ * the weekly run (no argument) and after a scan (--after-scan), on the success and the failure path.
+ */
+export function refillCheckin(
+  argv: readonly string[],
+  outcome: { readonly code: number; readonly behind?: { readonly remaining: number }; readonly runsCheckFailed?: boolean } | { readonly fail: string },
+): { state: "OK" | "ERROR" | "BEHIND"; message?: string; remaining?: number } | undefined {
+  const afterScan = argv.includes("--after-scan");
+  if (argv.length > 0 && !afterScan) return undefined;
+  const tag = afterScan ? " (after-scan)" : "";
+  if ("fail" in outcome) return { state: "ERROR", message: `GAP_REFILL_FAIL_${outcome.fail}${tag}` };
+  if (outcome.runsCheckFailed) return { state: "ERROR", message: `GAP_REFILL_${DEADLINE_RUNS_CHECK_FAILED}${tag}` };
+  if (outcome.code === 0 && outcome.behind)
+    return { state: "BEHIND", message: `BACKLOG_REMAINS stopped=DEADLINE remaining=${outcome.behind.remaining}${tag}`, remaining: outcome.behind.remaining };
+  return outcome.code === 0
+    ? { state: "OK", ...(afterScan ? { message: "AFTER_SCAN" } : {}) }
+    : { state: "ERROR", message: `GAP_REFILL_EXIT_${outcome.code}${tag}` };
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().then((c) => process.exit(c), (e) => { console.log(`gap-refill: FAIL ${/REFILL_GUARD_REFUSED/u.test(String(e)) ? "GUARD_REFUSED" : "error"}`); process.exit(1); });
+  const argv = process.argv.slice(2);
+  const checkIn = async (outcome: Parameters<typeof refillCheckin>[1]) => {
+    const c = refillCheckin(argv, outcome);
+    if (c) await reportPart(process.env, "gap-refill", c.state, c.message, {}, c.remaining === undefined ? {} : { remaining: c.remaining });
+  };
+  main().then(
+    async (c) => {
+      await checkIn({
+        code: c,
+        ...(behindRemaining === undefined ? {} : { behind: { remaining: behindRemaining } }),
+        ...(runsCheckFailedUntilDeadline ? { runsCheckFailed: true } : {}),
+      });
+      process.exit(c);
+    },
+    async (e) => {
+      const why = /REFILL_GUARD_REFUSED/u.test(String(e)) ? "GUARD_REFUSED" : "error";
+      console.log(`gap-refill: FAIL ${why}`);
+      await checkIn({ fail: why });
+      process.exit(1);
+    },
+  );
 }
 
 /** REFILL_BUDGET_MS: blank -> the default; plain digits 1..86400000 -> the number; anything else throws (fail closed). */

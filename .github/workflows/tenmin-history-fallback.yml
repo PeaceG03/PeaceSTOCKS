@@ -92,6 +92,20 @@ jobs:
           if [ -n "$run_id" ]; then
             gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n tenmin-history-record -D "$RUNNER_TEMP/record"
           fi
+      # Only the held day itself unblocks a held chain: the decide step reads the newest daily 10-minute
+      # report (per-day status COMPLETE / STUCK_SHORT) and restarts only once the held day is resolved.
+      - name: Fetch the newest daily 10-minute report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/daily"
+          # Main's runs only: a branch dispatch's report must not resolve the main chain's held day.
+          run_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=tenmin-daily-report&per_page=100" \
+            --jq '[.artifacts[] | select((.expired | not) and .workflow_run.head_branch == "main")] | sort_by(.created_at) | last | .workflow_run.id // empty')"
+          if [ -n "$run_id" ]; then
+            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n tenmin-daily-report -D "$RUNNER_TEMP/daily" || echo "daily report not readable yet"
+          fi
       - name: Decide and dispatch
         id: redispatch
         env:
@@ -102,6 +116,7 @@ jobs:
           # an old cap restarts (CONTINUE_RANGE_END_CAP_RAISED) and a closed new range restarts a
           # finished chain (CONTINUE_NEW_RANGE_CLOSED).
           TENMIN_RECORD_FILE: ${{ runner.temp }}/record/tenmin-history-record.json
+          TENMIN_DAILY_REPORT_FILE: ${{ runner.temp }}/daily/tenmin-daily-report.json
           TENMIN_DISPATCH_REF: ${{ github.event.repository.default_branch }}
         # After a dispatch: if a scheduled scanner.yml run created in the last 10 min was cancelled,
         # rewrite TENMIN_RECORD_FILE to STOP_SCAN_CANCELLED, cancel the just-dispatched tenmin_history

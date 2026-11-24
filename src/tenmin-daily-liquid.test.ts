@@ -18,6 +18,7 @@ import {
   runTenMinDailyLiquid,
   selectTenMinDailyLiquidNames,
   tenMinDailyCatchupSessions,
+  tenMinDailyHistoryHold,
   tenMinDailyIndexKey,
   tenMinDailyYieldReason,
   tradingSessionsBefore,
@@ -78,11 +79,14 @@ function barsFor(sessions: readonly string[], dv: Record<string, number> = DV): 
 /** One 10-minute Massive bar JSON for a UTC ISO time. */
 const aggBar = (iso: string, price: number) =>
   `{"v":100,"vw":${price},"o":${price},"c":${price + 0.01},"h":${price + 0.02},"l":${price - 0.01},"t":${Date.parse(iso)},"n":3}`;
-/** Two regular-hours bars on session D (EDT: 13:30Z and 13:40Z). */
-const dayBars = (symbol: string, d: string) => {
+/** The first `count` regular-hours ten-minute bars on session D (EDT: from 13:30Z). Synthetic prices. */
+const barsOnDay = (symbol: string, d: string, count: number) => {
   const base = symbol.charCodeAt(0);
-  return [aggBar(`${d}T13:30:00Z`, base), aggBar(`${d}T13:40:00Z`, base + 0.5)];
+  const open = Date.parse(`${d}T13:30:00Z`);
+  return Array.from({ length: count }, (_, i) => aggBar(new Date(open + i * 600_000).toISOString(), base + i / 100));
 };
+/** All 39 regular-hours bars on a normal session D (the done-day rule needs every one). */
+const dayBars = (symbol: string, d: string) => barsOnDay(symbol, d, 39);
 
 function replyPages(symbol: string, securityId: string, from: string, to: string, bars: string[], fetchedAt = "2026-10-10T06:31:00.000Z"): TenMinuteRangeReply[] {
   const body = `{"ticker":"${symbol}","adjusted":false,"results":[${bars.join(",")}],"status":"OK","request_id":"SYN-${symbol}-${from}-${to}","count":${bars.length}}`;
@@ -392,7 +396,8 @@ test("outage: 5 network/5xx failures in a row stop the run; a 404-style failure 
     },
   });
   assert.equal(gapRun.sessions[0]!.gaps, 1);
-  assert.equal(gapRun.sessions[0]!.status, "COMPLETE");
+  // Done-day rule: a gap is not a saved stock, so the day is not done and catch-up re-runs it.
+  assert.equal(gapRun.sessions[0]!.status, "PARTIAL");
 });
 
 test("yield reason: guard windows, deadline, waiting scheduled scan only (history, restarter and the daily run itself do not preempt)", async () => {
@@ -677,4 +682,361 @@ test("liquidRequiresObjectStore: only unset/\"\"/0/1; a typo throws instead of t
   assert.equal(liquidRequiresObjectStore("1"), true);
   for (const bad of ["true", "yes", "2"])
     assert.throws(() => liquidRequiresObjectStore(bad), /PEACESTOCKS_REQUIRE_OBJECT_STORE_INVALID/u, bad);
+});
+
+test("done-day: a stock short of 39 bars keeps the day open; catch-up re-runs it until its bars are saved", async () => {
+  const store = new MemoryObjectClient();
+  const calls: string[] = [];
+  let bbbBars = 30;
+  const fetchPages = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+    calls.push(`${sec.symbol}:${from}:${to}`);
+    return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, sec.symbol === "BBB" ? bbbBars : 39));
+  };
+  const first = await baseRun(store, calls, { catchupSessions: 1, fetchPages });
+  assert.equal(first.sessions[0]!.status, "PARTIAL", "BBB has 30 of 39 bars");
+  assert.equal(first.sessions[0]!.shortNames, 1);
+  assert.equal(first.sessions[0]!.expectedBars, 39);
+  let index = await readTenMinDailyIndex(store, "2026-10-09");
+  assert.equal(index!.done, undefined);
+  assert.equal(index!.notDoneRuns, 1);
+  assert.equal(index!.stored.find((e) => e.securityId === "sec_bbb")?.bars, 30);
+
+  // Re-run: only the short stock is fetched again; a reply with no more bars is not written.
+  calls.length = 0;
+  const bbbKey = tenMinRangeFileKey(RANGE_FROM, RANGE_TO, "sec_bbb", "BBB", "2026-10-09", "2026-10-09", 1);
+  const shortBytes = await store.get(bbbKey);
+  const second = await baseRun(store, calls, { catchupSessions: 1, fetchPages });
+  assert.deepEqual(calls, ["BBB:2026-10-09:2026-10-09"]);
+  assert.equal(second.sessions[0]!.status, "PARTIAL");
+  assert.deepEqual(await store.get(bbbKey), shortBytes, "same-size reply does not replace the stored one");
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-09"))!.notDoneRuns, 2);
+
+  // The provider now has every bar: the day is done.
+  bbbBars = 39;
+  calls.length = 0;
+  const third = await baseRun(store, calls, { catchupSessions: 1, fetchPages });
+  assert.deepEqual(calls, ["BBB:2026-10-09:2026-10-09"]);
+  assert.equal(third.sessions[0]!.status, "COMPLETE");
+  assert.equal(third.sessions[0]!.refetchedThisRun, 1);
+  index = await readTenMinDailyIndex(store, "2026-10-09");
+  assert.equal(index!.done?.expectedBars, 39);
+  assert.equal(index!.stored.find((e) => e.securityId === "sec_bbb")?.bars, 39);
+
+  // Done days are not re-run.
+  calls.length = 0;
+  const fourth = await baseRun(store, calls, { catchupSessions: 1, fetchPages });
+  assert.deepEqual(calls, []);
+  assert.equal(fourth.sessions[0]!.status, "COMPLETE");
+});
+
+test("done-day: all ten-minute bars without the daily bars saved is not done; it finishes once the daily bars land", async () => {
+  const store = new MemoryObjectClient();
+  const calls: string[] = [];
+  // Ranking bars exist for earlier sessions, but the session's own daily bars are not saved yet.
+  const noDailyForD = async (sessions: readonly string[]) => barsFor(sessions.filter((s) => s !== "2026-10-09"));
+  const first = await baseRun(store, calls, { catchupSessions: 1, loadBars: noDailyForD });
+  assert.equal(first.sessions[0]!.status, "WAITING_DAILY_BARS");
+  assert.equal(first.sessions[0]!.missingDailyBars, 3);
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-09"))!.done, undefined);
+  calls.length = 0;
+  const second = await baseRun(store, calls, { catchupSessions: 1 });
+  assert.deepEqual(calls, [], "no Massive request: only the daily bars were missing");
+  assert.equal(second.sessions[0]!.status, "COMPLETE");
+  assert.ok((await readTenMinDailyIndex(store, "2026-10-09"))!.done);
+});
+
+test("done-day: a half day is done at 21 bars", async () => {
+  const store = new MemoryObjectClient();
+  const calls: string[] = [];
+  // 2026-11-27 is the NYSE half day after Thanksgiving (EST: open 14:30Z).
+  const fetchPages = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+    calls.push(`${sec.symbol}:${from}`);
+    const open = Date.parse(`${from}T14:30:00Z`);
+    const bars = Array.from({ length: 21 }, (_, i) => aggBar(new Date(open + i * 600_000).toISOString(), 50 + i / 100));
+    return replyPages(sec.symbol, sec.securityId, from, to, bars);
+  };
+  const run = await baseRun(store, calls, { lastCompletedSession: "2026-11-27", catchupSessions: 1, fetchPages });
+  assert.equal(run.sessions[0]!.sessionDate, "2026-11-27");
+  assert.equal(run.sessions[0]!.expectedBars, 21);
+  assert.equal(run.sessions[0]!.status, "COMPLETE");
+});
+
+test("history hold: a failed day holds the chain until that day itself is stored or STUCK_SHORT, not when a later day is done", async () => {
+  const store = new MemoryObjectClient();
+  const calls: string[] = [];
+  let shortBars = 12;
+  const short = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+    calls.push(`${sec.symbol}:${from}`);
+    return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, from === "2026-10-08" ? shortBars : 39));
+  };
+  assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-08", catchupSessions: 2 }), undefined, "nothing tried yet");
+  await baseRun(store, calls, { lastCompletedSession: "2026-10-08", catchupSessions: 1, fetchPages: short });
+  assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-08", catchupSessions: 2 }), "2026-10-08");
+  // 10-09 is a later session and gets done: the chain stays held on 10-08.
+  await baseRun(store, calls, { lastCompletedSession: "2026-10-09", catchupSessions: 2, fetchPages: short });
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.done, undefined);
+  assert.ok((await readTenMinDailyIndex(store, "2026-10-09"))!.done);
+  assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-09", catchupSessions: 2 }), "2026-10-08");
+  // 10-08 itself gets every bar: unblocked.
+  shortBars = 39;
+  const run = await baseRun(store, calls, { lastCompletedSession: "2026-10-09", catchupSessions: 2, fetchPages: short });
+  assert.equal(run.sessions.find((s) => s.sessionDate === "2026-10-08")!.status, "COMPLETE");
+  assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-09", catchupSessions: 2 }), undefined);
+  // Outside the window it never blocks.
+  assert.equal(await tenMinDailyHistoryHold(new MemoryObjectClient(), { lastCompletedSession: "2026-10-09", catchupSessions: 2 }), undefined);
+});
+
+test("history hold: a day that leaves the window not done is recorded STUCK_SHORT (no longer retried, never full)", async () => {
+  const store = new MemoryObjectClient();
+  const short = async (sec: { securityId: string; symbol: string }, from: string, to: string) =>
+    replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, from === "2026-10-08" ? 12 : 39));
+  await baseRun(store, [], { lastCompletedSession: "2026-10-08", catchupSessions: 1, fetchPages: short });
+  // Next run's window is only 10-09: 10-08 left it after 1 failed pass.
+  const next = await baseRun(store, [], { lastCompletedSession: "2026-10-09", catchupSessions: 1, fetchPages: short });
+  assert.deepEqual(next.warnings.filter((w) => w.startsWith("TENMIN_DAILY_STUCK_SHORT")), ["TENMIN_DAILY_STUCK_SHORT_LEFT_WINDOW:2026-10-08:36/117"]);
+  const index = (await readTenMinDailyIndex(store, "2026-10-08"))!;
+  assert.equal(index.done, undefined);
+  assert.deepEqual([index.stuckShort?.status, index.stuckShort?.reason, index.stuckShort?.passes, index.stuckShort?.dayBars], ["STUCK_SHORT", "LEFT_WINDOW", 1, "36/117"]);
+});
+
+/** Rewrite a stored index into main's pre-rule shape (no done, no counts, entries without bars). */
+async function toPreRule(store: MemoryObjectClient, sessionDate: string): Promise<void> {
+  const { sha256Hex } = await import("./intraday-reply-dust");
+  const index = (await readTenMinDailyIndex(store, sessionDate))!;
+  const { checksum: _c, done: _d, notDoneRuns: _n, shortNames: _s, missingDailyBars: _m, dayBars: _b, shortStocks: _ss, dailyBars: _db, stuckShort: _st, doneRule: _r, ...body } = index;
+  const legacy = { ...body, stored: body.stored.map(({ securityId, fetch }) => ({ securityId, fetch })) };
+  const enc = new TextEncoder();
+  await store.put(tenMinDailyIndexKey(sessionDate), enc.encode(JSON.stringify({ ...legacy, checksum: sha256Hex(enc.encode(JSON.stringify(legacy))) })));
+}
+
+test("B1: a pre-rule full index is never stamped STUCK_SHORT when it leaves the window", async () => {
+  const store = new MemoryObjectClient();
+  await baseRun(store, [], { lastCompletedSession: "2026-10-08", catchupSessions: 1 });
+  await toPreRule(store, "2026-10-08");
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.done, undefined, "main's shape: no done field");
+  const next = await baseRun(store, [], { lastCompletedSession: "2026-10-09", catchupSessions: 1 });
+  assert.deepEqual(next.warnings.filter((w) => w.startsWith("TENMIN_DAILY_STUCK_SHORT")), []);
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.stuckShort, undefined, "never stamped 0/N");
+});
+
+test("B1: every tracked unfinished day older than the window is stamped LEFT_WINDOW, not only the 10 before it", async () => {
+  const store = new MemoryObjectClient();
+  const short = async (sec: { securityId: string; symbol: string }, from: string, to: string) =>
+    replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, from === "2026-10-08" ? 12 : 39));
+  await baseRun(store, [], { lastCompletedSession: "2026-10-08", catchupSessions: 1, fetchPages: short });
+  // The daily step was off for weeks: the next run is 25 sessions later.
+  const next = await baseRun(store, [], { lastCompletedSession: "2026-11-12", catchupSessions: 1, fetchPages: short });
+  assert.deepEqual(next.warnings.filter((w) => w.startsWith("TENMIN_DAILY_STUCK_SHORT")), ["TENMIN_DAILY_STUCK_SHORT_LEFT_WINDOW:2026-10-08:36/117"]);
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.stuckShort?.reason, "LEFT_WINDOW");
+});
+
+test("NO_SELECTION: a day with no stock to select writes a marker, and the seal guard does not wait on it", async () => {
+  const { tenMinRangeSealRefusal } = await import("./tenmin-daily-liquid");
+  const store = new MemoryObjectClient();
+  const opts = { lastCompletedSession: "2026-10-09", catchupSessions: 1 };
+  assert.equal(await tenMinRangeSealRefusal(store, "2026-09-01", "2026-10-31", opts), "TENMIN_SEAL_REFUSED_DAY_RETRYING:2026-10-09:not-tried");
+  const run = await baseRun(store, [], { ...opts, loadBars: async () => [] });
+  assert.equal(run.sessions[0]!.status, "NO_SELECTION");
+  assert.equal(await readTenMinDailyIndex(store, "2026-10-09"), undefined, "no index: the selection is not frozen empty");
+  assert.equal(await tenMinRangeSealRefusal(store, "2026-09-01", "2026-10-31", opts), undefined, "nothing of the daily step's own to wait for");
+  // A later run that can select names writes the index, which then decides.
+  await baseRun(store, [], { ...opts, fetchPages: async (sec, from, to) => replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, 12)) });
+  assert.match((await tenMinRangeSealRefusal(store, "2026-09-01", "2026-10-31", opts))!, /^TENMIN_SEAL_REFUSED_DAY_RETRYING:2026-10-09:\d+\/117$/u);
+});
+
+test("counts: every day and stock status shows bars stored vs. needed (38/39; 20/21 on a half day)", async () => {
+  const store = new MemoryObjectClient();
+  const calls: string[] = [];
+  const short = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+    calls.push(`${sec.symbol}:${from}`);
+    return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, sec.symbol === "BBB" ? 38 : 39));
+  };
+  const run = await baseRun(store, calls, { catchupSessions: 1, fetchPages: short });
+  const day = run.sessions[0]!;
+  assert.equal(day.bars, "116/117", "3 stocks x 39 bars, BBB has 38");
+  assert.equal(day.dailyBars, "3/3");
+  assert.deepEqual(day.shortStockBars, { "38/39": 1 });
+  const index = (await readTenMinDailyIndex(store, "2026-10-09"))!;
+  assert.equal(index.dayBars, "116/117");
+  assert.deepEqual(index.shortStocks, [{ securityId: "sec_bbb", bars: "38/39" }]);
+  assert.equal(index.dailyBars, "3/3");
+  // The run log line (stdout summary) carries the counts but no stock names.
+  assert.ok(!JSON.stringify(run.sessions).includes("sec_bbb"));
+
+  // Half day (2026-11-27): one stock at 20 of 21 bars.
+  const half = new MemoryObjectClient();
+  const halfPages = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+    const open = Date.parse(`${from}T14:30:00Z`);
+    const count = sec.symbol === "CCC" ? 20 : 21;
+    return replyPages(sec.symbol, sec.securityId, from, to, Array.from({ length: count }, (_, i) => aggBar(new Date(open + i * 600_000).toISOString(), 50)));
+  };
+  const halfRun = await baseRun(half, [], { lastCompletedSession: "2026-11-27", catchupSessions: 1, fetchPages: halfPages });
+  assert.equal(halfRun.sessions[0]!.bars, "62/63");
+  assert.deepEqual(halfRun.sessions[0]!.shortStockBars, { "20/21": 1 });
+  assert.deepEqual((await readTenMinDailyIndex(half, "2026-11-27"))!.shortStocks, [{ securityId: "sec_ccc", bars: "20/21" }]);
+
+  // A done day shows its full count, also when skipped on the next run.
+  const done = new MemoryObjectClient();
+  await baseRun(done, [], { catchupSessions: 1 });
+  const again = await baseRun(done, [], { catchupSessions: 1 });
+  assert.equal(again.sessions[0]!.status, "COMPLETE");
+  assert.equal(again.sessions[0]!.bars, "117/117");
+});
+
+test("STUCK_SHORT: after 6 failed full passes a short day is STUCK_SHORT with its count; it keeps retrying (last), never done, and stops blocking", async () => {
+  const store = new MemoryObjectClient();
+  const calls: string[] = [];
+  let bbbBars = 38;
+  const pages = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+    calls.push(`${sec.symbol}:${from}`);
+    const count = from === "2026-10-08" && sec.symbol === "BBB" ? bbbBars : 39;
+    return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, count));
+  };
+  const hold = () => tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-08", catchupSessions: 1 });
+  for (let pass = 1; pass <= 5; pass += 1) {
+    const run = await baseRun(store, calls, { lastCompletedSession: "2026-10-08", catchupSessions: 1, fetchPages: pages });
+    assert.equal(run.sessions[0]!.status, "PARTIAL", `pass ${pass}: still retrying`);
+    assert.equal(await hold(), "2026-10-08", `pass ${pass}: a retrying day holds the chain`);
+  }
+  const sixth = await baseRun(store, calls, { lastCompletedSession: "2026-10-08", catchupSessions: 1, fetchPages: pages });
+  assert.equal(sixth.sessions[0]!.status, "STUCK_SHORT");
+  assert.equal(sixth.sessions[0]!.bars, "116/117");
+  let index = (await readTenMinDailyIndex(store, "2026-10-08"))!;
+  assert.equal(index.done, undefined, "never treated as a full 39-bar day");
+  assert.deepEqual(
+    { ...index.stuckShort, at: "t" },
+    { status: "STUCK_SHORT", reason: "FAILED_PASSES", at: "t", passes: 6, dayBars: "116/117", dailyBars: "3/3", shortNames: 1, missingDailyBars: 0 },
+  );
+  assert.equal(await hold(), undefined, "STUCK_SHORT no longer blocks");
+
+  // Still retried, after every other day in the window (10-09 is fetched first).
+  calls.length = 0;
+  const later = await baseRun(store, calls, { lastCompletedSession: "2026-10-09", catchupSessions: 2, fetchPages: pages });
+  assert.deepEqual(later.sessions.map((s) => s.sessionDate), ["2026-10-09", "2026-10-08"]);
+  assert.equal(calls.at(-1), "BBB:2026-10-08");
+  assert.equal(later.sessions[1]!.status, "STUCK_SHORT");
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.stuckShort?.passes, 6, "count kept from the pass that marked it");
+
+  // If every bar does arrive later, the day is done for real.
+  bbbBars = 39;
+  const fixed = await baseRun(store, [], { lastCompletedSession: "2026-10-09", catchupSessions: 2, fetchPages: pages });
+  assert.equal(fixed.sessions.find((s) => s.sessionDate === "2026-10-08")!.status, "COMPLETE");
+  index = (await readTenMinDailyIndex(store, "2026-10-08"))!;
+  assert.ok(index.done);
+  assert.equal(index.stuckShort, undefined);
+});
+
+test("B3: a tracked unfinished day and a STUCK_SHORT day under a sealed range: no fetch, no write under the range, counts kept; the unfinished day is stamped STUCK_SHORT (SEALED_OVER)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peacestocks-seal-old-"));
+  try {
+    const store = new MemoryObjectClient();
+    const calls: string[] = [];
+    let bbbBars = 30;
+    const pages = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+      calls.push(`${sec.symbol}:${from}`);
+      return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, sec.symbol === "BBB" ? bbbBars : 39));
+    };
+    // 10-08 short 6 times -> STUCK_SHORT; 10-09 short once (still retrying).
+    for (let i = 0; i < 6; i += 1) await baseRun(store, calls, { lastCompletedSession: "2026-10-08", catchupSessions: 1, fetchPages: pages });
+    await baseRun(store, calls, { catchupSessions: 1, fetchPages: pages });
+    assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.stuckShort?.status, "STUCK_SHORT");
+    assert.equal((await readTenMinDailyIndex(store, "2026-10-09"))!.notDoneRuns, 1);
+    // A range sealed over both days (as an older seal without the guard could).
+    await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: RANGE_FROM,
+      to: RANGE_TO,
+      fetches: [{ securityId: "sec_ddd", symbol: "DDD", fetchFrom: RANGE_FROM, fetchTo: RANGE_TO }],
+      zstdVersionProbe: pinnedZstd,
+      now: ISO,
+      fetchPages: async (sec, from, to) => replyPages(sec.symbol, sec.securityId, from, to, dayBars(sec.symbol, "2026-09-01")),
+    });
+    assert.ok(await readTenMinRangeManifest(store, RANGE_FROM, RANGE_TO));
+    const snapshot = async () => new Map(await Promise.all((await store.list("permanent/")).map(async (k) => [k, await store.get(k)] as const)));
+    const before = await snapshot();
+    const puts: string[] = [];
+    const watched = Object.assign(Object.create(store) as MemoryObjectClient, {
+      put: async (...args: Parameters<MemoryObjectClient["put"]>) => {
+        puts.push(args[0]);
+        return store.put(...args);
+      },
+    });
+    calls.length = 0;
+    bbbBars = 39;
+    const run = await baseRun(watched, calls, { catchupSessions: 2, fetchPages: pages });
+    assert.deepEqual(calls, [], "no fetch under a sealed range");
+    const index09 = await readTenMinDailyIndex(store, "2026-10-09");
+    // The only write is 10-09's own daily index (the SEALED_OVER stamp, the daily step's bookkeeping);
+    // no reply object, entries file or manifest of the sealed range is touched, and its read still passes.
+    assert.deepEqual(puts, [tenMinDailyIndexKey("2026-10-09")]);
+    assert.ok(await readTenMinRangeManifest(store, RANGE_FROM, RANGE_TO));
+    const after = await snapshot();
+    for (const [k, v] of before) if (k !== puts[0]) assert.deepEqual(after.get(k), v, `unchanged: ${k}`);
+    assert.deepEqual(run.sessions.map((x) => [x.sessionDate, x.status, x.bars]), [
+      ["2026-10-09", "STUCK_SHORT", "108/117"],
+      ["2026-10-08", "STUCK_SHORT", "108/117"],
+    ]);
+    assert.deepEqual(run.warnings.filter((w) => w.startsWith("TENMIN_DAILY_SKIPPED_RANGE_SEALED") || w.startsWith("TENMIN_DAILY_STUCK_SHORT_SEALED_OVER")).sort(), [
+      "TENMIN_DAILY_SKIPPED_RANGE_SEALED:2026-10-08:STUCK_SHORT:108/117",
+      "TENMIN_DAILY_SKIPPED_RANGE_SEALED:2026-10-09:STUCK_SHORT:108/117",
+      "TENMIN_DAILY_STUCK_SHORT_SEALED_OVER:2026-10-09:108/117",
+    ]);
+    assert.equal(index09!.done, undefined, "still not done (never treated as full)");
+    assert.deepEqual({ ...index09!.stuckShort, at: "t" }, { status: "STUCK_SHORT", reason: "SEALED_OVER", at: "t", passes: 1, dayBars: "108/117", dailyBars: "3/3", shortNames: 1, missingDailyBars: 0 });
+    // 10-08 keeps its own STUCK_SHORT record (FAILED_PASSES) unchanged.
+    assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.stuckShort?.reason, "FAILED_PASSES");
+    // STUCK_SHORT releases the chain; a second run writes nothing at all.
+    assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-09", catchupSessions: 1 }), undefined);
+    puts.length = 0;
+    await baseRun(watched, calls, { catchupSessions: 2, fetchPages: pages });
+    assert.deepEqual(puts, []);
+    assert.deepEqual(calls, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("B3: the reused one-day object under a sealed range is never overwritten; the sealed read still passes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "peacestocks-seal-reuse-"));
+  try {
+    const store = new MemoryObjectClient();
+    let bbbBars = 30;
+    const pages = async (sec: { securityId: string; symbol: string }, from: string, to: string) =>
+      replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, sec.symbol === "BBB" ? bbbBars : 39));
+    // Daily step stores 10-09 for AAA (full) and BBB (short: tracked, not done).
+    await baseRun(store, [], { n: 2, catchupSessions: 1, fetchPages: pages });
+    // The chain seals the range and reuses BBB's one-day object 10-09_10-09.
+    const chainCalls: string[] = [];
+    const result = await writeTenMinRangeReplyDust({
+      store,
+      root,
+      provider: PROVIDER,
+      from: RANGE_FROM,
+      to: RANGE_TO,
+      fetches: [{ securityId: "sec_bbb", symbol: "BBB", fetchFrom: "2026-10-09", fetchTo: "2026-10-09" }],
+      zstdVersionProbe: pinnedZstd,
+      now: ISO,
+      fetchPages: async (sec, from, to) => {
+        chainCalls.push(`${sec.symbol}:${from}:${to}`);
+        return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, 30));
+      },
+    });
+    assert.equal(result.sealed, true);
+    assert.deepEqual(chainCalls, [], "BBB reused the daily object");
+    const sealedRead = await readTenMinSecurityDay(store, "sec_bbb", "2026-10-09");
+    assert.equal(sealedRead.source, "range");
+    const key = tenMinRangeFileKey(RANGE_FROM, RANGE_TO, "sec_bbb", "BBB", "2026-10-09", "2026-10-09", 1);
+    const bytes = await store.get(key);
+    // The daily step now could get every BBB bar: it must not re-fetch into the sealed range.
+    bbbBars = 39;
+    await baseRun(store, [], { n: 2, catchupSessions: 1, fetchPages: pages });
+    assert.deepEqual(await store.get(key), bytes, "the reused object is byte-identical");
+    const after = await readTenMinSecurityDay(store, "sec_bbb", "2026-10-09");
+    assert.equal(after.source, "range");
+    assert.deepEqual(ohlcv(after.bars), ohlcv(sealedRead.bars));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

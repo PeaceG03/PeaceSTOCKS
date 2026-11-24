@@ -32,7 +32,11 @@ import { type ZstdVersionProbe, assertPinnedZstdForWriting } from "./reply-dust-
 import { type ScanRunPick, checkScannerRuns, createScanYieldCheck, inScanGuardWindow, isScanCheckFailure } from "./scan-yield";
 import type { SessionCalendar } from "./scanner";
 import { TENMIN_DAILY_CLOSE_ORIGIN } from "./tenmin-range-entries";
-import { lastCompletedSessionDate, pairRangeForDate } from "./tenmin-history";
+import { errorMessage, reportPart } from "./health-checkins";
+import { dayStuck } from "./day-stuck";
+import { type HistoryHoldDay, historyBlockingDay } from "./history-blocked";
+import { barCount, expectedTenMinBars, presentTenMinBars, shortStockCounts, tenMinSessionDone } from "./tenmin-day-done";
+import { lastCompletedSessionDate, pairRangeForDate, tradingSessionsBetween } from "./tenmin-history";
 import {
   TENMIN_RANGE_OUTAGE_STREAK,
   type TenMinRangeTickerFetch,
@@ -265,6 +269,8 @@ export interface TenMinDailyStoredEntry {
   fetch: TenMinRangeTickerFetch;
   /** true when the object already existed and was verified instead of fetched. */
   adopted?: boolean;
+  /** Ten-minute bars the stored reply holds for the session (absent on indexes written before the done-day rule). */
+  bars?: number;
 }
 
 export interface TenMinDailyGapEntry {
@@ -285,8 +291,103 @@ export interface TenMinDailyIndex {
   selected: TenMinDailySelected[];
   stored: TenMinDailyStoredEntry[];
   gaps: TenMinDailyGapEntry[];
+  /** Set once the day is done (done-day rule: every stock has all its bars AND its daily bars are saved). */
+  done?: { at: string; expectedBars: number };
+  /** Full catch-up passes that ended with the day still not done (the health check flags a stuck day). */
+  notDoneRuns?: number;
+  /** Stocks still short of the expected bars / without a saved daily bar after the last pass. */
+  shortNames?: number;
+  missingDailyBars?: number;
+  /** Day status count: ten-minute bars stored vs. needed over every selected stock, e.g. "19461/19500". */
+  dayBars?: string;
+  /** Each short stock's bars stored vs. needed, e.g. { securityId, bars: "38/39" }. */
+  shortStocks?: { securityId: string; bars: string }[];
+  /** Daily bars saved vs. needed for the selected stocks, e.g. "497/500". */
+  dailyBars?: string;
+  /**
+   * STUCK_SHORT (Peace, Nov 23): set when 6 full catch-up passes left the day not done, with the counts
+   * at that pass. The day stays not done and keeps being retried (after the other days); it no
+   * longer holds the history chain, and it is never treated as a full day.
+   */
+  stuckShort?: TenMinDailyStuckShort;
+  /**
+   * Set on every index this code writes (the done-day rule, Nov 23). An index without it was written
+   * before the rule (main through Nov 23): it has no done field and no per-stock bars, so its counts
+   * are unknown, not short. Such a pre-rule index is never stamped STUCK_SHORT and, once out of the
+   * window, never holds a seal (the range's own seal checks apply, as before the rule).
+   */
+  doneRule?: typeof TENMIN_DAILY_DONE_RULE;
   updatedAt: string;
   checksum: string;
+}
+
+export const TENMIN_DAILY_DONE_RULE = "done-day-v1" as const;
+/** Run-log marker: a tracked, not-done day under a sealed range was skipped (no fetch, no write). */
+export const TENMIN_DAILY_SKIPPED_RANGE_SEALED = "TENMIN_DAILY_SKIPPED_RANGE_SEALED" as const;
+/** Warning: a tracked day under a sealed range was stamped STUCK_SHORT (SEALED_OVER) with its count. */
+export const TENMIN_DAILY_STUCK_SHORT_SEALED_OVER = "TENMIN_DAILY_STUCK_SHORT_SEALED_OVER" as const;
+/** The daily step's first session (Sep 29, 2026) is in this two-month range; no daily index is older. */
+export const TENMIN_DAILY_FIRST_RANGE_FROM = "2026-09-01" as const;
+
+/**
+ * NO_SELECTION marker (Auditor, early review c): a day the daily step tried but could select no stock
+ * for (no ranked names) writes no index, so the seal guard would wait on it as "not tried" for its
+ * whole window life. The step writes this small marker instead; the guard accepts the day (the daily
+ * step has nothing of its own in it). A later run that does select names writes the index, which wins.
+ */
+export function tenMinDailyNoSelectionKey(sessionDate: string): string {
+  return tenMinDailyIndexKey(sessionDate).replace(/\.json$/u, ".no-selection.json");
+}
+
+/** Pure: true for an index written before the done-day rule (no doneRule marker). */
+export function isPreRuleIndex(index: Pick<TenMinDailyIndex, "doneRule">): boolean {
+  return index.doneRule !== TENMIN_DAILY_DONE_RULE;
+}
+
+/**
+ * Every daily index key from the first daily range up to and including the range that holds
+ * `toSession`, sorted by session date (lists each range's daily/ folder; nothing else).
+ */
+export async function listTenMinDailyIndexDays(store: Pick<ReplyDustStore, "list">, toSession: string): Promise<string[]> {
+  requireDate(toSession);
+  const days: string[] = [];
+  let month = TENMIN_DAILY_FIRST_RANGE_FROM.slice(0, 7);
+  const seen = new Set<string>();
+  while (month <= toSession.slice(0, 7)) {
+    const { calendarFrom, calendarTo } = pairRangeForDate(`${month}-15`);
+    const prefix = `${tenMinRangePrefix(calendarFrom, calendarTo)}/daily/`;
+    if (!seen.has(prefix)) {
+      seen.add(prefix);
+      for (const key of await store.list(prefix)) {
+        const day = /^(\d{4}-\d{2}-\d{2})\.json$/u.exec(key.slice(prefix.length))?.[1];
+        if (day && day <= toSession) days.push(day);
+      }
+    }
+    const [y, m] = month.split("-").map(Number) as [number, number];
+    month = m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, "0")}`;
+  }
+  return [...new Set(days)].sort();
+}
+
+export const TENMIN_DAILY_STUCK_SHORT = "STUCK_SHORT" as const;
+
+export interface TenMinDailyStuckShort {
+  status: typeof TENMIN_DAILY_STUCK_SHORT;
+  /**
+   * FAILED_PASSES: 6 full passes failed. LEFT_WINDOW: the day left the 10-session window not done (no
+   * longer retried). SEALED_OVER: a history range was sealed over the day while it was not done (an
+   * older seal without the guard, or a manual reseal); nothing is fetched under a seal, so it is no
+   * longer retried.
+   */
+  reason?: "FAILED_PASSES" | "LEFT_WINDOW" | "SEALED_OVER";
+  at: string;
+  /** Full catch-up passes that had failed when the day became STUCK_SHORT. */
+  passes: number;
+  /** Counts recorded at that pass, e.g. "19461/19500" and "500/500". */
+  dayBars: string;
+  dailyBars: string;
+  shortNames: number;
+  missingDailyBars: number;
 }
 
 export function tenMinDailyIndexKey(sessionDate: string): string {
@@ -367,7 +468,42 @@ async function verifyExistingDaily(
   return verified ?? "INVALID";
 }
 
-export type TenMinDailySessionStatus = "COMPLETE" | "PARTIAL" | "SKIPPED_RANGE_SEALED" | "NO_SELECTION";
+/**
+ * Pure: a day's counts from its index, bars stored vs. needed. Indexes written before the counts
+ * existed get them from their stored entries (a stock with no stored entry has 0 bars).
+ */
+export function tenMinDailyIndexCounts(
+  index: Pick<TenMinDailyIndex, "selected" | "stored" | "done" | "missingDailyBars" | "dayBars" | "shortStocks" | "dailyBars">,
+  expectedBars: number,
+): { dayBars: string; shortStocks: { securityId: string; bars: string }[]; dailyBars: string } {
+  const n = index.selected.length;
+  if (index.done)
+    return { dayBars: index.dayBars ?? barCount(n * expectedBars, n * expectedBars), shortStocks: [], dailyBars: index.dailyBars ?? barCount(n, n) };
+  const saved = new Map(index.stored.map((entry) => [entry.securityId, Math.min(entry.bars ?? 0, expectedBars)]));
+  const shortStocks =
+    index.shortStocks ??
+    index.selected
+      .filter((name) => (saved.get(name.securityId) ?? 0) < expectedBars)
+      .map((name) => ({ securityId: name.securityId, bars: barCount(saved.get(name.securityId) ?? 0, expectedBars) }));
+  const stored = index.selected.reduce((sum, name) => sum + (saved.get(name.securityId) ?? 0), 0);
+  return {
+    dayBars: index.dayBars ?? barCount(stored, n * expectedBars),
+    shortStocks,
+    dailyBars: index.dailyBars ?? barCount(n - (index.missingDailyBars ?? 0), n),
+  };
+}
+
+/**
+ * COMPLETE only when the day is done by the done-day rule. WAITING_DAILY_BARS: every stock has all its
+ * ten-minute bars but some daily bars are not saved yet (catch-up keeps re-running the day).
+ */
+export type TenMinDailySessionStatus =
+  | "COMPLETE"
+  | "PARTIAL"
+  | "WAITING_DAILY_BARS"
+  | typeof TENMIN_DAILY_STUCK_SHORT
+  | "SKIPPED_RANGE_SEALED"
+  | "NO_SELECTION";
 
 export interface TenMinDailySessionReport {
   sessionDate: string;
@@ -379,6 +515,19 @@ export interface TenMinDailySessionReport {
   adoptedThisRun: number;
   gaps: number;
   requests: number;
+  /** Bars each stock needs for this session (39, or 21 on a half day). */
+  expectedBars?: number;
+  /** Stocks still short of expectedBars / without a saved daily bar at the end of this run. */
+  shortNames?: number;
+  missingDailyBars?: number;
+  /** Stored names whose short reply was fetched again this run. */
+  refetchedThisRun?: number;
+  /** Ten-minute bars stored vs. needed over every selected stock, e.g. "19461/19500". */
+  bars?: string;
+  /** Daily bars saved vs. needed, e.g. "500/500". */
+  dailyBars?: string;
+  /** Short stocks by count, e.g. { "38/39": 2, "0/39": 1 } (no stock names in the run log). */
+  shortStockBars?: Record<string, number>;
 }
 
 export interface TenMinDailyRunReport {
@@ -444,8 +593,40 @@ export async function runTenMinDailyLiquid(options: {
   };
   let outageStreak = 0;
   let stop = false;
+  // A day that left the window not done is no longer retried: record it STUCK_SHORT with its counts
+  // (it can then never hold a seal or the chain forever, and is never treated as full). Every tracked
+  // day older than the window is covered (Auditor B1), not only the sessions just before it. A
+  // pre-rule index (written before the done-day rule: no done field, no per-stock bars) is never
+  // stamped: its counts are unknown, not short.
+  const windowStart = sessions[0] ?? lastCompleted;
+  for (const sessionDate of (await listTenMinDailyIndexDays(store, windowStart)).filter((d) => d < windowStart)) {
+    const old = await readTenMinDailyIndex(store, sessionDate);
+    if (!old || old.done || old.stuckShort || isPreRuleIndex(old)) continue;
+    const counts = tenMinDailyIndexCounts(old, expectedTenMinBars(sessionDate, calendar));
+    await writeTenMinDailyIndex(
+      store,
+      finalizeIndex({
+        ...old,
+        stuckShort: {
+          status: TENMIN_DAILY_STUCK_SHORT,
+          reason: "LEFT_WINDOW",
+          at: stamp(),
+          passes: old.notDoneRuns ?? 0,
+          dayBars: counts.dayBars,
+          dailyBars: counts.dailyBars,
+          shortNames: old.shortNames ?? counts.shortStocks.length,
+          missingDailyBars: old.missingDailyBars ?? 0,
+        },
+        updatedAt: stamp(),
+      }),
+    );
+    report.warnings.push(`TENMIN_DAILY_STUCK_SHORT_LEFT_WINDOW:${sessionDate}:${counts.dayBars}`);
+  }
+  // STUCK_SHORT days are still retried, but after every other day, so they never starve a newer one.
+  const stuckFirst = await Promise.all(sessions.map(async (d) => !!(await readTenMinDailyIndex(store, d))?.stuckShort));
+  const ordered = [...sessions.filter((_, i) => !stuckFirst[i]), ...sessions.filter((_, i) => stuckFirst[i])];
 
-  for (const sessionDate of sessions) {
+  for (const sessionDate of ordered) {
     if (stop) break;
     const { calendarFrom, calendarTo } = pairRangeForDate(sessionDate);
     const range = `${calendarFrom}_${calendarTo}`;
@@ -460,12 +641,65 @@ export async function runTenMinDailyLiquid(options: {
       gaps: 0,
       requests: 0,
     };
+    let index = await readTenMinDailyIndex(store, sessionDate);
+    // A sealed range owns its sessions: nothing is fetched or written under it (Auditor B3; a re-fetch
+    // would overwrite an object the seal reused). A tracked day keeps its stored objects and counts;
+    // it is still not done by its own bars (seal guard), and is reported as skipped. A tracked day that
+    // is neither done nor STUCK_SHORT is stamped STUCK_SHORT (SEALED_OVER) with its counts, once, in its
+    // own daily index (Auditor round 4: only the short day itself, full or STUCK_SHORT, unblocks history).
     if (await tenMinRangeSealedFor(store, sessionDate)) {
       sessionReport.status = "SKIPPED_RANGE_SEALED";
+      if (index && !index.done && !index.stuckShort && !isPreRuleIndex(index)) {
+        const counts = tenMinDailyIndexCounts(index, expectedTenMinBars(sessionDate, calendar));
+        index = finalizeIndex({
+          ...index,
+          stuckShort: {
+            status: TENMIN_DAILY_STUCK_SHORT,
+            reason: "SEALED_OVER",
+            at: stamp(),
+            passes: index.notDoneRuns ?? 0,
+            dayBars: counts.dayBars,
+            dailyBars: counts.dailyBars,
+            shortNames: index.shortNames ?? counts.shortStocks.length,
+            missingDailyBars: index.missingDailyBars ?? 0,
+          },
+          updatedAt: stamp(),
+        });
+        await writeTenMinDailyIndex(store, index);
+        report.warnings.push(`${TENMIN_DAILY_STUCK_SHORT_SEALED_OVER}:${sessionDate}:${counts.dayBars}`);
+      }
+      if (index?.stuckShort && !index.done) sessionReport.status = TENMIN_DAILY_STUCK_SHORT;
+      if (index) {
+        sessionReport.selected = index.selected.length;
+        sessionReport.stored = index.stored.length;
+        if (!isPreRuleIndex(index) || index.done) {
+          const counts = tenMinDailyIndexCounts(index, expectedTenMinBars(sessionDate, calendar));
+          sessionReport.bars = counts.dayBars;
+          sessionReport.dailyBars = counts.dailyBars;
+        }
+        if (!index.done)
+          report.warnings.push(
+            `${TENMIN_DAILY_SKIPPED_RANGE_SEALED}:${sessionDate}:${index.stuckShort ? TENMIN_DAILY_STUCK_SHORT : "not-done"}:${sessionReport.bars ?? "pre-rule"}`,
+          );
+      }
       report.sessions.push(sessionReport);
       continue;
     }
-    let index = await readTenMinDailyIndex(store, sessionDate);
+    const expectedBars = expectedTenMinBars(sessionDate, calendar);
+    sessionReport.expectedBars = expectedBars;
+    if (index?.done) {
+      sessionReport.status = "COMPLETE";
+      sessionReport.selected = index.selected.length;
+      sessionReport.stored = index.stored.length;
+      sessionReport.shortNames = 0;
+      sessionReport.missingDailyBars = 0;
+      // A done day has every bar (indexes written before the counts carry no dayBars).
+      sessionReport.bars = index.dayBars ?? barCount(index.selected.length * expectedBars, index.selected.length * expectedBars);
+      sessionReport.dailyBars = index.dailyBars ?? barCount(index.selected.length, index.selected.length);
+      sessionReport.shortStockBars = {};
+      report.sessions.push(sessionReport);
+      continue;
+    }
     let dirty = false;
     if (!index) {
       const trailingSessions = tradingSessionsBefore(sessionDate, TENMIN_DAILY_LOOKBACK_SESSIONS, calendar);
@@ -479,6 +713,10 @@ export async function runTenMinDailyLiquid(options: {
       if (!selected.length) {
         sessionReport.status = "NO_SELECTION";
         report.warnings.push(`TENMIN_DAILY_NO_SELECTION:${sessionDate}`);
+        await store.put(
+          tenMinDailyNoSelectionKey(sessionDate),
+          new TextEncoder().encode(`${JSON.stringify({ schemaVersion: "tenmin-daily-no-selection-v1", sessionDate, at: stamp() })}\n`),
+        );
         report.sessions.push(sessionReport);
         continue;
       }
@@ -493,6 +731,7 @@ export async function runTenMinDailyLiquid(options: {
         selected,
         stored: [],
         gaps: [],
+        doneRule: TENMIN_DAILY_DONE_RULE,
         updatedAt: stamp(),
       });
       // Freeze the selection before the first request so a resumed run fetches the same names.
@@ -512,32 +751,61 @@ export async function runTenMinDailyLiquid(options: {
       sinceSave = 0;
     };
     if (index.gaps.length) dirty = true;
+    let sessionStopped = false;
+    let refetched = 0;
+    // Bars held by a stored object (counted once, then kept in the index). Undefined = unreadable.
+    const storedBars = async (securityId: string, fetch: TenMinRangeTickerFetch): Promise<number | undefined> => {
+      try {
+        return presentTenMinBars(await decodeDailyObjectBars(store, provider, securityId, sessionDate, fetch, backend));
+      } catch {
+        return undefined;
+      }
+    };
 
     try {
       for (const name of index.selected) {
-        if (stored.has(name.securityId)) continue;
+        let prior = stored.get(name.securityId);
+        if (prior && prior.bars === undefined) {
+          const counted = await storedBars(name.securityId, prior.fetch);
+          if (counted === undefined) {
+            gaps.set(name.securityId, { securityId: name.securityId, symbol: name.symbol, reason: "TENMIN_DAILY_OBJECT_UNVERIFIED", at: stamp() });
+            dirty = true;
+            continue;
+          }
+          prior = { ...prior, bars: counted };
+          stored.set(name.securityId, prior);
+          dirty = true;
+        }
+        // Done-day rule: a stored name is finished only with all its bars; a short one is re-run.
+        if (prior && (prior.bars ?? 0) >= expectedBars) continue;
         const yieldReason = options.shouldYield ? await options.shouldYield() : undefined;
         if (yieldReason) {
           report.yielded = yieldReason;
           stop = true;
+          sessionStopped = true;
           break;
         }
-        const existing = await verifyExistingDaily(store, provider, name.securityId, name.symbol, sessionDate, backend);
-        if (existing === "INVALID") {
-          gaps.set(name.securityId, { securityId: name.securityId, symbol: name.symbol, reason: "TENMIN_DAILY_OBJECT_UNVERIFIED", at: stamp() });
-          dirty = true;
-          continue;
-        }
-        if (existing) {
-          stored.set(name.securityId, { securityId: name.securityId, fetch: existing, adopted: true });
-          sessionReport.adoptedThisRun += 1;
-          dirty = true;
-          if (++sinceSave >= INDEX_SAVE_EVERY) await save();
-          continue;
+        if (!prior) {
+          const existing = await verifyExistingDaily(store, provider, name.securityId, name.symbol, sessionDate, backend);
+          if (existing === "INVALID") {
+            gaps.set(name.securityId, { securityId: name.securityId, symbol: name.symbol, reason: "TENMIN_DAILY_OBJECT_UNVERIFIED", at: stamp() });
+            dirty = true;
+            continue;
+          }
+          if (existing) {
+            const counted = await storedBars(name.securityId, existing);
+            prior = { securityId: name.securityId, fetch: existing, adopted: true, bars: counted ?? 0 };
+            stored.set(name.securityId, prior);
+            sessionReport.adoptedThisRun += 1;
+            dirty = true;
+            if (++sinceSave >= INDEX_SAVE_EVERY) await save();
+            if ((prior.bars ?? 0) >= expectedBars) continue;
+          }
         }
         if (report.massiveRequests >= options.maxRequests) {
           report.budgetStop = true;
           stop = true;
+          sessionStopped = true;
           break;
         }
         report.massiveRequests += 1;
@@ -546,6 +814,12 @@ export async function runTenMinDailyLiquid(options: {
           const pages = await options.fetchPages({ securityId: name.securityId, symbol: name.symbol }, sessionDate, sessionDate);
           report.massiveRequests += Math.max(0, pages.length - 1);
           sessionReport.requests += Math.max(0, pages.length - 1);
+          const bars = presentTenMinBars(barsFromPages(provider, sessionDate, name.securityId, pages));
+          // A re-run only replaces a short stored reply with one that holds more bars.
+          if (prior && bars <= (prior.bars ?? 0)) {
+            outageStreak = 0;
+            continue;
+          }
           const { fetch } = await writeTenMinRangeFetch(store, pages, {
             provider,
             calendarFrom,
@@ -554,9 +828,13 @@ export async function runTenMinDailyLiquid(options: {
             fetchTo: sessionDate,
             backend,
             origin: TENMIN_DAILY_CLOSE_ORIGIN,
+            // Done-day rule: a short stored reply is replaced by this one, which holds more bars.
+            ...(prior ? { replace: "shorter-reply" as const } : {}),
           });
-          stored.set(name.securityId, { securityId: name.securityId, fetch });
-          sessionReport.fetchedThisRun += 1;
+          stored.set(name.securityId, { securityId: name.securityId, fetch, bars });
+          gaps.delete(name.securityId);
+          if (prior) refetched += 1;
+          else sessionReport.fetchedThisRun += 1;
           outageStreak = 0;
           dirty = true;
           if (++sinceSave >= INDEX_SAVE_EVERY) await save();
@@ -575,6 +853,7 @@ export async function runTenMinDailyLiquid(options: {
             if (outageStreak >= TENMIN_RANGE_OUTAGE_STREAK) {
               report.outageStop = `MASSIVE_OUTAGE:${message}`;
               stop = true;
+              sessionStopped = true;
               break;
             }
             continue;
@@ -588,14 +867,172 @@ export async function runTenMinDailyLiquid(options: {
       // Keep what was stored even when the run aborts.
       await save();
     }
+    // Done-day rule: all ten-minute bars for every stock AND its daily bars saved.
+    const dailySaved = new Set(
+      (await loadBars([sessionDate])).filter((bar) => bar.sessionDate === sessionDate).map((bar) => bar.securityId),
+    );
+    const verdict = tenMinSessionDone({
+      sessionDate,
+      selected: index.selected.map((name) => name.securityId),
+      savedBars: new Map([...stored.values()].map((entry) => [entry.securityId, entry.bars ?? 0])),
+      dailyBarsSaved: dailySaved,
+      calendar,
+    });
+    const notDoneRuns = (index.notDoneRuns ?? 0) + (!verdict.done && !sessionStopped ? 1 : 0);
+    const {
+      done: _done,
+      notDoneRuns: _runs,
+      shortNames: _short,
+      missingDailyBars: _missing,
+      dayBars: _dayBars,
+      shortStocks: _shortStocks,
+      dailyBars: _dailyBars,
+      stuckShort: priorStuck,
+      ...indexBody
+    } = index;
+    const dayBars = barCount(verdict.barsStored, verdict.barsNeeded);
+    const dailyBars = barCount(index.selected.length - verdict.missingDailyBars.length, index.selected.length);
+    // STUCK_SHORT once 6 full passes failed; the counts are recorded at the pass that marked it.
+    const stuckShort: TenMinDailyStuckShort | undefined = verdict.done
+      ? undefined
+      : (priorStuck ??
+        (dayStuck(notDoneRuns)
+          ? {
+              status: TENMIN_DAILY_STUCK_SHORT,
+              reason: "FAILED_PASSES" as const,
+              at: stamp(),
+              passes: notDoneRuns,
+              dayBars,
+              dailyBars,
+              shortNames: verdict.shortNames.length,
+              missingDailyBars: verdict.missingDailyBars.length,
+            }
+          : undefined));
+    index = finalizeIndex({
+      ...indexBody,
+      stored: [...stored.values()],
+      gaps: [...gaps.values()],
+      ...(verdict.done ? { done: { at: stamp(), expectedBars: verdict.expectedBars } } : {}),
+      ...(notDoneRuns ? { notDoneRuns } : {}),
+      shortNames: verdict.shortNames.length,
+      missingDailyBars: verdict.missingDailyBars.length,
+      dayBars,
+      shortStocks: verdict.shortStocks.map((stock) => ({ securityId: stock.securityId, bars: barCount(stock.bars, verdict.expectedBars) })),
+      dailyBars,
+      ...(stuckShort ? { stuckShort } : {}),
+      doneRule: TENMIN_DAILY_DONE_RULE,
+      updatedAt: stamp(),
+    });
+    await writeTenMinDailyIndex(store, index);
     sessionReport.selected = index.selected.length;
     sessionReport.stored = stored.size;
     sessionReport.gaps = gaps.size;
-    sessionReport.status = stored.size + gaps.size >= index.selected.length ? "COMPLETE" : "PARTIAL";
+    sessionReport.shortNames = verdict.shortNames.length;
+    sessionReport.missingDailyBars = verdict.missingDailyBars.length;
+    if (refetched) sessionReport.refetchedThisRun = refetched;
+    sessionReport.bars = dayBars;
+    sessionReport.dailyBars = dailyBars;
+    sessionReport.shortStockBars = shortStockCounts(verdict.shortStocks, verdict.expectedBars);
+    sessionReport.status = verdict.done
+      ? "COMPLETE"
+      : stuckShort
+        ? TENMIN_DAILY_STUCK_SHORT
+        : !verdict.shortNames.length
+          ? "WAITING_DAILY_BARS"
+          : "PARTIAL";
     report.sessions.push(sessionReport);
   }
   report.estimatedKeyMinutes = Math.round(((report.massiveRequests * TENMIN_DAILY_SECONDS_PER_REQUEST) / 60) * 10) / 10;
   return report;
+}
+
+/**
+ * The session (inside the 10-session catch-up window) that holds the history chain, or undefined.
+ * Reads only the daily indexes and range manifests (no Massive request). A sealed range counts as done
+ * only for days the daily step never tracked; a tracked day is done only by its own bars.
+ */
+export async function tenMinDailyHistoryHold(
+  store: Pick<ReplyDustStore, "get" | "head">,
+  options: { now?: Date; lastCompletedSession?: string; catchupSessions?: number; calendar?: SessionCalendar } = {},
+): Promise<string | undefined> {
+  const calendar = options.calendar ?? US_EQUITY_MARKET_CALENDAR;
+  const lastCompleted = options.lastCompletedSession ?? lastCompletedSessionDate(options.now ?? new Date(), calendar);
+  const sessions = tenMinDailyCatchupSessions(lastCompleted, options.catchupSessions ?? TENMIN_DAILY_CATCHUP_SESSIONS, calendar);
+  const days: HistoryHoldDay[] = [];
+  for (const sessionDate of sessions) {
+    const index = await readTenMinDailyIndex(store, sessionDate);
+    // A sealed range counts as done only for a day the daily step never tracked (seal guard). A tracked
+    // day under it that failed a pass holds the chain like any other until it is full or STUCK_SHORT;
+    // the daily step stamps it STUCK_SHORT (SEALED_OVER) on its next run, which releases it.
+    if (await tenMinRangeSealedFor(store, sessionDate)) {
+      const done = !index || !!index.done;
+      days.push({ sessionDate, done, failed: !done && (index?.notDoneRuns ?? 0) >= 1, stuckShort: !done && !!index?.stuckShort });
+      continue;
+    }
+    const done = !!index?.done;
+    days.push({ sessionDate, done, failed: !done && (index?.notDoneRuns ?? 0) >= 1, stuckShort: !done && !!index?.stuckShort });
+  }
+  return historyBlockingDay(days, sessions);
+}
+
+/** Seal-guard refusal prefix: a day in the range is still retrying in the daily step. */
+export const TENMIN_SEAL_REFUSED_DAY_RETRYING = "TENMIN_SEAL_REFUSED_DAY_RETRYING" as const;
+
+/**
+ * Seal guard (Peace, Nov 23): a history range may seal (and so count as done) only if every day in
+ * it is full or STUCK_SHORT. Inside the daily step's catch-up window a day it tracks (it has an index)
+ * must be done or STUCK_SHORT, and a day it has not tried yet must wait for it. Older than the window
+ * (Auditor B1): a pre-rule index (written before the rule) and a day with no index are history-only
+ * (the range's own seal checks); a day that left the window not done is STUCK_SHORT (LEFT_WINDOW, no
+ * longer retried), stamped by the daily step's sweep, so it never holds the seal forever even while
+ * the daily step is paused. Returns the refusal for the first day that must wait, or undefined.
+ */
+export async function tenMinRangeSealRefusal(
+  store: Pick<ReplyDustStore, "get">,
+  calendarFrom: string,
+  calendarTo: string,
+  options: { now?: Date; lastCompletedSession?: string; catchupSessions?: number; calendar?: SessionCalendar } = {},
+): Promise<string | undefined> {
+  const calendar = options.calendar ?? US_EQUITY_MARKET_CALENDAR;
+  const lastCompleted = options.lastCompletedSession ?? lastCompletedSessionDate(options.now ?? new Date(), calendar);
+  const window = new Set(tenMinDailyCatchupSessions(lastCompleted, options.catchupSessions ?? TENMIN_DAILY_CATCHUP_SESSIONS, calendar));
+  for (const sessionDate of tradingSessionsBetween(calendarFrom, calendarTo, calendar)) {
+    if (sessionDate > lastCompleted) break;
+    const index = await readTenMinDailyIndex(store, sessionDate);
+    if (index) {
+      if (index.done || index.stuckShort) continue;
+      if (!window.has(sessionDate)) continue;
+      // A pre-rule index in the window is re-checked (and recounted) by the next daily step run.
+      if (isPreRuleIndex(index)) return `${TENMIN_SEAL_REFUSED_DAY_RETRYING}:${sessionDate}:pre-rule`;
+      const counts = tenMinDailyIndexCounts(index, expectedTenMinBars(sessionDate, calendar));
+      return `${TENMIN_SEAL_REFUSED_DAY_RETRYING}:${sessionDate}:${counts.dayBars}`;
+    }
+    if (window.has(sessionDate)) {
+      // The daily step tried the day and had no stock to select: nothing of its own to wait for.
+      if (await store.get(tenMinDailyNoSelectionKey(sessionDate))) continue;
+      return `${TENMIN_SEAL_REFUSED_DAY_RETRYING}:${sessionDate}:not-tried`;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * History-run override (host): when the daily step is on and R2 is configured, the chain checks the
+ * done-day hold before any Massive request and the seal guard before sealing a range. Off otherwise
+ * (no daily step, nothing to wait for).
+ */
+export function tenMinHistoryDailyStepHold(
+  env: NodeJS.ProcessEnv,
+  openStore: (env: NodeJS.ProcessEnv) => Pick<ReplyDustStore, "get" | "head"> = (e) => R2ObjectClient.fromEnv(e),
+): {
+  dailyStepHold?: () => Promise<string | undefined>;
+  sealGuard?: (calendarFrom: string, calendarTo: string) => Promise<string | undefined>;
+} {
+  if (!tenMinDailyEnabled(env) || !env.PEACESTOCKS_R2_BUCKET?.trim()) return {};
+  return {
+    dailyStepHold: () => tenMinDailyHistoryHold(openStore(env)),
+    sealGuard: (calendarFrom, calendarTo) => tenMinRangeSealRefusal(openStore(env), calendarFrom, calendarTo),
+  };
 }
 
 export interface TenMinSecurityDayRead {
@@ -626,7 +1063,41 @@ export async function readTenMinSecurityDay(
   const entry = index?.stored.find((item) => item.securityId === securityId);
   if (!index || !entry) return { source: "none", bars: [] };
   const provider = options.provider ?? index.provider;
-  const verified = await verifyExistingDaily(store, provider, securityId, entry.fetch.symbol, sessionDate, backend, entry.fetch);
+  return { source: "daily", bars: await decodeDailyObjectBars(store, provider, securityId, sessionDate, entry.fetch, backend) };
+}
+
+/** Pure: canonical ten-minute bars for one session from freshly fetched reply pages. */
+function barsFromPages(provider: string, sessionDate: string, securityId: string, pages: readonly TenMinuteRangeReply[]): CanonicalTenMinuteBar[] {
+  const results: Array<Record<string, unknown>> = [];
+  let requestId: unknown;
+  for (const page of pages) {
+    const parsed = JSON.parse(new TextDecoder().decode(page.body)) as Record<string, unknown>;
+    if (requestId === undefined) requestId = parsed.request_id;
+    if (Array.isArray(parsed.results))
+      for (const raw of parsed.results) if (raw && typeof raw === "object") results.push(raw as Record<string, unknown>);
+  }
+  const first = pages[0];
+  return massiveTenMinuteBarsFromReply({
+    provider,
+    sessionDate,
+    securityId,
+    symbol: first?.symbol ?? "",
+    reply: { results, ...(requestId === undefined ? {} : { request_id: requestId }) },
+    observedAt: first?.fetchedAt ?? "",
+  });
+}
+
+/** Verify and decode one stored daily object into canonical bars (throws when it does not verify). */
+async function decodeDailyObjectBars(
+  store: ReplyDustStore,
+  provider: string,
+  securityId: string,
+  sessionDate: string,
+  fetch: TenMinRangeTickerFetch,
+  backend: ReplyDustBackend,
+): Promise<CanonicalTenMinuteBar[]> {
+  const { calendarFrom, calendarTo } = pairRangeForDate(sessionDate);
+  const verified = await verifyExistingDaily(store, provider, securityId, fetch.symbol, sessionDate, backend, fetch);
   if (!verified || verified === "INVALID") throw new Error(`TENMIN_DAILY_OBJECT_UNVERIFIED:${securityId}:${sessionDate}`);
   const results: Array<Record<string, unknown>> = [];
   let requestId: unknown;
@@ -643,17 +1114,14 @@ export async function readTenMinSecurityDay(
     if (Array.isArray(parsed.results))
       for (const raw of parsed.results) if (raw && typeof raw === "object") results.push(raw as Record<string, unknown>);
   }
-  return {
-    source: "daily",
-    bars: massiveTenMinuteBarsFromReply({
-      provider,
-      sessionDate,
-      securityId,
-      symbol: verified.symbol,
-      reply: { results, ...(requestId === undefined ? {} : { request_id: requestId }) },
-      observedAt: verified.observedAt,
-    }),
-  };
+  return massiveTenMinuteBarsFromReply({
+    provider,
+    sessionDate,
+    securityId,
+    symbol: verified.symbol,
+    reply: { results, ...(requestId === undefined ? {} : { request_id: requestId }) },
+    observedAt: verified.observedAt,
+  });
 }
 
 const ACTIVE_RUN_STATES = new Set(["queued", "in_progress", "waiting", "pending", "requested"]);
@@ -731,7 +1199,18 @@ export async function runTenMinDailyFromEnv(env: NodeJS.ProcessEnv = process.env
     },
     fetchPages: (security, from, to) => massive.getTenMinuteRangeReplies(security, from, to),
   });
-  return { mode: "tenmin-daily", status: "RAN", ...report, rateLimitedResponses: massive.rateLimitedResponses };
+  // After the run: the day (if any) that now holds the history chain, and when this report was written.
+  // The fallback reads this report (artifact tenmin-daily-report) to restart a held chain only once
+  // the held day itself is full or STUCK_SHORT.
+  const historyHold = await tenMinDailyHistoryHold(store).catch(() => undefined);
+  return {
+    mode: "tenmin-daily",
+    status: "RAN",
+    ...report,
+    rateLimitedResponses: massive.rateLimitedResponses,
+    historyHold: historyHold ?? null,
+    finishedAt: new Date().toISOString(),
+  };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
@@ -746,9 +1225,11 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import
         process.stdout.write(`::error title=Daily 10-minute step stopped: active-run check failed::${yielded}\n`);
         process.exitCode = 2;
       }
+      await reportPart(process.env, "tenmin-daily", isScanCheckFailure(yielded) ? "ERROR" : "OK", isScanCheckFailure(yielded) ? yielded : String(summary.status ?? ""));
     })
-    .catch((error: unknown) => {
+    .catch(async (error: unknown) => {
       process.stderr.write(`TENMIN_DAILY_FAILED:${error instanceof Error ? error.message : String(error)}\n`);
       process.exitCode = 2;
+      await reportPart(process.env, "tenmin-daily", "ERROR", errorMessage(error));
     });
 }

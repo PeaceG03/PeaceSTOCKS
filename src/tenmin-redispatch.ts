@@ -94,6 +94,11 @@ export const TENMIN_REFUSAL_CODES = [
 /** scanner.yml cron that runs only the restarter job (never a scan). Must match scanner.yml. */
 export const TENMIN_RESTARTER_CRON = "47 * * * *" as const;
 /** Chain wait reasons that send a heal dispatch (restart right after the guard window ends). */
+/** Outcome/decision reason prefix: a failed day in the daily step's catch-up window holds the chain. */
+export const TENMIN_WAIT_DAILY_STEP = "WAIT_DAILY_STEP" as const;
+/** Decision reason prefix: the fallback restarts a held chain because the held day itself is now full or STUCK_SHORT. */
+export const TENMIN_CONTINUE_HELD_DAY_RESOLVED = "CONTINUE_HELD_DAY_RESOLVED" as const;
+
 export const TENMIN_HEAL_REASONS: ReadonlySet<string> = new Set(["WAIT_GUARD_WINDOW", "WAIT_NEAR_GUARD_WINDOW"]);
 /** Heal decides this long after the window ends (clock skew, late window edges). */
 export const TENMIN_HEAL_MARGIN_MINUTES = 2;
@@ -197,6 +202,9 @@ export function tenMinRunOutcome(report: TenMinHistoryRunReport): TenMinRunOutco
     const refusal = TENMIN_REFUSAL_CODES.find((code) => message.includes(code));
     return out("stop", refusal ? `STOP_REFUSAL:${refusal}` : `STOP_ERROR:${message.slice(0, 160)}`);
   }
+  // Not "continue": a held run would be re-dispatched at once and spend the chain doing nothing.
+  // The decision turns it into a wait; the fallback restarts it after the next daily step.
+  if (report.dailyStepHold) return out("stop", `${TENMIN_WAIT_DAILY_STEP}:${report.dailyStepHold}`);
   if (report.outageStop) return out("stop", `STOP_OUTAGE:${report.outageStop.slice(0, 160)}`);
   if (report.reopen) return out("stop", "STOP_BOUNDED_MANUAL_RUN:reopen");
   if (report.maxRanges !== undefined) return out("stop", `STOP_BOUNDED_MANUAL_RUN:maxRanges=${report.maxRanges}`);
@@ -309,6 +317,11 @@ export interface TenMinRedispatchInput {
    */
   scanCheckStops?: number;
   finishedAt?: string;
+  /**
+   * fallback: the held day itself is resolved ("<day>:COMPLETE" or "<day>:STUCK_SHORT"), read from the
+   * newest daily 10-minute report written after the held run finished (heldDayResolution).
+   */
+  heldDayResolved?: string;
 }
 
 /** Decision reason prefix: a finished chain restarts because a new two-month range closed. */
@@ -365,6 +378,41 @@ export function maxChainOf(value: string | number | undefined): number {
   return Math.min(n, TENMIN_REDISPATCH_HARD_MAX_CHAIN);
 }
 
+/** The parts of a daily 10-minute run report (artifact tenmin-daily-report) the fallback reads. */
+export interface TenMinDailyReportFacts {
+  status?: string;
+  finishedAt?: string;
+  sessions?: readonly { sessionDate: string; status: string }[];
+}
+
+/** Resolution word when the held day left the daily step's window (the step then marks it STUCK_SHORT). */
+export const TENMIN_HELD_DAY_LEFT_WINDOW = "LEFT_WINDOW_STUCK_SHORT" as const;
+
+/**
+ * Pure (rule: only the short day itself unblocks history): "<day>:COMPLETE" or "<day>:STUCK_SHORT"
+ * when the newest daily report written after the held run finished shows the held day full or
+ * STUCK_SHORT; undefined otherwise. Another day being done never unblocks it.
+ */
+export function heldDayResolution(
+  heldReason: string | undefined,
+  daily: TenMinDailyReportFacts | undefined,
+  heldSinceIso: string | undefined,
+): string | undefined {
+  if (!heldReason?.startsWith(`${TENMIN_WAIT_DAILY_STEP}:`) || !daily || !heldSinceIso) return undefined;
+  const day = /\d{4}-\d{2}-\d{2}/u.exec(heldReason.slice(TENMIN_WAIT_DAILY_STEP.length + 1))?.[0];
+  if (!day || daily.status !== "RAN" || !daily.finishedAt || !(daily.finishedAt > heldSinceIso)) return undefined;
+  const sessions = daily.sessions ?? [];
+  const status = sessions.find((s) => s.sessionDate === day)?.status;
+  // Under a sealed range the daily step reports a tracked day STUCK_SHORT (stamped SEALED_OVER); a bare
+  // SKIPPED_RANGE_SEALED is not a resolution (only full or STUCK_SHORT unblocks, Auditor round 4).
+  if (status === "COMPLETE" || status === "STUCK_SHORT") return `${day}:${status}`;
+  // Older than every session in the step's window: it is no longer retried, and the step recorded it
+  // STUCK_SHORT when it left the window (the restarted run re-checks the hold itself).
+  const oldest = sessions.map((s) => s.sessionDate).sort()[0];
+  if (!status && oldest && day < oldest) return `${day}:${TENMIN_HELD_DAY_LEFT_WINDOW}`;
+  return undefined;
+}
+
 /** Pure decision: dispatch the next tenmin_history run now, wait, or stop the chain. */
 export function decideTenMinRedispatch(input: TenMinRedispatchInput): TenMinRedispatchDecision {
   const nextChain = input.chain + 1;
@@ -382,6 +430,15 @@ export function decideTenMinRedispatch(input: TenMinRedispatchInput): TenMinRedi
   if (!input.outcome) return stop("STOP_NO_OUTCOME");
   const scanRetry = scanCheckRetry(input);
   if (scanRetry) return scanRetry;
+  if (input.outcome.reason.startsWith(`${TENMIN_WAIT_DAILY_STEP}:`)) {
+    // Chain intact. The held run re-checks the hold itself, so at most one run per daily step.
+    // Only the held day itself unblocks: once it is full or STUCK_SHORT (never another later day).
+    if (input.trigger !== "fallback" || !input.heldDayResolved) return wait(input.outcome.reason);
+    if (nextChain > maxChainOf(input.maxChain)) return stop(`STOP_CHAIN_CAP:${maxChainOf(input.maxChain)}`);
+    const gate = queueAndGuard(input);
+    if (gate) return wait(gate);
+    return { dispatch: true, nextAction: "continue", reason: `${TENMIN_CONTINUE_HELD_DAY_RESOLVED}:${input.heldDayResolved}`, nextChain };
+  }
   const capRaised = rangeEndCapRaised(input);
   const newRange = newRangeClosed(input);
   const restart = capRaised ?? newRange;
@@ -846,6 +903,11 @@ async function main(mode: string | undefined): Promise<void> {
             FAILED.has(r.conclusion),
         )
       : undefined;
+    const heldDayResolved = heldDayResolution(
+      record?.outcome?.reason,
+      readJson<TenMinDailyReportFacts>(env.TENMIN_DAILY_REPORT_FILE),
+      record?.finishedAt,
+    );
     const newRangeClosedSinceRecord =
       record?.outcome?.reason.startsWith("STOP_DONE:no-range-left") && record.finishedAt
         ? tenMinNewRangeClosedSince(record.finishedAt, now)
@@ -867,6 +929,7 @@ async function main(mode: string | undefined): Promise<void> {
       ...(newRangeClosedSinceRecord ? { newRangeClosed: newRangeClosedSinceRecord } : {}),
       ...(record?.scanCheckStops !== undefined ? { scanCheckStops: record.scanCheckStops } : {}),
       ...(record?.finishedAt ? { finishedAt: record.finishedAt } : {}),
+      ...(heldDayResolved ? { heldDayResolved } : {}),
     });
     output("next_action", decision.nextAction);
     output("reason", decision.reason);

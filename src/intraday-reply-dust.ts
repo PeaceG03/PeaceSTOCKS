@@ -173,9 +173,26 @@ export class FileReplyDustStore implements ReplyDustStore {
   }
 }
 
+/** Refusal: a reply-dust key already holds different bytes (stored objects are never overwritten). */
+/** Named overwrites of an existing reply object (see storeVerifiedReplyDust). */
+export type ReplyDustReplace = "shorter-reply" | "unverified" | "no-manifest";
+
+export const REPLY_DUST_OVERWRITE_REFUSED = "REPLY_DUST_OVERWRITE_REFUSED" as const;
+
 /**
  * Encode a reply, decode it back, byte-compare to the reply, put it, read it back and compare.
  * Throws before the put if the decoded bytes differ. Returns the stored bytes.
+ *
+ * Never overwrites (Auditor B3): when the key already holds byte-identical bytes the write is a
+ * no-op success (a rerun or refill of the same reply, like DAILY_BARS_PACK_EXISTS_EQUIVALENT); when
+ * it holds different bytes the write is refused and nothing is touched. Two named exceptions, both
+ * for writers that never run under a sealed range (the range writer refuses them once sealed):
+ * - "shorter-reply": the daily step's done-day rule replaces its own short reply with one that holds
+ *   more bars (the caller compares the bars);
+ * - "unverified": a resume found the stored object failed verification (corrupt or no metadata) and
+ *   fetched it again (the caller ran the verification);
+ * - "no-manifest": a grouped-daily file whose day has no manifest is a leftover of a crashed attempt
+ *   (the file was written, the manifest was not); the caller checked the manifest is absent.
  */
 export async function storeVerifiedReplyDust(
   store: ReplyDustStore,
@@ -184,6 +201,7 @@ export async function storeVerifiedReplyDust(
   label: string,
   backend: ReplyDustBackend = nodeReplyDustBackend,
   metadataFor?: (encoded: Uint8Array) => ObjectMetadata,
+  options: { replace?: ReplyDustReplace } = {},
 ): Promise<Uint8Array> {
   const encoded = encodeReplyDust(body, backend);
   const metadata = metadataFor ? metadataFor(encoded) : {};
@@ -195,6 +213,11 @@ export async function storeVerifiedReplyDust(
     throw new Error(`REPLY_DUST_WRITE_VERIFY_FAILED:${label}:${String(error)}`);
   }
   if (!sameBytes(decoded, body)) throw new Error(`REPLY_DUST_WRITE_VERIFY_FAILED:${label}`);
+  if (await store.head(key)) {
+    const existing = await store.get(key);
+    if (existing && sameBytes(existing, encoded)) return encoded;
+    if (!options.replace) throw new Error(`${REPLY_DUST_OVERWRITE_REFUSED}:${label}`);
+  }
   await store.put(key, encoded, metadata);
   const stored = await store.get(key);
   if (!stored || !sameBytes(stored, encoded))
@@ -286,8 +309,14 @@ export async function writeReplyDustFile(
     });
   // A file already here is not listed in the sealed manifest (the caller checked), so it is a
   // leftover that failed verification on resume, and is replaced.
-  const encoded = await storeVerifiedReplyDust(store, key, reply.body, securityId, backend, (bytes) =>
-    replyDustObjectMetadata(options.provider, reply.sessionDate, entryFor(bytes)),
+  const encoded = await storeVerifiedReplyDust(
+    store,
+    key,
+    reply.body,
+    securityId,
+    backend,
+    (bytes) => replyDustObjectMetadata(options.provider, reply.sessionDate, entryFor(bytes)),
+    { replace: "unverified" },
   );
   return entryFor(encoded);
 }

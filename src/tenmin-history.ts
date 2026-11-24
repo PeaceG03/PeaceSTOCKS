@@ -669,6 +669,8 @@ export interface TenMinHistoryRangeReport {
   fetchFrom: string;
   fetchTo: string;
   status: "SEALED" | "ALREADY_SEALED" | "PARTIAL" | "REOPENED" | "OUTAGE_STOP" | "ERROR";
+  /** Set when the seal guard refused to seal this range (status PARTIAL). */
+  sealRefused?: string;
   /** Set when status is ERROR (e.g. TENMIN_UNIVERSE_EMPTY); the run stopped at this range. */
   error?: string;
   securitiesPlanned: number;
@@ -717,6 +719,11 @@ export interface TenMinHistoryRunReport {
   /** TENMIN_HISTORY_MAX_RANGE_END for this run, and the ranges it held back. */
   rangeEndCap?: TenMinHistoryPlan["rangeEndCap"];
   yieldedForScan?: string;
+  /**
+   * Set when a failed day in the daily 10-minute step's catch-up window holds the chain (done-day
+   * rule): the session date. The run made no Massive request.
+   */
+  dailyStepHold?: string;
   /**
    * Set when the run yielded before the range phase (dated ticker-index phase): no range was
    * attempted, so "no range left" must not be inferred from this report.
@@ -798,6 +805,17 @@ export async function runTenMinHistory(options: {
   /** One session's raw grouped-daily reply. Defaults to the shared provider (same pace). */
   fetchGroupedDaily?: (sessionDate: string) => Promise<ProviderRawReply>;
   writeReport?: boolean;
+  /**
+   * Done-day hold: the failed session in the daily step's catch-up window that holds the chain, or
+   * undefined (see tenMinDailyHistoryHold). Checked before any Massive request.
+   */
+  dailyStepHold?: () => Promise<string | undefined>;
+  /**
+   * Seal guard: why the range [calendarFrom, calendarTo] must not seal yet (a day in it is still
+   * retrying in the daily step), or undefined. A refusal leaves the range PARTIAL and holds the chain
+   * on that day (dailyStepHold, outcome WAIT_DAILY_STEP) until the day is full or STUCK_SHORT.
+   */
+  sealGuard?: (calendarFrom: string, calendarTo: string) => Promise<string | undefined>;
 }): Promise<TenMinHistoryRunResult> {
   const env = options.env ?? process.env;
   // Validate the range-end cap first: an invalid value fails before any store or Massive call.
@@ -845,6 +863,40 @@ export async function runTenMinHistory(options: {
         });
 
   const lastCompleted = options.lastCompletedSession ?? lastCompletedSessionDate(now);
+  const held = options.dailyStepHold ? await options.dailyStepHold() : undefined;
+  if (held) {
+    const configured = options.windowStart ?? DEFAULT_TENMIN_HISTORY_WINDOW_START;
+    const heldPlan = planTenMinHistoryRanges({
+      windowStart: configured,
+      lastCompletedSession: lastCompleted,
+      ...(maxRangeEnd ? { maxRangeEnd } : {}),
+    });
+    return {
+      report: {
+        groupedDailyRequests: 0,
+        groupedDailyStored: 0,
+        groupedDailyResumed: 0,
+        schemaVersion: TENMIN_HISTORY_RUN_SCHEMA,
+        runId: `tenmin-history-${stamp().replaceAll(/[^0-9]/gu, "").slice(0, 17)}`,
+        provider: providerName,
+        configuredWindowStart: configured,
+        windowStart: heldPlan.windowStart,
+        lastCompletedSession: lastCompleted,
+        skippedBefore: heldPlan.skippedBefore,
+        reopen: options.reopen === true,
+        securityLink: TENMIN_SECURITY_LINK,
+        ranges: [],
+        rangesPlanned: heldPlan.ranges.length,
+        dailyStepHold: held,
+        stoppedOnError: false,
+        warnings: [],
+        zstdVersion,
+        massiveRequests: 0,
+        completedAt: stamp(),
+      },
+      rangeResults: [],
+    };
+  }
   // Optional phase: dated ticker reference indexes (off unless TICKER_INDEX_DATED === "true").
   // Runs before range history so loadTickerReferenceIndexAsOf can see asOf ≤ D. Probe by default.
   let datedTickerIndex: DatedTickerRunReport | undefined;
@@ -919,6 +971,7 @@ export async function runTenMinHistory(options: {
   let massiveRequests = 0;
   let yieldedForScan: string | undefined;
   let outageStop: string | undefined;
+  let sealHold: string | undefined;
   let stoppedOnError = false;
   let error: string | undefined;
   const groupedTotals = { requests: 0, stored: 0, resumed: 0 };
@@ -1104,6 +1157,7 @@ export async function runTenMinHistory(options: {
           : {}),
         delistedCoverage: TENMIN_DELISTED_COVERAGE_MISSING,
         shouldYield,
+        ...(options.sealGuard ? { sealGuard: () => options.sealGuard!(range.calendarFrom, range.calendarTo) } : {}),
         fetchPages,
         ...(options.zstdVersionProbe ? { zstdVersionProbe: options.zstdVersionProbe } : {}),
         now: stamp,
@@ -1116,7 +1170,7 @@ export async function runTenMinHistory(options: {
       warnings.push(...(result.warnings ?? []));
       const status: TenMinHistoryRangeReport["status"] = result.outageStop
         ? "OUTAGE_STOP"
-        : result.yieldedForScan
+        : result.yieldedForScan || result.sealRefused
           ? "PARTIAL"
           : result.alreadySealed
             ? "ALREADY_SEALED"
@@ -1127,6 +1181,7 @@ export async function runTenMinHistory(options: {
         ...base,
         ...(result.manifest ? { delistedCoverage: tenMinRangeDelistedCoverage(result.manifest) } : {}),
         status,
+        ...(result.sealRefused ? { sealRefused: result.sealRefused } : {}),
         ...plannedCounts,
         securitiesWritten: result.securitiesWritten.length,
         securitiesResumed: result.securitiesResumed.length,
@@ -1161,6 +1216,12 @@ export async function runTenMinHistory(options: {
       }
       if (result.yieldedForScan) {
         yieldedForScan = result.yieldedForScan;
+        break;
+      }
+      if (result.sealRefused) {
+        // Hold the chain on the retrying day (same wait as the done-day hold; no alert).
+        sealHold = /\d{4}-\d{2}-\d{2}/u.exec(result.sealRefused)?.[0] ?? result.sealRefused;
+        warnings.push(result.sealRefused);
         break;
       }
     } catch (err) {
@@ -1228,6 +1289,7 @@ export async function runTenMinHistory(options: {
     ...(plan.rangeEndCap ? { rangeEndCap: plan.rangeEndCap } : {}),
     ...(yieldedForScan ? { yieldedForScan } : {}),
     ...(outageStop ? { outageStop } : {}),
+    ...(sealHold ? { dailyStepHold: sealHold } : {}),
     stoppedOnError,
     ...(error ? { error } : {}),
     warnings: [...new Set(warnings)],
