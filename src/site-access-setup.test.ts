@@ -6,7 +6,7 @@ const EMAIL = "owner@example.test";
 const HOST = "stocks.example.test";
 
 /** In-memory stand-in for the Cloudflare Access API (account-level apps, reusable policies, org). */
-function fakeCloudflare(options: { ignoreAppPolicies?: boolean; orgStatus?: number; failPolicyPost?: string } = {}) {
+function fakeCloudflare(options: { ignoreAppPolicies?: boolean; failPolicyPost?: string } = {}) {
   const apps = new Map<string, Record<string, unknown>>();
   const policies = new Map<string, Record<string, unknown>>();
   const calls: string[] = [];
@@ -19,10 +19,6 @@ function fakeCloudflare(options: { ignoreAppPolicies?: boolean; orgStatus?: numb
     const path = url.pathname.replace("/client/v4/accounts/acct/access", "");
     calls.push(`${method} ${path}`);
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
-    if (path === "/organizations") {
-      if (options.orgStatus) return Response.json({ success: false, errors: [{ code: 10000, message: "Authentication error" }] }, { status: options.orgStatus });
-      return ok({ auth_domain: "example-team.cloudflareaccess.com" });
-    }
     if (path === "/policies" && method === "GET") return ok([...policies.values()]);
     if (path === "/policies" && method === "POST") {
       if (options.failPolicyPost) return Response.json({ success: false, errors: [{ code: 12130, message: options.failPolicyPost }] }, { status: 400 });
@@ -58,6 +54,7 @@ const input = (fetchImpl: typeof fetch, over: Record<string, unknown> = {}) => (
   accountId: "acct",
   hostname: HOST,
   allowedEmail: EMAIL,
+  teamDomain: "example-team.cloudflareaccess.com",
   fetchImpl,
   ...over,
 });
@@ -81,6 +78,7 @@ test("access setup: creates one app with one single-email policy, then is idempo
   assert.equal(second.aud, first.aud);
   assert.equal(cf.apps.size, 1);
   assert.equal(cf.policies.size, 1);
+  assert.ok(!cf.calls.some((c) => c.includes("/organizations")), "team domain is never looked up");
   assert.ok(!cf.calls.slice(cf.calls.lastIndexOf("GET /policies")).includes("POST /apps"));
 });
 
@@ -104,7 +102,9 @@ test("access setup: refuses bad input before any API call, and never prints the 
     assert.ok(!error.message.includes(EMAIL));
     return true;
   });
-  const noOrg = fakeCloudflare({ orgStatus: 403 });
-  await assert.rejects(setupSiteAccess(input(noOrg.fetchImpl)), /ACCESS_API_403:GET \/organizations/u);
-  assert.deepEqual(noOrg.calls, ["GET /organizations"]);
+  const quiet = fakeCloudflare();
+  for (const teamDomain of [undefined, "", "   "]) {
+    await assert.rejects(setupSiteAccess(input(quiet.fetchImpl, { teamDomain })), /team domain missing/u);
+  }
+  assert.deepEqual(quiet.calls, []);
 });

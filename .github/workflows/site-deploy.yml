@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       team_domain:
-        description: "Cloudflare Access team domain, e.g. myteam.cloudflareaccess.com (blank = look it up)"
-        required: false
-        default: ""
+        description: "Cloudflare Access (Zero Trust) team domain. Not secret."
+        required: true
+        default: "blue-leaf-13b3.cloudflareaccess.com"
 permissions:
   contents: read
 concurrency:

@@ -24,8 +24,8 @@ export interface AccessSetupInput {
   accountId: string | undefined;
   hostname: string | undefined;
   allowedEmail: string | undefined;
-  /** Optional; looked up from the Access organization when blank. */
-  teamDomain?: string | undefined;
+  /** Required: <team>.cloudflareaccess.com (with or without https://). */
+  teamDomain: string | undefined;
   fetchImpl?: typeof fetch;
 }
 
@@ -132,14 +132,10 @@ export async function setupSiteAccess(input: AccessSetupInput): Promise<AccessSe
   if (!EMAIL.test(email)) throw new AccessSetupError("allowed email missing or not exactly one address");
   const call = client({ apiToken, accountId, email, fetchImpl: input.fetchImpl ?? fetch });
 
-  let teamDomain = normalizeTeamDomain(input.teamDomain);
-  if (input.teamDomain?.trim() && !teamDomain)
-    throw new AccessSetupError("team domain must look like <team>.cloudflareaccess.com");
-  if (!teamDomain) {
-    const org = await call<{ auth_domain?: string }>("GET", "/organizations");
-    teamDomain = normalizeTeamDomain(org.result?.auth_domain);
-    if (!teamDomain) throw new AccessSetupError("no Access team domain found: set up Zero Trust or pass team_domain");
-  }
+  // Given explicitly (site-deploy.yml input, default blue-leaf-13b3.cloudflareaccess.com): never looked
+  // up, so the token needs no Access: Organizations permission.
+  const teamDomain = normalizeTeamDomain(input.teamDomain);
+  if (!teamDomain) throw new AccessSetupError("team domain missing or not <team>.cloudflareaccess.com");
 
   const policyBody = {
     name: SITE_ACCESS_POLICY_NAME,
