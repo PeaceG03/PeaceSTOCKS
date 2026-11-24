@@ -62,6 +62,8 @@ export interface StrategyEvaluation {
   /** Holm-adjusted pooledP over the latest record of every strategy in the log. */
   adjustedP: number;
   foldsPositive: number;
+  /** Slippage charged, bps per side (the verdict's cost floor reads it). */
+  costBpsPerSide: number;
 }
 
 /** A fold counts as positive when net beats both benchmarks on its test window. */
@@ -118,5 +120,5 @@ export function evaluateStrategy(
   const familySize = Math.max(variantsTried, strategies.length);
   const adjusted = holmAdjusted(strategies.map((s) => s.pooledP), familySize);
   const adjustedP = adjusted[strategies.findIndex((s) => s.strategyHash === record.strategyHash)]!;
-  return { record, daily, variantsTried, familySize, adjustedP, foldsPositive: results.filter((r) => r.positive).length };
+  return { record, daily, variantsTried, familySize, adjustedP, foldsPositive: results.filter((r) => r.positive).length, costBpsPerSide: strategy.costs.slippageBpsPerSide };
 }

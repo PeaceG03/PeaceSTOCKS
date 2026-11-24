@@ -20,7 +20,7 @@ always Peace's own decision.
 | Costs | `src/research-costs.ts` | Equal weight over the list's picks that have an outcome. turnover_t = Σ\|w_t − w_{t−1}\|, counting entry, sells and the final exit. cost_t = turnover_t × bps per side / 10⁴. Every result carries gross, cost, net and turnover. The benchmarks (equal-weight universe, SPY) carry no cost. |
 | Variant log | `src/append-only-log.ts`, `src/research-variants.ts` | `variants.jsonl` is a hash-chained, append-only JSONL file. Each line holds seq, prev, at, entry and hash. An edited, deleted, reordered or forged line (even one with a recomputed hash) is refused. Each record has the strategy's config hash, every candidate variant's hash, per-fold metrics and the pooled metrics. The pick for each fold is made **on train only**. |
 | Multiple testing | `src/research-stats.ts` | One-sided t-tests run on the pooled daily excess series, against the universe and against SPY. A strategy's p is the larger of the two (intersection-union). Holm step-down is applied over the latest record of every strategy in the log. The family size is max(distinct variants ever tried, strategies), so trying more variants makes the same evidence worth less. |
-| Verdict | `src/research-verdict.ts` | `IMPROVEMENT` only if **all** of these hold: (1) pooled net-of-cost mean beats the equal-weight universe; (2) it also beats SPY; (3) it is positive vs the universe in more than half the folds (strictly); (4) Holm-adjusted p < 0.05; (5) the held-out period was evaluated once and is positive vs both. Anything else is `NOT_PROVEN`, with every failed reason listed. |
+| Verdict | `src/research-verdict.ts` | `IMPROVEMENT` only if **all** of these hold: (1) pooled net-of-cost mean beats the equal-weight universe; (2) it also beats SPY; (3) it is positive vs the universe in more than half the folds (strictly); (4) Holm-adjusted p < 0.05; (5) the held-out period was evaluated once and is positive vs both; (6) at least 3 folds were scored (`TOO_FEW_FOLDS` otherwise: with 1 or 2 folds a majority is one or two lucky windows, and 3 is the smallest count where a majority still leaves a fold to disagree); (7) costs were at least 5 bps per side (`COST_BELOW_FLOOR`). Anything else is `NOT_PROVEN`, with every failed reason listed. |
 
 ## Running it
 
@@ -33,6 +33,8 @@ pnpm research baseline --data <local raw dir> --out <dir> \
 # A recorded human decision to allow one more held-out look (TTY only):
 pnpm research unseal --out <dir> --strategy <strategyHash> --by <name> --reason "<why>"
 ```
+
+`--bps` below 5 (bps per side) or not a number is refused (`COST_BELOW_FLOOR`) before any data is read: 5 bps is a conservative floor for one-way slippage on these names, and anything lower would make turnover look nearly free.
 
 The baseline loads only bars dated before `--heldout-from`. Its bar window starts 370 days before
 `--from` so a year of eligibility history exists. Outputs in `<dir>`:

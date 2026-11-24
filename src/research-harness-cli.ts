@@ -11,7 +11,7 @@ import type { HarnessSession } from "./research-costs";
 import { HeldOutSeal, walkForwardFolds, type FoldConfig } from "./research-folds";
 import { evaluateStrategy, type StrategyConfig, type VariantRecord } from "./research-variants";
 import { holmAdjusted } from "./research-stats";
-import { verdictFor } from "./research-verdict";
+import { assertCostFloor, verdictFor } from "./research-verdict";
 
 export function dateArg(value: string): string {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(Date.parse(value)) || new Date(value).toISOString().slice(0, 10) !== value)
@@ -71,7 +71,8 @@ export async function researchMain(args: string[]): Promise<void> {
   const from = dateArg(arg(args, "from", "2025-03-03"));
   const heldOut = { from: dateArg(arg(args, "heldout-from", "2026-08-27")), to: dateArg(arg(args, "heldout-to", "2026-11-20")) };
   if (!(from < heldOut.from && heldOut.from < heldOut.to)) throw new Error("INVALID_RESEARCH_RANGE");
-  const bps = Number(arg(args, "bps", "10"));
+  // Cost floor (docs/RESEARCH_HARNESS.md): refused before any data is read or any strategy registered.
+  const bps = assertCostFloor(Number(arg(args, "bps", "10")));
   const foldsConfig: FoldConfig = {
     trainSessions: Number(arg(args, "train", "63")), testSessions: Number(arg(args, "test", "63")),
     embargoSessions: Number(arg(args, "embargo", "2")), mode: arg(args, "mode", "rolling") === "expanding" ? "expanding" : "rolling",
