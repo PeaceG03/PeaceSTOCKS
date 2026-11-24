@@ -76,9 +76,14 @@ export async function runHealthAlert(options: {
     return (await response.json()) as T;
   };
   const label = env.SCANNER_ALERT_LABEL || SCANNER_ALERT_LABEL;
-  const open = (await gh<Issue[]>(`/issues?state=open&labels=${encodeURIComponent(label)}&per_page=100`)).filter(
-    (issue) => !issue.pull_request && issue.title === HEALTH_ALERT_TITLE,
-  );
+  // Every page of open scanner-alert issues (a single page of 100 could miss the open health issue
+  // and open a duplicate). Capped at 20 pages.
+  const open: Issue[] = [];
+  for (let page = 1; page <= 20; page += 1) {
+    const batch = await gh<Issue[]>(`/issues?state=open&labels=${encodeURIComponent(label)}&per_page=100&page=${page}`);
+    open.push(...batch.filter((issue) => !issue.pull_request && issue.title === HEALTH_ALERT_TITLE));
+    if (batch.length < 100) break;
+  }
   const existing = open.sort((a, b) => a.number - b.number)[0];
   if (existing) {
     await gh(`/issues/${existing.number}/comments`, { method: "POST", body: JSON.stringify({ body }) });
