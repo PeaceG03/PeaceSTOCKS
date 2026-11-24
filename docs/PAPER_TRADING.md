@@ -57,7 +57,7 @@ again on its next run.
 | Switch | Where | Effect |
 | --- | --- | --- |
 | `PAPER_TRADING_ENABLED` | repository variable (Settings → Secrets and variables → Actions → Variables) | must be exactly `true`; anything else and the workflow job is skipped and the CLI does nothing |
-| `PAPER_TRADING_KILL` | repository variable | `true` stops all new orders (entries and exits) and all ledger writes |
+| `PAPER_TRADING_KILL` | repository variable | any value except empty or `false` (fail-safe; use `true`) stops all new orders (entries and exits) and all ledger writes |
 | `PAPER_TRADING_KILL` | a file of that name at the repository root | same, when committed to main |
 | `paper/KILL` | an object in the bucket | same |
 
