@@ -7,7 +7,7 @@ import {
   prepareSafeStoreDirectory,
   prepareSafeStoreFile,
 } from "./store-path";
-import { isSplitAction } from "./split-adjust";
+import { isSplitAction, SETTLEMENT_ACTION_TYPES } from "./split-adjust";
 import type {
   CanonicalDailyBar,
   CorporateAction,
@@ -330,6 +330,11 @@ export class MarketStorage implements MarketStore {
 
   async loadSplitActions(): Promise<CorporateAction[]> {
     return (await readJsonLines<CorporateAction>(this.path("corporate-actions.jsonl"))).filter(isSplitAction);
+  }
+
+  /** Stored MERGER / CLOSURE / DELISTING records (paper trading: cash settlements of STUCK holdings). */
+  async loadSettlementActions(): Promise<CorporateAction[]> {
+    return (await readJsonLines<CorporateAction>(this.path("corporate-actions.jsonl"))).filter((action) => SETTLEMENT_ACTION_TYPES.includes(action.actionType));
   }
 
   async loadBarsForSecurity(

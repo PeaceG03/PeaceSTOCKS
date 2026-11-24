@@ -160,8 +160,8 @@ test("end to end: intents before the open, fills from stored opens, day row vs S
   assert.deepEqual(r1.intents, { sessionDate: "2026-12-08", outcome: "WRITTEN", entries: 2, exits: 0 });
   const i1 = await read<PaperIntents>(client, paperLedgerKey("intents", "2026-12-08"));
   assert.deepEqual(i1.orders.map((o) => [o.side, o.securityId, o.clientOrderId]), [
-    ["BUY", "a", "paper-rules-v2_2026-12-08_a_BUY"],
-    ["BUY", "b", "paper-rules-v2_2026-12-08_b_BUY"],
+    ["BUY", "a", "paper-rules-v3_2026-12-08_a_BUY"],
+    ["BUY", "b", "paper-rules-v3_2026-12-08_b_BUY"],
   ]);
   assert.equal(i1.recordedAt, "2026-12-08T11:15:00.000Z");
   assert.ok(Date.parse(i1.recordedAt) < Date.parse(i1.sessionOpen));
@@ -198,7 +198,7 @@ test("end to end: intents before the open, fills from stored opens, day row vs S
 
   // Every ledger row carries the rules version and file hash.
   const { rulesSha256 } = loadPaperRules();
-  for (const row of [i1, i2, e2, f1, f2, d, ...i1.orders, ...e2.orders, ...f1.fills, ...f2.fills]) assert.deepEqual([row.rulesVersion, row.rulesSha256], ["paper-rules-v2", rulesSha256]);
+  for (const row of [i1, i2, e2, f1, f2, d, ...i1.orders, ...e2.orders, ...f1.fills, ...f2.fills]) assert.deepEqual([row.rulesVersion, row.rulesSha256], ["paper-rules-v3", rulesSha256]);
   // Append-only: no key was ever put twice.
   assert.equal(new Set(client.puts).size, client.puts.length);
 });
@@ -211,8 +211,8 @@ test("costs: P&L is net of slippage both sides and commission", () => {
     { securityId: "a", sessionDate: "2026-12-09", open: 100, close: 100, revision: 1 },
   ] as never);
   const intent = (S: string, side: "BUY" | "SELL"): PaperIntents => ({
-    schemaVersion: "paper-intents-v1", rulesVersion: "paper-rules-v2", rulesSha256: "x", sessionDate: S, freezeSessionDate: "2026-12-07",
-    recordedAt: "", sessionOpen: "", orders: [{ rulesVersion: "paper-rules-v2", rulesSha256: "x", clientOrderId: `${S}${side}`, sessionDate: S, securityId: "a", side, purpose: side === "BUY" ? "ENTRY" : "EXIT" }],
+    schemaVersion: "paper-intents-v1", rulesVersion: "paper-rules-v3", rulesSha256: "x", sessionDate: S, freezeSessionDate: "2026-12-07",
+    recordedAt: "", sessionOpen: "", orders: [{ rulesVersion: "paper-rules-v3", rulesSha256: "x", clientOrderId: `${S}${side}`, sessionDate: S, securityId: "a", side, purpose: side === "BUY" ? "ENTRY" : "EXIT" }],
   });
   for (const [rules, commission] of [[loaded, 0], [withCommission, 1]] as const) {
     const entry = computeFills({ intents: intent("2026-12-08", "BUY"), prior: { cash: 100000, positions: [] }, bars, splits: new Map(), loaded: rules });
@@ -331,31 +331,20 @@ test("exits fill at the actual open: a real crash is booked, splits adjust, conf
   for (const open of [170, 180, 250, 30]) near(fills(open).fills[0]!.fillPrice!, open * 0.999, `move to ${open}`);
 });
 
-test("exits with no open: held and counted; written off at the last close after N misses (N from the rules)", () => {
+test("exits with no open: held, counted and marked at the last close until the N-th miss (src/paper-stuck.test.ts covers N)", () => {
   const loaded = loadPaperRules();
-  assert.equal(loaded.rules.writeOffAfterMissedExits, 5);
   const position = (missedExits?: number) => ({ securityId: "a", qty: 100, entryOpen: 100, entryFillPrice: 100.1, entrySessionDate: "2026-12-01", ...(missedExits === undefined ? {} : { missedExits }) });
   const order = (side: "BUY" | "SELL") => ({ rulesVersion: "v", rulesSha256: "x", clientOrderId: side, sessionDate: "2026-12-09", securityId: "a", side, purpose: side === "BUY" ? "ENTRY" as const : "EXIT" as const });
   const intents: PaperIntents = { schemaVersion: "paper-intents-v1", rulesVersion: "v", rulesSha256: "x", sessionDate: "2026-12-09", freezeSessionDate: "2026-12-08", recordedAt: "", sessionOpen: "", orders: [order("SELL"), order("BUY")] };
   const bars = new PaperBars([{ securityId: "a", sessionDate: "2026-12-02", open: 100, close: 90, revision: 1 }, { securityId: "z", sessionDate: "2026-12-09", open: 1, close: 1, revision: 1 }] as never);
-  const fills = (missed: number | undefined, rules: LoadedPaperRules = loaded, splits = new Map()) => computeFills({ intents, prior: { cash: 0, positions: [position(missed)] }, bars, splits, loaded: rules });
-  const first = fills(undefined);
+  const first = computeFills({ intents, prior: { cash: 0, positions: [position()] }, bars, splits: new Map(), loaded });
   assert.deepEqual(first.fills.map((f) => f.status), ["NO_PRICE", "ALREADY_HELD"]);
   assert.deepEqual(first.positionsAfter, [position(1)]);
   near(first.equityAtOpen, 100 * 90, "marked at last close");
-  const fourth = fills(3);
-  assert.deepEqual([fourth.fills[0]!.status, fourth.positionsAfter[0]!.missedExits], ["NO_PRICE", 4]);
-  const fifth = fills(4);
-  assert.deepEqual([fifth.fills[0]!.status, fifth.fills[0]!.flags, fifth.fills[0]!.rawPrice], ["WRITTEN_OFF", ["WRITE_OFF_LAST_CLOSE"], 90]);
-  assert.deepEqual([fifth.fills[0]!.slippageUsd, fifth.fills[0]!.commissionUsd, fifth.positionsAfter], [0, 0, []]);
-  near(fifth.cashAfter, 100 * 90, "written off at the last close, no slippage");
-  assert.equal(fifth.fills[1]!.status, "NO_PRICE"); // no longer held, but no open to buy at
-  // A recorded split between entry and the last close adjusts the write-off like an exit.
-  near(fills(4, loaded, new Map([["a", [{ effectiveDate: "2026-12-02", factor: 0.5 }]]])).cashAfter, 100 * 180);
-  // N comes from the rules file, not a constant.
-  const n2: LoadedPaperRules = { ...loaded, rules: { ...loaded.rules, writeOffAfterMissedExits: 2 } };
-  assert.equal(fills(1, n2).fills[0]!.status, "WRITTEN_OFF");
-  assert.equal(fills(0, n2).fills[0]!.status, "NO_PRICE");
+  // At the N-th miss: $0, kept as a STUCK holding, still ALREADY_HELD for a new pick.
+  const fifth = computeFills({ intents, prior: { cash: 0, positions: [position(4)] }, bars, splits: new Map(), loaded });
+  assert.deepEqual(fifth.fills.map((f) => f.status), ["MARKED_ZERO", "ALREADY_HELD"]);
+  near(fifth.equityAtOpen, 0);
 });
 
 test("benchmarks treat names like paper exits: big moves count, conflicts use the raw open, splits adjust", () => {
@@ -420,11 +409,11 @@ test("entries never spend more cash than is left, even when held names inflate e
 
 test("corrections: a later split record appends a correction (n, n+1), never re-corrects, never touches the fill", () => {
   const loaded = loadPaperRules();
-  const fill = (status: "FILLED" | "WRITTEN_OFF" | "NO_PRICE", fillPrice = 51 * 0.999) => ({
-    rulesVersion: "paper-rules-v2", rulesSha256: "x", clientOrderId: "o", securityId: "a", side: "SELL" as const, purpose: "EXIT" as const,
+  const fill = (status: "FILLED" | "MARKED_ZERO" | "NO_PRICE", fillPrice = 51 * 0.999) => ({
+    rulesVersion: "paper-rules-v3", rulesSha256: "x", clientOrderId: "o", securityId: "a", side: "SELL" as const, purpose: "EXIT" as const,
     status, qty: 100, rawPrice: 51, fillPrice, splitFactorApplied: 1, entrySessionDate: "2026-12-08", notionalUsd: 0, commissionUsd: 0, slippageUsd: 0, flags: [],
   });
-  const fills = (f: ReturnType<typeof fill>) => ({ schemaVersion: "paper-fills-v1", rulesVersion: "paper-rules-v2", rulesSha256: "x", sessionDate: "2026-12-09", cashBefore: 0, cashAfterExits: 0, equityAtOpen: 0, cashAfter: 0, positionsAfter: [], fills: [f] }) as PaperFills;
+  const fills = (f: ReturnType<typeof fill>) => ({ schemaVersion: "paper-fills-v1", rulesVersion: "paper-rules-v3", rulesSha256: "x", sessionDate: "2026-12-09", cashBefore: 0, cashAfterExits: 0, equityAtOpen: 0, cashAfter: 0, positionsAfter: [], fills: [f] }) as PaperFills;
   const half = new Map([["a", [{ effectiveDate: "2026-12-09", factor: 0.5 }]]]);
   const now = new Date("2026-12-11T11:15:00.000Z");
   assert.deepEqual(correctionsFor({ fills: fills(fill("FILLED")), latest: new Map(), splits: new Map(), loaded, now }), []);
@@ -439,9 +428,8 @@ test("corrections: a later split record appends a correction (n, n+1), never re-
   const [second] = correctionsFor({ fills: fills(fill("FILLED")), latest: new Map([["a", first!]]), splits: quarter, loaded, now });
   assert.deepEqual([second!.n, second!.previousFactor, second!.correctedFactor], [2, 0.5, 0.25]);
   near(second!.cashAdjustmentUsd, 100 * (204 - 102) * 0.999);
-  // Write-offs are corrected without slippage; unfilled exits are not corrected.
-  const [wo] = correctionsFor({ fills: fills(fill("WRITTEN_OFF", 51)), latest: new Map(), splits: half, loaded, now });
-  near(wo!.correctedFillPrice, 102);
+  // Unfilled exits and $0 marks are not split-corrected (a STUCK holding is resolved separately).
+  assert.deepEqual(correctionsFor({ fills: fills(fill("MARKED_ZERO", 0)), latest: new Map(), splits: half, loaded, now }), []);
   assert.deepEqual(correctionsFor({ fills: fills(fill("NO_PRICE")), latest: new Map(), splits: half, loaded, now }), []);
   // A split outside (entry, exit] does not count.
   assert.deepEqual(correctionsFor({ fills: fills(fill("FILLED")), latest: new Map(), splits: new Map([["a", [{ effectiveDate: "2026-12-08", factor: 0.5 }]]]), loaded, now }), []);

@@ -26,10 +26,16 @@ export interface PaperRules {
   readonly slippageBpsPerSide: number;
   readonly wholeShares: true;
   /**
-   * A held name with no open at this many exit attempts in a row (halted, delisted) is written off at
-   * its last known close. Rule addition in v2; needs Peace's confirmation.
+   * A held name with no open at this many exit attempts in a row (halted, delisted) is valued at $0 in
+   * the ledger and in performance, and kept as a STUCK holding (never closed for good).
    */
-  readonly writeOffAfterMissedExits: number;
+  readonly markZeroAfterMissedExits: number;
+  /**
+   * MARK_ZERO_THEN_CORRECT (Peace, Nov 24): count a stuck holding at $0 for now; when a real later
+   * price, buyout cash or bankruptcy payout shows up in the stored data, append a correction for the
+   * actual amount. Fills and earlier ledger entries are never rewritten.
+   */
+  readonly stuckPositionRule: "MARK_ZERO_THEN_CORRECT";
 }
 
 export interface LoadedPaperRules {
@@ -39,11 +45,13 @@ export interface LoadedPaperRules {
 }
 
 /**
- * v2 (Nov 24, before any run): drops v1's unapproved 1.8x "fill flat" gap rule (Auditor FAIL on #127:
- * it booked real crashes at 0% and biased P&L upward) and adds the write-off rule. v1 never ran; no
- * ledger row was ever written under it.
+ * v2 (Nov 24, before any run): dropped v1's unapproved 1.8x "fill flat" gap rule (Auditor FAIL on #127:
+ * it booked real crashes at 0% and biased P&L upward) and added a write-off at the last close.
+ * v3 (Nov 24, before any run): replaces that write-off with Peace's $0-then-correct rule
+ * (markZeroAfterMissedExits, stuckPositionRule). Neither v1 nor v2 ever ran; no ledger row was ever
+ * written under them, so their files were removed.
  */
-export const PAPER_RULES_CURRENT_VERSION = "paper-rules-v2";
+export const PAPER_RULES_CURRENT_VERSION = "paper-rules-v3";
 
 const KEYS = [
   "rulesVersion",
@@ -59,7 +67,8 @@ const KEYS = [
   "commissionPerOrderUsd",
   "slippageBpsPerSide",
   "wholeShares",
-  "writeOffAfterMissedExits",
+  "markZeroAfterMissedExits",
+  "stuckPositionRule",
 ] as const;
 
 function fail(why: string): never {
@@ -98,8 +107,9 @@ export function parsePaperRules(text: string): PaperRules {
   finiteIn(record.dailyLossLimitFraction, "dailyLossLimitFraction", 0, 1, true);
   finiteIn(record.commissionPerOrderUsd, "commissionPerOrderUsd", 0, 1000);
   finiteIn(record.slippageBpsPerSide, "slippageBpsPerSide", 0, 1000);
-  finiteIn(record.writeOffAfterMissedExits, "writeOffAfterMissedExits", 1, 60);
-  if (!Number.isInteger(record.writeOffAfterMissedExits)) fail("writeOffAfterMissedExits_NOT_AN_INTEGER");
+  finiteIn(record.markZeroAfterMissedExits, "markZeroAfterMissedExits", 1, 60);
+  if (!Number.isInteger(record.markZeroAfterMissedExits)) fail("markZeroAfterMissedExits_NOT_AN_INTEGER");
+  if (record.stuckPositionRule !== "MARK_ZERO_THEN_CORRECT") fail("stuckPositionRule");
   return Object.freeze({ ...record }) as unknown as PaperRules;
 }
 

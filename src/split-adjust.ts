@@ -37,6 +37,9 @@ export interface SplitEvent {
   factor: number;
 }
 
+/** Corporate action types that can settle a held name for cash (details.cash_per_share); used by paper trading. */
+export const SETTLEMENT_ACTION_TYPES: readonly string[] = ["MERGER", "CLOSURE", "DELISTING"];
+
 export function isSplitAction(action: Pick<CorporateAction, "actionType">): boolean {
   return action.actionType === "SPLIT" || action.actionType === "REVERSE_SPLIT";
 }

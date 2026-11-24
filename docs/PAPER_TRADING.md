@@ -9,10 +9,10 @@ anywhere. Every "order" is a row in a simulated ledger, filled from the stored d
 `src/paper-no-live-broker.test.ts` fails if a live broker endpoint appears in `src/` or the workflows.
 Going to real money is out of scope and would need Peace's own explicit yes first.
 
-## Pre-registered rules (`config/paper-rules-v2.json`, rulesVersion `paper-rules-v2`)
+## Pre-registered rules (`config/paper-rules-v3.json`, rulesVersion `paper-rules-v3`)
 
 These were committed before any paper result existed. They are not tuned. A rule change is a new file
-(`paper-rules-v3.json`) with a new version, never an edit; every ledger row records `rulesVersion` and
+(`paper-rules-v4.json`) with a new version, never an edit; every ledger row records `rulesVersion` and
 `rulesSha256` (sha256 of the exact file bytes).
 
 Version history:
@@ -20,9 +20,13 @@ Version history:
   not in Peace's approved list: a held name whose open-to-open move was 1.8x or more either way was
   closed flat at its entry price. Because split records arrive days late, that rule also closed real
   crashes at 0% and flattered paper P&L (Auditor review of #127). Removed.
-- `paper-rules-v2` (Nov 24): v1 without the gap rule, exits always at the actual open, plus the
-  write-off rule below (a rule addition, **pending Peace's confirmation**). The config file changed, so
-  the version was bumped.
+- `paper-rules-v2` (Nov 24, never run; no ledger row was ever written under it): v1 without the gap
+  rule, exits always at the actual open, plus a write-off at the last known close after 5 missed exits.
+  Removed.
+- `paper-rules-v3` (Nov 24): v2 with that write-off replaced by Peace's decision (Nov 24, via Auditor):
+  "count it at $0 for now and correct it when real data shows up" (`stuckPositionRule`
+  `MARK_ZERO_THEN_CORRECT`, `markZeroAfterMissedExits` 5). The config schema changed, so the version
+  was bumped.
 
 | Rule | Value |
 | --- | --- |
@@ -36,7 +40,7 @@ Version history:
 | Slippage | 10 bps per side: buys fill at open x 1.001, sells at open x 0.999 |
 | Shares | whole shares only (rounded down); leftover stays in cash |
 | Exit price | always at the actual open, adjusted only by split records known at fill time; no move is ever filled flat |
-| Write-off (pending Peace's confirmation) | a held name with no open for 5 exit attempts in a row (halted, delisted) is written off at its last known close, no slippage (`writeOffAfterMissedExits`) |
+| No price ($0 then correct) | a held name with no open for 5 exit attempts in a row (halted, delisted) is valued at $0 in the ledger and in performance from that open on (`markZeroAfterMissedExits`), kept as a STUCK holding, never closed for good; a real later price, buyout cash or bankruptcy payout in the stored data adds an appended correction for the actual amount (`stuckPositionRule` `MARK_ZERO_THEN_CORRECT`) |
 
 Note on timing: the held-out eval's h1 outcome (src/holdout-eval.ts) is next open to the close h
 sessions later, so h1 is open to close of the entry day. Paper trading holds open to open, one session
@@ -97,7 +101,7 @@ Stored in the same R2 bucket the scanner uses, under `paper/v1/`, written by the
 | `paper/v1/intents/<T>.json` | before T's open, once D's freeze status is stored | the entries for T's open: BUY each picked name, or why entries were refused |
 | `paper/v1/fills/<T>.json` | once T's bars are stored | each order's fill (price, shares, slippage, commission) or why it did not fill; cash and positions after |
 | `paper/v1/days/<T>.json` | with the fills | the window from the previous open to T's open: paper return vs SPY and vs the equal-weight universe, plus cumulative |
-| `paper/v1/corrections/<S>/<securityId>_<n>.json` | when a late split record changes an exit's price | the n-th correction of the exit fill of that name at S's open: old and new split factor and price, and the cash difference |
+| `paper/v1/corrections/<S>/<securityId>_<n>.json` | when a late split record changes an exit's price, or a STUCK holding marked $0 at S's open is resolved | the n-th correction of the exit fill of that name at S's open: old and new split factor and price, and the cash difference; or (`paper-stuck-resolution-v1`) the actual amount a STUCK holding brought in |
 
 - **Append-only**: every object is written once and never overwritten or deleted. Each write is a
   single conditional put (`If-None-Match: *`): R2 itself refuses to overwrite an existing key (412),
@@ -109,7 +113,7 @@ Stored in the same R2 bucket the scanner uses, under `paper/v1/`, written by the
   and does not write or fill it again.
 - **Restart-safe**: state (cash, positions) is read back from the newest fills object; a crash between
   steps is finished by the next run, with the same result as an uninterrupted run.
-- Order of a run: append corrections for late split records, fill any stored exits and intents whose
+- Order of a run: append corrections for late split records and resolutions for STUCK holdings, fill any stored exits and intents whose
   session bars exist (oldest first, stopping at the first session not yet stored), write the missing
   day rows, then write the exits and the intents for the next open.
 
@@ -120,10 +124,31 @@ Stored in the same R2 bucket the scanner uses, under `paper/v1/`, written by the
   booked as it happened.
 - A name with no open that session stays held (marked at its last stored close, or its entry open),
   its `missedExits` count goes up, and it gets a new SELL at the next open. When the count reaches 5
-  (`writeOffAfterMissedExits`) it is written off (`WRITTEN_OFF`) at its last stored close, split-adjusted
-  the same way, with no slippage or commission.
+  (`markZeroAfterMissedExits`) it is valued at $0 (`MARKED_ZERO` fill, flag `STUCK_AT_ZERO`, no cash),
+  and the position stays on the book as a STUCK holding (`stuckSince` = that session). See below.
 - Then entries: per-name notional = min(equity at the open / number of names, 10% of equity);
   never more than the cash left. A name still held (its exit had no price) is not bought again.
+
+### No price for 5 sessions: valued at $0, then corrected (`MARK_ZERO_THEN_CORRECT`)
+- From the open of the 5th straight session with no price, a STUCK holding is valued at $0 in
+  `equityAtOpen`, in the daily-loss mark and in the day rows. The loss (its last stored close, or its
+  entry open) is booked once, in the window ending at that open; later windows see it at $0 again, so it
+  is never counted twice. It takes no cash and no slot of the 10% cap (entries are sized from equity with
+  it at $0), it gets no more SELL orders, and if it is picked again it is not bought (`ALREADY_HELD`).
+- It is not closed for good. Each run checks every STUCK holding against the data stored now. When a
+  real later price (the first usable open after entry, sold at it with normal slippage, split-adjusted
+  like an exit) or a cash settlement record (a stored `MERGER`, `CLOSURE` or `DELISTING` corporate
+  action with `details.cash_per_share`, e.g. buyout cash or a bankruptcy payout; no slippage) shows up,
+  an appended correction (`paper-stuck-resolution-v1`) records the actual amount under the
+  `MARKED_ZERO` fill's session, once. Whichever is earlier wins; on the same date the cash settlement.
+  Its `cashAdjustmentUsd` (shares x actual per-share amount) enters cash at the next open that is
+  filled, where the holding leaves the book (`STUCK_RESOLVED`, no cash of its own). The `MARKED_ZERO`
+  fill and every earlier entry are never rewritten. With no such data it stays at $0, with no correction.
+- Limits: only bars in the window a run loads (from about 3 weeks before the sessions it reads) are
+  searched for a later price, so a late bar for an old session is not picked up; no collector stores
+  settlement records yet (the storage reader is ready: `loadSettlementActions`), so until one does,
+  only a later price can resolve a STUCK holding; and the benchmarks are not corrected after a
+  resolution.
 
 ### Late split records: corrections, never rewrites
 Split records often arrive days after the split. A fill is never rewritten. Each run re-checks the
@@ -139,10 +164,12 @@ fact; they used the records known when their day row was written, the same as th
 - **SPY**: the security-master SPY ETF, no costs.
 - **Equal-weight universe**: the average open-to-open return of every security-master record that is
   `ACTIVE` with eligibility `LEVEL_2`/`LEVEL_3` (the current master, not point in time) with a positive
-  open on both sessions. No costs.
+  open on both sessions. No costs. The same $0 rule applies: a name with no open for 5 stored sessions
+  in a row (after one with an open) counts at -100% once, in the window ending at the 5th; it is left
+  out before that and after (no price), like any missing price.
 - Both benchmarks treat a name exactly as paper exits do: actual opens, split-adjusted by the stored
   records, conflicting records use the raw open, and no move is dropped or flattened. Only a missing
-  price leaves a name out.
+  price leaves a name out (apart from the $0 rule above).
 
 ## Site
 The site's **Paper trading** card shows the newest days: paper, SPY and universe returns per day and

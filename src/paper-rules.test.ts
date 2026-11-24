@@ -3,13 +3,13 @@ import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 import { loadPaperRules, parsePaperRules, PAPER_RULES_CURRENT_VERSION } from "./paper-rules";
 
-const file = () => readFileSync(new URL("../config/paper-rules-v2.json", import.meta.url), "utf8");
+const file = () => readFileSync(new URL("../config/paper-rules-v3.json", import.meta.url), "utf8");
 
-test("paper rules v2: exactly the pre-registered values", () => {
+test("paper rules v3: exactly the pre-registered values", () => {
   const { rules, rulesSha256 } = loadPaperRules();
-  assert.equal(PAPER_RULES_CURRENT_VERSION, "paper-rules-v2");
+  assert.equal(PAPER_RULES_CURRENT_VERSION, "paper-rules-v3");
   assert.deepEqual({ ...rules }, {
-    rulesVersion: "paper-rules-v2",
+    rulesVersion: "paper-rules-v3",
     mode: "SIMULATED_ONLY",
     list: "TOP_15_OVERALL",
     weighting: "EQUAL",
@@ -22,7 +22,8 @@ test("paper rules v2: exactly the pre-registered values", () => {
     commissionPerOrderUsd: 0,
     slippageBpsPerSide: 10,
     wholeShares: true,
-    writeOffAfterMissedExits: 5,
+    markZeroAfterMissedExits: 5,
+    stuckPositionRule: "MARK_ZERO_THEN_CORRECT",
   });
   assert.match(rulesSha256, /^[0-9a-f]{64}$/u);
 });
@@ -39,8 +40,11 @@ test("paper rules: the doc states the same rules as the file", () => {
     "lost 3% or more",
     "$0 per order",
     "10 bps per side",
-    "rulesVersion `paper-rules-v2`",
+    "rulesVersion `paper-rules-v3`",
     "5 exit attempts in a row",
+    "valued at $0",
+    "`MARK_ZERO_THEN_CORRECT`",
+    "appended correction",
     "at the actual open",
     "simulated, no real money",
   ])
@@ -68,8 +72,13 @@ test("paper rules: strict parsing rejects unknown keys, missing keys, wrong enum
   bad({ slippageBpsPerSide: "10" });
   bad({ startingCapitalUsd: Number.NaN });
   bad({ unexplainedGapRatio: 1.8 }); // v1's gap rule is gone for good
-  bad({ writeOffAfterMissedExits: 0 });
-  bad({ writeOffAfterMissedExits: 2.5 });
+  bad({ writeOffAfterMissedExits: 5 }); // v2's last-close write-off is gone for good
+  bad({ markZeroAfterMissedExits: 0 });
+  bad({ markZeroAfterMissedExits: 61 });
+  bad({ markZeroAfterMissedExits: 2.5 });
+  bad({}, "markZeroAfterMissedExits");
+  bad({ stuckPositionRule: "WRITE_OFF_LAST_CLOSE" });
+  bad({}, "stuckPositionRule");
   bad({ rulesVersion: "v1" });
   assert.throws(() => parsePaperRules("not json"), /PAPER_RULES_INVALID:NOT_JSON/u);
   assert.throws(() => loadPaperRules("../x"), /PAPER_RULES_INVALID/u);

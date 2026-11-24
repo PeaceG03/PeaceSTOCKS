@@ -1,10 +1,10 @@
 /**
  * Simulated paper trading of the frozen TOP_15_OVERALL picks under the pre-registered rules
- * (config/paper-rules-v2.json, docs/PAPER_TRADING.md). No broker: every order is a ledger row filled from
+ * (config/paper-rules-v3.json, docs/PAPER_TRADING.md). No broker: every order is a ledger row filled from
  * the stored daily bars. Nothing here sends an order anywhere.
  *
  * One run: (1) gates (enabled, kill switches) before anything is read or written; (1b) corrections for
- * late split records; (2) fill stored exits and intents whose session bars exist, oldest first; (3)
+ * late split records; (1c) resolutions of STUCK holdings (marked $0) from a later price or cash settlement; (2) fill stored exits and intents whose session bars exist, oldest first; (3)
  * write missing day rows; (4) before the next open, write its exits (SELL everything held, whatever the
  * freeze status) and, once the freeze status is stored, its entries (BUY the frozen picks if the freeze
  * proof holds and the daily loss limit was not hit). Every write is write-once (src/paper-ledger.ts).
@@ -32,12 +32,14 @@ import {
   type PaperLedgerStore,
   type PaperOrderIntent,
   type PaperPosition,
+  type PaperStuckResolution,
 } from "./paper-ledger";
 import type { LoadedPaperRules, PaperRules } from "./paper-rules";
 import { resolveSessionPredictionStatus } from "./prediction-status";
 import { resolveSpyBenchmarkId } from "./scanner";
 import { nextEligibleSession, previousEligibleSession } from "./session-open";
-import { splitEventsBySecurity, type SplitEvent } from "./split-adjust";
+import { SETTLEMENT_ACTION_TYPES, splitEventsBySecurity, type SplitEvent } from "./split-adjust";
+export { SETTLEMENT_ACTION_TYPES };
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 
 /** Read-only view of the scanner's stored data that paper trading uses. */
@@ -47,6 +49,15 @@ export interface PaperMarketReader {
   loadBarsBetween(from: string, to: string): Promise<CanonicalDailyBar[]>;
   loadSecurities(): Promise<SecurityMasterRecord[]>;
   loadSplitActions(): Promise<CorporateAction[]>;
+  /** Stored MERGER / CLOSURE / DELISTING records (cash settlements). Optional: none means none known. */
+  loadSettlementActions?(): Promise<CorporateAction[]>;
+}
+
+/** Cash per share a stored settlement record pays (0 is a valid bankruptcy payout), or undefined. */
+export function settlementCashPerShare(action: Pick<CorporateAction, "actionType" | "details">): number | undefined {
+  if (!SETTLEMENT_ACTION_TYPES.includes(action.actionType)) return undefined;
+  const cash = (action.details as Record<string, unknown> | undefined)?.cash_per_share;
+  return typeof cash === "number" && Number.isFinite(cash) && cash >= 0 ? cash : undefined;
 }
 
 export type PaperGate =
@@ -165,6 +176,15 @@ export class PaperBars {
     }
     return best?.close;
   }
+  /** Sessions with a usable open for this security, oldest first. */
+  openSessions(id: string): string[] {
+    return [...(this.byId.get(id)?.keys() ?? [])].filter((date) => this.open(id, date) !== undefined).sort();
+  }
+}
+
+/** A holding's mark: $0 once STUCK, otherwise qty x the last close (or the entry open when none). */
+export function positionMark(position: PaperPosition, lastClose: number | undefined): number {
+  return position.stuckSince ? 0 : position.qty * (lastClose ?? position.entryOpen);
 }
 
 interface BookState {
@@ -181,6 +201,8 @@ export function computeFills(input: {
   loaded: LoadedPaperRules;
   /** Corrections to add to cash at this open: their total, and every key applied so far (this open's included). */
   corrections?: { usd: number; applied: string[] };
+  /** STUCK holdings whose resolution enters cash at this open (they leave the book here). */
+  resolved?: readonly PaperStuckResolution[];
 }): PaperFills {
   const { intents, bars, splits } = input;
   const { rules, rulesSha256 } = input.loaded;
@@ -201,50 +223,66 @@ export function computeFills(input: {
   });
   const none = { qty: 0, notionalUsd: 0, commissionUsd: 0, slippageUsd: 0 };
 
+  // A STUCK holding whose resolution (the actual amount) enters cash at this open leaves the book here.
+  for (const resolution of input.resolved ?? []) {
+    const position = held.get(resolution.securityId);
+    if (!position?.stuckSince) continue;
+    held.delete(resolution.securityId);
+    fills.push({ ...stamp, clientOrderId: resolution.clientOrderId, securityId: resolution.securityId, side: "SELL", purpose: "EXIT", status: "STUCK_RESOLVED", ...none, qty: position.qty, entrySessionDate: position.entrySessionDate, flags: [] });
+  }
+
   for (const order of intents.orders.filter((o) => o.side === "SELL")) {
     const position = held.get(order.securityId);
     if (!position) {
       fills.push({ ...base(order), status: "NOT_HELD", ...none, flags: [] });
       continue;
     }
-    const rawOpen = bars.open(order.securityId, S);
-    const missed = (position.missedExits ?? 0) + 1;
-    if (rawOpen === undefined && missed < rules.writeOffAfterMissedExits) {
-      // Halted or no bar: stays held, sold at the next open it has.
-      held.set(order.securityId, { ...position, missedExits: missed });
-      fills.push({ ...base(order), status: "NO_PRICE", ...none, flags: [] });
+    if (position.stuckSince) {
+      // Already at $0: stays a STUCK holding until a resolution shows up in the data.
+      fills.push({ ...base(order), status: "STUCK", ...none, flags: [] });
       continue;
     }
-    // Exit at the actual open (split-adjusted by the records known now; later records append a
-    // correction). After writeOffAfterMissedExits misses in a row: written off at the last known close.
-    const writeOff = rawOpen === undefined;
-    const rawPrice = rawOpen ?? bars.lastClose(order.securityId, S, true) ?? position.entryOpen;
+    const rawOpen = bars.open(order.securityId, S);
+    if (rawOpen === undefined) {
+      const missed = (position.missedExits ?? 0) + 1;
+      if (missed < rules.markZeroAfterMissedExits) {
+        // Halted or no bar: stays held (marked at its last close), sold at the next open it has.
+        held.set(order.securityId, { ...position, missedExits: missed });
+        fills.push({ ...base(order), status: "NO_PRICE", ...none, flags: [] });
+        continue;
+      }
+      // markZeroAfterMissedExits misses in a row: $0 from this open on, kept as a STUCK holding. Cash is
+      // unchanged; a later price or cash settlement appends a resolution for the actual amount.
+      held.set(order.securityId, { ...position, missedExits: missed, stuckSince: S });
+      fills.push({ ...base(order), status: "MARKED_ZERO", ...none, qty: position.qty, fillPrice: 0, entrySessionDate: position.entrySessionDate, flags: ["STUCK_AT_ZERO"] });
+      continue;
+    }
+    // Exit at the actual open (split-adjusted by the records known now; later records append a correction).
+    const rawPrice = rawOpen;
     const split = appliedSplitFactor(splits.get(order.securityId), position.entrySessionDate, S);
     const price = rawPrice / split.factor;
-    const fillPrice = writeOff ? price : sellFillPrice(price, bps);
+    const fillPrice = sellFillPrice(price, bps);
     const notional = position.qty * fillPrice;
-    const orderCommission = writeOff ? 0 : commission;
-    cash += notional - orderCommission;
+    cash += notional - commission;
     held.delete(order.securityId);
     fills.push({
       ...base(order),
-      status: writeOff ? "WRITTEN_OFF" : "FILLED",
+      status: "FILLED",
       qty: position.qty,
-      ...(rawOpen !== undefined ? { rawOpen } : {}),
+      rawOpen,
       rawPrice,
       fillPrice,
       splitFactorApplied: split.factor,
       entrySessionDate: position.entrySessionDate,
       notionalUsd: notional,
-      commissionUsd: orderCommission,
-      slippageUsd: writeOff ? 0 : position.qty * price * (bps / 10_000),
-      flags: [...(split.unreconciled ? ["SPLIT_UNRECONCILED"] : []), ...(writeOff ? ["WRITE_OFF_LAST_CLOSE"] : [])],
+      commissionUsd: commission,
+      slippageUsd: position.qty * price * (bps / 10_000),
+      flags: split.unreconciled ? ["SPLIT_UNRECONCILED"] : [],
     });
   }
   const cashAfterExits = cash;
   let marked = 0;
-  for (const position of held.values())
-    marked += position.qty * (bars.lastClose(position.securityId, S, true) ?? position.entryOpen);
+  for (const position of held.values()) marked += positionMark(position, bars.lastClose(position.securityId, S, true));
   const equityAtOpen = cashAfterExits + marked;
 
   const buys = intents.orders.filter((o) => o.side === "BUY");
@@ -299,7 +337,7 @@ export function computeFills(input: {
 }
 
 /**
- * Corrections owed on stored exit fills: for each FILLED / WRITTEN_OFF exit whose split factor (by the
+ * Corrections owed on stored exit fills: for each FILLED exit whose split factor (by the
  * records known now, appliedSplitFactor) differs from the factor its latest price used, the next
  * correction. The fill itself is never rewritten. Pure.
  */
@@ -313,7 +351,7 @@ export function correctionsFor(input: {
   const { rules, rulesSha256 } = input.loaded;
   const out: PaperCorrection[] = [];
   for (const fill of input.fills.fills) {
-    if (fill.side !== "SELL" || (fill.status !== "FILLED" && fill.status !== "WRITTEN_OFF")) continue;
+    if (fill.side !== "SELL" || fill.status !== "FILLED") continue;
     if (fill.rawPrice === undefined || fill.splitFactorApplied === undefined || !fill.entrySessionDate || fill.fillPrice === undefined) continue;
     const previous = input.latest.get(fill.securityId);
     const previousFactor = previous?.correctedFactor ?? fill.splitFactorApplied;
@@ -321,7 +359,7 @@ export function correctionsFor(input: {
     const now = appliedSplitFactor(input.splits.get(fill.securityId), fill.entrySessionDate, input.fills.sessionDate).factor;
     if (Math.abs(now / previousFactor - 1) <= 1e-9) continue;
     const price = fill.rawPrice / now;
-    const correctedFillPrice = fill.status === "WRITTEN_OFF" ? price : sellFillPrice(price, rules.slippageBpsPerSide);
+    const correctedFillPrice = sellFillPrice(price, rules.slippageBpsPerSide);
     out.push({
       schemaVersion: "paper-correction-v1",
       rulesVersion: rules.rulesVersion,
@@ -341,6 +379,78 @@ export function correctionsFor(input: {
     });
   }
   return out;
+}
+
+/**
+ * The resolution of one STUCK holding from data stored now, or undefined when none has shown up: the
+ * earliest of (a) the first usable open after its entry session, up to `through` (sold at it with normal
+ * slippage, split-adjusted like an exit) and (b) a cash settlement record (settlementCashPerShare)
+ * effective after entry and on or before `through` (cash per share, split-adjusted, no slippage). On the
+ * same date the settlement wins. Pure.
+ */
+export function stuckResolutionFor(input: {
+  position: PaperPosition;
+  clientOrderId: string;
+  n: number;
+  bars: PaperBars;
+  splits: ReadonlyMap<string, SplitEvent[]>;
+  settlements: readonly CorporateAction[];
+  through: string;
+  loaded: LoadedPaperRules;
+  now: Date;
+}): PaperStuckResolution | undefined {
+  const { position, bars, splits, through } = input;
+  const { rules, rulesSha256 } = input.loaded;
+  if (!position.stuckSince) return undefined;
+  const id = position.securityId;
+  const after = position.entrySessionDate;
+  const priceDate = bars.openSessions(id).find((date) => date > after && date <= through);
+  let settlement: { action: CorporateAction; cash: number } | undefined;
+  for (const action of input.settlements) {
+    if (action.securityId !== id || !(action.effectiveDate > after) || action.effectiveDate > through) continue;
+    const cash = settlementCashPerShare(action);
+    if (cash === undefined) continue;
+    if (!settlement || action.effectiveDate < settlement.action.effectiveDate) settlement = { action, cash };
+  }
+  const common = {
+    schemaVersion: "paper-stuck-resolution-v1" as const,
+    rulesVersion: rules.rulesVersion,
+    rulesSha256,
+    sessionDate: position.stuckSince,
+    securityId: id,
+    clientOrderId: input.clientOrderId,
+    n: input.n,
+    qty: position.qty,
+    recordedAt: input.now.toISOString(),
+  };
+  if (settlement && (priceDate === undefined || settlement.action.effectiveDate <= priceDate)) {
+    const factor = appliedSplitFactor(splits.get(id), after, settlement.action.effectiveDate).factor;
+    const perShareUsd = settlement.cash / factor;
+    return {
+      ...common,
+      source: "CASH_SETTLEMENT",
+      actionId: settlement.action.actionId,
+      actionType: settlement.action.actionType,
+      effectiveDate: settlement.action.effectiveDate,
+      rawAmount: settlement.cash,
+      splitFactorApplied: factor,
+      perShareUsd,
+      cashAdjustmentUsd: position.qty * perShareUsd,
+    };
+  }
+  if (priceDate === undefined) return undefined;
+  const rawAmount = bars.open(id, priceDate)!;
+  const factor = appliedSplitFactor(splits.get(id), after, priceDate).factor;
+  const perShareUsd = sellFillPrice(rawAmount / factor, rules.slippageBpsPerSide);
+  return {
+    ...common,
+    source: "PRICE",
+    sourceSessionDate: priceDate,
+    rawAmount,
+    splitFactorApplied: factor,
+    perShareUsd,
+    cashAdjustmentUsd: position.qty * perShareUsd - rules.commissionPerOrderUsd,
+  };
 }
 
 /** How many recent fill sessions are re-checked for late split records each run. */
@@ -363,6 +473,20 @@ export function windowReturn(
   return b / appliedSplitFactor(splits.get(id), from, to).factor / a - 1;
 }
 
+/**
+ * The universe benchmark's side of the $0 rule: true when `to` is exactly the N-th stored session in a
+ * row with no open for this name, after a session that had one. That window counts it at -100% once;
+ * windows before and after leave it out (no price), as before. A later price is not fed back.
+ */
+export function stuckAt(bars: PaperBars, id: string, to: string, n: number, calendar = US_EQUITY_MARKET_CALENDAR): boolean {
+  let date: string | undefined = to;
+  for (let i = 0; i < n; i += 1) {
+    if (!date || !bars.hasSession(date) || bars.open(id, date) !== undefined) return false;
+    date = previousEligibleSession(date, calendar);
+  }
+  return date !== undefined && bars.open(id, date) !== undefined;
+}
+
 const compound = (cumulative: number, r: number | null) => (r === null ? cumulative : (1 + cumulative) * (1 + r) - 1);
 
 export function computeDay(input: {
@@ -374,15 +498,18 @@ export function computeDay(input: {
   splits: ReadonlyMap<string, SplitEvent[]>;
   securities: readonly SecurityMasterRecord[];
   loaded: LoadedPaperRules;
+  calendar?: typeof US_EQUITY_MARKET_CALENDAR;
 }): PaperDay {
   const { from, to, bars, splits } = input;
+  const calendar = input.calendar ?? US_EQUITY_MARKET_CALENDAR;
   const { rules, rulesSha256 } = input.loaded;
   const spyId = resolveSpyBenchmarkId(input.securities);
   const spy = spyId ? windowReturn(bars, splits, spyId, from.sessionDate, to.sessionDate) ?? null : null;
   const universe: number[] = [];
   for (const security of input.securities) {
     if (security.status !== "ACTIVE" || (security.eligibility !== "LEVEL_2" && security.eligibility !== "LEVEL_3")) continue;
-    const r = windowReturn(bars, splits, security.securityId, from.sessionDate, to.sessionDate);
+    const r = windowReturn(bars, splits, security.securityId, from.sessionDate, to.sessionDate) ??
+      (stuckAt(bars, security.securityId, to.sessionDate, input.loaded.rules.markZeroAfterMissedExits, calendar) ? -1 : undefined);
     if (r !== undefined) universe.push(r);
   }
   const universeReturn = universe.length ? universe.reduce((sum, r) => sum + r, 0) / universe.length : null;
@@ -427,6 +554,11 @@ export function nextOpenSession(now: Date, calendar = US_EQUITY_MARKET_CALENDAR)
   const next = nextEligibleSession(today, calendar);
   if (!next) throw new Error("PAPER_NO_NEXT_SESSION");
   return next;
+}
+
+/** Calendar days of bars loaded before the earliest session a run reads: last closes and N missed sessions. */
+export function paperBarsLookbackDays(rules: Pick<PaperRules, "markZeroAfterMissedExits">): number {
+  return Math.max(21, Math.ceil((rules.markZeroAfterMissedExits * 7) / 5) + 10);
 }
 
 function addDays(date: string, days: number): string {
@@ -521,12 +653,38 @@ export async function runPaperTrading(options: {
     return result;
   }
 
-  // Bars for every session this run reads, plus 21 days before for last-close marks.
+  // Bars for every session this run reads, plus enough days before for last-close marks and for the
+  // universe's N-sessions-without-a-price check (paperBarsLookbackDays).
   const predecessors = missingDays.map((s) => fillSessions[fillSessions.indexOf(s) - 1]!);
   const dates = [...pending, ...missingDays, ...predecessors, D, ...(lastFilled ? [lastFilled] : [])].sort();
-  const bars = new PaperBars(await market.loadBarsBetween(addDays(dates[0]!, -21), dates.at(-1)!));
+  const bars = new PaperBars(await market.loadBarsBetween(addDays(dates[0]!, -paperBarsLookbackDays(rules)), dates.at(-1)!));
   let securities: SecurityMasterRecord[] | undefined;
   const loadSecurities = async () => (securities ??= await market.loadSecurities());
+
+  // (1c) STUCK holdings (marked $0): append the resolution once a later price or a cash settlement is
+  // stored. The MARKED_ZERO fill is never rewritten; the cash enters at the next open that is filled.
+  const stuck = lastFilled ? (await readFills(lastFilled)).positionsAfter.filter((p) => p.stuckSince) : [];
+  if (stuck.length) {
+    const settlements = (await market.loadSettlementActions?.()) ?? [];
+    for (const position of stuck) {
+      const own = correctionKeys.map(parsePaperCorrectionKey).filter((k) => k && k.sessionDate === position.stuckSince && k.securityId === position.securityId);
+      let resolvedAlready = false;
+      for (const k of own) {
+        const stored = await ledger.read<{ schemaVersion: string }>(paperCorrectionKey(k!.sessionDate, k!.securityId, k!.n));
+        if (stored?.schemaVersion === "paper-stuck-resolution-v1") resolvedAlready = true;
+      }
+      if (resolvedAlready) continue;
+      const markedZero = (await readFills(position.stuckSince!)).fills.find((f) => f.securityId === position.securityId && f.status === "MARKED_ZERO");
+      if (!markedZero) throw new Error("PAPER_LEDGER_STUCK_FILL_MISSING");
+      const n = own.reduce((max, k) => Math.max(max, k!.n), 0) + 1;
+      const resolution = stuckResolutionFor({ position, clientOrderId: markedZero.clientOrderId, n, bars, splits, settlements, through: pending[0] ?? D, loaded, now });
+      if (!resolution) continue;
+      const key = paperCorrectionKey(position.stuckSince!, position.securityId, n);
+      await ledger.putOnce(key, resolution);
+      correctionKeys.push(key);
+      (result.corrections ??= []).push(key);
+    }
+  }
 
   // (2) Fill pending intents, oldest first; stop at the first session whose bars are not stored yet.
   let state: BookState = lastFilled
@@ -546,11 +704,14 @@ export async function runPaperTrading(options: {
     // Corrections not yet in cash enter it at this open.
     const applied = new Set((allFilled.length ? (await readFills(allFilled.at(-1)!)).correctionsApplied : undefined) ?? []);
     let usd = 0;
+    const resolved: PaperStuckResolution[] = [];
     for (const key of correctionKeys.filter((k) => !applied.has(k)).sort()) {
-      usd += (await ledger.read<PaperCorrection>(key))!.cashAdjustmentUsd;
+      const correction = (await ledger.read<PaperCorrection | PaperStuckResolution>(key))!;
+      usd += correction.cashAdjustmentUsd;
+      if (correction.schemaVersion === "paper-stuck-resolution-v1") resolved.push(correction);
       applied.add(key);
     }
-    const fills = computeFills({ intents, prior: state, bars, splits, loaded, corrections: { usd, applied: [...applied] } });
+    const fills = computeFills({ intents, prior: state, bars, splits, loaded, corrections: { usd, applied: [...applied] }, resolved });
     if ((await ledger.putOnce(paperLedgerKey("fills", S), fills)) === "KEPT_EXISTING") {
       // A concurrent or earlier write won: continue from what is stored.
       fillsCache.delete(S);
@@ -582,6 +743,7 @@ export async function runPaperTrading(options: {
       splits,
       securities: await loadSecurities(),
       loaded,
+      calendar,
     });
     await ledger.putOnce(paperLedgerKey("days", S), day);
     previousDay = (await ledger.read<PaperDay>(paperLedgerKey("days", S)))!;
@@ -610,7 +772,8 @@ export async function runPaperTrading(options: {
   });
   // Sessions before T still waiting for their fills (T's own exits, if already written, are not).
   const stillPending = pending.filter((s) => s < T && !result.filled.includes(s));
-  const holdings = new Set(state.positions.map((p) => p.securityId));
+  // STUCK holdings get no exit orders: they stay at $0 until a resolution shows up.
+  const holdings = new Set(state.positions.filter((p) => !p.stuckSince).map((p) => p.securityId));
   for (const s of stillPending) {
     const intents = intentSessions.includes(s) ? await ledger.read<PaperIntents>(paperLedgerKey("intents", s)) : undefined;
     for (const o of intents?.orders ?? []) if (o.side === "BUY") holdings.add(o.securityId);
@@ -648,7 +811,7 @@ export async function runPaperTrading(options: {
       if (last) {
         const lastFills = await readFills(last);
         let mark = lastFills.cashAfter;
-        for (const p of lastFills.positionsAfter) mark += p.qty * (bars.lastClose(p.securityId, D, false) ?? p.entryOpen);
+        for (const p of lastFills.positionsAfter) mark += positionMark(p, bars.lastClose(p.securityId, D, false));
         if (dailyLossBreached(lastFills.equityAtOpen, mark, rules.dailyLossLimitFraction)) refused = "DAILY_LOSS_LIMIT";
       }
       if (!refused) picks = proof.securityIds;

@@ -3,7 +3,7 @@
  *
  * Append-only: every object is written once under paper/v1/ and never overwritten or deleted. Keys have
  * exactly these shapes: intents, exits, fills, days (one per trading session) and corrections (one per
- * correction of an exit fill). A write to a key that already
+ * correction of an exit fill, or the one resolution of a STUCK holding). A write to a key that already
  * exists keeps the stored object (a retried step is a no-op), so an order can never be duplicated.
  * Writes are conditional puts (If-None-Match: *): the store refuses an overwrite.
  */
@@ -111,10 +111,13 @@ export interface PaperIntents extends RulesStamp {
 }
 
 /**
- * WRITTEN_OFF: a held name with no open at writeOffAfterMissedExits exit attempts in a row, closed at
- * its last known close (no slippage). There is no "fill flat": exits always fill at the actual open.
+ * MARKED_ZERO: a held name with no open at markZeroAfterMissedExits exit attempts in a row; valued at $0
+ * from that open on and kept as a STUCK holding (stuckSince), never closed for good. STUCK: a later exit
+ * attempt for a stuck holding (nothing changes). STUCK_RESOLVED: the holding leaves the book at the open
+ * where its stuck-resolution correction (the actual amount) enters cash. There is no "fill flat": exits
+ * always fill at the actual open.
  */
-export type PaperFillStatus = "FILLED" | "WRITTEN_OFF" | "NO_PRICE" | "NOT_HELD" | "ALREADY_HELD" | "ZERO_QTY";
+export type PaperFillStatus = "FILLED" | "MARKED_ZERO" | "STUCK" | "STUCK_RESOLVED" | "NO_PRICE" | "NOT_HELD" | "ALREADY_HELD" | "ZERO_QTY";
 
 export interface PaperFill extends RulesStamp {
   clientOrderId: string;
@@ -127,7 +130,7 @@ export interface PaperFill extends RulesStamp {
   rawOpen?: number;
   /** Price paid / received per share after slippage (and split adjustment on exits). */
   fillPrice?: number;
-  /** Exits: the unadjusted price the exit used (the session's open, or the last close for a write-off). */
+  /** Exits: the unadjusted price the exit used (the session's open). */
   rawPrice?: number;
   /** Exits: the split factor applied (product over (entry, exit] of the split records known then; 1 if none or unreconciled). */
   splitFactorApplied?: number;
@@ -149,6 +152,8 @@ export interface PaperPosition {
   entrySessionDate: string;
   /** Exit attempts in a row with no open (halted / delisted); absent means 0. */
   missedExits?: number;
+  /** Session it was marked to $0 (STUCK holding): valued at $0 until a stuck-resolution correction. */
+  stuckSince?: string;
 }
 
 export interface PaperFills extends RulesStamp {
@@ -188,6 +193,39 @@ export interface PaperCorrection extends RulesStamp {
   correctedFactor: number;
   correctedFillPrice: number;
   /** qty x (correctedFillPrice - previousFillPrice). */
+  cashAdjustmentUsd: number;
+  recordedAt: string;
+}
+
+/**
+ * A STUCK holding (marked to $0) resolved by data that showed up later: the first real open after entry
+ * (sold at it with normal slippage) or a cash settlement record (buyout cash, liquidation or bankruptcy
+ * payout per share; no slippage). Appended once under the MARKED_ZERO fill's session; its cash enters at
+ * the next open that is filled, where the holding leaves the book (STUCK_RESOLVED). Nothing is rewritten.
+ */
+export interface PaperStuckResolution extends RulesStamp {
+  schemaVersion: "paper-stuck-resolution-v1";
+  /** Session of the MARKED_ZERO fill (the position's stuckSince). */
+  sessionDate: string;
+  securityId: string;
+  /** The MARKED_ZERO fill's order id. */
+  clientOrderId: string;
+  n: number;
+  qty: number;
+  source: "PRICE" | "CASH_SETTLEMENT";
+  /** PRICE: the session whose open was used. */
+  sourceSessionDate?: string;
+  /** CASH_SETTLEMENT: the stored corporate action. */
+  actionId?: string;
+  actionType?: string;
+  effectiveDate?: string;
+  /** Unadjusted open (PRICE) or cash per share (CASH_SETTLEMENT) as stored. */
+  rawAmount: number;
+  /** Split factor applied over (entry, source date]. */
+  splitFactorApplied: number;
+  /** Per entry-time share, after slippage for PRICE. */
+  perShareUsd: number;
+  /** qty x perShareUsd, less one order commission for PRICE (the holding was at $0). */
   cashAdjustmentUsd: number;
   recordedAt: string;
 }
@@ -234,7 +272,7 @@ export class PaperLedgerStore {
    * Write once, as one conditional put: the store itself refuses to overwrite an existing key, so the
    * stored object is kept (KEPT_EXISTING) even if two writers race.
    */
-  async putOnce(key: string, value: PaperIntents | PaperExits | PaperFills | PaperDay | PaperCorrection): Promise<"WRITTEN" | "KEPT_EXISTING"> {
+  async putOnce(key: string, value: PaperIntents | PaperExits | PaperFills | PaperDay | PaperCorrection | PaperStuckResolution): Promise<"WRITTEN" | "KEPT_EXISTING"> {
     if (!LEDGER_KEY.test(key) && !CORRECTION_KEY.test(key)) throw new Error("PAPER_LEDGER_KEY_REFUSED");
     const written = await this.client.putIfAbsent(key, new TextEncoder().encode(`${JSON.stringify(value)}\n`));
     return written ? "WRITTEN" : "KEPT_EXISTING";

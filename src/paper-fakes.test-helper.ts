@@ -36,6 +36,7 @@ export class FakeMarket implements PaperMarketReader {
   statuses: PredictionStatus[] = [];
   sets: PredictionSet[] = [];
   splits: CorporateAction[] = [];
+  settlements: CorporateAction[] = [];
   securities: SecurityMasterRecord[] = [];
   readonly calls: string[] = [];
   async loadPredictionStatuses(sessionDate: string) {
@@ -57,6 +58,10 @@ export class FakeMarket implements PaperMarketReader {
   async loadSplitActions() {
     this.calls.push("splits");
     return this.splits;
+  }
+  async loadSettlementActions() {
+    this.calls.push("settlements");
+    return this.settlements;
   }
 
   security(securityId: string, options: { symbol?: string; assetType?: "STOCK" | "ETF"; eligibility?: SecurityMasterRecord["eligibility"]; status?: string } = {}) {
@@ -83,6 +88,18 @@ export class FakeMarket implements PaperMarketReader {
       actionType: from < to ? "SPLIT" : "REVERSE_SPLIT",
       effectiveDate,
       details: { split_from: from, split_to: to },
+      observedAt: `${effectiveDate}T00:00:00.000Z`,
+    } as unknown as CorporateAction);
+  }
+
+  /** A cash settlement record (buyout cash, liquidation or bankruptcy payout) per share. */
+  settle(securityId: string, effectiveDate: string, actionType: "MERGER" | "CLOSURE" | "DELISTING", cashPerShare: number) {
+    this.settlements.push({
+      actionId: `settle_${securityId}_${effectiveDate}_${this.settlements.length}`,
+      securityId,
+      actionType,
+      effectiveDate,
+      details: { cash_per_share: cashPerShare },
       observedAt: `${effectiveDate}T00:00:00.000Z`,
     } as unknown as CorporateAction);
   }

@@ -12,7 +12,7 @@ const date = (i: number) => `2026-12-${String(i).padStart(2, "0")}`;
 function day(i: number, patch: Record<string, unknown> = {}) {
   return {
     schemaVersion: "paper-day-v1",
-    rulesVersion: "paper-rules-v2",
+    rulesVersion: "paper-rules-v3",
     rulesSha256: "x",
     fromSessionDate: date(i - 1),
     toSessionDate: date(i),
