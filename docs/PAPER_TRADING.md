@@ -32,7 +32,9 @@ Version history:
 - `paper-rules-v5` (Nov 24): v4 plus the mass drop-out rule (`dropoutSpikeMultiple` 3,
   `dropoutSpikeMinNames` 200, `dropoutFallbackSessions` 40): when far more names than normal stop
   arriving at once, it is a gap in our data and their missing sessions are not missed exits (Peace's
-  intent: data gaps never count as misses). The config schema changed, so the version was bumped.
+  intent: data gaps never count as misses); and the reverse-split guard on recoveries
+  (`recoveryGuardMultiple` 3), because a v4 replay benchmark of +33% was driven by recoveries of up to
+  726x. The config schema changed, so the version was bumped.
 
 | Rule | Value |
 | --- | --- |
@@ -49,6 +51,7 @@ Version history:
 | No price ($0 then correct) | a held name with no open for 5 exit attempts in a row (halted, delisted) is valued at $0 in the ledger and in performance from that open on (`markZeroAfterMissedExits`), kept as a STUCK holding, never closed for good; a real later price, buyout cash or bankruptcy payout in the stored data adds an appended correction for the actual amount (`stuckPositionRule` `MARK_ZERO_THEN_CORRECT`) |
 | Coverage hole | a session whose stored bars cover fewer than 50% of the median name count of the 20 stored sessions before it (`coverageHoleFraction`), or that has no bars at all, is a coverage hole in our data, not a halt: a name with no open there does not count as a missed exit, for paper or the universe |
 | Data drop-out | a session where the names that had a bar on the stored session before it and none on this one number more than 200 (`dropoutSpikeMinNames`) and more than 3x the 99th percentile of that count over the 20 stored sessions before it (`dropoutSpikeMultiple`) is a data drop-out. For a name that dropped out there, its missing sessions do not count toward the $0 mark (flag `DATA_DROPOUT`) for its first 40 covered sessions (`dropoutFallbackSessions`); after that the normal $0-then-correct rule applies (so a name that never comes back is marked $0 at its 45th covered session), for paper and the universe |
+| Recovery guard | a later price for a $0-marked name that is more than 3x its last close before the mark (`recoveryGuardMultiple`), with no stored split or corporate-action record for it in between, is not booked: the name stays STUCK at $0 with flag `RECOVERY_NEEDS_REVIEW` until a split record or a sane price arrives, for paper and the universe |
 
 Note on timing: the held-out eval's h1 outcome (src/holdout-eval.ts) is next open to the close h
 sessions later, so h1 is open to close of the entry day. Paper trading holds open to open, one session
@@ -160,9 +163,29 @@ Stored in the same R2 bucket the scanner uses, under `paper/v1/`, written by the
 - Limits: only bars in the window a run loads (from about 103 calendar days before the sessions it reads, `paperBarsLookbackDays`) are
   searched for a later price, so a late bar for an old session is not picked up; no collector stores
   settlement records yet (the storage reader is ready: `loadSettlementActions`), so until one does,
-  only a later price can resolve a STUCK holding; a later price is booked as it is (no gap filter), so a
-  reverse split with no stored record between the $0 mark and the later open makes the recovery too
-  large, for paper and the universe alike.
+  only a later price can resolve a STUCK holding.
+
+### Reverse-split guard on recoveries (`RECOVERY_NEEDS_REVIEW`)
+- A name marked $0 often comes back after a reverse split whose record is not stored yet; its raw
+  later price then looks like a 5x or 700x gain. So a later open is not booked when it is more than
+  3x the close the mark took away
+  (`recoveryGuardMultiple`; the last stored close before the mark, kept on the position as
+  `stuckBasisClose` and on the universe entry as `basisClose`), and no split record and no stored
+  corporate action (`MERGER`, `CLOSURE`, `DELISTING`) exists for the name after that close and up to
+  that open.
+- The name stays STUCK at $0 and is flagged `RECOVERY_NEEDS_REVIEW` (`recoveryNeedsReview` on the paper
+  position and on the universe entry, with the held-back session, raw open and ratio; day rows count
+  them as `paperRecoveryNeedsReview` and `universeRecoveryNeedsReview`; the site shows a "recovery held
+  for review" line). It is resolved as usual when a split record arrives (the same open is then booked,
+  adjusted), when a later open is 3x or less, or when a cash settlement arrives. One function decides
+  it for paper and the universe (`stuckResolutionCheck`).
+- Why 3x: in the v4 replay over the stored bars the median recovery was 1.00x the close the mark took
+  away and the 99th percentile 4.5x; 48 recoveries were above 2x and 24 above 5x (up to 726x), and the
+  10 largest made up 0.19 of the 0.46 total correction. A real stock very rarely triples while it has no
+  price for 5 or more sessions; a reverse split does that routinely (1-for-3 and larger).
+- Limits: an unrecorded forward split (the recovery comes out too low) is not guarded; a real tripling
+  waits until a record or a lower price shows up; a record of any kind for the name lets the price book,
+  even if its factor does not explain the jump.
 - Coverage holes are judged by name count only. On the stored bars through 2026-11-23 no session falls
   under 50% of the trailing median (the lowest is about 96%). The two large v4 universe $0 days
   (2025-10-07 and 2026-08-27) were the 5th session after about 5-6% of names stopped arriving at once;
@@ -213,13 +236,14 @@ fact; they used the records known when their day row was written, the same as th
   open on both sessions. No costs.
 - The universe uses the same `MARK_ZERO_THEN_CORRECT` rule as paper, with the same trigger, data and
   code (`universeStuckAt`, `missKind`, `missedSessions`, `PaperBars.covered`, `PaperBars.dropoutSpike`,
-  `stuckResolutionFor`):
+  `stuckResolutionCheck`):
   - A name with no open on its 5th counted session in a row (after a session with an open; coverage
     holes and a data drop-out's fallback window skipped, not counted) counts at -100% once, in the window ending there. Its lost slice of the
     index (index level at the window's opening open / names that window) and the close it was worth (its
     last stored close) are carried in the day rows (`universeStuck`).
-  - Each later window checks every carried name with `stuckResolutionFor` (no costs): the first later
-    open or a cash settlement record, exactly as for a paper STUCK holding. When one shows up in the
+  - Each later window checks every carried name with `stuckResolutionCheck` (no costs): the first later
+    open or a cash settlement record, with the same reverse-split guard, exactly as for a paper STUCK
+    holding. When one shows up in the
     window, the recovered slice (slice x actual per-share amount / that close) is added to the window's
     universe return (`universeResolved`, `universeCorrectionReturn`), once, and the name leaves the
     list. So paper and the universe recover the same share of the $0 loss from the same data, in the
@@ -236,4 +260,5 @@ fact; they used the records known when their day row was written, the same as th
 The site's **Paper trading** card shows the newest days: paper, SPY and universe returns per day and
 cumulative, with the experimental label and "Paper trading: simulated, no real money." A window with
 data drop-out names shows a "data gap" line with how many universe and paper names were not counted as
-missed (`DATA_DROPOUT`).
+missed (`DATA_DROPOUT`), and a window with $0-marked names whose later price is held back shows a
+"recovery held for review" line (`RECOVERY_NEEDS_REVIEW`).

@@ -154,6 +154,22 @@ export interface PaperPosition {
   missedExits?: number;
   /** Session it was marked to $0 (STUCK holding): valued at $0 until a stuck-resolution correction. */
   stuckSince?: string;
+  /** The close the $0 mark took away (last stored close before stuckSince, else the entry open) and its session. */
+  stuckBasisSessionDate?: string;
+  stuckBasisClose?: number;
+  /** RECOVERY_NEEDS_REVIEW: a later price held back by the reverse-split guard (still STUCK, at $0). */
+  recoveryNeedsReview?: PaperRecoveryReview;
+}
+
+/**
+ * A later open for a $0-marked name that was not booked: more than recoveryGuardMultiple x the basis
+ * close with no stored split or corporate-action record in between (a likely unrecorded reverse split).
+ */
+export interface PaperRecoveryReview {
+  sourceSessionDate: string;
+  rawAmount: number;
+  /** Split-adjusted open / basis close. */
+  ratio: number;
 }
 
 export interface PaperFills extends RulesStamp {
@@ -240,6 +256,8 @@ export interface PaperUniverseStuck {
   basisClose: number;
   /** Index units lost: index level at that window's opening open / universe size of that window. */
   units: number;
+  /** RECOVERY_NEEDS_REVIEW: a later price held back by the reverse-split guard, as for paper. */
+  recoveryNeedsReview?: PaperRecoveryReview;
 }
 
 export interface PaperUniverseResolution {
@@ -284,6 +302,10 @@ export interface PaperDay extends RulesStamp {
   universeDataDropout?: number;
   /** Paper exits not filled this window because of a mass data drop-out (fills flagged DATA_DROPOUT). */
   paperDataDropout?: number;
+  /** Universe $0 names whose later price is held back by the reverse-split guard (RECOVERY_NEEDS_REVIEW). */
+  universeRecoveryNeedsReview?: number;
+  /** Paper STUCK holdings whose later price is held back by the reverse-split guard (RECOVERY_NEEDS_REVIEW). */
+  paperRecoveryNeedsReview?: number;
   /** Universe $0 marks resolved in this window, by the same data and function as paper. */
   universeResolved?: PaperUniverseResolution[];
   /** The recovered slices as a return on the index at this window's opening open (in universeReturn). */

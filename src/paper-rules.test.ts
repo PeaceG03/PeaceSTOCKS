@@ -28,6 +28,7 @@ test("paper rules v5: exactly the pre-registered values", () => {
     dropoutSpikeMultiple: 3,
     dropoutSpikeMinNames: 200,
     dropoutFallbackSessions: 40,
+    recoveryGuardMultiple: 3,
   });
   assert.match(rulesSha256, /^[0-9a-f]{64}$/u);
 });
@@ -54,6 +55,8 @@ test("paper rules: the doc states the same rules as the file", () => {
     "data drop-out",
     "`DATA_DROPOUT`",
     "40 covered sessions",
+    "`RECOVERY_NEEDS_REVIEW`",
+    "more than 3x",
     "at the actual open",
     "simulated, no real money",
   ])
@@ -99,6 +102,8 @@ test("paper rules: strict parsing rejects unknown keys, missing keys, wrong enum
   bad({ dropoutFallbackSessions: 0 });
   bad({ dropoutFallbackSessions: 4.5 });
   bad({}, "dropoutFallbackSessions");
+  bad({ recoveryGuardMultiple: 0.9 });
+  bad({}, "recoveryGuardMultiple");
   bad({ rulesVersion: "v1" });
   assert.throws(() => parsePaperRules("not json"), /PAPER_RULES_INVALID:NOT_JSON/u);
   assert.throws(() => loadPaperRules("../x"), /PAPER_RULES_INVALID/u);

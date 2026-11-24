@@ -17,5 +17,6 @@
   "coverageHoleFraction": 0.5,
   "dropoutSpikeMultiple": 3,
   "dropoutSpikeMinNames": 200,
-  "dropoutFallbackSessions": 40
+  "dropoutFallbackSessions": 40,
+  "recoveryGuardMultiple": 3
 }

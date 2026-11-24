@@ -113,6 +113,10 @@ function paperCard(data: SiteData): string {
                 d.dataDropout
                   ? `<div class="mute issues">data gap: ${d.dataDropout.universe} universe names, ${d.dataDropout.paper} paper names not counted as missed (${wrapAtUnderscores("DATA_DROPOUT")})</div>`
                   : ""
+              }${
+                d.recoveryNeedsReview
+                  ? `<div class="mute issues">recovery held for review: ${d.recoveryNeedsReview.universe} universe names, ${d.recoveryNeedsReview.paper} paper names (${wrapAtUnderscores("RECOVERY_NEEDS_REVIEW")})</div>`
+                  : ""
               }</td><td class="r" data-label="Paper">${escapeHtml(percent(d.paper))}</td><td class="r" data-label="SPY">${escapeHtml(percent(d.spy))}</td><td class="r" data-label="Universe">${escapeHtml(percent(d.universe))}</td></tr>`,
           )
           .join("")}</tbody></table></div>`

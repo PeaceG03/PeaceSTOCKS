@@ -42,7 +42,7 @@ test("marks $0 at the 5th straight miss, not at the 4th; kept as a STUCK holding
   assert.equal(fifth.fills[0]!.status, "MARKED_ZERO");
   assert.deepEqual(fifth.fills[0]!.flags, ["STUCK_AT_ZERO"]);
   assert.deepEqual([fifth.fills[0]!.qty, fifth.fills[0]!.fillPrice, fifth.fills[0]!.notionalUsd, fifth.fills[0]!.slippageUsd, fifth.fills[0]!.commissionUsd], [100, 0, 0, 0, 0]);
-  assert.deepEqual(fifth.positionsAfter, [position(5, { stuckSince: "2026-12-09" })], "kept, not closed");
+  assert.deepEqual(fifth.positionsAfter, [position(5, { stuckSince: "2026-12-09", stuckBasisSessionDate: "2026-12-02", stuckBasisClose: 90 })], "kept, not closed; the close the mark took away is kept");
   near(fifth.cashAfter, 1000, "no cash for a $0 mark");
   near(fifth.equityAtOpen, 1000, "valued at $0");
   // N comes from the rules, not a constant.

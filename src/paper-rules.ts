@@ -52,6 +52,12 @@ export interface PaperRules {
   readonly dropoutSpikeMultiple: number;
   readonly dropoutSpikeMinNames: number;
   readonly dropoutFallbackSessions: number;
+  /**
+   * Reverse-split guard: a recovery price for a $0-marked name above recoveryGuardMultiple x its last
+   * close before the mark, with no stored split or corporate-action record for it in between, is not
+   * booked (RECOVERY_NEEDS_REVIEW) until a record or a sane price arrives.
+   */
+  readonly recoveryGuardMultiple: number;
 }
 
 export interface LoadedPaperRules {
@@ -68,7 +74,7 @@ export interface LoadedPaperRules {
  * v4 (Nov 24, before any run): added coverageHoleFraction (a session with far fewer names than normal
  * is a hole in our data and is not a missed exit).
  * v5 (Nov 24, before any run): adds the mass drop-out rule (dropoutSpikeMultiple, dropoutSpikeMinNames,
- * dropoutFallbackSessions). v1-v4 never ran; no ledger row was ever written under them, so their
+ * dropoutFallbackSessions) and the reverse-split guard on recoveries (recoveryGuardMultiple). v1-v4 never ran; no ledger row was ever written under them, so their
  * files were removed.
  */
 export const PAPER_RULES_CURRENT_VERSION = "paper-rules-v5";
@@ -93,6 +99,7 @@ const KEYS = [
   "dropoutSpikeMultiple",
   "dropoutSpikeMinNames",
   "dropoutFallbackSessions",
+  "recoveryGuardMultiple",
 ] as const;
 
 function fail(why: string): never {
@@ -140,6 +147,7 @@ export function parsePaperRules(text: string): PaperRules {
   if (!Number.isInteger(record.dropoutSpikeMinNames)) fail("dropoutSpikeMinNames_NOT_AN_INTEGER");
   finiteIn(record.dropoutFallbackSessions, "dropoutFallbackSessions", 1, 250);
   if (!Number.isInteger(record.dropoutFallbackSessions)) fail("dropoutFallbackSessions_NOT_AN_INTEGER");
+  finiteIn(record.recoveryGuardMultiple, "recoveryGuardMultiple", 1, 1000);
   return Object.freeze({ ...record }) as unknown as PaperRules;
 }
 

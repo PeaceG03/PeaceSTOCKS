@@ -103,3 +103,14 @@ test("paper card: a data drop-out window says how many names were not counted as
   assert.match(html, /data gap: 562 universe names, 2 paper names not counted as missed \(DATA_<wbr>DROPOUT\)/u);
   assert.equal((html.match(/data gap:/gu) ?? []).length, 1);
 });
+
+test("paper card: a window with recoveries held by the reverse-split guard says so", async () => {
+  const client = new MemoryObjectClient();
+  await client.put(`${PAPER_DAYS_PREFIX}${date(3)}.json`, enc(day(3, { universeRecoveryNeedsReview: 3, paperRecoveryNeedsReview: 1 })));
+  await client.put(`${PAPER_DAYS_PREFIX}${date(4)}.json`, enc(day(4, { universeRecoveryNeedsReview: -2, paperRecoveryNeedsReview: "x" })));
+  const data = await loadSiteData(client);
+  assert.deepEqual(data.paper!.days.map((d) => [d.to, d.recoveryNeedsReview]), [[date(4), undefined], [date(3), { universe: 3, paper: 1 }]]);
+  const html = card(renderSitePage(data));
+  assert.match(html, /recovery held for review: 3 universe names, 1 paper names \(RECOVERY_<wbr>NEEDS_<wbr>REVIEW\)/u);
+  assert.equal((html.match(/recovery held for review:/gu) ?? []).length, 1);
+});

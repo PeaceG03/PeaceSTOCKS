@@ -102,6 +102,8 @@ export interface SitePaperDay {
   entriesRefused?: string;
   /** Names not priced this window because of a mass data drop-out (DATA_DROPOUT), not counted as missed. */
   dataDropout?: { universe: number; paper: number };
+  /** $0-marked names whose later price waits for review (RECOVERY_NEEDS_REVIEW). */
+  recoveryNeedsReview?: { universe: number; paper: number };
 }
 
 export interface SitePaper {
@@ -380,6 +382,12 @@ function dataDropout(day: PaperDay): { dataDropout?: { universe: number; paper: 
   return universe || paper ? { dataDropout: { universe, paper } } : {};
 }
 
+function recoveryNeedsReview(day: PaperDay): { recoveryNeedsReview?: { universe: number; paper: number } } {
+  const universe = count(day.universeRecoveryNeedsReview);
+  const paper = count(day.paperRecoveryNeedsReview);
+  return universe || paper ? { recoveryNeedsReview: { universe, paper } } : {};
+}
+
 function sitePaperDay(day: PaperDay, session: string): SitePaperDay {
   return {
     from: typeof day.fromSessionDate === "string" ? clip(day.fromSessionDate) : "unknown",
@@ -392,5 +400,6 @@ function sitePaperDay(day: PaperDay, session: string): SitePaperDay {
     cumulativeUniverse: fraction(day.cumulativeUniverseReturn),
     ...(typeof day.entriesRefused === "string" ? { entriesRefused: clip(day.entriesRefused) } : {}),
     ...dataDropout(day),
+    ...recoveryNeedsReview(day),
   };
 }
