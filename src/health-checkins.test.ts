@@ -72,6 +72,8 @@ test("wiring: scan, daily 10-minute step, history chain, backfill and gap refill
   assert.match(backfill, /reportPart\(process\.env, "backfill", "ERROR", errorMessage\(error\)\)/u);
   assert.match(backfill, /reportPart\(process\.env, "backfill", result\.stoppedOnError \? "ERROR" : "OK"/u);
   const refill = await src("gap-refill.ts");
-  assert.match(refill, /reportPart\(process\.env, "gap-refill", c === 0 \? "OK" : "ERROR"/u);
-  assert.match(refill, /reportPart\(process\.env, "gap-refill", "ERROR"/u);
+  // Both outcomes (success and thrown failure) go through refillCheckin (tested in gap-refill.health-checkin.test.ts).
+  assert.match(refill, /await checkIn\(\{ code: c/u);
+  assert.match(refill, /await checkIn\(\{ fail: why \}\)/u);
+  assert.match(refill, /reportPart\(process\.env, "gap-refill", c\.state, c\.message/u);
 });

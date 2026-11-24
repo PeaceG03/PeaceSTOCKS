@@ -193,18 +193,39 @@ async function main(): Promise<number> {
   return ok === sessions.length && after.ok ? 0 : 2;
 }
 
+/**
+ * Pure: the health check-in a gap-refill run writes, or undefined for the read-only probes (--check,
+ * --check-asof check coverage for other jobs and never check in). The refill itself checks in both as
+ * the weekly run (no argument) and after a scan (--after-scan), on the success and the failure path.
+ */
+export function refillCheckin(
+  argv: readonly string[],
+  outcome: { readonly code: number } | { readonly fail: string },
+): { state: "OK" | "ERROR"; message?: string } | undefined {
+  const afterScan = argv.includes("--after-scan");
+  if (argv.length > 0 && !afterScan) return undefined;
+  const tag = afterScan ? " (after-scan)" : "";
+  if ("fail" in outcome) return { state: "ERROR", message: `GAP_REFILL_FAIL_${outcome.fail}${tag}` };
+  return outcome.code === 0
+    ? { state: "OK", ...(afterScan ? { message: "AFTER_SCAN" } : {}) }
+    : { state: "ERROR", message: `GAP_REFILL_EXIT_${outcome.code}${tag}` };
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  // Only the refill itself checks in (--check / --check-asof are read-only probes for other jobs).
-  const refillRun = !process.argv[2];
+  const argv = process.argv.slice(2);
+  const checkIn = async (outcome: { code: number } | { fail: string }) => {
+    const c = refillCheckin(argv, outcome);
+    if (c) await reportPart(process.env, "gap-refill", c.state, c.message);
+  };
   main().then(
     async (c) => {
-      if (refillRun) await reportPart(process.env, "gap-refill", c === 0 ? "OK" : "ERROR", c === 0 ? undefined : `GAP_REFILL_EXIT_${c}`);
+      await checkIn({ code: c });
       process.exit(c);
     },
     async (e) => {
       const why = /REFILL_GUARD_REFUSED/u.test(String(e)) ? "GUARD_REFUSED" : "error";
       console.log(`gap-refill: FAIL ${why}`);
-      if (refillRun) await reportPart(process.env, "gap-refill", "ERROR", `GAP_REFILL_FAIL_${why}`);
+      await checkIn({ fail: why });
       process.exit(1);
     },
   );
