@@ -1,12 +1,13 @@
 // The variant log and the held-out seal live in ONE pinned ledger, not in --out: a fresh --out
 // folder can neither reset the Holm family nor reopen / re-register the seal.
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { AppendOnlyLog, gitCommittedHead } from "./append-only-log";
 import { RESEARCH_LEDGER_DIR, researchMain } from "./research-harness-cli";
+import type { VariantRecord } from "./research-variants";
 import { writeSyntheticStore } from "./research-fixture";
 
 const base = (root: string, out: string, scanner: string, heldOutTo = "2025-08-29") => [
@@ -52,4 +53,25 @@ test("the committed ledger carries the harness-v1 baseline and verifies against 
     const read = new AppendOnlyLog(path, undefined, { anchor: () => gitCommittedHead(path) }).read();
     assert.ok(read.length >= min, `${file}: ${read.length}`);
   }
+});
+
+test("the CLI's Holm family counts every candidate variant in the ledger, not just the strategies", async () => {
+  const root = mkdtempSync(join(tmpdir(), "research-family-"));
+  const ledgerDir = join(root, "ledger");
+  try {
+    writeSyntheticStore(root, { from: "2025-01-01", to: "2025-08-29" });
+    mkdirSync(ledgerDir, { recursive: true });
+    // An earlier experiment: ONE strategy that tried THREE candidate variants inside it.
+    const earlier = new AppendOnlyLog<VariantRecord>(join(ledgerDir, "variants.jsonl"));
+    const none = { sessions: 0, mean: 0, t: 0, p: 1 };
+    earlier.append({
+      strategyHash: "earlier-multi-candidate", name: "EARLIER", candidateHashes: ["v1", "v2", "v3"], folds: [],
+      pooled: { sessions: 0, meanGross: 0, meanNet: 0, meanCost: 0, meanTurnover: 0, meanUniverse: 0, meanSpy: 0, excessUniverse: none, excessSpy: none, sharpeNet: 0 },
+      pooledP: 1,
+    });
+    await researchMain(base(root, join(root, "out"), "scanner-a"), { ledgerDir });
+    const r = report(join(root, "out"));
+    assert.equal(r.variantsTried, 8); // 3 earlier + 5 now
+    assert.ok(r.results.every((x) => x.familySize === 8), JSON.stringify(r.results.map((x) => x.familySize))); // 6 strategies, 8 variants
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

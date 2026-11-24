@@ -9,8 +9,7 @@ import { EvalHistory, type EvalBar } from "./holdout-eval";
 import { buildHarnessSession, splitDatesById } from "./research-harness-data";
 import type { HarnessSession } from "./research-costs";
 import { HeldOutSeal, walkForwardFolds, type FoldConfig } from "./research-folds";
-import { evaluateStrategy, type StrategyConfig, type VariantRecord } from "./research-variants";
-import { holmAdjusted } from "./research-stats";
+import { evaluateStrategy, holmFamily, type StrategyConfig, type VariantRecord } from "./research-variants";
 import { assertCostFloor, verdictFor } from "./research-verdict";
 
 export function dateArg(value: string): string {
@@ -125,16 +124,12 @@ export async function researchMain(args: string[], deps: ResearchMainDeps = {}):
   const evaluations = strategies.map((s) => evaluateStrategy(sessions, folds, s, log));
   // Recompute the correction AFTER all five variants were registered/evaluated, not incrementally.
   const all = log.entries();
-  const latest = new Map<string, VariantRecord>();
-  for (const entry of all) latest.set(entry.strategyHash, entry);
-  const family = [...latest.values()];
-  const variantsTried = new Set(all.flatMap((r) => r.candidateHashes)).size;
-  const familySize = Math.max(variantsTried, family.length);
-  const adjusted = holmAdjusted(family.map((r) => r.pooledP), familySize);
+  const family = holmFamily(all);
+  const { variantsTried, familySize } = family;
   const results = evaluations.map((evaluation) => {
     evaluation.variantsTried = variantsTried;
     evaluation.familySize = familySize;
-    evaluation.adjustedP = adjusted[family.findIndex((r) => r.strategyHash === evaluation.record.strategyHash)]!;
+    evaluation.adjustedP = family.adjustedP(evaluation.record.strategyHash);
     const result = { ...evaluation, daily: undefined, verdict: verdictFor(evaluation, undefined) };
     const file = `${evaluation.record.name}.json`;
     writeFileSync(join(out, file), `${JSON.stringify(result, null, 2)}\n`);
