@@ -166,3 +166,43 @@ test("site page: phone layout stacks session and check-in rows; issue codes wrap
   assert.doesNotMatch(html, /&lt;wbr&gt;/u);
 });
 
+
+const XSS_PAYLOADS = ["<script>", '"><img onerror>'] as const;
+
+test("site page: every card field escapes <script> and attribute-break payloads", () => {
+  for (const payload of XSS_PAYLOADS) {
+    const html = renderSitePage({
+      generatedAt: payload,
+      health: { headline: payload, attention: false, at: payload, lines: [payload] },
+      checkins: [{ part: payload, name: payload, state: payload, at: payload, message: payload, remaining: payload as unknown as number }],
+      caughtUpThrough: payload,
+      backlog: { state: "BEHIND", remaining: 1, message: payload },
+      reports: [
+        {
+          sessionDate: payload,
+          status: payload,
+          completedAt: payload,
+          expected: payload as unknown as number,
+          valid: payload as unknown as number,
+          incomplete: payload as unknown as number,
+          failures: [payload],
+          failureCount: 1,
+        },
+      ],
+      predictions: { state: "off", status: payload, reason: payload, sessionDate: payload, picks: [{ setType: payload, symbols: [payload] }] },
+      readErrors: ["health"],
+      readErrorReasons: { health: payload },
+    });
+    const safe = sitePage.escapeHtml(payload);
+    assert.match(html, new RegExp(safe.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+    assert.equal(html.includes(payload), false, `raw payload leaked: ${JSON.stringify(payload)}`);
+    assert.doesNotMatch(html, /<script/u);
+    assert.doesNotMatch(html, /<img/u);
+    assert.match(html, new RegExp(`<div class="mute">${safe}</div>`, "u")); // check-in message (and other mute lines)
+    assert.match(html, new RegExp(`<span class="session-date">${safe}</span>`, "u"));
+    assert.match(html, new RegExp(`<span class="valid">${safe} / ${safe}</span>`, "u"));
+    assert.match(html, new RegExp(`data-label="When">${safe}</td>`, "u"));
+    assert.match(html, new RegExp(`data-label="Part">${safe}<div class="mute">${safe}</div></td>`, "u"));
+    assert.match(html, new RegExp(`<span class="valid">${safe} / ${safe}</span><div class="mute">${safe} incomplete</div>`, "u"));
+  }
+});
