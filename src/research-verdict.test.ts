@@ -92,3 +92,32 @@ test("cost floor: below 5 bps per side is NOT_PROVEN (COST_BELOW_FLOOR); 5 bps i
   }
   assert.equal(verdictFor(evaluation({ bps: 5 }), good).verdict, "IMPROVEMENT");
 });
+
+test("caller thresholds can only tighten the defaults: a library caller cannot lower the bar", () => {
+  const loose = [
+    { minFolds: 1 }, { minCostBpsPerSide: 0 }, { alpha: 0.5 }, { minPositiveFoldShare: 0 },
+    { minFolds: Number.NaN }, { minCostBpsPerSide: Number.NEGATIVE_INFINITY }, { alpha: Number.POSITIVE_INFINITY }, { minPositiveFoldShare: Number.NaN },
+  ];
+  const failing: Array<[Parameters<typeof evaluation>[0], string]> = [
+    [{ positive: 1, folds: 1 }, "TOO_FEW_FOLDS"],
+    [{ bps: 0 }, "COST_BELOW_FLOOR"],
+    [{ adjustedP: 0.2 }, "NOT_SIGNIFICANT_AFTER_CORRECTION"],
+    [{ positive: 2, folds: 4 }, "NOT_POSITIVE_IN_MOST_FOLDS"],
+  ];
+  for (const over of loose) {
+    const thresholds = { ...DEFAULT_VERDICT_THRESHOLDS, ...over };
+    for (const [ev, reason] of failing) {
+      const v = verdictFor(evaluation(ev), good, thresholds);
+      assert.equal(v.verdict, "NOT_PROVEN", `${JSON.stringify(over)} ${reason}`);
+      assert.ok(v.reasons.includes(reason), `${JSON.stringify(over)} ${reason}`);
+    }
+  }
+  // The combined bypass from the review: one fold at zero cost.
+  const bypass = verdictFor(evaluation({ positive: 1, folds: 1, bps: 0 }), good, { ...DEFAULT_VERDICT_THRESHOLDS, minFolds: 1, minCostBpsPerSide: 0 });
+  assert.equal(bypass.verdict, "NOT_PROVEN");
+  // Stricter thresholds still apply.
+  assert.equal(verdictFor(evaluation({ positive: 3, folds: 3 }), good, { ...DEFAULT_VERDICT_THRESHOLDS, minFolds: 4 }).verdict, "NOT_PROVEN");
+  assert.equal(verdictFor(evaluation({ bps: 8 }), good, { ...DEFAULT_VERDICT_THRESHOLDS, minCostBpsPerSide: 9 }).verdict, "NOT_PROVEN");
+  assert.equal(verdictFor(evaluation({ adjustedP: 0.02 }), good, { ...DEFAULT_VERDICT_THRESHOLDS, alpha: 0.01 }).verdict, "NOT_PROVEN");
+  assert.equal(verdictFor(evaluation({}), good, { ...DEFAULT_VERDICT_THRESHOLDS }).verdict, "IMPROVEMENT");
+});
