@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { SeriesMetrics } from "./research-stats";
 import type { StrategyEvaluation } from "./research-variants";
-import { DEFAULT_VERDICT_THRESHOLDS, LIVE_PAPER_RUN_NOTE, verdictFor } from "./research-verdict";
+import { clampThresholds, DEFAULT_VERDICT_THRESHOLDS, LIVE_PAPER_RUN_NOTE, verdictFor } from "./research-verdict";
 
 const metrics = (exU: number, exS: number, spySessions = 50): SeriesMetrics => ({
   sessions: 50,
@@ -120,4 +120,11 @@ test("caller thresholds can only tighten the defaults: a library caller cannot l
   assert.equal(verdictFor(evaluation({ bps: 8 }), good, { ...DEFAULT_VERDICT_THRESHOLDS, minCostBpsPerSide: 9 }).verdict, "NOT_PROVEN");
   assert.equal(verdictFor(evaluation({ adjustedP: 0.02 }), good, { ...DEFAULT_VERDICT_THRESHOLDS, alpha: 0.01 }).verdict, "NOT_PROVEN");
   assert.equal(verdictFor(evaluation({}), good, { ...DEFAULT_VERDICT_THRESHOLDS }).verdict, "IMPROVEMENT");
+});
+
+test("a non-finite caller threshold means the default (not a check that can never pass)", () => {
+  const nan = { alpha: Number.NaN, minPositiveFoldShare: Number.NaN, minFolds: Number.NaN, minCostBpsPerSide: Number.NaN };
+  const v = verdictFor(evaluation({}), good, nan);
+  assert.equal(v.verdict, "IMPROVEMENT", JSON.stringify(v.reasons));
+  assert.deepEqual(clampThresholds(nan), DEFAULT_VERDICT_THRESHOLDS);
 });

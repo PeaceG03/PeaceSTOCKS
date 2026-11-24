@@ -121,3 +121,39 @@ test("CLI: compares with the merge base of HEAD and the base branch (a branch be
     assert.throws(() => ledgerCheckBase(dir, "nope"), /LEDGER_BASE_REF_MISSING/u);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("ledger check: a log not yet on the base is skipped without skipping the other log", () => {
+  const { dir, ledger } = repo();
+  try {
+    git(dir, "rm", "-q", "research-ledger/variants.jsonl", "research-ledger/variants.jsonl.head");
+    git(dir, "commit", "-qm", "base without variants");
+    git(dir, "branch", "-f", "base");
+    const seal = join(ledger, "heldout.jsonl");
+    rmSync(seal);
+    rmSync(`${seal}.head`);
+    new AppendOnlyLog<{ r: number }>(seal, () => "2026-01-02T00:00:00.000Z").append({ r: 9 });
+    git(dir, "commit", "-qam", "rewrite the seal");
+    assert.deepEqual(ledgerProblemsAgainstBase(dir, "base"), ["heldout.jsonl:base-head-not-in-chain:seq-0"]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("ledger check CLI: exit 0 when append-only, exit 1 with the problems when not", () => {
+  const tsx = new URL("../node_modules/.bin/tsx", import.meta.url).pathname;
+  const cli = new URL("./research-ledger-check.ts", import.meta.url).pathname;
+  const { dir, variants } = repo();
+  try {
+    const ok = execFileSync(tsx, [cli, "base"], { cwd: dir, encoding: "utf8" });
+    assert.match(ok, /append-only against base/u);
+    rewrite(variants, [0, 1]);
+    git(dir, "commit", "-qam", "rewrite");
+    let status = 0;
+    let stdout = "";
+    try {
+      execFileSync(tsx, [cli, "base"], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    } catch (error) {
+      ({ status, stdout } = error as { status: number; stdout: string });
+    }
+    assert.equal(status, 1);
+    assert.match(stdout, /LEDGER_NOT_APPEND_ONLY:variants\.jsonl:base-head-not-in-chain/u);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
