@@ -26,7 +26,7 @@ import { isCheckinSilent } from "./health-silent";
 import { silentParts } from "./health-silent-parts";
 import { R2ObjectClient } from "./object-store";
 import { expectedTenMinBars } from "./tenmin-day-done";
-import { TENMIN_DAILY_CATCHUP_SESSIONS, readTenMinDailyIndex, tenMinDailyCatchupSessions, tenMinDailyIndexCounts } from "./tenmin-daily-liquid";
+import { TENMIN_DAILY_CATCHUP_SESSIONS, type TenMinDailyStuckShort, readTenMinDailyIndex, tenMinDailyCatchupSessions, tenMinDailyIndexCounts } from "./tenmin-daily-liquid";
 import { lastCompletedSessionDate } from "./tenmin-history";
 
 export const HEALTHY = "Healthy" as const;
@@ -69,6 +69,8 @@ export interface HealthStuckDay {
   dailyBars: string;
   /** Each short stock with its bars stored vs. needed, e.g. "38/39" (R2 only; lines carry counts). */
   shortStocks: { securityId: string; bars: string }[];
+  /** The STUCK_SHORT record (counts when the day was marked); absent on indexes written before it. */
+  stuckShort?: TenMinDailyStuckShort;
 }
 
 /** Pure: "2 at 38/39, 1 at 0/39" from short stocks (no stock names), fewest bars first. */
@@ -103,9 +105,9 @@ function ageMinutes(atIso: string, now: Date): number {
 export function stuckDayLine(day: HealthStuckDay): string {
   const what =
     day.shortNames > 0
-      ? `stuck short of ${day.expectedBars} bars: ${day.bars} bars, ${day.shortNames} stock/s short (${shortStocksLine(day.shortStocks)})`
-      : `stuck waiting for daily bars: ${day.bars} bars`;
-  return `daily 10-minute step: ${day.sessionDate} ${what}, daily bars ${day.dailyBars}, after ${day.reRuns} re-run/s`;
+      ? `STUCK_SHORT, short of ${day.expectedBars} bars: ${day.bars} bars, ${day.shortNames} stock/s short (${shortStocksLine(day.shortStocks)})`
+      : `STUCK_SHORT, waiting for daily bars: ${day.bars} bars`;
+  return `daily 10-minute step: ${day.sessionDate} ${what}, daily bars ${day.dailyBars}, after ${day.reRuns} re-run/s (not done, still retried)`;
 }
 
 export function evaluateHealth(input: {
@@ -176,7 +178,8 @@ export async function readStuckDays(
   const output: HealthStuckDay[] = [];
   for (const sessionDate of tenMinDailyCatchupSessions(lastCompletedSessionDate(now), catchupSessions)) {
     const index = await readTenMinDailyIndex(store, sessionDate).catch(() => undefined);
-    if (!index || index.done || !dayStuck(index.notDoneRuns ?? 0)) continue;
+    // STUCK_SHORT days (and older indexes past 6 failed passes) are flagged; they are never done.
+    if (!index || index.done || !(index.stuckShort || dayStuck(index.notDoneRuns ?? 0))) continue;
     const expectedBars = expectedTenMinBars(sessionDate);
     output.push({
       sessionDate,
@@ -185,6 +188,7 @@ export async function readStuckDays(
       missingDailyBars: index.missingDailyBars ?? 0,
       reRuns: index.notDoneRuns ?? 0,
       ...(({ dayBars, ...rest }) => ({ bars: dayBars, ...rest }))(tenMinDailyIndexCounts(index, expectedBars)),
+      ...(index.stuckShort ? { stuckShort: index.stuckShort } : {}),
     });
   }
   return output;

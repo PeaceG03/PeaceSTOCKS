@@ -69,7 +69,7 @@ test("counts: health output and latest.json show each stuck day and short stock 
   assert.equal(shortStocksLine(day!.shortStocks), "1 at 0/39, 1 at 38/39");
   assert.equal(
     stuckDayLine(day!),
-    "daily 10-minute step: 2026-10-21 stuck short of 39 bars: 77/117 bars, 2 stock/s short (1 at 0/39, 1 at 38/39), daily bars 3/3, after 6 re-run/s",
+    "daily 10-minute step: 2026-10-21 STUCK_SHORT, short of 39 bars: 77/117 bars, 2 stock/s short (1 at 0/39, 1 at 38/39), daily bars 3/3, after 6 re-run/s (not done, still retried)",
   );
   const result = await runHealthCheck(store, NOW);
   assert.ok(result.lines.includes(stuckDayLine(day!)));

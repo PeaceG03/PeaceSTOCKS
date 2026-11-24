@@ -818,3 +818,46 @@ test("counts: every day and stock status shows bars stored vs. needed (38/39; 20
   assert.equal(again.sessions[0]!.status, "COMPLETE");
   assert.equal(again.sessions[0]!.bars, "117/117");
 });
+
+test("STUCK_SHORT: after 6 failed full passes a short day is STUCK_SHORT with its count; it keeps retrying (last), never done, and stops blocking", async () => {
+  const store = new MemoryObjectClient();
+  const calls: string[] = [];
+  let bbbBars = 38;
+  const pages = async (sec: { securityId: string; symbol: string }, from: string, to: string) => {
+    calls.push(`${sec.symbol}:${from}`);
+    const count = from === "2026-10-08" && sec.symbol === "BBB" ? bbbBars : 39;
+    return replyPages(sec.symbol, sec.securityId, from, to, barsOnDay(sec.symbol, from, count));
+  };
+  const hold = () => tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-08", catchupSessions: 1 });
+  for (let pass = 1; pass <= 5; pass += 1) {
+    const run = await baseRun(store, calls, { lastCompletedSession: "2026-10-08", catchupSessions: 1, fetchPages: pages });
+    assert.equal(run.sessions[0]!.status, "PARTIAL", `pass ${pass}: still retrying`);
+    assert.equal(await hold(), "2026-10-08", `pass ${pass}: a retrying day holds the chain`);
+  }
+  const sixth = await baseRun(store, calls, { lastCompletedSession: "2026-10-08", catchupSessions: 1, fetchPages: pages });
+  assert.equal(sixth.sessions[0]!.status, "STUCK_SHORT");
+  assert.equal(sixth.sessions[0]!.bars, "116/117");
+  let index = (await readTenMinDailyIndex(store, "2026-10-08"))!;
+  assert.equal(index.done, undefined, "never treated as a full 39-bar day");
+  assert.deepEqual(
+    { ...index.stuckShort, at: "t" },
+    { status: "STUCK_SHORT", at: "t", passes: 6, dayBars: "116/117", dailyBars: "3/3", shortNames: 1, missingDailyBars: 0 },
+  );
+  assert.equal(await hold(), undefined, "STUCK_SHORT no longer blocks");
+
+  // Still retried, after every other day in the window (10-09 is fetched first).
+  calls.length = 0;
+  const later = await baseRun(store, calls, { lastCompletedSession: "2026-10-09", catchupSessions: 2, fetchPages: pages });
+  assert.deepEqual(later.sessions.map((s) => s.sessionDate), ["2026-10-09", "2026-10-08"]);
+  assert.equal(calls.at(-1), "BBB:2026-10-08");
+  assert.equal(later.sessions[1]!.status, "STUCK_SHORT");
+  assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.stuckShort?.passes, 6, "count kept from the pass that marked it");
+
+  // If every bar does arrive later, the day is done for real.
+  bbbBars = 39;
+  const fixed = await baseRun(store, [], { lastCompletedSession: "2026-10-09", catchupSessions: 2, fetchPages: pages });
+  assert.equal(fixed.sessions.find((s) => s.sessionDate === "2026-10-08")!.status, "COMPLETE");
+  index = (await readTenMinDailyIndex(store, "2026-10-08"))!;
+  assert.ok(index.done);
+  assert.equal(index.stuckShort, undefined);
+});

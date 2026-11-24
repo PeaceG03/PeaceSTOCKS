@@ -55,7 +55,35 @@ test("health run: a day the daily step keeps re-running short of 39 bars is flag
   const stuck = await readStuckDays(store, NOW);
   assert.deepEqual(stuck, [{ sessionDate: "2026-10-21", expectedBars: 39, shortNames: 3, missingDailyBars: 0, reRuns: 6, bars: "0/0", shortStocks: [], dailyBars: "0/0" }]);
   const result = await runHealthCheck(store, NOW);
-  assert.ok(result.lines.includes("daily 10-minute step: 2026-10-21 stuck short of 39 bars: 0/0 bars, 3 stock/s short (), daily bars 0/0, after 6 re-run/s"));
+  assert.ok(result.lines.includes("daily 10-minute step: 2026-10-21 STUCK_SHORT, short of 39 bars: 0/0 bars, 3 stock/s short (), daily bars 0/0, after 6 re-run/s (not done, still retried)"));
+});
+
+test("health run: a STUCK_SHORT day is flagged with the count recorded when it was marked", async () => {
+  const store = new MemoryObjectClient();
+  const body = {
+    schemaVersion: "tenmin-daily-liquid-index-v1",
+    sessionDate: "2026-10-22",
+    rangeFrom: "2026-09-01",
+    rangeTo: "2026-10-31",
+    provider: "massive-stocks",
+    rule: { n: 1, lookbackSessions: 20, method: "m", trailingSessions: [] },
+    selectedAt: "t",
+    selected: [],
+    stored: [],
+    gaps: [],
+    notDoneRuns: 7,
+    shortNames: 1,
+    missingDailyBars: 0,
+    stuckShort: { status: "STUCK_SHORT", at: "t", passes: 6, dayBars: "38/39", dailyBars: "1/1", shortNames: 1, missingDailyBars: 0 },
+    updatedAt: "t",
+  };
+  const checksum = sha256Hex(new TextEncoder().encode(JSON.stringify(body)));
+  await store.put(tenMinDailyIndexKey("2026-10-22"), new TextEncoder().encode(JSON.stringify({ ...body, checksum })));
+  const result = await runHealthCheck(store, NOW);
+  assert.equal(result.stuckDays[0]?.stuckShort?.dayBars, "38/39");
+  assert.ok(result.lines.some((line) => line.startsWith("daily 10-minute step: 2026-10-22 STUCK_SHORT")));
+  const latest = JSON.parse(new TextDecoder().decode((await store.get(HEALTH_CHECK_LATEST_KEY))!)) as { stuckDays: { stuckShort?: { passes: number } }[] };
+  assert.equal(latest.stuckDays[0]?.stuckShort?.passes, 6);
 });
 
 test("health workflow: scheduled outside the scan guard windows, R2 only, runs the health check", async () => {

@@ -81,5 +81,5 @@ test("health: days stuck short of 39 bars are flagged", () => {
     stuckDays: [{ sessionDate: "2026-10-23", expectedBars: 39, shortNames: 4, missingDailyBars: 0, reRuns: 6, bars: "152/156", dailyBars: "4/4", shortStocks: [{ securityId: "s1", bars: "38/39" }, { securityId: "s2", bars: "38/39" }, { securityId: "s3", bars: "38/39" }, { securityId: "s4", bars: "38/39" }] }],
   });
   assert.match(r.headline, /^needs attention: daily 10-minute step \(1 stuck day\/s\)$/u);
-  assert.ok(r.lines.includes("daily 10-minute step: 2026-10-23 stuck short of 39 bars: 152/156 bars, 4 stock/s short (4 at 38/39), daily bars 4/4, after 6 re-run/s"));
+  assert.ok(r.lines.includes("daily 10-minute step: 2026-10-23 STUCK_SHORT, short of 39 bars: 152/156 bars, 4 stock/s short (4 at 38/39), daily bars 4/4, after 6 re-run/s (not done, still retried)"));
 });

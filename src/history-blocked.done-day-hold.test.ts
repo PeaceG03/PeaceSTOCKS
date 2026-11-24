@@ -32,3 +32,9 @@ test("history hold: a day the daily step has not tried yet does not block", () =
 test("history hold: the oldest blocking day is named", () => {
   assert.equal(historyBlockingDay([day("2026-10-09", "failed"), day("2026-10-07", "failed")], W), "2026-10-07");
 });
+
+test("STUCK_SHORT: a stuck day no longer blocks; a retrying one still does", () => {
+  const window = ["2026-10-20", "2026-10-21"];
+  assert.equal(historyBlockingDay([{ sessionDate: "2026-10-20", done: false, failed: true, stuckShort: true }], window), undefined);
+  assert.equal(historyBlockingDay([{ sessionDate: "2026-10-20", done: false, failed: true, stuckShort: false }], window), "2026-10-20");
+});

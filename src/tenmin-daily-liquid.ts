@@ -33,6 +33,7 @@ import { type ScanRunPick, checkScannerRuns, createScanYieldCheck, inScanGuardWi
 import type { SessionCalendar } from "./scanner";
 import { TENMIN_DAILY_CLOSE_ORIGIN } from "./tenmin-range-entries";
 import { errorMessage, reportPart } from "./health-checkins";
+import { dayStuck } from "./day-stuck";
 import { type HistoryHoldDay, historyBlockingDay } from "./history-blocked";
 import { barCount, expectedTenMinBars, presentTenMinBars, shortStockCounts, tenMinSessionDone } from "./tenmin-day-done";
 import { lastCompletedSessionDate, pairRangeForDate } from "./tenmin-history";
@@ -303,8 +304,28 @@ export interface TenMinDailyIndex {
   shortStocks?: { securityId: string; bars: string }[];
   /** Daily bars saved vs. needed for the selected stocks, e.g. "497/500". */
   dailyBars?: string;
+  /**
+   * STUCK_SHORT (Peace, Nov 23): set when 6 full catch-up passes left the day not done, with the counts
+   * at that pass. The day stays not done and keeps being retried (after the other days); it no
+   * longer holds the history chain, and it is never treated as a full day.
+   */
+  stuckShort?: TenMinDailyStuckShort;
   updatedAt: string;
   checksum: string;
+}
+
+export const TENMIN_DAILY_STUCK_SHORT = "STUCK_SHORT" as const;
+
+export interface TenMinDailyStuckShort {
+  status: typeof TENMIN_DAILY_STUCK_SHORT;
+  at: string;
+  /** Full catch-up passes that had failed when the day became STUCK_SHORT. */
+  passes: number;
+  /** Counts recorded at that pass, e.g. "19461/19500" and "500/500". */
+  dayBars: string;
+  dailyBars: string;
+  shortNames: number;
+  missingDailyBars: number;
 }
 
 export function tenMinDailyIndexKey(sessionDate: string): string {
@@ -414,7 +435,13 @@ export function tenMinDailyIndexCounts(
  * COMPLETE only when the day is done by the done-day rule. WAITING_DAILY_BARS: every stock has all its
  * ten-minute bars but some daily bars are not saved yet (catch-up keeps re-running the day).
  */
-export type TenMinDailySessionStatus = "COMPLETE" | "PARTIAL" | "WAITING_DAILY_BARS" | "SKIPPED_RANGE_SEALED" | "NO_SELECTION";
+export type TenMinDailySessionStatus =
+  | "COMPLETE"
+  | "PARTIAL"
+  | "WAITING_DAILY_BARS"
+  | typeof TENMIN_DAILY_STUCK_SHORT
+  | "SKIPPED_RANGE_SEALED"
+  | "NO_SELECTION";
 
 export interface TenMinDailySessionReport {
   sessionDate: string;
@@ -504,8 +531,11 @@ export async function runTenMinDailyLiquid(options: {
   };
   let outageStreak = 0;
   let stop = false;
+  // STUCK_SHORT days are still retried, but after every other day, so they never starve a newer one.
+  const stuckFirst = await Promise.all(sessions.map(async (d) => !!(await readTenMinDailyIndex(store, d))?.stuckShort));
+  const ordered = [...sessions.filter((_, i) => !stuckFirst[i]), ...sessions.filter((_, i) => stuckFirst[i])];
 
-  for (const sessionDate of sessions) {
+  for (const sessionDate of ordered) {
     if (stop) break;
     const { calendarFrom, calendarTo } = pairRangeForDate(sessionDate);
     const range = `${calendarFrom}_${calendarTo}`;
@@ -721,10 +751,26 @@ export async function runTenMinDailyLiquid(options: {
       dayBars: _dayBars,
       shortStocks: _shortStocks,
       dailyBars: _dailyBars,
+      stuckShort: priorStuck,
       ...indexBody
     } = index;
     const dayBars = barCount(verdict.barsStored, verdict.barsNeeded);
     const dailyBars = barCount(index.selected.length - verdict.missingDailyBars.length, index.selected.length);
+    // STUCK_SHORT once 6 full passes failed; the counts are recorded at the pass that marked it.
+    const stuckShort: TenMinDailyStuckShort | undefined = verdict.done
+      ? undefined
+      : (priorStuck ??
+        (dayStuck(notDoneRuns)
+          ? {
+              status: TENMIN_DAILY_STUCK_SHORT,
+              at: stamp(),
+              passes: notDoneRuns,
+              dayBars,
+              dailyBars,
+              shortNames: verdict.shortNames.length,
+              missingDailyBars: verdict.missingDailyBars.length,
+            }
+          : undefined));
     index = finalizeIndex({
       ...indexBody,
       stored: [...stored.values()],
@@ -736,6 +782,7 @@ export async function runTenMinDailyLiquid(options: {
       dayBars,
       shortStocks: verdict.shortStocks.map((stock) => ({ securityId: stock.securityId, bars: barCount(stock.bars, verdict.expectedBars) })),
       dailyBars,
+      ...(stuckShort ? { stuckShort } : {}),
       updatedAt: stamp(),
     });
     await writeTenMinDailyIndex(store, index);
@@ -748,7 +795,13 @@ export async function runTenMinDailyLiquid(options: {
     sessionReport.bars = dayBars;
     sessionReport.dailyBars = dailyBars;
     sessionReport.shortStockBars = shortStockCounts(verdict.shortStocks, verdict.expectedBars);
-    sessionReport.status = verdict.done ? "COMPLETE" : !verdict.shortNames.length ? "WAITING_DAILY_BARS" : "PARTIAL";
+    sessionReport.status = verdict.done
+      ? "COMPLETE"
+      : stuckShort
+        ? TENMIN_DAILY_STUCK_SHORT
+        : !verdict.shortNames.length
+          ? "WAITING_DAILY_BARS"
+          : "PARTIAL";
     report.sessions.push(sessionReport);
   }
   report.estimatedKeyMinutes = Math.round(((report.massiveRequests * TENMIN_DAILY_SECONDS_PER_REQUEST) / 60) * 10) / 10;
@@ -774,7 +827,7 @@ export async function tenMinDailyHistoryHold(
     }
     const index = await readTenMinDailyIndex(store, sessionDate);
     const done = !!index?.done;
-    days.push({ sessionDate, done, failed: !done && (index?.notDoneRuns ?? 0) >= 1 });
+    days.push({ sessionDate, done, failed: !done && (index?.notDoneRuns ?? 0) >= 1, stuckShort: !done && !!index?.stuckShort });
   }
   return historyBlockingDay(days, sessions);
 }
