@@ -13,7 +13,8 @@ inputs:
 runs:
   using: composite
   steps:
-    # Alert first, so a failed artifact upload can never suppress it.
+    # Alert first, so a failed artifact upload can never suppress it; the upload has always() so a
+    # failed alert (gh error) cannot skip the backups either.
     - name: Alert on FAIL
       if: ${{ inputs.outcome == 'failure' }}
       shell: bash
@@ -27,6 +28,7 @@ runs:
         if [ -n "$n" ]; then gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$body"
         else gh issue create --repo "$GITHUB_REPOSITORY" --title "$t" --label scanner-alert --assignee PeaceG03 --body "$body"; fi
     - name: Keep pre-images
+      if: ${{ always() }}
       uses: actions/upload-artifact@v4
       with:
         name: ${{ inputs.artifact-name }}

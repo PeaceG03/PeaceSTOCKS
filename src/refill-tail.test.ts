@@ -13,6 +13,8 @@ test("one shared refill tail: pre-images artifact and failure alert", () => {
   assert.match(action, /uses: actions\/upload-artifact@v4\n {6}with:\n {8}name: \$\{\{ inputs\.artifact-name \}\}\n {8}path: refill-backup\//u);
   assert.match(action, /- name: Alert on FAIL\n {6}if: \$\{\{ inputs\.outcome == 'failure' \}\}/u);
   assert.ok(action.indexOf("Alert on FAIL") < action.indexOf("upload-artifact"), "alert runs before the upload");
+  // The upload must run even if the alert step fails (a gh error would otherwise skip the backups).
+  assert.match(action, /- name: Keep pre-images\n {6}if: \$\{\{ always\(\) \}\}\n {6}uses: actions\/upload-artifact@v4/u);
   // The alert logic lives only in the shared action.
   const files = readdirSync(new URL("workflows/", gh)).map((f) => `workflows/${f}`);
   const withAlert = [ACTION, ...files].filter((f) => read(f).includes('t="Daily-bars gap refill needs a person"'));
