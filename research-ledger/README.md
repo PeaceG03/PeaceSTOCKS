@@ -15,3 +15,6 @@ main's held-out markers must stay unchanged. Outside git the anchor fails open (
 
 Seeded from the harness-v1 baseline (2026-11-24, scanner "main@f1605fe7 scanner-config-v0.1"):
 5 variants, 5 registrations, held-out not evaluated.
+Then the post-floor (v2) baseline (2026-11-24, derived scanner label
+"7586e96ac8e4 scanner-v0.1 config-d003c0562045"): 5 more variants and 5 more registrations (same
+held-out window), so 10 variants tried and a Holm family of 10; held-out still not evaluated.

@@ -138,3 +138,22 @@ test("--scanner is refused: the label is derived from the commit and the scanner
     assert.deepEqual(readdirSync(out), []); // refused before any folder or ledger is created
   } finally { rmSync(out, { recursive: true, force: true }); }
 });
+
+test("the committed ledger carries the post-floor (v2) baseline under its own derived label: 10 variants, Holm family 10", async () => {
+  const { holmFamily } = await import("./research-variants");
+  const anchored = (path: string) => ({ anchor: () => gitCommittedHead(path) });
+  const variantsPath = join(RESEARCH_LEDGER_DIR, "variants.jsonl");
+  const sealPath = join(RESEARCH_LEDGER_DIR, "heldout.jsonl");
+  const family = holmFamily(new AppendOnlyLog<VariantRecord>(variantsPath, undefined, anchored(variantsPath)).entries());
+  assert.ok(family.variantsTried >= 10 && family.familySize >= 10, `tried ${family.variantsTried}, family ${family.familySize}`);
+  const seal = new AppendOnlyLog<Record<string, unknown>>(sealPath, undefined, anchored(sealPath)).read().map((l) => JSON.stringify(l.entry));
+  const labels = new Set(seal.flatMap((e) => [...e.matchAll(/"scanner":"([^"]*)"/gu)].map((m) => m[1]!)));
+  assert.ok(labels.has("main@f1605fe7 scanner-config-v0.1"));
+  const derived = [...labels].filter((l) => /^[0-9a-f]{12} scanner-v0\.1 config-[0-9a-f]{12}$/u.test(l));
+  assert.ok(derived.length >= 1, [...labels].join(","));
+  for (const label of derived) assert.equal(seal.filter((e) => e.includes(`"scanner":"${label}"`)).length, 5, label);
+  // Held-out stays sealed: registrations only, all on the reserved window.
+  assert.ok(seal.every((e) => /"window":\{"from":"2026-08-27","to":"2026-11-20"\}/u.test(e)), "window");
+  assert.ok(seal.every((e) => !/EVALUAT|UNSEAL/u.test(e)), "no evaluation or unseal");
+  assert.deepEqual(readdirSync(RESEARCH_LEDGER_DIR).filter((f) => f === "heldout-markers"), []);
+});

@@ -52,6 +52,32 @@ baseline's 5 variants and 5 registrations.
 
 No command in this PR evaluates the held-out period. That is a deliberate, separate step.
 
+## Baseline (post-floor v2, 2026-11-24)
+
+Scanner label `7586e96ac8e4 scanner-v0.1 config-d003c0562045` (derived: commit 7586e96 on
+builder/harness-next, which ranks with eligibility floor v2; the harness-v1 label is not reused).
+Same data, dates and settings as harness-v1 below: development 2025-03-03..2026-08-26, 5 rolling folds
+of 63/63 with a 2-session embargo, 307 pooled test sessions, 10 bps per side. These 5 variants are
+appended to `research-ledger/`, so variants tried = **10** and every Holm correction is over a family
+of 10 (the 5 harness-v1 variants plus these). Held-out 2026-08-27..2026-11-20: registered under the
+new label with the same window, **not evaluated**. Run offline under `env -i` on the local store; no
+network, no live bucket.
+
+Mean per session, net of costs (universe +0.101%, SPY +0.083%):
+
+| List | gross | cost | turnover | net | vs universe (t) | vs SPY (t) | Holm p | folds + | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| TOP_15_OVERALL | +0.158% | 0.049% | 0.49 | +0.109% | +0.008% (0.05) | +0.026% (0.15) | 1.000 | 3/5 | NOT_PROVEN |
+| TOP_50_OVERALL | +0.137% | 0.045% | 0.45 | +0.091% | −0.009% (−0.08) | +0.008% (0.07) | 1.000 | 3/5 | NOT_PROVEN |
+| STRONGEST_MOMENTUM | +0.056% | 0.032% | 0.32 | +0.024% | −0.076% (−0.37) | −0.059% (−0.28) | 1.000 | 3/5 | NOT_PROVEN |
+| FASTEST_IMPROVING | +0.214% | 0.059% | 0.59 | +0.155% | +0.054% (0.32) | +0.071% (0.41) | 1.000 | 3/5 | NOT_PROVEN |
+| DEFENSIVE_LOW_RISK | −0.016% | 0.040% | 0.40 | −0.057% | −0.157% (−2.85) | −0.140% (−2.87) | 1.000 | 0/5 | NOT_PROVEN |
+
+With the floor, the lists no longer lose to the market as clearly as in harness-v1, but no list beats
+both benchmarks by a margin distinguishable from noise (largest t = 0.41), every Holm p is 1.000 over
+the family of 10, and all five are `NOT_PROVEN`. The universe itself changed with the floor, so the two
+tables are not a like-for-like comparison of picks. The harness-v1 caveats below apply unchanged.
+
 ## Baseline (harness-v1, 2026-11-24)
 
 Data: the local copy of the 2-year store (bars 2024-10-07 onward). Development sessions
