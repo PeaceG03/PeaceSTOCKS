@@ -104,3 +104,37 @@ test("access jwt: unknown-kid refetch of the certs is throttled to once a minute
   assert.equal((await verifyAccessJwt(sign(claims()), c)).ok, true);
   assert.equal(c.calls.length, 2);
 });
+
+test("access jwt: substring and lookalike emails are refused", async () => {
+  clearAccessCertCache();
+  const c = config();
+  for (const email of [
+    "wner@example.test",
+    "owner@example.tes",
+    "owner@example.test.evil.test",
+    "xowner@example.test",
+    "owner@example.testx",
+    "owner+x@example.test",
+    "owner@example.test,other@example.test",
+    "owner@exampIe.test",
+    " ",
+  ]) {
+    assert.deepEqual(await verifyAccessJwt(sign(claims({ email })), c), { ok: false, reason: "EMAIL_NOT_ALLOWED" }, email);
+  }
+  // Allowed email configured with surrounding space/case still matches only itself.
+  assert.equal((await verifyAccessJwt(sign(claims()), config({ allowedEmail: "  OWNER@example.test " }))).ok, true);
+});
+
+test("access jwt: clock skew allowance is exactly 60 s on both sides", async () => {
+  clearAccessCertCache();
+  const c = config();
+  const verdict = async (over: Record<string, unknown>) => {
+    const result = await verifyAccessJwt(sign(claims(over)), c);
+    return result.ok ? "OK" : result.reason;
+  };
+  assert.equal(await verdict({ exp: NOW - 59 }), "OK");
+  assert.equal(await verdict({ exp: NOW - 60 }), "EXPIRED");
+  assert.equal(await verdict({ exp: NOW - 61 }), "EXPIRED");
+  assert.equal(await verdict({ nbf: NOW + 60 }), "OK");
+  assert.equal(await verdict({ nbf: NOW + 61 }), "NOT_YET_VALID");
+});
