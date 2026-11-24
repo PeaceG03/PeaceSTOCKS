@@ -1,0 +1,16 @@
+{
+  "rulesVersion": "paper-rules-v1",
+  "mode": "SIMULATED_ONLY",
+  "list": "TOP_15_OVERALL",
+  "weighting": "EQUAL",
+  "startingCapitalUsd": 100000,
+  "entry": "NEXT_SESSION_OPEN_AFTER_FREEZE",
+  "exit": "FOLLOWING_SESSION_OPEN",
+  "holdSessions": 1,
+  "maxPositionFractionOfEquity": 0.1,
+  "dailyLossLimitFraction": 0.03,
+  "commissionPerOrderUsd": 0,
+  "slippageBpsPerSide": 10,
+  "wholeShares": true,
+  "unexplainedGapRatio": 1.8
+}

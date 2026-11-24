@@ -1,0 +1,108 @@
+/**
+ * Pre-registered paper-trading rules (docs/PAPER_TRADING.md). The rules live in a versioned file,
+ * config/paper-rules-<version>.json, committed before any paper result exists. Changing a rule means a
+ * NEW file with a new rulesVersion, never an edit: every ledger row records the version and the sha256
+ * of the exact file bytes, so a result can always be traced to the rules it ran under.
+ *
+ * Simulation only: there is no broker client in this repository.
+ */
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+export interface PaperRules {
+  readonly rulesVersion: string;
+  readonly mode: "SIMULATED_ONLY";
+  readonly list: "TOP_15_OVERALL";
+  readonly weighting: "EQUAL";
+  readonly startingCapitalUsd: number;
+  readonly entry: "NEXT_SESSION_OPEN_AFTER_FREEZE";
+  readonly exit: "FOLLOWING_SESSION_OPEN";
+  readonly holdSessions: 1;
+  readonly maxPositionFractionOfEquity: number;
+  readonly dailyLossLimitFraction: number;
+  readonly commissionPerOrderUsd: number;
+  readonly slippageBpsPerSide: number;
+  readonly wholeShares: true;
+  /** A held name whose split-adjusted open-to-open move is this many times or more (either way) is filled flat. */
+  readonly unexplainedGapRatio: number;
+}
+
+export interface LoadedPaperRules {
+  readonly rules: PaperRules;
+  /** sha256 (hex) of the rules file bytes exactly as committed. */
+  readonly rulesSha256: string;
+}
+
+export const PAPER_RULES_CURRENT_VERSION = "paper-rules-v1";
+
+const KEYS = [
+  "rulesVersion",
+  "mode",
+  "list",
+  "weighting",
+  "startingCapitalUsd",
+  "entry",
+  "exit",
+  "holdSessions",
+  "maxPositionFractionOfEquity",
+  "dailyLossLimitFraction",
+  "commissionPerOrderUsd",
+  "slippageBpsPerSide",
+  "wholeShares",
+  "unexplainedGapRatio",
+] as const;
+
+function fail(why: string): never {
+  throw new Error(`PAPER_RULES_INVALID:${why}`);
+}
+
+function finiteIn(value: unknown, name: string, min: number, max: number, minExclusive = false): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) fail(`${name}_NOT_A_NUMBER`);
+  if (value > max || value < min || (minExclusive && value === min)) fail(`${name}_OUT_OF_RANGE`);
+  return value;
+}
+
+/** Strict: exactly the known keys, fixed enum values, numbers in sane ranges. Anything else throws. */
+export function parsePaperRules(text: string): PaperRules {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    fail("NOT_JSON");
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) fail("NOT_AN_OBJECT");
+  const record = raw as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  const expected = [...KEYS].sort();
+  if (keys.length !== expected.length || keys.some((key, i) => key !== expected[i])) fail("KEYS");
+  if (typeof record.rulesVersion !== "string" || !/^paper-rules-v[0-9]+$/u.test(record.rulesVersion)) fail("rulesVersion");
+  if (record.mode !== "SIMULATED_ONLY") fail("mode");
+  if (record.list !== "TOP_15_OVERALL") fail("list");
+  if (record.weighting !== "EQUAL") fail("weighting");
+  if (record.entry !== "NEXT_SESSION_OPEN_AFTER_FREEZE") fail("entry");
+  if (record.exit !== "FOLLOWING_SESSION_OPEN") fail("exit");
+  if (record.holdSessions !== 1) fail("holdSessions");
+  if (record.wholeShares !== true) fail("wholeShares");
+  finiteIn(record.startingCapitalUsd, "startingCapitalUsd", 0, 1e9, true);
+  finiteIn(record.maxPositionFractionOfEquity, "maxPositionFractionOfEquity", 0, 1, true);
+  finiteIn(record.dailyLossLimitFraction, "dailyLossLimitFraction", 0, 1, true);
+  finiteIn(record.commissionPerOrderUsd, "commissionPerOrderUsd", 0, 1000);
+  finiteIn(record.slippageBpsPerSide, "slippageBpsPerSide", 0, 1000);
+  finiteIn(record.unexplainedGapRatio, "unexplainedGapRatio", 1, 100, true);
+  return Object.freeze({ ...record }) as unknown as PaperRules;
+}
+
+export function paperRulesPath(version: string = PAPER_RULES_CURRENT_VERSION): string {
+  if (!/^paper-rules-v[0-9]+$/u.test(version)) fail("rulesVersion");
+  return join(dirname(fileURLToPath(import.meta.url)), "..", "config", `${version}.json`);
+}
+
+/** Read and validate a rules file; the file name must match its rulesVersion. */
+export function loadPaperRules(version: string = PAPER_RULES_CURRENT_VERSION): LoadedPaperRules {
+  const bytes = readFileSync(paperRulesPath(version));
+  const rules = parsePaperRules(bytes.toString("utf8"));
+  if (rules.rulesVersion !== version) fail("FILE_VERSION_MISMATCH");
+  return { rules, rulesSha256: createHash("sha256").update(bytes).digest("hex") };
+}
