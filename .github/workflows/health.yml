@@ -34,11 +34,10 @@ jobs:
     if: ${{ github.ref == 'refs/heads/main' && ((github.event_name == 'schedule' && github.event.schedule == '40 1,7,13,19 * * *') || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'check')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    env:
-      PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
-      PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
-      PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
-      PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+    # issues: write lets the alert step open (or comment on) the one health issue.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -49,8 +48,23 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Also prunes check-ins older than one month (retention).
       - name: Health check
+        env:
+          PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+          PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+          PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+          PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+          HEALTH_RESULT_FILE: ${{ runner.temp }}/health-result.json
         run: pnpm -s exec tsx src/health-check.ts
+      # A non-OK result (or a check that did not finish) opens ONE "PeaceSTOCKS health needs attention"
+      # issue (label scanner-alert), or comments on the open one; never a new issue per run. No R2 secrets here.
+      - name: Health alert (issue)
+        if: ${{ always() }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEALTH_RESULT_FILE: ${{ runner.temp }}/health-result.json
+        run: pnpm -s exec tsx src/health-alert.ts
   weekly:
     if: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'schedule' && github.event.workflow_run.head_branch == 'main') || (github.ref == 'refs/heads/main' && ((github.event_name == 'schedule' && github.event.schedule == '30 21 * * 0') || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'weekly'))) }}
     runs-on: ubuntu-24.04

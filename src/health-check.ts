@@ -6,14 +6,17 @@
 // - 3 or more silent parts at once: the health check's own likely fault is flagged, and the silent
 //   parts are still listed by name.
 // - No parts reporting: "no parts reporting", never "Healthy".
+import { writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { dayStuck } from "./day-stuck";
 import { countErrorParts } from "./health-error-count";
 import {
   HEALTH_PARTS,
   type HealthCheckinStore,
+  type HealthPruneStore,
   errorMessage,
   latestHealthCheckin,
+  pruneHealthCheckins,
   redactHealthMessage,
   writeVerifiedHealthJson,
 } from "./health-checkins";
@@ -195,7 +198,10 @@ export async function readStuckDays(
 }
 
 /** One health check: latest check-in per declared part, stuck days, carried no-response counts. Writes latest.json. */
-export async function runHealthCheck(store: HealthCheckinStore, now: Date = new Date()): Promise<HealthCheckResult> {
+export async function runHealthCheck(
+  store: HealthPruneStore,
+  now: Date = new Date(),
+): Promise<HealthCheckResult & { prunedCheckins: number }> {
   const latest = new Map<string, HealthCheckinFacts | undefined>();
   for (const part of HEALTH_PARTS) latest.set(part.name, await latestHealthCheckin(store, part.id));
   let priorRequests: Record<string, number> = {};
@@ -216,16 +222,22 @@ export async function runHealthCheck(store: HealthCheckinStore, now: Date = new 
     stuckDays: await readStuckDays(store, now),
   });
   const at = now.toISOString();
+  // Retention: check-ins older than one month are pruned (after the latest ones were read).
+  const prunedCheckins = await pruneHealthCheckins(store, now);
   await writeVerifiedHealthJson(store, HEALTH_CHECK_STATE_KEY, { schemaVersion: HEALTH_CHECK_SCHEMA, requests: result.requests, updatedAt: at });
-  await writeVerifiedHealthJson(store, HEALTH_CHECK_LATEST_KEY, { schemaVersion: HEALTH_CHECK_SCHEMA, at, ...result });
-  return result;
+  await writeVerifiedHealthJson(store, HEALTH_CHECK_LATEST_KEY, { schemaVersion: HEALTH_CHECK_SCHEMA, at, ...result, prunedCheckins });
+  return { ...result, prunedCheckins };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   runHealthCheck(R2ObjectClient.fromEnv(process.env))
-    .then((result) => {
+    .then(async (result) => {
       for (const line of result.lines) process.stdout.write(`${line}\n`);
+      process.stdout.write(`pruned check-ins older than one month: ${result.prunedCheckins}\n`);
       if (result.headline !== HEALTHY) process.stdout.write(`::warning title=PeaceSTOCKS health::${result.headline}\n`);
+      // The alert step (src/health-alert.ts) reads this file; a missing file means the check failed.
+      if (process.env.HEALTH_RESULT_FILE)
+        await writeFile(process.env.HEALTH_RESULT_FILE, `${JSON.stringify({ headline: result.headline, lines: result.lines })}\n`, "utf8");
     })
     .catch((error: unknown) => {
       process.stdout.write(`HEALTH_CHECK_FAILED:${redactHealthMessage(errorMessage(error))?.slice(0, 120) ?? ""}\n`);

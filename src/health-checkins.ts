@@ -9,6 +9,8 @@ import type { ObjectHead, ObjectMetadata } from "./object-store";
 import { R2ObjectClient } from "./object-store";
 
 export const HEALTH_CHECKIN_SCHEMA = "health-checkin-v1" as const;
+import { isCheckinExpired } from "./health-expired";
+
 export const HEALTH_CHECKIN_PREFIX = "permanent/health/checkins/" as const;
 const CHECKSUM_META = "health-checkin-sha256";
 const WRITE_TIMEOUT_MS = 20_000;
@@ -78,6 +80,33 @@ export function redactHealthMessage(message: string | undefined): string | undef
     .replace(/\s+/gu, " ")
     .trim();
   return cleaned.slice(0, MESSAGE_MAX);
+}
+
+/** A check-in store that can also prune old check-ins. */
+export type HealthPruneStore = HealthCheckinStore & { delete(key: string): Promise<void> };
+
+/** At most this many old check-ins are deleted per health check (the rest go on the next one). */
+export const HEALTH_PRUNE_MAX_PER_RUN = 2000;
+const CHECKIN_KEY = /^permanent\/health\/checkins\/[a-z-]+\/(\d{4}-\d{2}-\d{2})\/[0-9A-Za-z-]+\.json$/u;
+
+/**
+ * Retention (Peace's Oct 22 spec, settled Nov 23): check-ins are kept for one month. Deletes
+ * check-ins filed under a day 31 or more days before `now` (isCheckinExpired), only keys that are
+ * exactly check-in keys under permanent/health/checkins/. Returns how many were deleted.
+ */
+export async function pruneHealthCheckins(store: Pick<HealthPruneStore, "list" | "delete">, now: Date): Promise<number> {
+  const today = Date.parse(`${now.toISOString().slice(0, 10)}T00:00:00Z`);
+  let deleted = 0;
+  for (const key of await store.list(HEALTH_CHECKIN_PREFIX)) {
+    if (deleted >= HEALTH_PRUNE_MAX_PER_RUN) break;
+    const day = CHECKIN_KEY.exec(key)?.[1];
+    if (!day) continue;
+    const ageDays = (today - Date.parse(`${day}T00:00:00Z`)) / 86_400_000;
+    if (!Number.isFinite(ageDays) || !isCheckinExpired(ageDays)) continue;
+    await store.delete(key);
+    deleted += 1;
+  }
+  return deleted;
 }
 
 export function healthCheckinKey(checkin: Pick<HealthCheckin, "part" | "at" | "runId">, nonce: string): string {
