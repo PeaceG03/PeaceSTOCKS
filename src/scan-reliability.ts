@@ -4,7 +4,9 @@
  * (permanent/prediction-status/<session>.jsonl) and the trading calendar. Output: one row per
  * trading session in the range, the current streak of consecutive on-time freezes ending at the
  * latest session, and every miss with its reason. A session's outcome is its earliest FROZEN record
- * whose freeze time (predictedAt) is before nextSessionOpen; otherwise it is a miss:
+ * whose freeze time (predictedAt) is before the next session's 09:30 ET open, computed from the
+ * trading calendar (the record's own stored nextSessionOpen is never trusted; a differing stored
+ * value is flagged storedOpenMismatch). Otherwise it is a miss:
  *  - NO_RECORD: no status was stored for the session at all;
  *  - FROZEN_AFTER_OPEN: frozen, but at or after the open (or with no freeze time);
  *  - <reason>: the latest non-FROZEN record's reason (EVIDENCE_ONLY = collected later, catch-up).
@@ -23,6 +25,8 @@ export interface SessionFreeze {
   /** Minutes between the freeze and the next open (positive = before the open). */
   minutesBeforeOpen?: number;
   records: number;
+  /** A FROZEN record stored a nextSessionOpen different from the calendar's (reported, ignored). */
+  storedOpenMismatch?: boolean;
 }
 
 export interface ScanReliabilityReport {
@@ -37,16 +41,20 @@ export interface ScanReliabilityReport {
   rows: SessionFreeze[];
 }
 
-export function sessionFreeze(sessionDate: string, records: readonly PredictionStatus[]): SessionFreeze {
+export function sessionFreeze(sessionDate: string, records: readonly PredictionStatus[], calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR): SessionFreeze {
   const own = records.filter((r) => r.sessionDate === sessionDate);
   if (!own.length) return { sessionDate, onTime: false, outcome: "NO_RECORD", records: 0 };
+  // Fail closed: with no calendar open the session cannot count as on time.
+  const open = nextSessionOpen(sessionDate, calendar)?.nextSessionOpen.getTime() ?? Number.NaN;
   const frozen = own
     .filter((r) => r.status === "FROZEN")
-    .map((r) => ({ r, at: Date.parse(r.predictedAt ?? ""), open: Date.parse(r.nextSessionOpen ?? "") }))
+    .map((r) => ({ r, at: Date.parse(r.predictedAt ?? "") }))
     .sort((a, b) => (a.at || Infinity) - (b.at || Infinity));
-  const onTime = frozen.find((f) => Number.isFinite(f.at) && Number.isFinite(f.open) && f.at < f.open);
-  if (onTime) return { sessionDate, onTime: true, outcome: "FROZEN_BEFORE_OPEN", minutesBeforeOpen: (onTime.open - onTime.at) / 60_000, records: own.length };
-  if (frozen.length) return { sessionDate, onTime: false, outcome: "FROZEN_AFTER_OPEN", records: own.length };
+  const mismatch = frozen.some((f) => f.r.nextSessionOpen !== undefined && Date.parse(f.r.nextSessionOpen) !== open);
+  const flag = mismatch ? { storedOpenMismatch: true } : {};
+  const onTime = frozen.find((f) => Number.isFinite(f.at) && Number.isFinite(open) && f.at < open);
+  if (onTime) return { sessionDate, onTime: true, outcome: "FROZEN_BEFORE_OPEN", minutesBeforeOpen: (open - onTime.at) / 60_000, records: own.length, ...flag };
+  if (frozen.length) return { sessionDate, onTime: false, outcome: "FROZEN_AFTER_OPEN", records: own.length, ...flag };
   const latest = [...own].sort((a, b) => (a.attemptedAt ?? a.recordedAt).localeCompare(b.attemptedAt ?? b.recordedAt)).at(-1)!;
   return { sessionDate, onTime: false, outcome: latest.reason, records: own.length };
 }
@@ -57,7 +65,7 @@ export function scanReliability(
   to: string,
   calendar: SessionCalendar = US_EQUITY_MARKET_CALENDAR,
 ): ScanReliabilityReport {
-  const rows = tradingSessionsInRange(from, to, calendar).map((d) => sessionFreeze(d, records));
+  const rows = tradingSessionsInRange(from, to, calendar).map((d) => sessionFreeze(d, records, calendar));
   let longest = 0;
   let run = 0;
   for (const row of rows) {

@@ -47,3 +47,20 @@ test("Actions runs are joined to the session whose close-to-next-open window the
   assert.equal(fri!.windowEnd, "2026-11-23T14:30:00.000Z");
   assert.equal(mon!.runs, 0);
 });
+
+test("the open comes from the trading calendar, never from the record's stored nextSessionOpen", () => {
+  // Stored open is a day late (wrong or forged): a freeze after the real 11-24 09:30 ET open is a miss.
+  const late = sessionFreeze("2026-11-23", [rec("2026-11-23", "FROZEN", "PREDICTIONS_FROZEN", "2026-11-24T15:00:00Z", "2026-11-25T14:30:00Z")]);
+  assert.equal(late.outcome, "FROZEN_AFTER_OPEN");
+  assert.equal(late.storedOpenMismatch, true);
+  // No stored open at all: still judged against the calendar's open.
+  const unstamped = sessionFreeze("2026-11-23", [rec("2026-11-23", "FROZEN", "PREDICTIONS_FROZEN", "2026-11-24T06:20:00Z")]);
+  assert.equal(unstamped.onTime, true);
+  assert.equal(unstamped.minutesBeforeOpen, 490);
+  // Over a holiday the next open is after it (Thanksgiving 2026-11-26 closed: 11-25 -> 11-27).
+  const holiday = sessionFreeze("2026-11-25", [rec("2026-11-25", "FROZEN", "PREDICTIONS_FROZEN", "2026-11-26T20:00:00Z", "2026-11-26T14:30:00Z")]);
+  assert.equal(holiday.onTime, true);
+  assert.equal(holiday.storedOpenMismatch, true);
+  const report = scanReliability([rec("2026-11-23", "FROZEN", "PREDICTIONS_FROZEN", "2026-11-24T15:00:00Z", "2026-11-25T14:30:00Z")], "2026-11-23", "2026-11-23");
+  assert.equal(report.onTime, 0);
+});
