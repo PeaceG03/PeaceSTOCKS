@@ -138,3 +138,24 @@ test("access jwt: clock skew allowance is exactly 60 s on both sides", async () 
   assert.equal(await verdict({ nbf: NOW + 60 }), "OK");
   assert.equal(await verdict({ nbf: NOW + 61 }), "NOT_YET_VALID");
 });
+
+test("access jwt: cached certs expire after 10 minutes and are fetched again", async () => {
+  clearAccessCertCache();
+  const TTL_MS = 10 * 60_000;
+  let ms = 5_000_000;
+  const c = config({ nowMs: () => ms });
+  assert.equal((await verifyAccessJwt(sign(claims()), c)).ok, true);
+  assert.equal(c.calls.length, 1);
+  ms += TTL_MS - 1;
+  assert.equal((await verifyAccessJwt(sign(claims()), c)).ok, true);
+  assert.equal(c.calls.length, 1, "still cached just inside 10 minutes");
+  ms += 1;
+  assert.equal((await verifyAccessJwt(sign(claims()), c)).ok, true);
+  assert.equal(c.calls.length, 2, "refetched once the 10 minutes are up");
+  ms += TTL_MS - 1;
+  await verifyAccessJwt(sign(claims()), c);
+  assert.equal(c.calls.length, 2, "the new fetch starts a new 10 minutes");
+  ms += 1;
+  await verifyAccessJwt(sign(claims()), c);
+  assert.equal(c.calls.length, 3);
+});
