@@ -33,10 +33,33 @@ Actions → **Site deploy** → Run workflow on **main** (`.github/workflows/sit
 - It runs in the GitHub environment **`site`**. GitHub creates the environment on the first run if it
   does not exist yet, with no protection rules ("Running a workflow that references an environment
   that does not exist will create an environment with the referenced name", GitHub Docs, *Managing
-  environments for deployment*). To require an approval or limit it to main, add those rules in
-  Settings → Environments → site (repository admin).
+  environments for deployment*). Create it yourself first instead, with the main-only rule and the
+  secrets in it: see *Before the first run* below.
 - Input `team_domain` (required, not secret): defaults to `blue-leaf-13b3.cloudflareaccess.com`. The team
   domain is always passed in, never looked up, so the token needs no Access: Organizations permission.
+
+### Before the first run: the `site` environment (repository admin, once)
+Do this before dispatching the deploy, so the deploy secrets are only given to the `site` job on main:
+1. Settings → Environments → **New environment** → name it `site` → Configure environment.
+2. **Deployment branches and tags** → *Selected branches and tags* → **Add deployment branch rule** →
+   Ref type *Branch*, pattern `main`. No other rule. (Optionally also add yourself under
+   *Required reviewers*.)
+3. Under **Environment secrets**, add these 6, with the same names the workflow reads:
+   | Environment secret | Then, at repository level |
+   | --- | --- |
+   | `CLOUDFLARE_API_TOKEN` | **delete** the repository secret (only site-deploy.yml uses it) |
+   | `PEACESTOCKS_SITE_ALLOWED_EMAIL` | **delete** the repository secret (only site-deploy.yml uses it) |
+   | `PEACESTOCKS_R2_READ_ACCESS_KEY_ID` | **delete** the repository secret (only site-deploy.yml uses it) |
+   | `PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY` | **delete** the repository secret (only site-deploy.yml uses it) |
+   | `PEACESTOCKS_R2_ACCOUNT_ID` | **keep** the repository secret: scanner.yml, gap-refill.yml, health.yml, net-rerun.yml and oct2024-tenmin.yml read it |
+   | `PEACESTOCKS_R2_BUCKET` | **keep** the repository secret: the same scanner workflows read it |
+
+   So the four site-only secrets are moved into `site`, and the two shared ones are copied into it.
+   Moving the shared two would break the live scanner. An environment secret takes precedence over a
+   repository secret with the same name for jobs in that environment.
+4. For `PEACESTOCKS_R2_READ_ACCESS_KEY_ID` / `PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY`, use a **fresh
+   site-only R2 API token: Object Read only, on the `peacestocks` bucket only**. Create it in R2 → Manage
+   API tokens. Do not reuse the box's `R2_READ_*` pair (its scope is unverified), and never use the writer key.
 
 ### Cloudflare API token (`CLOUDFLARE_API_TOKEN`)
 Needed:
@@ -66,12 +89,13 @@ Needed:
 ### Read-only R2 key (`PEACESTOCKS_R2_READ_ACCESS_KEY_ID` / `PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY`)
 Use a **dedicated R2 API token with Object Read only, scoped to the `peacestocks` bucket**. Never the
 scanner's writer key (`PEACESTOCKS_R2_ACCESS_KEY_ID` / `PEACESTOCKS_R2_SECRET_ACCESS_KEY`).
-Right now these two repository secrets hold the box's `R2_READ_*` pair, **whose scope has not been
-verified** (it may be broader than one bucket or not read-only). Before relying on it, check it in R2 →
-Manage API tokens, or replace it with a new Object Read token for the bucket. The Worker also refuses
-to send anything but GET/HEAD, but the key's own scope is the real limit.
+Right now the repository secrets hold the box's `R2_READ_*` pair, **whose scope has not been
+verified** (it may be broader than one bucket or not read-only). The pair put into the `site`
+environment must be a **fresh site-only Object Read token on the `peacestocks` bucket**, used for
+nothing else. The Worker also refuses to send anything but GET/HEAD, but the key's own scope is the
+real limit.
 
-### All repository secrets it needs
+### All secrets it reads (environment `site`, see above)
 | Secret | What |
 | --- | --- |
 | `CLOUDFLARE_API_TOKEN` | the token above |

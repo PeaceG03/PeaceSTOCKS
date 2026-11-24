@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 
 const workflow = readFileSync(new URL("../.github/workflows/site-deploy.yml", import.meta.url), "utf8");
@@ -61,4 +61,39 @@ test("wrangler.toml: custom domain only, no workers.dev or preview URL, no R2 bi
   assert.match(wrangler, /\nworkers_dev = false\n/u);
   assert.match(wrangler, /\npreview_urls = false\n/u);
   assert.doesNotMatch(wrangler, /r2_buckets/u);
+});
+
+const SITE_SECRETS = [
+  "CLOUDFLARE_API_TOKEN",
+  "PEACESTOCKS_R2_ACCOUNT_ID",
+  "PEACESTOCKS_R2_BUCKET",
+  "PEACESTOCKS_R2_READ_ACCESS_KEY_ID",
+  "PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY",
+  "PEACESTOCKS_SITE_ALLOWED_EMAIL",
+];
+
+test("site deploy workflow: the 6 secrets are read only inside the 'site' deploy job, and the docs move/copy exactly those", () => {
+  const jobStart = workflow.indexOf("\n  deploy:\n");
+  const header = workflow.slice(jobStart, workflow.indexOf("\n    steps:\n"));
+  assert.match(header, /\n    environment: site\n/u);
+  const refs = [...workflow.matchAll(/secrets\.([A-Z0-9_]+)/gu)];
+  assert.ok(refs.every((m) => (m.index ?? 0) > jobStart), "no secret is read outside the deploy job");
+  assert.deepEqual([...new Set(refs.map((m) => m[1]))].sort(), SITE_SECRETS);
+
+  // Which of them other workflows also read decides move (site-only) vs copy (shared with the scanner).
+  const dir = new URL("../.github/workflows/", import.meta.url);
+  const others = readdirSync(dir).filter((f) => f.endsWith(".yml") && f !== "site-deploy.yml").map((f) => readFileSync(new URL(f, dir), "utf8")).join("\n");
+  const shared = SITE_SECRETS.filter((name) => new RegExp(`secrets\\.${name}\\b`, "u").test(others));
+  assert.deepEqual(shared, ["PEACESTOCKS_R2_ACCOUNT_ID", "PEACESTOCKS_R2_BUCKET"]);
+
+  const docs = readFileSync(new URL("../docs/SITE.md", import.meta.url), "utf8");
+  const section = docs.slice(docs.indexOf("### Before the first run: the `site` environment"), docs.indexOf("### Cloudflare API token"));
+  assert.ok(section.length > 0, "docs have the environment step");
+  assert.match(section, /Deployment branches and tags[\s\S]*pattern `main`/u);
+  for (const name of SITE_SECRETS) {
+    const row = section.split("\n").find((line) => line.includes(`| \`${name}\` |`));
+    assert.ok(row, `docs list ${name}`);
+    assert.match(row!, shared.includes(name) ? /\*\*keep\*\* the repository secret/u : /\*\*delete\*\* the repository secret/u, name);
+  }
+  assert.match(section, /fresh\s+site-only R2 API token: Object Read only, on the `peacestocks` bucket only/u);
 });
