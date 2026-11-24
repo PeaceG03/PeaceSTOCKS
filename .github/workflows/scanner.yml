@@ -33,9 +33,17 @@ on:
         required: false
         default: "2026-10-02"
       max_sessions:
-        description: "Max trading sessions to attempt during backfill"
+        description: "backfill only: max sessions FETCHED this run (stored sessions do not count; re-dispatch unchanged to continue)"
         required: false
         default: "35"
+      backfill_request_spacing_ms:
+        description: "backfill only: minimum gap between Massive requests in ms (12500 = Basic-safe default)"
+        required: false
+        default: "12500"
+      backfill_chunk_sessions:
+        description: "backfill only: trading sessions per chunk (each chunk has its own checkpoint and ticker refresh)"
+        required: false
+        default: "150"
       tenmin_history_reopen:
         description: "tenmin_history only: reopen sealed ranges to retry gaps + new securities (default off)"
         required: false
@@ -442,8 +450,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       # Reply Dust writes need exactly zstd 1.5.7 (different zstd builds can produce different bytes).
       # Build it from the checksum-verified release tarball, cache the binary, and put it first on PATH.
-      # Non-blocking until Reply Dust is switched on, so a download hiccup can't stop a scan;
-      # the writer itself refuses to start without exactly 1.5.7.
+      # Blocking here: the backfill job always writes Reply Dust and packs, and refuses to start without
+      # exactly 1.5.7, so fail at this step with a clear name instead of inside the job.
       - name: Restore pinned zstd 1.5.7
         id: zstd-cache
         continue-on-error: true
@@ -453,7 +461,6 @@ jobs:
           key: zstd-1.5.7-eb33e51f49a15e02-${{ runner.os }}-ubuntu-24.04
       - name: Build pinned zstd 1.5.7
         if: ${{ steps.zstd-cache.outputs.cache-hit != 'true' }}
-        continue-on-error: true
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
@@ -463,7 +470,6 @@ jobs:
           make -C zstd-1.5.7 -j"$(nproc)" zstd-release
           install -D -m 0755 zstd-1.5.7/programs/zstd ~/.local/zstd-1.5.7/bin/zstd
       - name: Use pinned zstd 1.5.7
-        continue-on-error: true
         run: |
           set -euo pipefail
           ~/.local/zstd-1.5.7/bin/zstd --version | grep -F ' v1.5.7,'
@@ -478,11 +484,17 @@ jobs:
           test -n "$PEACESTOCKS_SOURCE_COMMIT"
           test -n "$MARKETS_BACKFILL_FROM"
           test -n "$MARKETS_BACKFILL_TO"
-      - name: Daily historical backfill into R2
+      # The resumable, rate-limited, sha-checked backfill job (src/backfill-job-cli.ts):
+      # Reply Dust + a sealed daily-bars pack per session, each re-verified; stops at a session boundary
+      # on a 403/plan window, the session cap or the 110 min budget, and resumes on an unchanged re-dispatch.
+      - name: Daily historical backfill into R2 (verified job)
         env:
           PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
           GITHUB_TOKEN: ${{ github.token }}
-        run: pnpm backfill --from "$MARKETS_BACKFILL_FROM" --to "$MARKETS_BACKFILL_TO" --max-sessions "${{ github.event.inputs.max_sessions }}"
+          BACKFILL_MAX_SESSIONS: ${{ github.event.inputs.max_sessions }}
+          BACKFILL_REQUEST_SPACING_MS: ${{ github.event.inputs.backfill_request_spacing_ms }}
+          BACKFILL_CHUNK_SESSIONS: ${{ github.event.inputs.backfill_chunk_sessions }}
+        run: pnpm backfill --from "$MARKETS_BACKFILL_FROM" --to "$MARKETS_BACKFILL_TO" --max-sessions "$BACKFILL_MAX_SESSIONS" --request-spacing-ms "$BACKFILL_REQUEST_SPACING_MS" --chunk-sessions "$BACKFILL_CHUNK_SESSIONS" --budget-ms 6600000
 
   # Dispatch only: never on this workflow's schedule. Shares peacestocks-r2-writer concurrency with
   # scan/backfill so it queues behind (or ahead of) them; the host also yields via scanYieldReason.

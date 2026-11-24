@@ -69,9 +69,13 @@ test("wiring: scan, daily 10-minute step, history chain, backfill and gap refill
   const daily = await src("tenmin-daily-liquid.ts");
   assert.match(daily, /reportPart\(process\.env, "tenmin-daily", isScanCheckFailure\(yielded\) \? "ERROR" : "OK"/u);
   assert.match(daily, /reportPart\(process\.env, "tenmin-daily", "ERROR", errorMessage\(error\)\)/u);
-  const backfill = await src("backfill.ts");
-  assert.match(backfill, /reportPart\(process\.env, "backfill", "ERROR", errorMessage\(error\)\)/u);
-  assert.match(backfill, /reportPart\(process\.env, "backfill", result\.stoppedOnError \? "ERROR" : "OK"/u);
+  // Backfill: `pnpm backfill` is src/backfill-job-cli.ts (backfill-workflow-wiring.test.ts); it reports
+  // through reportPart by default, on a finished run and on a thrown error (codes only).
+  const backfill = await src("backfill-job-cli.ts");
+  assert.match(backfill, /const report = deps\.report \?\? reportPart;/u);
+  assert.match(backfill, /await report\(env, "backfill", "ERROR", "BACKFILL_JOB_FAILED"\);\n\s+throw error;/u);
+  assert.match(backfill, /await report\(env, "backfill", exitCode === 0 \? "OK" : "ERROR"/u);
+  assert.match(backfill, /backfillJobMain\(process\.argv\.slice\(2\), process\.env\)/u);
   const refill = await src("gap-refill.ts");
   // Both outcomes (success and thrown failure) go through refillCheckin (tested in gap-refill.health-checkin.test.ts).
   assert.match(refill, /await checkIn\(\{\s+code: c,/u);
