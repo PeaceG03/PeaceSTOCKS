@@ -1,0 +1,264 @@
+# Paper trading (simulated only)
+
+**Paper trading: simulated, no real money.** The picks it trades are labelled experimental:
+back-tests on held-out data show no reliable edge over random picks (docs/SCANNER.md, PR #124).
+Paper trading exists to measure the picks forward, under fixed rules, before anyone considers more.
+
+There is **no broker** in this repository: no broker client, no broker key, no order is ever sent
+anywhere. Every "order" is a row in a simulated ledger, filled from the stored daily bars.
+`src/paper-no-live-broker.test.ts` fails if a live broker endpoint appears in `src/` or the workflows.
+Going to real money is out of scope and would need Peace's own explicit yes first.
+
+## Pre-registered rules (`config/paper-rules-v5.json`, rulesVersion `paper-rules-v5`)
+
+These were committed before any paper result existed. They are not tuned. A rule change is a new file
+(`paper-rules-v6.json`) with a new version, never an edit; every ledger row records `rulesVersion` and
+`rulesSha256` (sha256 of the exact file bytes).
+
+Version history:
+- `paper-rules-v1` (Nov 24, never run; no ledger row was ever written under it). It had an extra rule
+  not in Peace's approved list: a held name whose open-to-open move was 1.8x or more either way was
+  closed flat at its entry price. Because split records arrive days late, that rule also closed real
+  crashes at 0% and flattered paper P&L (Auditor review of #127). Removed.
+- `paper-rules-v2` (Nov 24, never run; no ledger row was ever written under it): v1 without the gap
+  rule, exits always at the actual open, plus a write-off at the last known close after 5 missed exits.
+  Removed.
+- `paper-rules-v3` (Nov 24, never run; no ledger row was ever written under it): v2 with that write-off
+  replaced by Peace's decision (Nov 24, via Auditor): "count it at $0 for now and correct it when real
+  data shows up" (`stuckPositionRule` `MARK_ZERO_THEN_CORRECT`, `markZeroAfterMissedExits` 5). Removed.
+- `paper-rules-v4` (Nov 24, never run; no ledger row was ever written under it): v3 plus
+  `coverageHoleFraction` 0.5 (a coverage hole in our data is not a missed exit), and the universe
+  benchmark corrected by the same rule as paper (Auditor FAIL on #127 at 5234a50d). Removed.
+- `paper-rules-v5` (Nov 24): v4 plus the mass drop-out rule (`dropoutSpikeMultiple` 3,
+  `dropoutSpikeMinNames` 200, `dropoutFallbackSessions` 40): when far more names than normal stop
+  arriving at once, it is a gap in our data and their missing sessions are not missed exits (Peace's
+  intent: data gaps never count as misses); and the reverse-split guard on recoveries
+  (`recoveryGuardMultiple` 3), because a v4 replay benchmark of +33% was driven by recoveries of up to
+  726x. The config schema changed, so the version was bumped.
+
+| Rule | Value |
+| --- | --- |
+| List traded | `TOP_15_OVERALL` of the frozen session, every name, equal weight |
+| Starting paper capital | $100,000 (simulated) |
+| Entry | at the open (09:30 ET) of the next trading session after the freeze |
+| Exit | at the open of the following trading session (1-session hold, open to open) |
+| Position cap | at most 10% of equity per name (equal weight of 15 is about 6.7%) |
+| Daily loss limit | if the book lost 3% or more from its open to the close of the last trading day, no new entries at the next open (exits still happen) |
+| Commission | $0 per order |
+| Slippage | 10 bps per side: buys fill at open x 1.001, sells at open x 0.999 |
+| Shares | whole shares only (rounded down); leftover stays in cash |
+| Exit price | always at the actual open, adjusted only by split records known at fill time; no move is ever filled flat |
+| No price ($0 then correct) | a held name with no open for 5 exit attempts in a row (halted, delisted) is valued at $0 in the ledger and in performance from that open on (`markZeroAfterMissedExits`), kept as a STUCK holding, never closed for good; a real later price, buyout cash or bankruptcy payout in the stored data adds an appended correction for the actual amount (`stuckPositionRule` `MARK_ZERO_THEN_CORRECT`) |
+| Coverage hole | a session whose stored bars cover fewer than 50% of the median name count of the 20 stored sessions before it (`coverageHoleFraction`), or that has no bars at all, is a coverage hole in our data, not a halt: a name with no open there does not count as a missed exit, for paper or the universe |
+| Data drop-out | a session where the names that had a bar on the stored session before it and none on this one number more than 200 (`dropoutSpikeMinNames`) and more than 3x the 99th percentile of that count over the 20 stored sessions before it (`dropoutSpikeMultiple`) is a data drop-out. For a name that dropped out there, its missing sessions do not count toward the $0 mark (flag `DATA_DROPOUT`) for its first 40 covered sessions (`dropoutFallbackSessions`); after that the normal $0-then-correct rule applies (so a name that never comes back is marked $0 at its 45th covered session), for paper and the universe |
+| Recovery guard | a later price for a $0-marked name that is more than 3x its last close before the mark (`recoveryGuardMultiple`), with no stored split or corporate-action record for it in between, is not booked: the name stays STUCK at $0 with flag `RECOVERY_NEEDS_REVIEW` until a split record or a sane price arrives, for paper and the universe |
+
+Note on timing: the held-out eval's h1 outcome (src/holdout-eval.ts) is next open to the close h
+sessions later, so h1 is open to close of the entry day. Paper trading holds open to open, one session
+longer by the overnight gap, so the two are close but not identical.
+
+## Which picks may be traded
+
+Only picks frozen before the 09:30 ET open they are traded at. The ledger reuses the scanner's stored
+freeze status (`permanent/prediction-status/<D>.jsonl`, resolved with `resolveSessionPredictionStatus`,
+the same rule the site uses) and never recomputes it. For entries at the open of session T, with D the
+trading session before T, all of these must hold, else no entries are made (exits still happen):
+
+1. D has at least one status record, and none of D's records is `EVIDENCE_ONLY`.
+2. The resolved status is `FROZEN` with reason `PREDICTIONS_FROZEN` (so `UNAVAILABLE` of any reason,
+   and `NO_QUALIFYING_CANDIDATES`, are refused).
+3. The freeze proof is present: `predictedAt`, `nextSessionOpen` and `nextSessionDate`.
+4. `nextSessionDate` is T, and `predictedAt` is strictly before `nextSessionOpen`.
+5. D's stored `TOP_15_OVERALL` set exists, is not marked unavailable, is non-empty, and its `frozenAt`
+   is strictly before `nextSessionOpen`.
+6. The paper run writing the entry orders runs before T's open (`now < nextSessionOpen`). Orders are
+   never written after the open, so nothing can be entered with hindsight.
+
+## When the scan is late
+
+Exits never depend on the freeze. Before each open T, the first paper run writes
+`paper/v1/exits/<T>.json`: a SELL for every name held (plus every name bought at an earlier open whose
+fills are not computed yet, to be safe; a SELL for a name no longer held fills as `NOT_HELD`). So the
+1-session hold, "sell at the following open", holds even when the scan is late or fails.
+
+Entries do depend on it. When D has no status record yet at a pre-open run, the run writes the exits
+only and tries the entries again on its next pre-open run (11:15, 12:15 and 13:15 UTC):
+- the freeze lands before T's open and passes the proof: the entries for T are written then, and T
+  fills exits and entries together;
+- the freeze lands after T's open, or never: no entries are made at T (the day row for the window
+  that opens at T says `NO_FREEZE_STATUS`), and the book sits in cash until the next timely freeze.
+
+Nothing is ever entered after the open it is for.
+
+## Switches (all default off)
+
+| Switch | Where | Effect |
+| --- | --- | --- |
+| `PAPER_TRADING_ENABLED` | repository variable (Settings → Secrets and variables → Actions → Variables) | must be exactly `true`; anything else and the workflow job is skipped and the CLI does nothing |
+| `PAPER_TRADING_KILL` | repository variable | any value except empty or `false` (fail-safe; use `true`) stops all new orders (entries and exits) and all ledger writes |
+| `PAPER_TRADING_KILL` | a file of that name at the repository root | same, when committed to main |
+| `paper/KILL` | an object in the bucket | same |
+
+The workflow (`.github/workflows/paper-trading.yml`) runs only on main, only when the variable is
+`true`, at 11:15, 12:15 and 13:15 UTC on weekdays (06:15-09:15 ET, always before the 09:30 open).
+
+## Ledger
+
+Stored in the same R2 bucket the scanner uses, under `paper/v1/`, written by the paper workflow only:
+
+| Key | Written | What |
+| --- | --- | --- |
+| `paper/v1/exits/<T>.json` | before T's open, whenever anything is held, whatever the freeze | a SELL for every held name |
+| `paper/v1/intents/<T>.json` | before T's open, once D's freeze status is stored | the entries for T's open: BUY each picked name, or why entries were refused |
+| `paper/v1/fills/<T>.json` | once T's bars are stored | each order's fill (price, shares, slippage, commission) or why it did not fill; cash and positions after |
+| `paper/v1/days/<T>.json` | with the fills | the window from the previous open to T's open: paper return vs SPY and vs the equal-weight universe, plus cumulative |
+| `paper/v1/corrections/<S>/<securityId>_<n>.json` | when a late split record changes an exit's price, or a STUCK holding marked $0 at S's open is resolved | the n-th correction of the exit fill of that name at S's open: old and new split factor and price, and the cash difference; or (`paper-stuck-resolution-v1`) the actual amount a STUCK holding brought in |
+
+- **Append-only**: every object is written once and never overwritten or deleted. Each write is a
+  single conditional put (`If-None-Match: *`): R2 itself refuses to overwrite an existing key (412),
+  so even a writer racing outside the workflow's concurrency group cannot replace a stored object; the
+  run keeps the stored object. The ledger writer can only write keys of exactly these
+  five shapes; it has no delete.
+- **Idempotent orders**: each order's id is `<rulesVersion>_<session>_<securityId>_<side>` (the
+  client order id), unique per session, name and side. A retried run finds the object already stored
+  and does not write or fill it again.
+- **Restart-safe**: state (cash, positions) is read back from the newest fills object; a crash between
+  steps is finished by the next run, with the same result as an uninterrupted run.
+- Order of a run: append corrections for late split records and resolutions for STUCK holdings, fill any stored exits and intents whose
+  session bars exist (oldest first, stopping at the first session not yet stored), write the missing
+  day rows, then write the exits and the intents for the next open.
+
+### Fill rules
+- Exits first, at the session's actual open. Splits effective after entry and on or before the exit
+  session are applied from the split records stored at fill time. Conflicting split records use the
+  raw open (factor 1, flagged `SPLIT_UNRECONCILED`). There is no gap filter: a real crash or spike is
+  booked as it happened.
+- A name with no open that session stays held (marked at its last stored close, or its entry open),
+  its `missedExits` count goes up, and it gets a new SELL at the next open. On a coverage hole (see the
+  rules table) the count does not go up (`NO_PRICE` with flag `COVERAGE_HOLE`), and inside a data
+  drop-out's fallback window neither (`NO_PRICE` with flag `DATA_DROPOUT`): only a name missing on a
+  session our data covers, outside a data drop-out, counts. When the count reaches 5
+  (`markZeroAfterMissedExits`) it is valued at $0 (`MARKED_ZERO` fill, flag `STUCK_AT_ZERO`, no cash),
+  and the position stays on the book as a STUCK holding (`stuckSince` = that session). See below.
+- Then entries: per-name notional = min(equity at the open / number of names, 10% of equity);
+  never more than the cash left. A name still held (its exit had no price) is not bought again.
+
+### No price for 5 sessions: valued at $0, then corrected (`MARK_ZERO_THEN_CORRECT`)
+- From the open of the 5th straight counted session with no price (coverage holes and a data drop-out's
+  fallback window are skipped), a
+  STUCK holding is valued at $0 in
+  `equityAtOpen`, in the daily-loss mark and in the day rows. The loss (its last stored close, or its
+  entry open) is booked once, in the window ending at that open; later windows see it at $0 again, so it
+  is never counted twice. It takes no cash and no slot of the 10% cap (entries are sized from equity with
+  it at $0), it gets no more SELL orders, and if it is picked again it is not bought (`ALREADY_HELD`).
+- It is not closed for good. Each run checks every STUCK holding against the data stored now. When a
+  real later price (the first usable open after entry, sold at it with normal slippage, split-adjusted
+  like an exit) or a cash settlement record (a stored `MERGER`, `CLOSURE` or `DELISTING` corporate
+  action with `details.cash_per_share`, e.g. buyout cash or a bankruptcy payout; no slippage) shows up,
+  an appended correction (`paper-stuck-resolution-v1`) records the actual amount under the
+  `MARKED_ZERO` fill's session, once. Whichever is earlier wins; on the same date the cash settlement.
+  Its `cashAdjustmentUsd` (shares x actual per-share amount) enters cash at the next open that is
+  filled, where the holding leaves the book (`STUCK_RESOLVED`, no cash of its own). The `MARKED_ZERO`
+  fill and every earlier entry are never rewritten. With no such data it stays at $0, with no correction.
+- Limits: only bars in the window a run loads (from about 103 calendar days before the sessions it reads, `paperBarsLookbackDays`) are
+  searched for a later price, so a late bar for an old session is not picked up; no collector stores
+  settlement records yet (the storage reader is ready: `loadSettlementActions`), so until one does,
+  only a later price can resolve a STUCK holding.
+
+### Reverse-split guard on recoveries (`RECOVERY_NEEDS_REVIEW`)
+- A name marked $0 often comes back after a reverse split whose record is not stored yet; its raw
+  later price then looks like a 5x or 700x gain. So a later open is not booked when it is more than
+  3x the close the mark took away
+  (`recoveryGuardMultiple`; the last stored close before the mark, kept on the position as
+  `stuckBasisClose` and on the universe entry as `basisClose`), and no split record and no stored
+  corporate action (`MERGER`, `CLOSURE`, `DELISTING`) exists for the name after that close and up to
+  that open.
+- The name stays STUCK at $0 and is flagged `RECOVERY_NEEDS_REVIEW` (`recoveryNeedsReview` on the paper
+  position and on the universe entry, with the held-back session, raw open and ratio; day rows count
+  them as `paperRecoveryNeedsReview` and `universeRecoveryNeedsReview`; the site shows a "recovery held
+  for review" line). It is resolved as usual when a split record arrives (the same open is then booked,
+  adjusted), when a later open is 3x or less, or when a cash settlement arrives. One function decides
+  it for paper and the universe (`stuckResolutionCheck`).
+- Why 3x: in the v4 replay over the stored bars the median recovery was 1.00x the close the mark took
+  away and the 99th percentile 4.5x; 48 recoveries were above 2x and 24 above 5x (up to 726x), and the
+  10 largest made up 0.19 of the 0.46 total correction. A real stock very rarely triples while it has no
+  price for 5 or more sessions; a reverse split does that routinely (1-for-3 and larger).
+- Limits: an unrecorded forward split (the recovery comes out too low) is not guarded; a real tripling
+  waits until a record or a lower price shows up; a record of any kind for the name lets the price book,
+  even if its factor does not explain the jump.
+- Coverage holes are judged by name count only. On the stored bars through 2026-11-23 no session falls
+  under 50% of the trailing median (the lowest is about 96%). The two large v4 universe $0 days
+  (2025-10-07 and 2026-08-27) were the 5th session after about 5-6% of names stopped arriving at once;
+  those are data drop-outs, handled below.
+
+### Mass data drop-outs (`DATA_DROPOUT`)
+- Each stored session's drop-outs are the names that had a bar on the stored session before it and
+  none on it. A session is a data drop-out when that count is above both 200 names
+  (`dropoutSpikeMinNames`) and 3x the 99th percentile (nearest rank) of the counts on the 20 stored
+  sessions before it (`dropoutSpikeMultiple`). One shared function decides it (`PaperBars.dropoutSpike`),
+  and one decides each missing session for a name (`missKind`, `missedSessions`), for paper exits and
+  the universe alike.
+- For a name whose run of missing sessions starts on a data drop-out (no bar there, right after its
+  last open), the first 40 covered sessions of the run (`dropoutFallbackSessions`) do not count: paper
+  fills are `NO_PRICE` with flag `DATA_DROPOUT`, the universe leaves the name out of the window, and the
+  day row counts them (`paperDataDropout`, `universeDataDropout`; the site shows a "data gap" line).
+  After 40 covered sessions the normal rule applies: 5 more counted misses mark it $0, then it is
+  corrected if real data shows up.
+- Why these values (stored bars through 2026-11-23, 534 sessions): the median day has 26 drop-outs,
+  the 90th percentile 62, the 99th 94, and the largest normal day 144. Against its own trailing
+  20-session 99th percentile, every day is at most 1.5x except two: 2025-10-01 (436 names, 11.5x) and
+  2026-08-21 (613 names, 6.8x). 3x sits with a margin of 2x or more on both sides, and the 200-name floor
+  (about 2% of the names) is above every normal day, so a quiet stretch with a tiny p99 cannot trigger
+  it. Each of the pairs tried (2x/100, 3x/100, 3x/200, 4x/200, 5x/200) picks exactly these two days.
+- Why 40 sessions: the 2025-10-01 names came back after about 20 stored sessions and the 2026-08-21
+  names after 30 (all 613; only 45 within 20). A 20-session window would still mark the 2026-08-21
+  names $0 at the 25th session and correct them at the 30th. 40 covers both with 10 sessions to spare;
+  the cost is that a name that really stops trading on a drop-out day is marked $0 about 8 weeks later
+  than usual.
+- Limits: only a run that starts on the drop-out session is excused; a name that already missed a
+  session before the drop-out counts normally. The check needs the session before the run and its 20
+  trailing sessions in the loaded bars; otherwise the session counts as a normal miss.
+
+### Late split records: corrections, never rewrites
+Split records often arrive days after the split. A fill is never rewritten. Each run re-checks the
+exit fills of the last 30 filled sessions against the split records stored now. When the factor
+differs from the one the fill (or its latest correction) used, a correction is appended with the
+corrected price and `cashAdjustmentUsd = shares x (new price - old price)`. That cash enters the
+book at the next open that is filled (`correctionsUsd` and the cumulative `correctionsApplied` on the
+fills, `correctionsUsd` on that day row), exactly once. So the window in which a correction lands
+includes it in its return; earlier day rows are not changed. Benchmarks are not corrected after the
+fact; they used the records known when their day row was written, the same as the paper fill.
+
+### Benchmarks (same window, open to open)
+- **SPY**: the security-master SPY ETF, no costs.
+- **Equal-weight universe**: the average open-to-open return of every security-master record that is
+  `ACTIVE` with eligibility `LEVEL_2`/`LEVEL_3` (the current master, not point in time) with a positive
+  open on both sessions. No costs.
+- The universe uses the same `MARK_ZERO_THEN_CORRECT` rule as paper, with the same trigger, data and
+  code (`universeStuckAt`, `missKind`, `missedSessions`, `PaperBars.covered`, `PaperBars.dropoutSpike`,
+  `stuckResolutionCheck`):
+  - A name with no open on its 5th counted session in a row (after a session with an open; coverage
+    holes and a data drop-out's fallback window skipped, not counted) counts at -100% once, in the window ending there. Its lost slice of the
+    index (index level at the window's opening open / names that window) and the close it was worth (its
+    last stored close) are carried in the day rows (`universeStuck`).
+  - Each later window checks every carried name with `stuckResolutionCheck` (no costs): the first later
+    open or a cash settlement record, with the same reverse-split guard, exactly as for a paper STUCK
+    holding. When one shows up in the
+    window, the recovered slice (slice x actual per-share amount / that close) is added to the window's
+    universe return (`universeResolved`, `universeCorrectionReturn`), once, and the name leaves the
+    list. So paper and the universe recover the same share of the $0 loss from the same data, in the
+    window that ends at the same open. With no such data it stays at $0.
+  - Before and after, a name with no price is left out of the window, like any missing price.
+- Coverage holes and drop-outs are judged on the bars a run loads: N missed sessions, the 40-session
+  drop-out window, the session before and the 20 stored sessions before that (`paperBarsLookbackDays`,
+  about 103 calendar days for these values).
+- Both benchmarks treat a name exactly as paper exits do: actual opens, split-adjusted by the stored
+  records, conflicting records use the raw open, and no move is dropped or flattened. Only a missing
+  price leaves a name out (apart from the $0 rule above). SPY gets no $0 rule (it always trades).
+
+## Site
+The site's **Paper trading** card shows the newest days: paper, SPY and universe returns per day and
+cumulative, with the experimental label and "Paper trading: simulated, no real money." A window with
+data drop-out names shows a "data gap" line with how many universe and paper names were not counted as
+missed (`DATA_DROPOUT`), and a window with $0-marked names whose later price is held back shows a
+"recovery held for review" line (`RECOVERY_NEEDS_REVIEW`).

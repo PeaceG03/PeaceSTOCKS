@@ -2,7 +2,7 @@ import { writeVerifiedHealthJson } from "./health-checkins";
 import { SCAN_HEALTH_LATEST_KEY, type ScanHealthRecord, scanHealthKey } from "./scan-health";
 import { CORPORATE_ACTION_COVERAGE_KEY, type CorporateActionCoverageRecord } from "./corporate-action-coverage";
 import { createHash } from "node:crypto";
-import { isSplitAction } from "./split-adjust";
+import { isSplitAction, SETTLEMENT_ACTION_TYPES } from "./split-adjust";
 import type {
   CanonicalDailyBar,
   CorporateAction,
@@ -203,6 +203,11 @@ export class ObjectMarketStorage implements MarketStore {
 
   async loadSplitActions(): Promise<CorporateAction[]> {
     return lines<CorporateAction>(await this.readText("permanent/corporate-actions.jsonl")).filter(isSplitAction);
+  }
+
+  /** Stored MERGER / CLOSURE / DELISTING records (paper trading: cash settlements of STUCK holdings). */
+  async loadSettlementActions(): Promise<CorporateAction[]> {
+    return lines<CorporateAction>(await this.readText("permanent/corporate-actions.jsonl")).filter((action) => SETTLEMENT_ACTION_TYPES.includes(action.actionType));
   }
 
   /** One line per session whose splits + dividends were fetched and stored (see corporate-action-coverage.ts). */

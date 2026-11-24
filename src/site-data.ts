@@ -1,5 +1,6 @@
 import type { PredictionSet, PredictionStatus, ScannerRunReport, SecurityMasterRecord } from "./contracts";
 import { HEALTH_PARTS, latestHealthCheckin, type HealthCheckin } from "./health-checkins";
+import { PAPER_DAYS_PREFIX, paperLedgerSession, type PaperDay } from "./paper-ledger";
 import { resolveSessionPredictionStatus } from "./prediction-status";
 import {
   FREEZE_RELIABILITY_KEY,
@@ -88,6 +89,28 @@ export interface SitePredictions {
   picks: SitePicks[];
 }
 
+/** One open-to-open paper-trading window (simulated). Returns are fractions; null when unknown. */
+export interface SitePaperDay {
+  from: string;
+  to: string;
+  paper: number | null;
+  spy: number | null;
+  universe: number | null;
+  cumulativePaper: number | null;
+  cumulativeSpy: number | null;
+  cumulativeUniverse: number | null;
+  entriesRefused?: string;
+  /** Names not priced this window because of a mass data drop-out (DATA_DROPOUT), not counted as missed. */
+  dataDropout?: { universe: number; paper: number };
+  /** $0-marked names whose later price waits for review (RECOVERY_NEEDS_REVIEW). */
+  recoveryNeedsReview?: { universe: number; paper: number };
+}
+
+export interface SitePaper {
+  /** Newest first, at most SITE_PAPER_DAYS. Empty when paper trading has not completed a day. */
+  days: SitePaperDay[];
+}
+
 export interface SiteData {
   generatedAt: string;
   health?: SiteHealth;
@@ -101,6 +124,8 @@ export interface SiteData {
   backlog: { remaining?: number; state?: string; message?: string };
   reports: SiteReport[];
   predictions: SitePredictions;
+  /** Simulated paper-trading days (always set by loadSiteData). */
+  paper?: SitePaper;
   /** Reads that failed (key prefix only); the page still renders what it could read. */
   readErrors: string[];
   /** Why each failed read failed: HTTP status + S3 <Code>, or an error name. Never values or body text. */
@@ -108,6 +133,7 @@ export interface SiteData {
 }
 
 export const SITE_MAX_REPORTS = 20;
+export const SITE_PAPER_DAYS = 10;
 const FAILURES_SHOWN = 3;
 const TEXT_MAX = 200;
 
@@ -312,6 +338,20 @@ export async function loadSiteData(
     }
   }
 
+  // Paper trading (simulated): the newest day rows only, so a page view stays bounded.
+  const paper: SitePaper = { days: [] };
+  const paperSessions =
+    (await attempt("paper", readErrors, async () =>
+      (await reader.list(PAPER_DAYS_PREFIX))
+        .map((key) => paperLedgerSession(key, "days"))
+        .filter((session): session is string => session !== undefined)
+        .sort(),
+    )) ?? [];
+  for (const session of paperSessions.slice(-SITE_PAPER_DAYS).reverse()) {
+    const day = await attempt("paper", readErrors, async () => json<PaperDay>(await reader.get(`${PAPER_DAYS_PREFIX}${session}.json`)));
+    if (day) paper.days.push(sitePaperDay(day, session));
+  }
+
   return {
     generatedAt: now().toISOString(),
     ...(health ? { health } : {}),
@@ -326,7 +366,40 @@ export async function loadSiteData(
     },
     reports,
     predictions,
+    paper,
     readErrors: [...new Set(readErrors.names)],
     ...(readErrors.names.length ? { readErrorReasons: { ...readErrors.reasons } } : {}),
+  };
+}
+
+const fraction = (value: unknown): number | null => (typeof value === "number" && Number.isFinite(value) ? value : null);
+
+const count = (value: unknown): number => (typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : 0);
+
+function dataDropout(day: PaperDay): { dataDropout?: { universe: number; paper: number } } {
+  const universe = count(day.universeDataDropout);
+  const paper = count(day.paperDataDropout);
+  return universe || paper ? { dataDropout: { universe, paper } } : {};
+}
+
+function recoveryNeedsReview(day: PaperDay): { recoveryNeedsReview?: { universe: number; paper: number } } {
+  const universe = count(day.universeRecoveryNeedsReview);
+  const paper = count(day.paperRecoveryNeedsReview);
+  return universe || paper ? { recoveryNeedsReview: { universe, paper } } : {};
+}
+
+function sitePaperDay(day: PaperDay, session: string): SitePaperDay {
+  return {
+    from: typeof day.fromSessionDate === "string" ? clip(day.fromSessionDate) : "unknown",
+    to: session,
+    paper: fraction(day.paperReturn),
+    spy: fraction(day.spyReturn),
+    universe: fraction(day.universeReturn),
+    cumulativePaper: fraction(day.cumulativePaperReturn),
+    cumulativeSpy: fraction(day.cumulativeSpyReturn),
+    cumulativeUniverse: fraction(day.cumulativeUniverseReturn),
+    ...(typeof day.entriesRefused === "string" ? { entriesRefused: clip(day.entriesRefused) } : {}),
+    ...dataDropout(day),
+    ...recoveryNeedsReview(day),
   };
 }

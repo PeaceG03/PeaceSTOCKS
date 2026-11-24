@@ -5,8 +5,10 @@ here; `--out` only receives results. Commit both `.jsonl` files and their `.head
 research run: the committed head is the anchor `gitCommittedHead` checks on every read, so dropping or
 re-chaining lines (even with the head file rewritten) is refused as `LOG_TAMPERED` while the rewrite is
 uncommitted. A rewrite committed as a new commit passes that local check; CI's ledger check
-(`src/research-ledger-check.ts`) refuses it, because main's committed heads must stay in the chain and
-main's held-out markers must stay unchanged. Outside git the anchor fails open (only the head file guards).
+(`src/research-ledger-check.ts`) fails on it, because main's committed heads must stay in the chain and
+main's held-out markers must stay unchanged. That check is advisory, not a required check (no branch
+protection on main, and a PR runs its own copy of the workflow and checker), so a reviewer must look for
+it. Outside git the anchor fails open (only the head file guards).
 
 - `variants.jsonl`: every evaluated strategy (hashes, per-fold and pooled metrics; no symbols). Its
   distinct candidate hashes are the Holm family size, so it must never be reset.
