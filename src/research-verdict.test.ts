@@ -4,7 +4,7 @@ import type { SeriesMetrics } from "./research-stats";
 import type { StrategyEvaluation } from "./research-variants";
 import { clampThresholds, DEFAULT_VERDICT_THRESHOLDS, LIVE_PAPER_RUN_NOTE, verdictFor } from "./research-verdict";
 
-const metrics = (exU: number, exS: number, spySessions = 50): SeriesMetrics => ({
+const metrics = (exU: number, exS: number, spySessions = 50, ddNet = 0.05, ddSpy: number | null = 0.06): SeriesMetrics => ({
   sessions: 50,
   meanGross: 0,
   meanNet: 0,
@@ -15,6 +15,8 @@ const metrics = (exU: number, exS: number, spySessions = 50): SeriesMetrics => (
   excessUniverse: { sessions: 50, mean: exU, t: 0, p: 0 },
   excessSpy: { sessions: spySessions, mean: exS, t: 0, p: 0 },
   sharpeNet: 0,
+  maxDrawdownNet: ddNet,
+  maxDrawdownSpy: ddSpy,
 });
 
 const evaluation = (over: {
@@ -24,6 +26,8 @@ const evaluation = (over: {
   folds?: number;
   adjustedP?: number;
   bps?: number;
+  ddNet?: number;
+  ddSpy?: number | null;
   foldMetrics?: Array<{ exU: number; exS: number; spySessions?: number; positive?: boolean }>;
 }): StrategyEvaluation => {
   const folds = over.folds ?? 4;
@@ -51,7 +55,7 @@ const evaluation = (over: {
           positive: isPos,
         };
       }),
-      pooled: metrics(over.exU ?? 0.001, over.exS ?? 0.001),
+      pooled: metrics(over.exU ?? 0.001, over.exS ?? 0.001, 50, over.ddNet ?? 0.05, over.ddSpy === undefined ? 0.06 : over.ddSpy),
       pooledP: 0.001,
     },
     daily: [],
@@ -122,7 +126,7 @@ test("each failed check alone makes it NOT_PROVEN, with its reason", () => {
     assert.equal(v.note, LIVE_PAPER_RUN_NOTE);
   }
   assert.equal(verdictFor(evaluation({ positive: 5, folds: 5, adjustedP: 0.0499 }), good).verdict, "IMPROVEMENT");
-  assert.deepEqual(DEFAULT_VERDICT_THRESHOLDS, { alpha: 0.05, minPositiveFoldShare: 1, minFolds: 3, minCostBpsPerSide: 5 });
+  assert.deepEqual(DEFAULT_VERDICT_THRESHOLDS, { alpha: 0.05, minPositiveFoldShare: 1, minFolds: 3, minCostBpsPerSide: 5, maxDrawdownNet: 0.15, maxDrawdownSpyMultiple: 1.25 });
 });
 
 test("too few folds: one or two folds plus a positive held-out never give IMPROVEMENT; three can", () => {
@@ -173,8 +177,34 @@ test("caller thresholds can only tighten the defaults: a library caller cannot l
 });
 
 test("a non-finite caller threshold means the default (not a check that can never pass)", () => {
-  const nan = { alpha: Number.NaN, minPositiveFoldShare: Number.NaN, minFolds: Number.NaN, minCostBpsPerSide: Number.NaN };
+  const nan = { alpha: Number.NaN, minPositiveFoldShare: Number.NaN, minFolds: Number.NaN, minCostBpsPerSide: Number.NaN, maxDrawdownNet: Number.NaN, maxDrawdownSpyMultiple: Number.NaN };
   const v = verdictFor(evaluation({}), good, nan);
   assert.equal(v.verdict, "IMPROVEMENT", JSON.stringify(v.reasons));
   assert.deepEqual(clampThresholds(nan), DEFAULT_VERDICT_THRESHOLDS);
+});
+
+test("drawdown limits: pooled net drawdown > 15% or > 1.25x SPY drawdown is NOT_PROVEN", () => {
+  assert.equal(verdictFor(evaluation({ ddNet: 0.15, ddSpy: 0.12 }), good).verdict, "IMPROVEMENT");
+
+  const overAbs = verdictFor(evaluation({ ddNet: 0.1501, ddSpy: 0.20 }), good);
+  assert.equal(overAbs.verdict, "NOT_PROVEN");
+  assert.ok(overAbs.reasons.includes("DRAWDOWN_EXCEEDS_LIMIT"), overAbs.reasons.join(","));
+
+  const overSpy = verdictFor(evaluation({ ddNet: 0.0751, ddSpy: 0.06 }), good);
+  assert.equal(overSpy.verdict, "NOT_PROVEN");
+  assert.ok(overSpy.reasons.includes("DRAWDOWN_EXCEEDS_SPY_MULTIPLE"), overSpy.reasons.join(","));
+
+  const noSpyDd = verdictFor(evaluation({ ddNet: 0.05, ddSpy: null }), good);
+  assert.equal(noSpyDd.verdict, "NOT_PROVEN");
+  assert.ok(noSpyDd.reasons.includes("DRAWDOWN_EXCEEDS_SPY_MULTIPLE"), noSpyDd.reasons.join(","));
+
+  // Looser drawdown thresholds passed by a caller are clamped back down to defaults.
+  const looseDd = verdictFor(
+    evaluation({ ddNet: 0.16, ddSpy: 0.08 }),
+    good,
+    { ...DEFAULT_VERDICT_THRESHOLDS, maxDrawdownNet: 0.5, maxDrawdownSpyMultiple: 3 },
+  );
+  assert.equal(looseDd.verdict, "NOT_PROVEN");
+  assert.ok(looseDd.reasons.includes("DRAWDOWN_EXCEEDS_LIMIT"));
+  assert.ok(looseDd.reasons.includes("DRAWDOWN_EXCEEDS_SPY_MULTIPLE"));
 });

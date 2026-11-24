@@ -106,6 +106,25 @@ export interface SeriesMetrics {
   excessSpy: { sessions: number; mean: number; t: number; p: number };
   /** Annualized (sqrt 252) Sharpe of the net series (no risk-free rate). */
   sharpeNet: number;
+  /** Peak-to-trough compounded drawdown of the net series (0..1). */
+  maxDrawdownNet: number;
+  /** Peak-to-trough compounded drawdown of SPY over sessions with a SPY outcome (0..1, or null). */
+  maxDrawdownSpy: number | null;
+}
+
+/** Peak-to-trough compounded drawdown (fraction 0..1) from a series of simple daily returns. */
+export function maxDrawdown(returns: readonly number[]): number {
+  let equity = 1;
+  let peak = 1;
+  let maxDd = 0;
+  for (const r of returns) {
+    if (!Number.isFinite(r)) return 1;
+    equity = Math.max(0, equity * (1 + r));
+    if (equity > peak) peak = equity;
+    const dd = peak > 0 ? (peak - equity) / peak : 0;
+    if (dd > maxDd) maxDd = dd;
+  }
+  return maxDd;
 }
 
 export function seriesMetrics(daily: readonly DailyResult[]): SeriesMetrics {
@@ -123,5 +142,7 @@ export function seriesMetrics(daily: readonly DailyResult[]): SeriesMetrics {
     excessUniverse: oneSidedTest(daily.map((d) => d.net - d.universe)),
     excessSpy: oneSidedTest(withSpy.map((d) => d.net - d.spy!)),
     sharpeNet: sdNet > 0 ? (mean(net) / sdNet) * Math.sqrt(252) : 0,
+    maxDrawdownNet: maxDrawdown(net),
+    maxDrawdownSpy: withSpy.length ? maxDrawdown(withSpy.map((d) => d.spy!)) : null,
   };
 }
