@@ -116,7 +116,14 @@ export function renderSitePage(data: SiteData): string {
             p.status ? ` Last status: ${escapeHtml(p.status)}${p.reason ? ` (${escapeHtml(p.reason)})` : ""}.` : ""
           }</div>`
         : `<div class="mute">Session ${escapeHtml(p.sessionDate)}</div>${p.picks
-            .map((set) => `<div><b>${escapeHtml(set.setType)}</b>: ${set.symbols.map(escapeHtml).join(", ")}</div>`)
+            .map(
+              (set) =>
+                `<div><b>${escapeHtml(set.setType)}</b>: ${
+                  set.unavailableReason
+                    ? `<span class="mute">unavailable${set.unavailableReason === "INSUFFICIENT_HISTORY" ? " (not enough price history)" : ""}</span>`
+                    : set.symbols.map(escapeHtml).join(", ")
+                }</div>`,
+            )
             .join("")}`
     }</section>`,
   );

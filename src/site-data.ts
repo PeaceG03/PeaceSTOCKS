@@ -51,6 +51,8 @@ export interface SiteReport {
 export interface SitePicks {
   setType: string;
   symbols: string[];
+  /** The list could not be computed honestly for this session (it is then empty). */
+  unavailableReason?: string;
 }
 
 export interface SitePredictions {
@@ -222,6 +224,7 @@ export async function loadSiteData(
       predictions.picks = sets.map((set) => ({
         setType: set.setType,
         symbols: set.securityIds.map((id) => symbol.get(id) ?? id),
+        ...(set.unavailableReason ? { unavailableReason: set.unavailableReason } : {}),
       }));
     }
   }

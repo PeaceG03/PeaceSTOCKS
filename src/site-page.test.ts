@@ -97,3 +97,19 @@ test("site data: bounded run-report reads, newest by listing date, and a failed 
   assert.deepEqual(data.readErrors, ["scheduler"]);
   assert.match(renderSitePage(data), /Could not read: scheduler/u);
 });
+
+test("site page: a list marked unavailable says so, and is not shown as an empty pick list", async () => {
+  const client = await seeded();
+  const line = (setType: string, securityIds: string[], extra = {}) =>
+    JSON.stringify({ predictionId: `p-${setType}`, sessionDate: "2026-11-21", setType, securityIds, scannerVersion: "v", configFingerprint: "f", frozenAt: "x", ...extra });
+  await client.put("permanent/predictions/2026-11-21.jsonl", enc(`${line("TOP_15_OVERALL", ["sec-a"])}\n${line("FASTEST_IMPROVING", [], { unavailableReason: "INSUFFICIENT_HISTORY" })}\n`));
+  await client.put("permanent/security-master.json", enc([{ securityId: "sec-a", currentSymbol: "AAA" }]));
+  const data = await loadSiteData(client);
+  assert.deepEqual(data.predictions.picks, [
+    { setType: "TOP_15_OVERALL", symbols: ["AAA"] },
+    { setType: "FASTEST_IMPROVING", symbols: [], unavailableReason: "INSUFFICIENT_HISTORY" },
+  ]);
+  const html = renderSitePage(data);
+  assert.match(html, /FASTEST_IMPROVING<\/b>: <span class="mute">unavailable \(not enough price history\)<\/span>/u);
+  assert.match(html, /TOP_15_OVERALL<\/b>: AAA</u);
+});
