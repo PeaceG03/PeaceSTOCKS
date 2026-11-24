@@ -208,6 +208,10 @@ export class PaperBars {
     this.coveredCache.set(key, result);
     return result;
   }
+  /** Every stored session (as loaded), oldest first. */
+  storedSessions(): readonly string[] {
+    return (this.sorted ??= [...this.dates].sort());
+  }
   /** Stored session right after `date` (as loaded), or undefined. */
   nextStoredSession(date: string): string | undefined {
     const sorted = (this.sorted ??= [...this.dates].sort());
@@ -646,10 +650,15 @@ type GapRules = Pick<PaperRules, "coverageHoleFraction" | "dropoutSpikeMultiple"
  * its first dropoutFallbackSessions covered sessions do not count. lastOpen is undefined when the walk
  * leaves the loaded bars first (unknown, so never treated as missed).
  */
-export function missedSessions(bars: PaperBars, id: string, to: string, rules: GapRules, calendar = US_EQUITY_MARKET_CALENDAR): { misses: number; lastOpen?: string; dropout?: boolean } {
-  const first = bars.firstSession();
+export function missedSessions(bars: PaperBars, id: string, to: string, rules: GapRules, _calendar = US_EQUITY_MARKET_CALENDAR): { misses: number; lastOpen?: string; dropout?: boolean } {
+  // Only stored sessions can have an open or be covered (a session with no bars is a hole), so the walk
+  // goes over the stored sessions on or before `to`, newest first.
+  const stored = bars.storedSessions();
+  let i = stored.length - 1;
+  while (i >= 0 && stored[i]! > to) i -= 1;
   let covered = 0;
-  for (let date: string | undefined = to; date && first && date >= first; date = previousEligibleSession(date, calendar)) {
+  for (; i >= 0; i -= 1) {
+    const date = stored[i]!;
     if (bars.open(id, date) !== undefined) {
       const start = bars.nextStoredSession(date);
       const dropout = start !== undefined && start <= to && !bars.hasBar(id, start) && bars.dropoutSpike(start, rules);
