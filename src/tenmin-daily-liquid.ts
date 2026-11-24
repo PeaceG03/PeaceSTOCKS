@@ -324,6 +324,8 @@ export interface TenMinDailyIndex {
 export const TENMIN_DAILY_DONE_RULE = "done-day-v1" as const;
 /** Run-log marker: a tracked, not-done day under a sealed range was skipped (no fetch, no write). */
 export const TENMIN_DAILY_SKIPPED_RANGE_SEALED = "TENMIN_DAILY_SKIPPED_RANGE_SEALED" as const;
+/** Warning: a tracked day under a sealed range was stamped STUCK_SHORT (SEALED_OVER) with its count. */
+export const TENMIN_DAILY_STUCK_SHORT_SEALED_OVER = "TENMIN_DAILY_STUCK_SHORT_SEALED_OVER" as const;
 /** The daily step's first session (Sep 29, 2026) is in this two-month range; no daily index is older. */
 export const TENMIN_DAILY_FIRST_RANGE_FROM = "2026-09-01" as const;
 
@@ -371,8 +373,13 @@ export const TENMIN_DAILY_STUCK_SHORT = "STUCK_SHORT" as const;
 
 export interface TenMinDailyStuckShort {
   status: typeof TENMIN_DAILY_STUCK_SHORT;
-  /** FAILED_PASSES: 6 full passes failed. LEFT_WINDOW: the day left the 10-session window not done (no longer retried). */
-  reason?: "FAILED_PASSES" | "LEFT_WINDOW";
+  /**
+   * FAILED_PASSES: 6 full passes failed. LEFT_WINDOW: the day left the 10-session window not done (no
+   * longer retried). SEALED_OVER: a history range was sealed over the day while it was not done (an
+   * older seal without the guard, or a manual reseal); nothing is fetched under a seal, so it is no
+   * longer retried.
+   */
+  reason?: "FAILED_PASSES" | "LEFT_WINDOW" | "SEALED_OVER";
   at: string;
   /** Full catch-up passes that had failed when the day became STUCK_SHORT. */
   passes: number;
@@ -636,10 +643,32 @@ export async function runTenMinDailyLiquid(options: {
     };
     let index = await readTenMinDailyIndex(store, sessionDate);
     // A sealed range owns its sessions: nothing is fetched or written under it (Auditor B3; a re-fetch
-    // would overwrite an object the seal reused). A tracked day keeps its index, status and counts
-    // unchanged; it is still not done by its own bars (seal guard), and is reported as skipped.
+    // would overwrite an object the seal reused). A tracked day keeps its stored objects and counts;
+    // it is still not done by its own bars (seal guard), and is reported as skipped. A tracked day that
+    // is neither done nor STUCK_SHORT is stamped STUCK_SHORT (SEALED_OVER) with its counts, once, in its
+    // own daily index (Auditor round 4: only the short day itself, full or STUCK_SHORT, unblocks history).
     if (await tenMinRangeSealedFor(store, sessionDate)) {
       sessionReport.status = "SKIPPED_RANGE_SEALED";
+      if (index && !index.done && !index.stuckShort && !isPreRuleIndex(index)) {
+        const counts = tenMinDailyIndexCounts(index, expectedTenMinBars(sessionDate, calendar));
+        index = finalizeIndex({
+          ...index,
+          stuckShort: {
+            status: TENMIN_DAILY_STUCK_SHORT,
+            reason: "SEALED_OVER",
+            at: stamp(),
+            passes: index.notDoneRuns ?? 0,
+            dayBars: counts.dayBars,
+            dailyBars: counts.dailyBars,
+            shortNames: index.shortNames ?? counts.shortStocks.length,
+            missingDailyBars: index.missingDailyBars ?? 0,
+          },
+          updatedAt: stamp(),
+        });
+        await writeTenMinDailyIndex(store, index);
+        report.warnings.push(`${TENMIN_DAILY_STUCK_SHORT_SEALED_OVER}:${sessionDate}:${counts.dayBars}`);
+      }
+      if (index?.stuckShort && !index.done) sessionReport.status = TENMIN_DAILY_STUCK_SHORT;
       if (index) {
         sessionReport.selected = index.selected.length;
         sessionReport.stored = index.stored.length;
@@ -933,9 +962,11 @@ export async function tenMinDailyHistoryHold(
   for (const sessionDate of sessions) {
     const index = await readTenMinDailyIndex(store, sessionDate);
     // A sealed range counts as done only for a day the daily step never tracked (seal guard). A tracked
-    // day under it is not done, but the daily step no longer works it (B3), so it cannot hold the chain.
+    // day under it that failed a pass holds the chain like any other until it is full or STUCK_SHORT;
+    // the daily step stamps it STUCK_SHORT (SEALED_OVER) on its next run, which releases it.
     if (await tenMinRangeSealedFor(store, sessionDate)) {
-      days.push({ sessionDate, done: !index || !!index.done, failed: false });
+      const done = !index || !!index.done;
+      days.push({ sessionDate, done, failed: !done && (index?.notDoneRuns ?? 0) >= 1, stuckShort: !done && !!index?.stuckShort });
       continue;
     }
     const done = !!index?.done;

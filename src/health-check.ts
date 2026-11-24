@@ -201,6 +201,12 @@ export function stuckDayLine(day: HealthStuckDay): string {
     day.shortNames > 0
       ? `STUCK_SHORT, short of ${day.expectedBars} bars: ${day.bars} bars, ${day.shortNames} stock/s short (${shortStocksLine(day.shortStocks)})`
       : `STUCK_SHORT, waiting for daily bars: ${day.bars} bars`;
+  if (day.stuckShort?.reason === "SEALED_OVER") {
+    const passes = day.stuckShort.passes;
+    const fewer = dayStuck(passes) ? "" : ", fewer than 6 failed passes";
+    const where = day.leftWindow ? "left the window" : "in the window";
+    return `daily 10-minute step: ${day.sessionDate} ${what}, daily bars ${day.dailyBars}, sealed over by a history range after ${passes} failed pass/es${fewer}, ${where} (not done, no longer retried)`;
+  }
   if (day.leftWindow) {
     const passes = day.stuckShort?.passes ?? day.reRuns;
     const fewer = dayStuck(passes) ? "" : ", fewer than 6 failed passes";

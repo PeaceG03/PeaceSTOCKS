@@ -926,7 +926,7 @@ test("STUCK_SHORT: after 6 failed full passes a short day is STUCK_SHORT with it
   assert.equal(index.stuckShort, undefined);
 });
 
-test("B3: a tracked unfinished day and a STUCK_SHORT day under a sealed range: no fetch, no write, status and counts kept", async () => {
+test("B3: a tracked unfinished day and a STUCK_SHORT day under a sealed range: no fetch, no write under the range, counts kept; the unfinished day is stamped STUCK_SHORT (SEALED_OVER)", async () => {
   const root = await mkdtemp(join(tmpdir(), "peacestocks-seal-old-"));
   try {
     const store = new MemoryObjectClient();
@@ -956,10 +956,10 @@ test("B3: a tracked unfinished day and a STUCK_SHORT day under a sealed range: n
     assert.ok(await readTenMinRangeManifest(store, RANGE_FROM, RANGE_TO));
     const snapshot = async () => new Map(await Promise.all((await store.list("permanent/")).map(async (k) => [k, await store.get(k)] as const)));
     const before = await snapshot();
-    let puts = 0;
+    const puts: string[] = [];
     const watched = Object.assign(Object.create(store) as MemoryObjectClient, {
       put: async (...args: Parameters<MemoryObjectClient["put"]>) => {
-        puts += 1;
+        puts.push(args[0]);
         return store.put(...args);
       },
     });
@@ -967,19 +967,32 @@ test("B3: a tracked unfinished day and a STUCK_SHORT day under a sealed range: n
     bbbBars = 39;
     const run = await baseRun(watched, calls, { catchupSessions: 2, fetchPages: pages });
     assert.deepEqual(calls, [], "no fetch under a sealed range");
-    assert.equal(puts, 0, "no write under a sealed range");
-    assert.deepEqual(await snapshot(), before);
+    const index09 = await readTenMinDailyIndex(store, "2026-10-09");
+    // The only write is 10-09's own daily index (the SEALED_OVER stamp, the daily step's bookkeeping);
+    // no reply object, entries file or manifest of the sealed range is touched, and its read still passes.
+    assert.deepEqual(puts, [tenMinDailyIndexKey("2026-10-09")]);
+    assert.ok(await readTenMinRangeManifest(store, RANGE_FROM, RANGE_TO));
+    const after = await snapshot();
+    for (const [k, v] of before) if (k !== puts[0]) assert.deepEqual(after.get(k), v, `unchanged: ${k}`);
     assert.deepEqual(run.sessions.map((x) => [x.sessionDate, x.status, x.bars]), [
-      ["2026-10-09", "SKIPPED_RANGE_SEALED", "108/117"],
-      ["2026-10-08", "SKIPPED_RANGE_SEALED", "108/117"],
+      ["2026-10-09", "STUCK_SHORT", "108/117"],
+      ["2026-10-08", "STUCK_SHORT", "108/117"],
     ]);
-    assert.deepEqual(run.warnings.filter((w) => w.startsWith("TENMIN_DAILY_SKIPPED_RANGE_SEALED")).sort(), [
+    assert.deepEqual(run.warnings.filter((w) => w.startsWith("TENMIN_DAILY_SKIPPED_RANGE_SEALED") || w.startsWith("TENMIN_DAILY_STUCK_SHORT_SEALED_OVER")).sort(), [
       "TENMIN_DAILY_SKIPPED_RANGE_SEALED:2026-10-08:STUCK_SHORT:108/117",
-      "TENMIN_DAILY_SKIPPED_RANGE_SEALED:2026-10-09:not-done:108/117",
+      "TENMIN_DAILY_SKIPPED_RANGE_SEALED:2026-10-09:STUCK_SHORT:108/117",
+      "TENMIN_DAILY_STUCK_SHORT_SEALED_OVER:2026-10-09:108/117",
     ]);
-    assert.equal((await readTenMinDailyIndex(store, "2026-10-09"))!.done, undefined, "still not done (never treated as full)");
-    // The daily step no longer works it, so it does not hold the chain.
+    assert.equal(index09!.done, undefined, "still not done (never treated as full)");
+    assert.deepEqual({ ...index09!.stuckShort, at: "t" }, { status: "STUCK_SHORT", reason: "SEALED_OVER", at: "t", passes: 1, dayBars: "108/117", dailyBars: "3/3", shortNames: 1, missingDailyBars: 0 });
+    // 10-08 keeps its own STUCK_SHORT record (FAILED_PASSES) unchanged.
+    assert.equal((await readTenMinDailyIndex(store, "2026-10-08"))!.stuckShort?.reason, "FAILED_PASSES");
+    // STUCK_SHORT releases the chain; a second run writes nothing at all.
     assert.equal(await tenMinDailyHistoryHold(store, { lastCompletedSession: "2026-10-09", catchupSessions: 1 }), undefined);
+    puts.length = 0;
+    await baseRun(watched, calls, { catchupSessions: 2, fetchPages: pages });
+    assert.deepEqual(puts, []);
+    assert.deepEqual(calls, []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

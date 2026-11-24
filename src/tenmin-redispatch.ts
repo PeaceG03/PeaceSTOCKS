@@ -403,8 +403,9 @@ export function heldDayResolution(
   if (!day || daily.status !== "RAN" || !daily.finishedAt || !(daily.finishedAt > heldSinceIso)) return undefined;
   const sessions = daily.sessions ?? [];
   const status = sessions.find((s) => s.sessionDate === day)?.status;
-  // SKIPPED_RANGE_SEALED: the held day's range sealed; the daily step no longer works it (Auditor B3).
-  if (status === "COMPLETE" || status === "STUCK_SHORT" || status === "SKIPPED_RANGE_SEALED") return `${day}:${status}`;
+  // Under a sealed range the daily step reports a tracked day STUCK_SHORT (stamped SEALED_OVER); a bare
+  // SKIPPED_RANGE_SEALED is not a resolution (only full or STUCK_SHORT unblocks, Auditor round 4).
+  if (status === "COMPLETE" || status === "STUCK_SHORT") return `${day}:${status}`;
   // Older than every session in the step's window: it is no longer retried, and the step recorded it
   // STUCK_SHORT when it left the window (the restarted run re-checks the hold itself).
   const oldest = sessions.map((s) => s.sessionDate).sort()[0];
