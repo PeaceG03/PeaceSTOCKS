@@ -132,11 +132,35 @@ export async function loadSessionStatuses(store: Pick<HealthCheckinStore, "get">
   return jsonl<PredictionStatus>(await store.get(`permanent/prediction-status/${sessionDate}.jsonl`));
 }
 
-/** The health store plus a create-only put (the alert marker claim) and delete (release a failed claim). */
+/**
+ * The health store plus a create-only put (the alert marker claim), delete (release a failed claim), and a
+ * versioned read and conditional replace (take over an expired claim).
+ */
 export type FreezeWatchStore = HealthCheckinStore & {
   putIfAbsent(key: string, body: Uint8Array): Promise<boolean>;
   delete(key: string): Promise<void>;
+  getWithEtag(key: string): Promise<{ body: Uint8Array; etag: string } | undefined>;
+  putIfMatch(key: string, body: Uint8Array, etag: string): Promise<boolean>;
 };
+
+/**
+ * A claim older than this that never reached ALERTED was left by a run killed between the claim and the
+ * alert; the next run takes it over. Far above an alert's few seconds, so a live claim is never taken.
+ */
+export const MISSED_FREEZE_CLAIM_EXPIRY_MS = 2 * 60 * 60 * 1000;
+
+/** Pure: the marker is a claim (never ALERTED) older than the expiry. Unreadable markers are not. */
+export function claimExpired(body: Uint8Array, now: Date): boolean {
+  let marker: { at?: unknown; alert?: unknown; state?: unknown };
+  try {
+    marker = JSON.parse(new TextDecoder().decode(body)) as typeof marker;
+  } catch {
+    return false;
+  }
+  if (!marker || marker.state === "ALERTED" || marker.alert !== "CLAIMED") return false;
+  const at = typeof marker.at === "string" ? Date.parse(marker.at) : Number.NaN;
+  return Number.isFinite(at) && now.getTime() - at > MISSED_FREEZE_CLAIM_EXPIRY_MS;
+}
 
 export interface FreezeWatchDeps {
   store: FreezeWatchStore;
@@ -162,12 +186,19 @@ export async function runFreezeWatch(
   const missed = outcomes.slice(0, MISSED_FREEZE_LOOKBACK_SESSIONS).filter((o) => o.outcome !== "ON_TIME");
   // Claim each marker with one conditional put (If-None-Match: *). The scan job's last step and the :47 tick
   // are in different concurrency groups; head-then-put let both see no marker and both alert. A refused
-  // claim (412) means another run already alerted (or is alerting) for that session.
+  // claim (412) means another run already alerted (or is alerting) for that session, unless that claim
+  // expired: then one conditional replace (If-Match: <etag>) takes it over, and only one racer wins.
   const fresh: SessionFreeze[] = [];
   const markerKey = (miss: SessionFreeze) => `${MISSED_FREEZE_ALERT_PREFIX}${miss.sessionDate}.json`;
   for (const miss of missed) {
-    const claim = new TextEncoder().encode(`${JSON.stringify({ at: now.toISOString(), ...miss, alert: "CLAIMED" }, null, 2)}\n`);
-    if (await deps.store.putIfAbsent(markerKey(miss), claim)) fresh.push(miss);
+    const key = markerKey(miss);
+    const claim = new TextEncoder().encode(`${JSON.stringify({ at: now.toISOString(), ...miss, alert: "CLAIMED", state: "CLAIMED" }, null, 2)}\n`);
+    if (await deps.store.putIfAbsent(key, claim)) {
+      fresh.push(miss);
+      continue;
+    }
+    const existing = await deps.store.getWithEtag(key);
+    if (existing && claimExpired(existing.body, now) && (await deps.store.putIfMatch(key, claim, existing.etag))) fresh.push(miss);
   }
   if (!fresh.length)
     return { missed, alerted: [], reliability, line: `freeze watch: ${shareLine(reliability)}; ${missed.length} missed in the last ${MISSED_FREEZE_LOOKBACK_SESSIONS} sessions, none new` };
@@ -188,7 +219,7 @@ export async function runFreezeWatch(
   }
   // The claim is ours: record what the alert did.
   for (const miss of fresh)
-    await writeVerifiedHealthJson(deps.store, markerKey(miss), { at: now.toISOString(), ...miss, alert: did });
+    await writeVerifiedHealthJson(deps.store, markerKey(miss), { at: now.toISOString(), ...miss, alert: did, state: "ALERTED" });
   return { missed, alerted: fresh.map((m) => m.sessionDate), reliability, line: `freeze watch: ${shareLine(reliability)}; ${headline}; alert ${did}` };
 }
 

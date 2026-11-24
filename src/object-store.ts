@@ -27,6 +27,13 @@ export interface ObjectClient {
   list(prefix: string): Promise<string[]>;
   /** Every key under the prefix with its size, from the listing alone (no GET or HEAD per key). */
   listSizes?(prefix: string): Promise<ObjectListing[]>;
+  /** The body and its ETag (the version a conditional replace names), or undefined if the key does not exist. */
+  getWithEtag?(key: string): Promise<{ body: Uint8Array; etag: string } | undefined>;
+  /**
+   * Replace only that version (S3/R2 conditional write, If-Match: <etag>): true when replaced, false when
+   * the object changed or is gone. Used by the freeze watch to take over an expired alert claim.
+   */
+  putIfMatch?(key: string, body: Uint8Array, etag: string): Promise<boolean>;
 }
 
 export interface ObjectListing {
@@ -116,6 +123,9 @@ export function decodeRfc2047Value(value: string): string {
 export class MemoryObjectClient implements ObjectClient {
   private readonly objects = new Map<string, Uint8Array>();
   private readonly metadata = new Map<string, ObjectMetadata>();
+  /** Per-key write version, the memory store's ETag. */
+  private readonly versions = new Map<string, number>();
+  private writes = 0;
 
   async get(key: string): Promise<Uint8Array | undefined> {
     const found = this.objects.get(key);
@@ -126,6 +136,7 @@ export class MemoryObjectClient implements ObjectClient {
     assertObjectMetadata(metadata);
     this.objects.set(key, new Uint8Array(body));
     this.metadata.set(key, { ...metadata });
+    this.versions.set(key, ++this.writes);
   }
 
   async putIfAbsent(key: string, body: Uint8Array): Promise<boolean> {
@@ -142,6 +153,18 @@ export class MemoryObjectClient implements ObjectClient {
   async delete(key: string): Promise<void> {
     this.objects.delete(key);
     this.metadata.delete(key);
+    this.versions.delete(key);
+  }
+
+  async getWithEtag(key: string): Promise<{ body: Uint8Array; etag: string } | undefined> {
+    const found = this.objects.get(key);
+    return found ? { body: new Uint8Array(found), etag: `"m${this.versions.get(key)}"` } : undefined;
+  }
+
+  async putIfMatch(key: string, body: Uint8Array, etag: string): Promise<boolean> {
+    if (!this.objects.has(key) || `"m${this.versions.get(key)}"` !== etag) return false;
+    await this.put(key, body);
+    return true;
   }
 
   async list(prefix: string): Promise<string[]> {
@@ -388,6 +411,23 @@ export class R2ObjectClient implements ObjectClient {
   async delete(key: string): Promise<void> {
     const response = await this.request("DELETE", this.endpoint(key));
     if (!response.ok && response.status !== 404) throw new Error(`R2_DELETE_${response.status}`);
+  }
+
+  async getWithEtag(key: string): Promise<{ body: Uint8Array; etag: string } | undefined> {
+    const response = await this.request("GET", this.endpoint(key));
+    if (response.status === 404) return undefined;
+    if (!response.ok) throw new Error(`R2_GET_${response.status}`);
+    const etag = response.headers.get("etag");
+    if (!etag) throw new Error("R2_GET_NO_ETAG");
+    return { body: new Uint8Array(await response.arrayBuffer()), etag };
+  }
+
+  /** Replace only: PUT with If-Match: <etag> (signed). 412 (changed) or 404 (gone) is false. */
+  async putIfMatch(key: string, body: Uint8Array, etag: string): Promise<boolean> {
+    const response = await this.request("PUT", this.endpoint(key), body, { "if-match": etag });
+    if (response.status === 412 || response.status === 404) return false;
+    if (!response.ok) throw new Error(`R2_PUT_${response.status}`);
+    return true;
   }
 
   async list(prefix: string): Promise<string[]> {
