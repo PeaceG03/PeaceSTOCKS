@@ -418,3 +418,20 @@ The Grok team should focus on:
 - multi-session reliability.
 
 Only then should Scanner V0 be declared operational.
+
+## Held-out evaluation of the pick lists
+
+`src/holdout-eval.ts` (with the offline CLI `src/holdout-eval-cli.ts`) scores the lists on stored
+daily bars copied to a local directory. It never reads R2 or the network and prints aggregates only.
+
+- The ranker has no fitted parameters: its weights (above) were set by hand on 2026-08-26 and have
+  not changed. Sessions after that date are out of sample; earlier sessions are reported apart.
+- For each session D it rebuilds what a forward scan at D saw: bars up to D in the scan's own
+  window, ACTIVE = has a bar on D, eligibility from the bar count up to D (not the all-time count),
+  then the production `rankSecurities`.
+- Outcome: enter at the next session's open (lists freeze before it), exit at the close h sessions
+  after D. A name-window with a known split or reverse split after entry is dropped. Optional
+  winsorizing clips picks and baselines alike to the session's universe quantiles.
+- Baselines on the same sessions and names: the equal-weight universe average (every ranked name
+  with an outcome), random same-size lists from that universe (one-sided p = share of random
+  averages at or above the list's), and SPY. Also the mean daily Spearman IC of the overall score.
