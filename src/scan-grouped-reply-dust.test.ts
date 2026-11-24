@@ -609,7 +609,8 @@ test("daily-bars pack: a different existing pack FAILS the run with DAILY_BARS_P
   assert.equal(report.dailyBarsSidecar?.status, "exists-different");
   assert.ok(report.unresolvedFailures.includes(`DAILY_BARS_PACK_EXISTS_DIFFERENT:${DAY}`));
   assert.deepEqual(await packStore.get(dailyBarsSidecarFileKey(DAY)), before); // never overwritten
-  assert.ok((await barsClient.get(`permanent/daily-bars/${DAY.slice(0, 7)}.jsonl`))?.length); // JSONL still written
+  // Refused before any session write: nothing appended (was: JSONL still written).
+  assert.equal(await barsClient.get(`permanent/daily-bars/${DAY.slice(0, 7)}.jsonl`), undefined);
 });
 
 test("daily-bars pack: a write error FAILS the run with DAILY_BARS_PACK_WRITE_FAILED:<date>:<code> only", async () => {

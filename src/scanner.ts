@@ -21,7 +21,13 @@ import { refreshEligibility, refreshUniverse } from "./universe";
 import type { MarketStore } from "./storage";
 import { US_EQUITY_MARKET_CALENDAR, usEquityCalendarSha256 } from "./us-calendar";
 import type { DustReader } from "./reader";
-import { type ScanDailyBarsSidecarReport, maybeWriteScanDailyBarsSidecar } from "./daily-bars-sidecar";
+import {
+  DAILY_BARS_PACK_EXISTS_DIFFERENT,
+  DAILY_BARS_ROWS_OUTSIDE_PACK,
+  type ScanDailyBarsSidecarReport,
+  checkSealedDailyBarsPack,
+  maybeWriteScanDailyBarsSidecar,
+} from "./daily-bars-sidecar";
 import { corporateActionCoverageRecords } from "./corporate-action-coverage";
 import type { ReplyDustStore } from "./intraday-reply-dust";
 import type { ReplyDustBackend } from "./reply-dust";
@@ -179,6 +185,67 @@ export class MarketsScanner {
       });
     }
     const failures: string[] = [];
+    const packOptions =
+      this.dailyBarsPack ??
+      (this.groupedReplyDust?.store
+        ? {
+            store: this.groupedReplyDust.store,
+            ...(this.groupedReplyDust.backend ? { backend: this.groupedReplyDust.backend } : {}),
+            ...(this.groupedReplyDust.zstdVersionProbe
+              ? { zstdVersionProbe: this.groupedReplyDust.zstdVersionProbe }
+              : {}),
+          }
+        : undefined);
+    // Pack check FIRST, before any session write or Massive request. A sealed pack that holds the stored
+    // rows makes the stored evidence authoritative: re-collecting with today's universe would append
+    // rows under other identities after the seal (live Oct 13-21: 3-17 per day) and fail every retry.
+    if (packOptions) {
+      const storedRows = await this.storage.loadBars(sessionDate);
+      const sealed = await checkSealedDailyBarsPack({
+        store: packOptions.store,
+        sessionDate,
+        storedRows,
+        ...(packOptions.backend ? { backend: packOptions.backend } : {}),
+      });
+      if (sealed.state === "conflict") {
+        const failure = `${DAILY_BARS_PACK_EXISTS_DIFFERENT}:${sessionDate}`;
+        return this.finish({
+          runId,
+          session,
+          status: "FAILED",
+          expectedSecurities: 0,
+          processedSecurities: 0,
+          validSecurities: 0,
+          incompleteSecurities: 0,
+          unresolvedFailures: [failure],
+          scannerVersion: SCANNER_VERSION,
+          ...(this.groupedReplyDust ? { groupedReplyDust: disabledScanGroupedReplyDustReport("PACK_CONFLICT") } : {}),
+          dailyBarsSidecar: { enabled: true, sessionDate, status: "exists-different", bytesWritten: 0, warnings: [failure], failure },
+        });
+      }
+      if (sealed.state === "verified")
+        return this.rankAndFinish({
+          runId,
+          session,
+          sessionDate,
+          mode,
+          failures: sealed.outsidePack ? [`${DAILY_BARS_ROWS_OUTSIDE_PACK}:${sessionDate}:${sealed.outsidePack}`] : [],
+          bars: storedRows,
+          expected: storedRows.length,
+          received: new Set(storedRows.map((row) => row.securityId)),
+          incomplete: 0,
+          ...(this.groupedReplyDust ? { groupedReplyDust: disabledScanGroupedReplyDustReport("PACK_SEALED") } : {}),
+          dailyBarsSidecar: {
+            enabled: true,
+            sessionDate,
+            status: "sealed-verified",
+            source: sealed.source,
+            rows: sealed.rows,
+            bytesWritten: 0,
+            warnings: sealed.outsidePack ? [`${DAILY_BARS_ROWS_OUTSIDE_PACK}:${sessionDate}:${sealed.outsidePack}`] : [],
+          },
+        });
+    }
     let refresh;
     try {
       refresh = await refreshUniverse(this.provider, this.storage, sessionDate);
@@ -328,17 +395,6 @@ export class MarketsScanner {
     // Daily-bars pack alongside the JSONL write (which is unchanged): not gated on grouped Reply Dust;
     // bound to the day's grouped Dust when sealed, otherwise a pure pack. A different existing pack or
     // any write error FAILS the run (non-zero exit) with a code and the session date only.
-    const packOptions =
-      this.dailyBarsPack ??
-      (this.groupedReplyDust?.store
-        ? {
-            store: this.groupedReplyDust.store,
-            ...(this.groupedReplyDust.backend ? { backend: this.groupedReplyDust.backend } : {}),
-            ...(this.groupedReplyDust.zstdVersionProbe
-              ? { zstdVersionProbe: this.groupedReplyDust.zstdVersionProbe }
-              : {}),
-          }
-        : undefined);
     let dailyBarsSidecar: ScanDailyBarsSidecarReport | undefined;
     if (packOptions)
       dailyBarsSidecar = await maybeWriteScanDailyBarsSidecar({
@@ -352,6 +408,46 @@ export class MarketsScanner {
       });
     const packFailure = dailyBarsSidecar?.failure;
     if (packFailure) failures.push(packFailure);
+    return this.rankAndFinish({
+      runId,
+      session,
+      sessionDate,
+      mode,
+      failures,
+      bars,
+      expected,
+      received,
+      incomplete,
+      securities,
+      allBars,
+      ...(packFailure ? { packFailure } : {}),
+      ...(groupedReplyDust ? { groupedReplyDust } : {}),
+      ...(dailyBarsSidecar ? { dailyBarsSidecar } : {}),
+    });
+  }
+
+  /** Eligibility, ranking, prediction status and the run report; shared by collected and sealed sessions. */
+  private async rankAndFinish(input: {
+    runId: string;
+    session: ReturnType<SessionCalendar["getSession"]>;
+    sessionDate: string;
+    mode: ScannerRunMode;
+    failures: string[];
+    bars: CanonicalDailyBar[];
+    expected: number;
+    received: Set<string>;
+    incomplete: number;
+    securities?: SecurityMasterRecord[];
+    allBars?: CanonicalDailyBar[];
+    packFailure?: string;
+    groupedReplyDust?: ScanGroupedReplyDustReport;
+    dailyBarsSidecar?: ScanDailyBarsSidecarReport;
+  }): Promise<ScannerRunReport> {
+    const { runId, session, sessionDate, mode, failures, bars, expected, received, incomplete, packFailure, groupedReplyDust, dailyBarsSidecar } = input;
+    const securities = input.securities ?? (await refreshEligibility(this.storage));
+    const allBars =
+      input.allBars ??
+      (await this.storage.loadBarsBetween(scanBarWindowStart(sessionDate, this.calendar), sessionDate));
     const spyId = resolveSpyBenchmarkId(securities);
     const benchmark = spyId ? allBars.filter((bar) => bar.securityId === spyId) : [];
     const spySessions = new Set(benchmark.map((bar) => bar.sessionDate));
