@@ -799,6 +799,8 @@ export async function runTenMinDailyLiquid(options: {
             fetchTo: sessionDate,
             backend,
             origin: TENMIN_DAILY_CLOSE_ORIGIN,
+            // Done-day rule: a short stored reply is replaced by this one, which holds more bars.
+            ...(prior ? { replace: "shorter-reply" as const } : {}),
           });
           stored.set(name.securityId, { securityId: name.securityId, fetch, bars });
           gaps.delete(name.securityId);

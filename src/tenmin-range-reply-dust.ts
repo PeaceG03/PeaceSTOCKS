@@ -455,11 +455,17 @@ export async function writeTenMinRangeFetch(
     link?: string;
     /** rd-origin (see tenMinRangeObjectMetadata). */
     origin?: string;
+    /** Named overwrite of an existing object at the same key (see storeVerifiedReplyDust); refused once the range is sealed. */
+    replace?: "shorter-reply" | "unverified";
   },
 ): Promise<{ securityId: string; fetch: TenMinRangeTickerFetch }> {
   const { calendarFrom, calendarTo, fetchFrom, fetchTo, provider } = options;
   requireRange(calendarFrom, calendarTo);
   requireRange(fetchFrom, fetchTo);
+  // Under a sealed range no existing object is ever replaced (Auditor B3): the named overwrite is
+  // dropped, so a different object at an existing key is refused; new keys (a manual reopen) still write.
+  const replace =
+    options.replace && !(await store.head(tenMinRangeManifestKey(calendarFrom, calendarTo))) ? options.replace : undefined;
   const first = pages[0];
   if (!first) throw new Error("TENMIN_RANGE_NO_PAGES");
   if (pages.length > TENMIN_RANGE_PAGE_CAP)
@@ -521,6 +527,7 @@ export async function writeTenMinRangeFetch(
           ...(options.link !== undefined ? { link: options.link } : {}),
           ...(options.origin !== undefined ? { origin: options.origin } : {}),
         }),
+      replace ? { replace } : {},
     );
     files.push(entryFor(encoded));
   }
@@ -1257,6 +1264,8 @@ export async function writeTenMinRangeReplyDust(options: {
           fetchFrom: planned.fetchFrom,
           fetchTo: planned.fetchTo,
           backend,
+          // Reached only after resume found no stored copy of this fetch that verifies.
+          replace: "unverified",
           ...(options.securityLink ? { link: options.securityLink.source } : {}),
         });
         filesWritten += fetch.files.length;
