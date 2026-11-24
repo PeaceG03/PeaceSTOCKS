@@ -55,3 +55,7 @@ The scanners scheduled entry is runDueCollection. It deliberately separates the 
 Storage is separated into permanent/ evidence, cache/ rebuildable derived material, and transient/ cleanup workspace. Daily bars are raw/unadjusted source evidence; adjustments and technical features are reconstructed from evidence plus versioned recipes.
 
 Historical evidence backfill is run with `pnpm backfill -- --from YYYY-MM-DD --to YYYY-MM-DD`. It is evidence-only, resumable via `backfill-state.json`, idempotent, and never creates scanner beliefs or predictions. Prediction availability is recorded separately under `permanent/prediction-status/` so a provider failure cannot be confused with a valid empty candidate set.
+
+## Private site
+
+A read-only, single-login status page at stocks.jjpeace.com: see [docs/SITE.md](docs/SITE.md).

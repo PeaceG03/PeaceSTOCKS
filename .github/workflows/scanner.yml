@@ -63,6 +63,9 @@ on:
     - cron: "30 5 * * 2-6"
     # Later UTC morning retry if Massive was not ready yet (04:30 EST / 05:30 EDT). Saturday covers Friday.
     - cron: "30 9 * * 2-6"
+    # Observed Nov 2026: GitHub has not been firing the 05:30/09:30 UTC scan crons above (no scheduled
+    # run near either slot in the week to Nov 24, 2026). In practice the scan path is the hourly :47
+    # restarter's scan_backstop plus the chain follow-ups. See docs/SCANNER.md.
     # Ten-minute history restarter: hourly at :47 (off the :00/:30 marks). Runs ONLY the restarter
     # job (tenmin-history-fallback.yml via workflow_call); the scan job skips this cron. The decide
     # step waits (no dispatch) inside or just before a guard window and while any scan/history run

@@ -190,6 +190,13 @@ This led to requirements for:
 - explicit failure states;
 - consecutive successful-session certification.
 
+#### GitHub Actions scan crons (observed Nov 2026)
+
+scanner.yml schedules the scan at 05:30 and 09:30 UTC, Tue–Sat (`30 5 * * 2-6`, `30 9 * * 2-6`).
+GitHub has not been firing those two crons: in the week to Nov 24, 2026 no scheduled run started near
+either slot. In practice the scan runs through the hourly :47 restarter's `scan_backstop` and the
+chain follow-ups (scan dispatched after a history run), so it arrives late but is not skipped.
+
 ### Forward prediction integrity
 
 Historical evidence can be backfilled.

@@ -1,0 +1,95 @@
+name: Site deploy
+# Deploys the private PeaceSTOCKS site (src/read-worker.ts) to https://stocks.jjpeace.com.
+# Manual only. Order is fail-closed: the Cloudflare Access app + single-email policy are created or
+# updated and read back FIRST; if that fails, nothing is deployed. The Worker itself also refuses any
+# request without a valid Access JWT for the allowed email (403/503), and reads R2 only with the
+# read-only key pair. Never prints the email or any key.
+on:
+  workflow_dispatch:
+    inputs:
+      team_domain:
+        description: "Cloudflare Access team domain, e.g. myteam.cloudflareaccess.com (blank = look it up)"
+        required: false
+        default: ""
+permissions:
+  contents: read
+concurrency:
+  group: site-deploy
+  cancel-in-progress: false
+env:
+  SITE_HOSTNAME: stocks.jjpeace.com
+  WRANGLER_VERSION: 4.167.0
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Required secrets present (names only)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+          PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+          PEACESTOCKS_R2_READ_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_READ_ACCESS_KEY_ID }}
+          PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY }}
+          PEACESTOCKS_SITE_ALLOWED_EMAIL: ${{ secrets.PEACESTOCKS_SITE_ALLOWED_EMAIL }}
+        run: |
+          missing=0
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID PEACESTOCKS_R2_BUCKET PEACESTOCKS_R2_READ_ACCESS_KEY_ID PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY PEACESTOCKS_SITE_ALLOWED_EMAIL; do
+            if [ -z "${!name}" ]; then echo "::error::missing secret: $name"; missing=1; fi
+          done
+          exit "$missing"
+      - name: Worker typecheck and site tests
+        run: |
+          pnpm run typecheck:worker
+          pnpm exec tsx --test src/access-jwt.test.ts src/read-worker-site.test.ts src/site-page.test.ts src/r2-read-client.test.ts src/site-access-setup.test.ts
+      - name: Cloudflare Access app and single-email policy (deploy stops here on failure)
+        id: access
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+          SITE_ALLOWED_EMAIL: ${{ secrets.PEACESTOCKS_SITE_ALLOWED_EMAIL }}
+          ACCESS_TEAM_DOMAIN: ${{ inputs.team_domain }}
+        run: pnpm exec tsx src/site-access-setup.ts
+      - name: Deploy Worker (custom domain stocks.jjpeace.com)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+          ACCESS_AUD: ${{ steps.access.outputs.aud }}
+          ACCESS_TEAM_DOMAIN: ${{ steps.access.outputs.team_domain }}
+        run: |
+          test -n "$ACCESS_AUD" && test -n "$ACCESS_TEAM_DOMAIN"
+          npx --yes "wrangler@${WRANGLER_VERSION}" deploy --var "ACCESS_AUD:${ACCESS_AUD}" --var "ACCESS_TEAM_DOMAIN:${ACCESS_TEAM_DOMAIN}"
+      - name: Worker secrets (allowed email, read-only R2 keys)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+          ALLOWED_EMAIL: ${{ secrets.PEACESTOCKS_SITE_ALLOWED_EMAIL }}
+          R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+          R2_READ_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_READ_ACCESS_KEY_ID }}
+          R2_READ_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY }}
+        run: |
+          umask 077
+          file="$RUNNER_TEMP/site-secrets.json"
+          trap 'rm -f "$file"' EXIT
+          node -e 'const e=process.env; require("fs").writeFileSync(process.argv[1], JSON.stringify({ALLOWED_EMAIL:e.ALLOWED_EMAIL.trim(),R2_ACCOUNT_ID:e.CLOUDFLARE_ACCOUNT_ID,R2_BUCKET:e.R2_BUCKET,R2_READ_ACCESS_KEY_ID:e.R2_READ_ACCESS_KEY_ID,R2_READ_SECRET_ACCESS_KEY:e.R2_READ_SECRET_ACCESS_KEY}))' "$file"
+          npx --yes "wrangler@${WRANGLER_VERSION}" secret bulk "$file"
+      - name: Confirm the site is not public
+        run: |
+          for i in $(seq 1 24); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://${SITE_HOSTNAME}/" || true)
+            loc=$(curl -s -o /dev/null -w '%{redirect_url}' --max-time 15 "https://${SITE_HOSTNAME}/" || true)
+            if [ "$code" = "200" ]; then echo "::error::https://${SITE_HOSTNAME}/ answered 200 without a login"; exit 1; fi
+            case "$loc" in *.cloudflareaccess.com/*) echo "SITE_GATED: redirects to Access login ($code)"; exit 0;; esac
+            echo "waiting for ${SITE_HOSTNAME} (got ${code:-none}); try $i/24"; sleep 10
+          done
+          echo "::error::could not confirm the Access login on https://${SITE_HOSTNAME}/ (the Worker still refuses requests without a valid Access JWT)"
+          exit 1
