@@ -97,3 +97,12 @@ test("site deploy workflow: the 6 secrets are read only inside the 'site' deploy
   }
   assert.match(section, /fresh\s+site-only R2 API token: Object Read only, on the `peacestocks` bucket only/u);
 });
+
+test("site deploy workflow: runs on Node >= 22.12 (wrangler 4 and miniflare require it)", () => {
+  const versions = [...workflow.matchAll(/\n\s+node-version: "?([0-9.x]+)"?\n/gu)].map((m) => m[1]!);
+  assert.equal(versions.length, 1, "one setup-node step");
+  const [major, minor = "x"] = versions[0]!.split(".");
+  const okMajor = Number(major) >= 23;
+  const ok22 = Number(major) === 22 && (minor === "x" || minor === undefined || Number(minor) >= 12);
+  assert.ok(okMajor || ok22, `node-version ${versions[0]} is below 22.12`);
+});
