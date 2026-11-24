@@ -233,6 +233,8 @@ jobs:
         if: ${{ always() && github.ref == 'refs/heads/main' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # Not used by the freeze watch: blank the job-level Massive key for this step.
+          MASSIVE_API_KEY: ""
         run: pnpm -s exec tsx src/freeze-watch.ts
 
   # Daily liquid 10-minute step: the just-closed session(s) for the top TENMIN_DAILY_LIQUID_N names
