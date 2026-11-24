@@ -1,11 +1,13 @@
 // The variant log and the held-out seal live in ONE pinned ledger, not in --out: a fresh --out
 // folder can neither reset the Holm family nor reopen / re-register the seal.
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { AppendOnlyLog, gitCommittedHead } from "./append-only-log";
+import { AppendOnlyLog, gitCommittedHead, stableJson } from "./append-only-log";
 import { RESEARCH_LEDGER_DIR, researchMain } from "./research-harness-cli";
 import type { VariantRecord } from "./research-variants";
 import { writeSyntheticStore } from "./research-fixture";
@@ -73,5 +75,32 @@ test("the CLI's Holm family counts every candidate variant in the ledger, not ju
     const r = report(join(root, "out"));
     assert.equal(r.variantsTried, 8); // 3 earlier + 5 now
     assert.ok(r.results.every((x) => x.familySize === 8), JSON.stringify(r.results.map((x) => x.familySize))); // 6 strategies, 8 variants
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the CLI reads its ledger against the committed heads: rewriting a committed log and its head file is refused", async () => {
+  const root = mkdtempSync(join(tmpdir(), "research-anchor-"));
+  const ledgerDir = join(root, "repo", "research-ledger");
+  const git = (...args: string[]) => execFileSync("git", ["-C", join(root, "repo"), "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], { encoding: "utf8" });
+  try {
+    writeSyntheticStore(root, { from: "2025-01-01", to: "2025-08-29" });
+    mkdirSync(ledgerDir, { recursive: true });
+    git("init", "-q");
+    await researchMain(base(root, join(root, "out1"), "scanner-a"), { ledgerDir });
+    git("add", "research-ledger");
+    git("commit", "-q", "-m", "ledger");
+    // Drop the last variant record, re-chain, and write a matching head file (no git change).
+    const path = join(ledgerDir, "variants.jsonl");
+    const kept = readFileSync(path, "utf8").trimEnd().split("\n").slice(0, -1).map((l) => JSON.parse(l) as { at: string; entry: unknown });
+    let prev = "";
+    const text = kept.map((l, seq) => {
+      const hash = createHash("sha256").update(`${seq}|${prev}|${l.at}|${stableJson(l.entry)}`).digest("hex");
+      const line = JSON.stringify({ seq, prev, at: l.at, entry: l.entry, hash });
+      prev = hash;
+      return `${line}\n`;
+    }).join("");
+    writeFileSync(path, text);
+    writeFileSync(`${path}.head`, `${JSON.stringify({ seq: kept.length - 1, hash: prev })}\n`);
+    await assert.rejects(researchMain(base(root, join(root, "out2"), "scanner-a"), { ledgerDir }), /LOG_TAMPERED.*anchor/u);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
