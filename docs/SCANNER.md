@@ -138,6 +138,13 @@ session). A name is dropped for that session, nothing is guessed:
 - SPLIT_LIKE_MOVE_UNRECORDED: a move of 1.8x or more either way into any of the last 20 sessions.
   Split records arrive late (none in 2026-07..11 was recorded on its effective date), so a 2-for-1
   or 1-for-2 whose record has not arrived would otherwise read as a -50% / +100% day.
+  The cost: most of what this rule drops are real big movers, not splits. In the held-out replay
+  (2026-08-27..11-20, effective-date) it dropped 2,901 name-sessions (47.6 per session, 0.46%), and
+  only about 20% of them had any split record within -25..+30 sessions of the scan (565 in the
+  Auditor's count, 574 in ours; the windows are counted slightly differently). So about 80% are real
+  movers. With the rule off, those names would have taken 65 of the 915 TOP_15_OVERALL slots (about
+  7%, on 49 of 61 sessions) and 129 TOP_50 slots. The held-out conclusion (no robust edge) is the same
+  with or without the rule.
 
 The thresholds were chosen from the 2026 split records (build log `predictions-on.md`). The run
 report lists the count in `skips` as `SPLIT_ADJUST_EXCLUDED:<n>`. If the split records cannot be read,
