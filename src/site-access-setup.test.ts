@@ -221,3 +221,27 @@ test("access setup: the app is found by hostname only; a same-named app on anoth
   assert.equal(both.apps.get("app-ours")!.name, SITE_ACCESS_APP_NAME);
   assert.deepEqual(both.apps.get("app-elsewhere"), elsewhere);
 });
+
+test("access setup: the policy is found by name; an unrelated policy listed first is never overwritten", async () => {
+  const unrelated = { id: "pol-unrelated", name: "Someone else's policy", decision: "allow", include: [{ everyone: {} }], exclude: [], require: [] };
+  // Unrelated first and ours second: ours is updated, the unrelated one untouched.
+  const both = fakeCloudflare();
+  both.policies.set("pol-unrelated", structuredClone(unrelated));
+  both.policies.set("pol-ours", { id: "pol-ours", name: SITE_ACCESS_POLICY_NAME, decision: "allow", include: [{ email: { email: "old@example.test" } }] });
+  const updated = await setupSiteAccess(input(both.fetchImpl));
+  assert.equal(updated.policyId, "pol-ours");
+  assert.equal(updated.created.policy, false);
+  assert.deepEqual(both.calls.filter((c) => c.startsWith("PUT /policies") || c === "POST /policies"), ["PUT /policies/pol-ours"]);
+  assert.deepEqual(both.policies.get("pol-unrelated"), unrelated);
+  assert.deepEqual(both.policies.get("pol-ours")!.include, [{ email: { email: EMAIL } }]);
+
+  // Only the unrelated one: ours is created, the unrelated one untouched and not attached.
+  const lone = fakeCloudflare();
+  lone.policies.set("pol-unrelated", structuredClone(unrelated));
+  const created = await setupSiteAccess(input(lone.fetchImpl));
+  assert.equal(created.created.policy, true);
+  assert.notEqual(created.policyId, "pol-unrelated");
+  assert.ok(!lone.calls.some((c) => c.startsWith("PUT /policies")), lone.calls.join(", "));
+  assert.deepEqual(lone.policies.get("pol-unrelated"), unrelated);
+  assert.deepEqual(lone.apps.get(created.appId)!.policies, [{ id: created.policyId, precedence: 1 }]);
+});
