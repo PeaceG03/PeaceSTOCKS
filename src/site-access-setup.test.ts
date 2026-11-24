@@ -194,3 +194,30 @@ test("access setup: a retry after a failed deploy reuses the app and policy the 
   assert.equal(again.aud, "aud-prior");
   assert.ok(!cf.calls.some((c) => c.startsWith("POST ")));
 });
+
+test("access setup: the app is found by hostname only; a same-named app on another hostname is never chosen", async () => {
+  // Only a same-named app elsewhere: ours must be created, the other left alone.
+  const elsewhere = { id: "app-elsewhere", name: SITE_ACCESS_APP_NAME, type: "self_hosted", domain: "other.example.test", aud: "aud-elsewhere", policies: [{ id: "pol-x" }] };
+  const lone = fakeCloudflare();
+  lone.apps.set("app-elsewhere", structuredClone(elsewhere));
+  const created = await setupSiteAccess(input(lone.fetchImpl));
+  assert.deepEqual(created.created, { app: true, policy: true });
+  assert.notEqual(created.appId, "app-elsewhere");
+  assert.ok(lone.calls.includes("POST /apps"), lone.calls.join(", "));
+  assert.ok(!lone.calls.some((c) => c.startsWith("PUT /apps")), lone.calls.join(", "));
+  assert.deepEqual(lone.apps.get("app-elsewhere"), elsewhere);
+  assert.equal(lone.apps.size, 2);
+
+  // Ours on the hostname (under an old name) plus the same-named app elsewhere: ours is updated.
+  const both = fakeCloudflare();
+  both.apps.set("app-elsewhere", structuredClone(elsewhere));
+  both.apps.set("app-ours", { id: "app-ours", name: "renamed earlier", type: "self_hosted", domain: HOST, aud: "aud-ours", policies: [] });
+  const updated = await setupSiteAccess(input(both.fetchImpl));
+  assert.equal(updated.appId, "app-ours");
+  assert.equal(updated.aud, "aud-ours");
+  assert.equal(updated.created.app, false);
+  assert.ok(!both.calls.includes("POST /apps"), both.calls.join(", "));
+  assert.deepEqual(both.calls.filter((c) => c.startsWith("PUT /apps")), ["PUT /apps/app-ours"]);
+  assert.equal(both.apps.get("app-ours")!.name, SITE_ACCESS_APP_NAME);
+  assert.deepEqual(both.apps.get("app-elsewhere"), elsewhere);
+});
