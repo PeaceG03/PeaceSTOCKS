@@ -384,7 +384,8 @@ jobs:
     uses: ./.github/workflows/scan-backstop.yml
 
   backfill:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'backfill' }}
+    # No backfill from a topic branch: the job writes the canonical evidence store.
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'backfill' && github.ref == 'refs/heads/main' }}
     # Pinned so the runner image cannot change mid-rollout; move to 26.04 deliberately later.
     runs-on: ubuntu-24.04
     # actions: read lets backfill see a queued scan and yield the Massive budget to it.

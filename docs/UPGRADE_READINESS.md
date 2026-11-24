@@ -24,7 +24,7 @@ of sessions after the floor. If the start lands before the plan window, the run 
 
 ## Upgrade-day commands (Peace runs these; this PR dispatches nothing)
 
-`scanner.yml` with `mode=backfill` runs `pnpm backfill`, which is the verified job
+`scanner.yml` with `mode=backfill` on main only runs `pnpm backfill`, which is the verified job
 (`src/backfill-job-cli.ts` -> `runBackfillJob`): Reply Dust on, a sealed daily-bars pack per session,
 and both re-verified against their sha. The range is split into fixed chunks of
 `backfill_chunk_sessions` (default 150) sessions, each with its own checkpoint. `max_sessions` caps
@@ -44,6 +44,8 @@ gh workflow run scanner.yml -R PeaceG03/PeaceSTOCKS -f mode=backfill -f from=202
 | 0, `complete:false` | stopped at `MAX_SESSIONS`, `BUDGET` or `YIELDED` (a queued scan) | re-dispatch unchanged |
 | 2 | a session failed (`PLAN_WINDOW`, auth, 5xx after retries) | see the table below, then re-dispatch |
 | 3 | `REFUSED_SHA_MISMATCH` or `REFUSED_PACK_CONFLICT` | stop and investigate; nothing is overwritten |
+
+The workflow skips non-main refs, and the CLI also refuses them on Actions (`BACKFILL_MAIN_ONLY`). No environment approval gate was added: the workflow has no named environment configured here, so a new name could silently create an unprotected environment.
 
 The run logs JSON lines with codes, dates and counts only (no symbols, no keys).
 
