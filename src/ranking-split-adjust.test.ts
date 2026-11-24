@@ -171,3 +171,18 @@ test("bars before the split: prices x factor, volume / factor (dollar volume kep
   assert.deepEqual(got.bars.map((x) => [x.close, x.volume]), [[10, 100], [11, 200], [10.5, 300], [10, 400]]);
   assert.equal(got.bars[2], b[2]);
 });
+
+test("two different split factors recorded for one name on the same date: excluded, never multiplied", () => {
+  // Synthetic version of a real case: a 1-for-10 reverse and a 2-for-1 forward, both effective the same day.
+  // Raw prices jump exactly 5x, so multiplying the two factors (10 x 0.5) would "reconcile" perfectly.
+  const { securities, bars } = world(5);
+  const result = rank(securities, bars, [], D, DEFAULT_SCANNER_CONFIG, [
+    split("rs", SPLIT_DAY, 10, 1),
+    { ...split("rs", SPLIT_DAY, 1, 2), actionId: "a_rs_second" },
+  ]);
+  assert.equal(result.ranked.some((r) => r.securityId === "rs"), false);
+  assert.deepEqual(result.excluded, [{ securityId: "rs", reason: "SPLIT_UNRECONCILED" }]);
+  // The same factor recorded twice (two ids) is one split, not a conflict.
+  const dup = rank(securities, world(10).bars, [], D, DEFAULT_SCANNER_CONFIG, [split("rs", SPLIT_DAY, 10, 1), { ...split("rs", SPLIT_DAY, 10, 1), actionId: "dup" }]);
+  assert.ok(dup.ranked.some((r) => r.securityId === "rs"));
+});

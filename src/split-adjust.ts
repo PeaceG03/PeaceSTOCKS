@@ -6,7 +6,8 @@
  * bar before E: prices x (split_from / split_to), volume / the same factor (dollar volume unchanged).
  * The adjustment is used only when the prices agree with it: the adjusted move from the last close
  * before E to the first close on/after E must be within [1/2, 2]. Otherwise, or when the record has
- * no usable factor, the name is dropped for that session (SPLIT_UNRECONCILED). After adjusting, any
+ * no usable factor (including two different factors recorded for one date), the name is dropped for
+ * that session (SPLIT_UNRECONCILED). After adjusting, any
  * session-to-session close move of 3x or more either way (no recorded split explains it, or the
  * split data is missing) also drops the name (PRICE_GAP_UNEXPLAINED). Nothing is guessed.
  * Only splits effective on or before the scanned session are used.
@@ -28,22 +29,32 @@ export function isSplitAction(action: Pick<CorporateAction, "actionType">): bool
   return action.actionType === "SPLIT" || action.actionType === "REVERSE_SPLIT";
 }
 
-/** Split events by security, one per (date, factor), from any corporate-action records. */
+/** Split events by security, one per (date), from any corporate-action records; conflicting factors -> NaN. */
 export function splitEventsBySecurity(actions: readonly CorporateAction[]): Map<string, SplitEvent[]> {
-  const out = new Map<string, SplitEvent[]>();
-  const seen = new Set<string>();
+  // securityId -> effectiveDate -> distinct factors (NaN kept as "unusable").
+  const byName = new Map<string, Map<string, Set<number>>>();
   for (const action of actions) {
     if (!isSplitAction(action)) continue;
     const from = Number(action.details?.split_from);
     const to = Number(action.details?.split_to);
     const factor = Number.isFinite(from) && Number.isFinite(to) && from > 0 && to > 0 ? from / to : Number.NaN;
-    const key = `${action.securityId}|${action.effectiveDate}|${factor}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    let list = out.get(action.securityId);
-    if (!list) out.set(action.securityId, (list = []));
-    list.push({ effectiveDate: action.effectiveDate, factor });
+    let dates = byName.get(action.securityId);
+    if (!dates) byName.set(action.securityId, (dates = new Map()));
+    let factors = dates.get(action.effectiveDate);
+    if (!factors) dates.set(action.effectiveDate, (factors = new Set()));
+    factors.add(factor);
   }
+  const out = new Map<string, SplitEvent[]>();
+  for (const [securityId, dates] of byName)
+    out.set(
+      securityId,
+      [...dates].map(([effectiveDate, factors]) => ({
+        effectiveDate,
+        // The same factor recorded twice is one split. Different factors on one date conflict: unusable
+        // (never multiplied together), so the name is excluded as SPLIT_UNRECONCILED.
+        factor: factors.size === 1 ? [...factors][0]! : Number.NaN,
+      })),
+    );
   return out;
 }
 
@@ -63,7 +74,9 @@ export function splitAdjustedBars(
     const k = bars.findIndex((bar) => bar.sessionDate >= event.effectiveDate);
     if (k <= 0) continue; // the split is after the last bar we hold: nothing before it to rescale yet
     if (!Number.isFinite(event.factor)) return { excluded: "SPLIT_UNRECONCILED" };
-    byIndex.set(k, (byIndex.get(k) ?? 1) * event.factor);
+    // Two split dates that land on the same bar (no bar between them) cannot be told apart: excluded.
+    if (byIndex.has(k)) return { excluded: "SPLIT_UNRECONCILED" };
+    byIndex.set(k, event.factor);
   }
   for (const [k, factor] of byIndex) {
     const before = bars[k - 1]!.close;
