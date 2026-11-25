@@ -414,6 +414,109 @@ test("held-out window is inclusive at HELD_OUT_START_DATE 2026-08-27", async () 
   );
 });
 
+
+test("expected INACTIVE coverage excludes reopen ticker collisions with an already-stored INACTIVE row", async () => {
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
+  const securities: SecurityMasterRecord[] = [
+    makeSecurity({ securityId: "sec_active_AAA", currentSymbol: "AAA", status: "ACTIVE" }),
+    makeSecurity({
+      securityId: "sec_inactive_OLD",
+      currentSymbol: "REU",
+      status: "INACTIVE",
+      inactiveAt: "2026-10-14",
+      historicalSymbols: [{ symbol: "REU", effectiveFrom: "2024-01-01", source: "massive-stocks" }],
+    }),
+    makeSecurity({
+      securityId: "sec_inactive_NEW",
+      currentSymbol: "REU",
+      status: "INACTIVE",
+      inactiveAt: "2026-11-01",
+      historicalSymbols: [{ symbol: "REU", effectiveFrom: "2026-10-15", source: "massive-stocks" }],
+    }),
+    makeSecurity({
+      securityId: "sec_inactive_DEL",
+      currentSymbol: "DEL",
+      status: "INACTIVE",
+      inactiveAt: "2026-11-01",
+      historicalSymbols: [{ symbol: "DEL", effectiveFrom: "2024-01-01", source: "massive-stocks" }],
+    }),
+  ];
+  await storage.saveSecurities(securities);
+  await writeTickerReferenceIndex(
+    client,
+    {
+      pages: { active: 1, inactive: 1 },
+      entries: [
+        { pass: "active", page: 1, position: 0, ticker: "AAA", type: "CS", active: true, raw: JSON.stringify({ ticker: "AAA", type: "CS", active: true }) },
+        { pass: "inactive", page: 1, position: 0, ticker: "REU", type: "CS", active: false, raw: JSON.stringify({ ticker: "REU", type: "CS", active: false }) },
+        { pass: "inactive", page: 1, position: 1, ticker: "DEL", type: "CS", active: false, raw: JSON.stringify({ ticker: "DEL", type: "CS", active: false }) },
+      ],
+    },
+    { provider: "massive-stocks", asOf: "2026-11-25" },
+    fakeBackend,
+  );
+  const sessionDate = "2026-10-15";
+  const rawReply = new TextEncoder().encode(
+    JSON.stringify({
+      status: "OK",
+      resultsCount: 3,
+      results: [
+        { T: "AAA", o: 11, h: 12, l: 10, c: 11.5, v: 5100, t: 1792012800000, n: 10 },
+        { T: "REU", o: 21, h: 22, l: 20, c: 21.5, v: 4100, t: 1792012800000, n: 10 },
+        { T: "DEL", o: 31, h: 32, l: 30, c: 31.5, v: 3100, t: 1792012800000, n: 10 },
+      ],
+    }),
+  );
+  await writeDailyReplyDust(
+    client,
+    {
+      dataset: "stocks-grouped-daily",
+      sessionDate,
+      request: `/v2/aggs/grouped/locale/us/market/stocks/${sessionDate}`,
+      fetchedAt: `${sessionDate}T21:05:00Z`,
+      body: rawReply,
+    },
+    { provider: "massive-stocks", observedAt: `${sessionDate}T21:05:00Z` },
+    fakeBackend,
+  );
+  // Already-stored bar belongs to the old INACTIVE identity. Reopen correctly refuses the
+  // PIT-winning new INACTIVE id because symbolOn ?? currentSymbol collides on this date.
+  await storage.appendBars([
+    makeBar("sec_active_AAA", sessionDate, 11.5),
+    makeBar("sec_inactive_OLD", sessionDate, 21.5),
+    makeBar("sec_inactive_DEL", sessionDate, 31.5),
+  ]);
+
+  const report = await runCoverageCheck(client, {
+    replyDustBackend: fakeBackend,
+    liveAsOfFloor: "2026-11-24",
+    now: new Date("2026-11-25T17:00:00Z"),
+  });
+
+  assert.equal(report.replyDustReopen!.expectedInactivePairsTotal, 1);
+  assert.equal(report.replyDustReopen!.expectedInactivePairsPresentInBars, 1);
+  assert.equal(report.replyDustReopen!.expectedInactivePairsMissingFromBars, 0);
+  assert.equal(report.replyDustReopen!.expectedInactivePairsHeldOutTotal, 1);
+  assert.equal(report.replyDustReopen!.expectedInactivePairsHeldOutMissingFromBars, 0);
+  assert.equal(report.replyDustReopen!.expectedInactivePairsCoverageFraction, 1);
+  assert.equal(report.replyDustReopen!.idempotencyWouldAddInactiveRows, 0);
+  assert.equal(report.replyDustReopen!.expectedInactivePairsSkippedCollision, 1);
+  assert.equal(report.replyDustReopen!.expectedInactiveCollisionByReason["ticker-collision-inactive"], 1);
+  assert.equal(report.replyDustReopen!.expectedInactiveCollisionByReason["ticker-collision-active"], 0);
+  assert.equal(report.replyDustReopen!.expectedInactiveCollisionByReason["same-id-different-revision"], 0);
+  assert.ok(!report.anomalies.some((a) => a.startsWith("EXPECTED_INACTIVE_PAIRS_MISSING")));
+  assert.equal(coverageCheckFailed(report), false);
+
+  const summary = formatCoverageSummaryMarkdown(report);
+  assert.doesNotMatch(summary, /EXPECTED_INACTIVE_PAIRS_MISSING/u);
+  const serialized = JSON.stringify(report);
+  for (const forbidden of ["sec_active_AAA", "sec_inactive_OLD", "sec_inactive_NEW", "sec_inactive_DEL", "AAA", "REU", "DEL", "11.5", "21.5", "31.5"]) {
+    assert.ok(!serialized.includes(forbidden), `JSON leaked ${forbidden}`);
+    assert.ok(!summary.includes(forbidden), `summary leaked ${forbidden}`);
+  }
+});
+
 test("coverage-check.yml workflow wiring: manual-only, main-only, site env, read-only keys & permissions", () => {
   const yml = readFileSync(new URL("../.github/workflows/coverage-check.yml", import.meta.url), "utf8");
   const triggers = yml.slice(yml.indexOf("\non:"), yml.indexOf("\npermissions:"));

@@ -8,8 +8,12 @@
  * - Per-month and pre/post-held-out (>= 2026-08-27) daily-bars counts and distinct INACTIVE ids with >= 1 bar.
  * - Optional Reply Dust replay (pointInTimeUniverse -> readDailyReplyDustBars -> filterReopenBars) to measure
  *   expected INACTIVE coverage by exact securityId|sessionDate|revision pairs (overall and held-out
- *   >= 2026-08-27 separately). Id-level any-bar counts are secondary. Exits non-zero when any expected
- *   pair is missing or any anomaly fires (including IDEMPOTENCY_WOULD_ADD_ROWS, INDEX_ASOF_NOT_LIVE).
+ *   >= 2026-08-27 separately). The expected set is the same set reopen would write: already-present
+ *   INACTIVE dust pairs plus pairs filterReopenBars would still add against the full live session
+ *   (not ACTIVE-only existing). Ticker collisions reopen correctly refuses — including INACTIVE vs an
+ *   already-stored INACTIVE row — are excluded from expected and counted by reason (aggregates only).
+ *   Id-level any-bar counts are secondary. Exits non-zero when any expected pair is missing or any
+ *   anomaly fires (including IDEMPOTENCY_WOULD_ADD_ROWS, INDEX_ASOF_NOT_LIVE).
  */
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -22,7 +26,7 @@ import {
 } from "./contracts";
 import { readDailyReplyDustBars } from "./daily-reply-dust";
 import { tradingSessionsInRange } from "./daily-bars-coverage";
-import { pointInTimeUniverse } from "./pit-universe";
+import { pointInTimeUniverse, symbolOn } from "./pit-universe";
 import { ReadOnlyR2Client } from "./r2-read-client";
 import { nodeReplyDustBackend, type ReplyDustBackend } from "./reply-dust";
 import { READ_ONLY_ERROR } from "./r2-read-client";
@@ -56,12 +60,32 @@ export interface CoverageMonthSummary {
   distinctInactiveIds: number;
 }
 
+export const REOPEN_COLLISION_REASONS = [
+  "same-id-different-revision",
+  "ticker-collision-active",
+  "ticker-collision-inactive",
+  "ticker-collision-other",
+] as const;
+export type ReopenCollisionReason = (typeof REOPEN_COLLISION_REASONS)[number];
+
+export type CollisionReasonCounts = Record<ReopenCollisionReason, number>;
+
+export function emptyCollisionReasonCounts(): CollisionReasonCounts {
+  return {
+    "same-id-different-revision": 0,
+    "ticker-collision-active": 0,
+    "ticker-collision-inactive": 0,
+    "ticker-collision-other": 0,
+  };
+}
+
 export interface ReplyDustMonthSummary {
   month: string;
   dustSessions: number;
   expectedInactiveRows: number;
   expectedInactiveRowsPresent: number;
   expectedInactiveRowsMissing: number;
+  expectedInactiveRowsSkippedCollision: number;
   idempotencyWouldAddInactiveRows: number;
 }
 
@@ -142,6 +166,8 @@ export interface CoverageCheckReport {
     expectedInactivePairsHeldOutPresentInBars: number;
     expectedInactivePairsHeldOutMissingFromBars: number;
     expectedInactivePairsHeldOutCoverageFraction: number | null;
+    expectedInactivePairsSkippedCollision: number;
+    expectedInactiveCollisionByReason: CollisionReasonCounts;
     idempotencyWouldAddInactiveRows: number;
     idempotencyWouldAddNonInactiveRows: number;
     idempotencySkippedCollisionRows: number;
@@ -206,6 +232,86 @@ const BAR_TEMPLATE: Omit<CanonicalDailyBar, "securityId" | "sessionDate" | "revi
 
 function makeMinimalBar(securityId: string, sessionDate: string, revision: number): CanonicalDailyBar {
   return { ...BAR_TEMPLATE, securityId, sessionDate, revision };
+}
+
+export function barPairKey(bar: { securityId: string; sessionDate: string; revision: number }): string {
+  return `${bar.securityId}|${bar.sessionDate}|${bar.revision}`;
+}
+
+export function classifyInactiveTickerCollision(
+  bar: CanonicalDailyBar,
+  existing: readonly CanonicalDailyBar[],
+  securities: readonly SecurityMasterRecord[],
+  sessionDate: string,
+): ReopenCollisionReason {
+  const byId = new Map(securities.map((s) => [s.securityId, s]));
+  if (
+    existing.some(
+      (row) => row.securityId === bar.securityId && row.sessionDate === bar.sessionDate && row.revision !== bar.revision,
+    )
+  ) {
+    return "same-id-different-revision";
+  }
+  const sec = byId.get(bar.securityId);
+  const ticker = sec ? (symbolOn(sec, sessionDate) ?? sec.currentSymbol) : undefined;
+  const opponentStatuses = new Set<string>();
+  for (const row of existing) {
+    if (row.securityId === bar.securityId) continue;
+    const other = byId.get(row.securityId);
+    const otherTicker = other ? (symbolOn(other, sessionDate) ?? other.currentSymbol) : undefined;
+    if (ticker && otherTicker === ticker) opponentStatuses.add(other?.status ?? "UNKNOWN");
+  }
+  if (opponentStatuses.has("ACTIVE")) return "ticker-collision-active";
+  if (opponentStatuses.has("INACTIVE")) return "ticker-collision-inactive";
+  return "ticker-collision-other";
+}
+
+/**
+ * Expected INACTIVE pairs after a correct reopen: already-present exact dust pairs, plus pairs
+ * filterReopenBars would still add against the full live session. Collisions reopen refuses are
+ * not expected.
+ */
+export function expectedReopenInactiveBars(
+  dustBars: readonly CanonicalDailyBar[],
+  existing: readonly CanonicalDailyBar[],
+  securities: readonly SecurityMasterRecord[],
+  sessionDate: string,
+): {
+  expectedBars: CanonicalDailyBar[];
+  presentBars: CanonicalDailyBar[];
+  missingBars: CanonicalDailyBar[];
+  skippedCollisionByReason: CollisionReasonCounts;
+  skippedCollisionCount: number;
+} {
+  const statusById = new Map(securities.map((s) => [s.securityId, s.status]));
+  const liveKeySet = new Set(existing.map((b) => barPairKey(b)));
+  const idempotent = filterReopenBars(dustBars, existing, securities, sessionDate);
+  const missingBars = idempotent.newBars.filter((b) => (statusById.get(b.securityId) ?? "UNKNOWN") === "INACTIVE");
+  const missingKeys = new Set(missingBars.map((b) => barPairKey(b)));
+  const presentBars: CanonicalDailyBar[] = [];
+  const skippedCollisionByReason = emptyCollisionReasonCounts();
+  let skippedCollisionCount = 0;
+  for (const bar of dustBars) {
+    if ((statusById.get(bar.securityId) ?? "UNKNOWN") !== "INACTIVE") continue;
+    const key = barPairKey(bar);
+    if (liveKeySet.has(key) || missingKeys.has(key)) {
+      if (liveKeySet.has(key)) presentBars.push(bar);
+      continue;
+    }
+    skippedCollisionCount += 1;
+    skippedCollisionByReason[classifyInactiveTickerCollision(bar, existing, securities, sessionDate)] += 1;
+  }
+  return {
+    expectedBars: [...presentBars, ...missingBars],
+    presentBars,
+    missingBars,
+    skippedCollisionByReason,
+    skippedCollisionCount,
+  };
+}
+
+function addCollisionReasonCounts(target: CollisionReasonCounts, delta: CollisionReasonCounts): void {
+  for (const reason of REOPEN_COLLISION_REASONS) target[reason] += delta[reason];
 }
 
 async function mapConcurrent<T, R>(
@@ -383,6 +489,8 @@ export async function runCoverageCheck(
   let expectedInactiveRowsHeldOut = 0;
   let expectedInactivePairsHeldOutPresentInBars = 0;
   let expectedInactivePairsHeldOutMissingFromBars = 0;
+  let expectedInactivePairsSkippedCollision = 0;
+  const expectedInactiveCollisionByReason = emptyCollisionReasonCounts();
   let idempotencyWouldAddInactiveRows = 0;
   let idempotencyWouldAddNonInactiveRows = 0;
   let idempotencySkippedCollisionRows = 0;
@@ -478,6 +586,7 @@ export async function runCoverageCheck(
       let mExpectedRows = 0;
       let mExpectedPresent = 0;
       let mExpectedMissing = 0;
+      let mExpectedSkippedCollision = 0;
       let mIdempAddInactive = 0;
 
       const sessionOutcomes = await mapConcurrent(dustDates, replyDustConcurrency, async (sessionDate) => {
@@ -489,10 +598,8 @@ export async function runCoverageCheck(
           replyDustBackend,
         );
         const sessionExisting = monthBarsBySession.get(sessionDate) ?? [];
-        const activeOnlyExisting = sessionExisting.filter((b) => statusById.get(b.securityId) === "ACTIVE");
-        const liveKeySet = new Set(sessionExisting.map((b) => `${b.securityId}|${b.sessionDate}|${b.revision}`));
-        const expected = filterReopenBars(dustBars, activeOnlyExisting, securities, sessionDate);
         const idempotent = filterReopenBars(dustBars, sessionExisting, securities, sessionDate);
+        const expected = expectedReopenInactiveBars(dustBars, sessionExisting, securities, sessionDate);
 
         const expectedIds: string[] = [];
         let presentCount = 0;
@@ -500,9 +607,10 @@ export async function runCoverageCheck(
         let heldOutCount = 0;
         let heldOutPresentCount = 0;
         let heldOutMissingCount = 0;
-        for (const b of expected.newBars) {
+        const presentKeys = new Set(expected.presentBars.map((b) => barPairKey(b)));
+        for (const b of expected.expectedBars) {
           expectedIds.push(b.securityId);
-          const present = liveKeySet.has(`${b.securityId}|${b.sessionDate}|${b.revision}`);
+          const present = presentKeys.has(barPairKey(b));
           const heldOut = b.sessionDate >= heldOutStart;
           if (present) presentCount += 1;
           else missingCount += 1;
@@ -514,12 +622,14 @@ export async function runCoverageCheck(
         }
         return {
           expectedIds,
-          expectedRows: expected.newBars.length,
+          expectedRows: expected.expectedBars.length,
           presentCount,
           missingCount,
           heldOutCount,
           heldOutPresentCount,
           heldOutMissingCount,
+          skippedCollisionCount: expected.skippedCollisionCount,
+          skippedCollisionByReason: expected.skippedCollisionByReason,
           idempotentAdded: idempotent.addedByStatus,
           idempotentSkippedCollision: idempotent.skippedCollisionByStatus,
           idempotentSkippedNonInactive: idempotent.skippedNonInactiveByStatus,
@@ -534,9 +644,12 @@ export async function runCoverageCheck(
         expectedInactiveRowsHeldOut += out.heldOutCount;
         expectedInactivePairsHeldOutPresentInBars += out.heldOutPresentCount;
         expectedInactivePairsHeldOutMissingFromBars += out.heldOutMissingCount;
+        expectedInactivePairsSkippedCollision += out.skippedCollisionCount;
+        addCollisionReasonCounts(expectedInactiveCollisionByReason, out.skippedCollisionByReason);
         mExpectedRows += out.expectedRows;
         mExpectedPresent += out.presentCount;
         mExpectedMissing += out.missingCount;
+        mExpectedSkippedCollision += out.skippedCollisionCount;
 
         for (const [st, cnt] of Object.entries(out.idempotentAdded)) {
           if (st === "INACTIVE") {
@@ -556,6 +669,7 @@ export async function runCoverageCheck(
         expectedInactiveRows: mExpectedRows,
         expectedInactiveRowsPresent: mExpectedPresent,
         expectedInactiveRowsMissing: mExpectedMissing,
+        expectedInactiveRowsSkippedCollision: mExpectedSkippedCollision,
         idempotencyWouldAddInactiveRows: mIdempAddInactive,
       });
     }
@@ -619,6 +733,8 @@ export async function runCoverageCheck(
         expectedInactivePairsHeldOutTotal > 0
           ? expectedInactivePairsHeldOutPresentInBars / expectedInactivePairsHeldOutTotal
           : null,
+      expectedInactivePairsSkippedCollision,
+      expectedInactiveCollisionByReason,
       idempotencyWouldAddInactiveRows,
       idempotencyWouldAddNonInactiveRows,
       idempotencySkippedCollisionRows,
@@ -722,6 +838,7 @@ export function formatCoverageSummaryMarkdown(report: CoverageCheckReport): stri
       `- Dust sessions in reopen window: **${r.dustSessionsInReopenWindow}** (missing Dust: ${r.missingDustSessionsInReopenWindow}; total manifests in R2: ${r.dustManifestsTotal})`,
       `- Expected \`INACTIVE\` pairs (\`securityId|sessionDate|revision\`) present in live bars: **${r.expectedInactivePairsPresentInBars.toLocaleString("en-US")} / ${r.expectedInactivePairsTotal.toLocaleString("en-US")}** (${pairPct}; missing: **${r.expectedInactivePairsMissingFromBars.toLocaleString("en-US")}**)`,
       `- Held-out expected \`INACTIVE\` pairs (\`>= ${report.heldOutStart}\`): **${r.expectedInactivePairsHeldOutPresentInBars.toLocaleString("en-US")} / ${r.expectedInactivePairsHeldOutTotal.toLocaleString("en-US")}** (${heldOutPairPct}; missing: **${r.expectedInactivePairsHeldOutMissingFromBars.toLocaleString("en-US")}**)`,
+      `- Reopen-refused \`INACTIVE\` pairs excluded from expected (ticker collision): **${r.expectedInactivePairsSkippedCollision.toLocaleString("en-US")}** (same-id different revision: ${r.expectedInactiveCollisionByReason["same-id-different-revision"]}, vs ACTIVE ticker: ${r.expectedInactiveCollisionByReason["ticker-collision-active"]}, vs INACTIVE ticker: ${r.expectedInactiveCollisionByReason["ticker-collision-inactive"]}, other: ${r.expectedInactiveCollisionByReason["ticker-collision-other"]})`,
       `- Expected \`INACTIVE\` IDs with any live bar (secondary): **${r.expectedInactiveIdsPresentInBars.toLocaleString("en-US")} / ${r.expectedInactiveIdsCount.toLocaleString("en-US")}** (missing: **${r.expectedInactiveIdsMissingFromBars.toLocaleString("en-US")}**)`,
       `- Reopen idempotency against live bars: would add **${r.idempotencyWouldAddInactiveRows}** \`INACTIVE\` rows, **${r.idempotencyWouldAddNonInactiveRows}** non-\`INACTIVE\` rows`,
     );
