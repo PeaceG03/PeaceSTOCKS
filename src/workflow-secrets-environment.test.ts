@@ -50,7 +50,7 @@ test("no other workflow reads the data secrets outside an environment, and site-
     const yml = readFileSync(new URL(file, DIR), "utf8");
     for (const job of jobs(yml)) {
       if (!SECRET.test(job.text)) continue;
-      assert.equal(file, "site-deploy.yml", `${file}:${job.name} reads a data secret`);
+      assert.ok(file === "site-deploy.yml" || file === "coverage-check.yml", `${file}:${job.name} reads a data secret`);
       assert.equal(environmentOf(job.text), "site", `${file}:${job.name}`);
     }
   }

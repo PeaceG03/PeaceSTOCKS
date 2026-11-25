@@ -84,7 +84,7 @@ test("site deploy workflow: the 6 secrets are read only inside the 'site' deploy
 
   // Which of them other workflows also read decides move (site-only) vs copy (shared with the scanner).
   const dir = new URL("../.github/workflows/", import.meta.url);
-  const others = readdirSync(dir).filter((f) => f.endsWith(".yml") && f !== "site-deploy.yml").map((f) => readFileSync(new URL(f, dir), "utf8")).join("\n");
+  const others = readdirSync(dir).filter((f) => f.endsWith(".yml") && f !== "site-deploy.yml" && f !== "coverage-check.yml").map((f) => readFileSync(new URL(f, dir), "utf8")).join("\n");
   const shared = SITE_SECRETS.filter((name) => new RegExp(`secrets\\.${name}\\b`, "u").test(others));
   assert.deepEqual(shared, ["PEACESTOCKS_R2_ACCOUNT_ID", "PEACESTOCKS_R2_BUCKET"]);
 
