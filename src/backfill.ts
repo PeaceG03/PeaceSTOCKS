@@ -30,6 +30,7 @@ import {
 import { MarketStorage, type MarketStore } from "./storage";
 import { refreshEligibility, refreshUniverse } from "./universe";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
+import { etCalendarDate } from "./et-time";
 import { finalizeDailyPartition } from "./scanner";
 import { pointInTimeUniverse, symbolOn } from "./pit-universe";
 import { ScanYieldError, createScanYieldCheck } from "./scan-yield";
@@ -336,6 +337,8 @@ export async function backfillHistoricalEvidence(options: {
   reopenInactiveTails?: boolean;
   /** Called immediately when a session is attempted (including Dust-cached reopen sessions). */
   onSessionAttempt?: () => void;
+  /** Clock for today's ET universe-refresh date (defaults to current wall clock). */
+  now?: () => Date;
 }): Promise<BackfillResult> {
   const env = options.env ?? process.env;
   requireObjectStore(env);
@@ -399,16 +402,24 @@ export async function backfillHistoricalEvidence(options: {
   const startYield = await shouldYield();
   if (startYield) return yieldedBeforeSessions(startYield);
 
-  // Cold start: build the security master before grouped-daily can bind symbols. The yield check
-  // also runs at every ticker-list page boundary; stopping there discards the partial list, so
-  // the stored master is never compared against half the provider universe.
-  try {
-    await refreshUniverse(provider, storage, options.to, { shouldStop: shouldYield });
-  } catch (error) {
-    if (error instanceof ScanYieldError) return yieldedBeforeSessions(error.reason);
-    throw error;
-  }
+  // Massive's /v3/reference/tickers capture reflects today's live universe, never a historical
+  // chunk's `--to` date: stamp it with today's ET calendar date (and in reopen mode, skip when
+  // already refreshed today). Stopping at a ticker-page yield discards the partial list.
+  const universeAsOf = etCalendarDate(options.now ? options.now() : new Date());
   let securities = await storage.loadSecurities();
+  const refreshedToday =
+    reopenInactiveTails &&
+    securities.length > 0 &&
+    securities.some((s) => (s.lastUniverseSeenAt ?? "").slice(0, 10) >= universeAsOf);
+  if (!refreshedToday) {
+    try {
+      await refreshUniverse(provider, storage, universeAsOf, { shouldStop: shouldYield }, universeAsOf);
+    } catch (error) {
+      if (error instanceof ScanYieldError) return yieldedBeforeSessions(error.reason);
+      throw error;
+    }
+    securities = await storage.loadSecurities();
+  }
   const bind = (
     provider as MarketProvider & { bindUniverse?: (records: ProviderSecurityRecord[]) => void }
   ).bindUniverse;

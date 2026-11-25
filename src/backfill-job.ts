@@ -134,6 +134,7 @@ export async function runBackfillJob(options: BackfillJobOptions): Promise<Backf
     ...(options.maxSessions !== undefined ? { maxSessions: options.maxSessions } : {}),
     ...(options.reopenInactiveTails !== undefined ? { reopenInactiveTails: options.reopenInactiveTails } : {}),
     ...(options.onSessionAttempt ? { onSessionAttempt: options.onSessionAttempt } : {}),
+    ...(options.now ? { now: () => new Date(options.now!()) } : {}),
   });
   const progress = options.reopenInactiveTails
     ? ((await options.storage.loadBackfillReopenProgress?.()) as BackfillReopenState | undefined)
