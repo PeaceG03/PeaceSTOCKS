@@ -6,6 +6,7 @@
 // behind any R2 writer (peacestocks-r2-writer group). Fail closed: an API error dispatches nothing.
 // Logs: PASS/FAIL + reason only.
 import { pathToFileURL } from "node:url";
+import { scannerAutoChainEnabled } from "./scanner-auto-chain";
 
 /** Scheduled scan slots in UTC minutes after midnight (scanner.yml crons "30 5" and "30 9", Tue-Sat). */
 export const SCAN_SLOTS_UTC_MIN = [5 * 60 + 30, 9 * 60 + 30] as const;
@@ -71,6 +72,10 @@ export async function scanRunCreatedSince(sinceMs: number, runs: readonly Scanne
 }
 
 async function main(): Promise<number> {
+  if (!scannerAutoChainEnabled(process.env.SCANNER_AUTO_CHAIN)) {
+    console.log("scan-backstop: PASS manual-only (SCANNER_AUTO_CHAIN off); not dispatching");
+    return 0;
+  }
   const now = new Date();
   const slot = lastScanSlot(now);
   const since = slot.getTime() - 5 * 60_000;

@@ -76,12 +76,10 @@ test("a failed run check yields rather than risk the scan's budget", async () =>
   assert.match((await scanYieldReason({ now: midday, env: actionsEnv, fetchImpl: throwing })) ?? "", /^SCAN_CHECK_FAILED:Error: offline/);
 });
 
-test("scanner.yml schedule crons are 05:30 and 09:30 UTC Tue–Sat, plus the restarter-only :47 cron and the daily liquid 06:20/10:20 crons", () => {
+test("scanner.yml has no schedule crons while manual-only; daily liquid times stay outside the guard windows", () => {
   const yml = readFileSync(join(process.cwd(), ".github/workflows/scanner.yml"), "utf8");
   const crons = [...yml.matchAll(/^[ \t]*- cron: "([^"]+)"/gm)].map((m) => m[1]);
-  // "47 * * * *" and the daily liquid crons never run a scan (scan job gated off them; see
-  // tenmin-restarter.test.ts).
-  assert.deepEqual(crons, ["30 5 * * 2-6", "30 9 * * 2-6", "47 * * * *", "20 6 * * 2-6", "20 10 * * 2-6"]);
+  assert.deepEqual(crons, []);
   // The daily liquid ticks start outside every guard window, after the scan they follow.
   for (const hm of ["06:20", "10:20"]) assert.equal(inScanGuardWindow(new Date(`2026-10-13T${hm}:00Z`)), false, hm);
   assert.equal(yml.includes("30 21 * * 1-5"), false);

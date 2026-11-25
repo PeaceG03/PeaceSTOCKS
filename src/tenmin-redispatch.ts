@@ -292,6 +292,11 @@ export interface TenMinRedispatchInput {
   queue: { otherActiveRuns: number; checkFailed?: string };
   /** Repo variable TENMIN_AUTO_REDISPATCH; must be exactly "true". */
   killSwitch: string | undefined;
+  /**
+   * Repo variable SCANNER_AUTO_CHAIN. When provided, must be exactly "true" or the chain stops
+   * (unset defaults off in the workflow). Omitted keeps older callers on the kill switch only.
+   */
+  scannerAutoChain?: string;
   /** chain trigger: consecutive failed tenmin_history runs right before this one (from the run list). */
   priorConsecutiveFailures?: number;
   /** Runs already in this chain (the finished run's number; a manual dispatch is 0). */
@@ -418,6 +423,7 @@ export function decideTenMinRedispatch(input: TenMinRedispatchInput): TenMinRedi
   const nextChain = input.chain + 1;
   const stop = (reason: string): TenMinRedispatchDecision => ({ dispatch: false, nextAction: "stop", reason, nextChain });
   const wait = (reason: string): TenMinRedispatchDecision => ({ dispatch: false, nextAction: "wait", reason, nextChain });
+  if (input.scannerAutoChain !== undefined && input.scannerAutoChain !== "true") return stop("SCANNER_AUTO_CHAIN_OFF");
   if (input.killSwitch !== "true") return stop("KILL_SWITCH_OFF");
   if (input.trigger === "chain" && isTransientFailure(input.jobResult, input.outcome?.reason)) {
     const prior = input.priorConsecutiveFailures ?? 0;
@@ -834,6 +840,7 @@ async function main(mode: string | undefined): Promise<void> {
         ...(checkFailed ? { checkFailed } : {}),
       },
       killSwitch: await resolveRedispatchGate(env),
+      scannerAutoChain: env.SCANNER_AUTO_CHAIN ?? "",
       chain,
       maxChain: env.TENMIN_AUTO_REDISPATCH_MAX_CHAIN,
       priorConsecutiveFailures: priorConsecutiveFailures(runs, Number.isFinite(self) ? self : undefined),
@@ -922,6 +929,7 @@ async function main(mode: string | undefined): Promise<void> {
         ...(checkFailed ? { checkFailed } : {}),
       },
       killSwitch: await resolveRedispatchGate(env),
+      scannerAutoChain: env.SCANNER_AUTO_CHAIN ?? "",
       chain: record?.chain ?? 0,
       maxChain: env.TENMIN_AUTO_REDISPATCH_MAX_CHAIN,
       ...(newerFailed ? { newerFailedRun: `${newerFailed.id}:${newerFailed.conclusion}` } : {}),

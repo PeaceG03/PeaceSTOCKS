@@ -112,6 +112,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           TENMIN_AUTO_REDISPATCH: ${{ vars.TENMIN_AUTO_REDISPATCH }}
           TENMIN_AUTO_REDISPATCH_MAX_CHAIN: ${{ vars.TENMIN_AUTO_REDISPATCH_MAX_CHAIN }}
+          SCANNER_AUTO_CHAIN: ${{ vars.SCANNER_AUTO_CHAIN }}
           # TENMIN_HISTORY_MAX_RANGE_END is retired (no end cap): unset here, so a chain stopped at
           # an old cap restarts (CONTINUE_RANGE_END_CAP_RAISED) and a closed new range restarts a
           # finished chain (CONTINUE_NEW_RANGE_CLOSED).

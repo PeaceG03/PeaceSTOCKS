@@ -19,6 +19,7 @@ test("chain_followup: after scan/tenmin_daily/backfill, always(), skipped only w
   for (const j of ["scan", "tenmin_daily", "backfill"]) assert.match(job, new RegExp(`needs\\.${j}\\.result != 'skipped'`, "u"));
   assert.match(job, /uses: \.\/\.github\/workflows\/tenmin-history-fallback\.yml/u);
   assert.match(job, /actions: write/u);
+  assert.match(job, /vars\.SCANNER_AUTO_CHAIN == 'true'/u);
   assert.doesNotMatch(job, /schedule/u, "not tied to any cron");
 });
 

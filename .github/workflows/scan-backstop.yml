@@ -55,4 +55,5 @@ jobs:
       - name: Scan backstop (open-ended)
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          SCANNER_AUTO_CHAIN: ${{ vars.SCANNER_AUTO_CHAIN }}
         run: pnpm -s exec tsx src/scan-backstop.ts

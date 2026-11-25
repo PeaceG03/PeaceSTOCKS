@@ -33,7 +33,7 @@ test("wiring: one reusable dispatcher (actions: write, GITHUB_TOKEN, serialized)
   assert.match(job(s, "scan_backstop"), /uses: \.\/\.github\/workflows\/scan-backstop\.yml/u);
   const after = job(s, "scan_backstop_after_history");
   assert.match(after, /needs: \[tenmin_history\]/u);
-  assert.match(after, /always\(\) && needs\.tenmin_history\.result != 'skipped'/u);
+  assert.match(after, /always\(\) && vars\.SCANNER_AUTO_CHAIN == 'true' && needs\.tenmin_history\.result != 'skipped'/u);
   assert.match(after, /uses: \.\/\.github\/workflows\/scan-backstop\.yml/u);
   const f = job(wf("tenmin-history-fallback.yml"), "scan_backstop");
   assert.match(f, /needs: decide/u);
