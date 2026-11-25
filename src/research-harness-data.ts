@@ -1,5 +1,6 @@
 /**
  * Builds the research harness's per-session table from stored daily bars, point in time.
+ * Ticker-date collisions are excluded earlier, in loadResearchData / holdout-eval-cli (both sides).
  *
  * For session D (index i) it reuses the held-out eval's forward-scan rebuild: securities as a scan at
  * D knew them (ACTIVE = a bar on D, so names INACTIVE in today's master count on the days they

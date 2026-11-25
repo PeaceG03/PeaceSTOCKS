@@ -4,6 +4,7 @@ import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { CorporateAction, SecurityMasterRecord } from "./contracts";
+import { applyTickerDateCollisionExclusions, type TickerDateCollisionSummary } from "./pit-universe";
 import { AppendOnlyLog, gitCommittedHead } from "./append-only-log";
 import { EvalHistory, type EvalBar } from "./holdout-eval";
 import { buildHarnessSession, splitDatesById } from "./research-harness-data";
@@ -29,6 +30,7 @@ function arg(args: string[], key: string, fallback?: string): string {
 /** Local JSONL only; held-out prices are never retained or used in a development run. */
 export async function loadResearchData(root: string, from: string, before: string, minBars = 1000): Promise<{
   history: EvalHistory; master: SecurityMasterRecord[]; actions: CorporateAction[];
+  tickerDateCollisions: TickerDateCollisionSummary;
 }> {
   const loadFrom = shift(from, -370); // full year for eligibility, not today's all-time count
   const kept = new Map<string, EvalBar>();
@@ -48,12 +50,14 @@ export async function loadResearchData(root: string, from: string, before: strin
     }
     cursor.setUTCMonth(cursor.getUTCMonth() + 1);
   }
+  const master = JSON.parse(readFileSync(join(root, "permanent/security-master.json"), "utf8")) as SecurityMasterRecord[];
+  // Both sides of each colliding ticker-date are dropped before features, returns, or universe.
+  const tickerDateCollisions = applyTickerDateCollisionExclusions(kept, master);
   const history = new EvalHistory(kept.values(), minBars);
   kept.clear();
-  const master = JSON.parse(readFileSync(join(root, "permanent/security-master.json"), "utf8")) as SecurityMasterRecord[];
   // Required: a missing split source fails closed (never silently evaluate raw prices).
   const actions = readFileSync(join(root, "permanent/corporate-actions.jsonl"), "utf8").split("\n").filter(Boolean).map((s) => JSON.parse(s) as CorporateAction);
-  return { history, master, actions };
+  return { history, master, actions, tickerDateCollisions };
 }
 
 /**
@@ -111,7 +115,8 @@ export async function researchMain(args: string[], deps: ResearchMainDeps = {}):
   console.log(`loading development data before ${heldOut.from}; held-out reserved, not evaluated`);
   const minBars = Number(arg(args, "min-bars", "1000"));
   if (!(Number.isInteger(minBars) && minBars >= 1)) throw new Error("INVALID_MIN_BARS");
-  const { history, master, actions } = await loadResearchData(root, from, heldOut.from, minBars);
+  const { history, master, actions, tickerDateCollisions } = await loadResearchData(root, from, heldOut.from, minBars);
+  console.log(`ticker-date collisions excluded: collidingTickerDates=${tickerDateCollisions.collidingTickerDates} excludedSecurityDates=${tickerDateCollisions.excludedSecurityDates} excludedBars=${tickerDateCollisions.excludedBars}`);
   const indexes = history.sessions.map((d, i) => [d, i] as const).filter(([d]) => d >= from);
   if (indexes.length < 3) throw new Error("INSUFFICIENT_DEVELOPMENT_DATA");
   const splitDates = splitDatesById(actions);
@@ -149,7 +154,7 @@ export async function researchMain(args: string[], deps: ResearchMainDeps = {}):
     dataWarning: "Local bars were collected by the pre-fix ACTIVE-only backfill. Missing historical inactive bars cannot be recovered offline. This is a diagnostic baseline, not survivorship-free performance proof. No backfill was run.",
     splitKnowledge: "as-known", revisions: "latest stored revisions (not original publication vintages)",
     ledger: { dir: ledgerDir === RESEARCH_LEDGER_DIR ? "research-ledger" : "test-ledger", variants: log.read().at(-1)?.hash, variantRecords: all.length },
-    variantsTried, foldsConfig, folds, excludedBySplitAdjust: excluded, results,
+    variantsTried, foldsConfig, folds, excludedBySplitAdjust: excluded, tickerDateCollisions, results,
   };
   writeFileSync(join(out, "baseline.json"), `${JSON.stringify(report, null, 2)}\n`);
 }
