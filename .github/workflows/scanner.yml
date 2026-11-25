@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "scan (online scheduler), backfill (daily historical evidence), tenmin_history (10-minute range history), or tenmin_daily (daily liquid 10-minute step)"
+        description: "scan (online scheduler), backfill (daily historical evidence), tenmin_history (10-minute range history), tenmin_daily (daily liquid 10-minute step), or repair_backfill_asof (surgical R2 asOf repair)"
         required: true
         default: scan
         type: choice
@@ -24,6 +24,16 @@ on:
           - backfill
           - tenmin_history
           - tenmin_daily
+          - repair_backfill_asof
+      repair_apply:
+        description: "repair_backfill_asof only: apply surgical R2 repairs (default false = read-only dry-run)"
+        required: false
+        default: false
+        type: boolean
+      repair_bad_date:
+        description: "repair_backfill_asof only: historical asOf date stamped by aborted backfill (YYYY-MM-DD)"
+        required: false
+        default: "2025-05-13"
       from:
         description: "Backfill from date (YYYY-MM-DD inclusive)"
         required: false
@@ -679,3 +689,67 @@ jobs:
             if [ -n "$n" ]; then gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$body"
             else gh issue create --repo "$GITHUB_REPOSITORY" --title "Scanner stopped: alert check failed" --label scanner-alert --assignee PeaceG03 --body "$body"; fi
           fi
+
+  repair_backfill_asof:
+    environment: scanner-data
+    # Surgical forward repair of aborted backfill asOf metadata; main only, dry-run by default.
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'repair_backfill_asof' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    env:
+      PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+      PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+      PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
+      PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
+      PEACESTOCKS_REQUIRE_OBJECT_STORE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Restore pinned zstd 1.5.7
+        id: zstd-cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/zstd-1.5.7
+          key: zstd-1.5.7-eb33e51f49a15e02-${{ runner.os }}-ubuntu-24.04
+      - name: Build pinned zstd 1.5.7
+        if: ${{ steps.zstd-cache.outputs.cache-hit != 'true' }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+          echo "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3  zstd-1.5.7.tar.gz" | sha256sum -c -
+          tar xzf zstd-1.5.7.tar.gz
+          make -C zstd-1.5.7 -j"$(nproc)" zstd-release
+          install -D -m 0755 zstd-1.5.7/programs/zstd ~/.local/zstd-1.5.7/bin/zstd
+      - name: Use pinned zstd 1.5.7
+        run: |
+          set -euo pipefail
+          ~/.local/zstd-1.5.7/bin/zstd --version | grep -F ' v1.5.7,'
+          echo "$HOME/.local/zstd-1.5.7/bin" >> "$GITHUB_PATH"
+      - name: Refuse a run that would write the store to the runner disk
+        run: |
+          test -n "$PEACESTOCKS_R2_BUCKET"
+          test -n "$PEACESTOCKS_R2_ACCOUNT_ID"
+          test -n "$PEACESTOCKS_R2_ACCESS_KEY_ID"
+          test -n "$PEACESTOCKS_R2_SECRET_ACCESS_KEY"
+      - name: Run surgical backfill asOf repair
+        env:
+          REPAIR_APPLY: ${{ github.event.inputs.repair_apply }}
+          REPAIR_BAD_DATE: ${{ github.event.inputs.repair_bad_date }}
+        run: |
+          set -euo pipefail
+          ARGS=(--bad-date "${REPAIR_BAD_DATE:-2025-05-13}")
+          if [ "$REPAIR_APPLY" = "true" ]; then
+            ARGS+=(--apply)
+          fi
+          pnpm run repair:backfill-asof -- "${ARGS[@]}"
