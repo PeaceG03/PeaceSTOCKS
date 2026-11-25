@@ -501,6 +501,9 @@ jobs:
       # on a 403/plan window, the session cap or the 110 min budget, and resumes on an unchanged re-dispatch.
       - name: Daily historical backfill into R2 (verified job)
         env:
+          # Safety net only (bar counts, month reads, and appendBars stream lines now): Node 20's
+          # default ~2 GB heap died on dispatch 45513478068; ubuntu-24.04 runners have 16 GB.
+          NODE_OPTIONS: --max-old-space-size=12288
           PEACEAI_MARKETS_ROOT: ${{ runner.temp }}/peacestocks-scratch
           GITHUB_TOKEN: ${{ github.token }}
           BACKFILL_MAX_SESSIONS: ${{ github.event.inputs.max_sessions }}
