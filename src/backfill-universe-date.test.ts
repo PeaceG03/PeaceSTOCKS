@@ -73,12 +73,17 @@ test("backfill never stamps security-master, membership, or ticker-reference-ind
   assert.equal(idxManifest.base.asOf, "2026-11-24");
   assert.ok(!idxManifest.base.key.includes("base-2025-05-13"));
 
-  // Second reopen call on the same ET date skips redundant refreshUniverse ticker requests.
+  // Second reopen call on the same ET date with a pending session skips redundant refreshUniverse ticker requests (kills never-skip).
+  const bars14 = await seedProvider.getDailyBars("2025-05-14", [securityId("massive-stocks", "FIGI00000AAA", "STOCK")]);
+  await writeDailyReplyDust(client, seedProvider.takeRawReplies()[0]!, {
+    provider: seedProvider.providerName,
+    observedAt: bars14[0]!.observedAt,
+  });
   const reqsBefore = fake.calls.tickers;
   await backfillHistoricalEvidence({
     root: "/unused",
-    from: "2025-05-13",
-    to: "2025-05-13",
+    from: "2025-05-14",
+    to: "2025-05-14",
     provider: new MassiveMarketProvider({
       apiKey: "fake-key-not-real",
       baseUrl: FAKE_MASSIVE_BASE_URL,
@@ -96,4 +101,72 @@ test("backfill never stamps security-master, membership, or ticker-reference-ind
     now: () => new Date("2026-11-24T23:00:00.000Z"),
   });
   assert.equal(fake.calls.tickers, reqsBefore, "same-day reopen skips redundant refreshUniverse");
+});
+
+test("backfill ET UTC-midnight boundary and reopen refresh skip when lastUniverseSeenAt is stale", async () => {
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
+  const fake = fakeMassive({
+    tickers: [{ ticker: "AAA", figi: "FIGI00000AAA", type: "CS", active: true }],
+    grouped: () => [{ T: "AAA", o: 10, h: 11, l: 9, c: 10.5, v: 1000 }],
+  });
+  const seedProvider = new MassiveMarketProvider({
+    apiKey: "fake-key-not-real",
+    baseUrl: FAKE_MASSIVE_BASE_URL,
+    fetchImpl: fake.fetchImpl,
+    minRequestIntervalMs: 0,
+    retryBackoffMs: 0,
+    keepRawReplies: true,
+    now: () => "2025-05-13T21:00:00.000Z",
+  });
+  await seedProvider.listApprovedSecurities();
+  const bars = await seedProvider.getDailyBars("2025-05-13", [securityId("massive-stocks", "FIGI00000AAA", "STOCK")]);
+  await writeDailyReplyDust(client, seedProvider.takeRawReplies()[0]!, {
+    provider: seedProvider.providerName,
+    observedAt: bars[0]!.observedAt,
+  });
+
+  // Seed security-master with stale lastUniverseSeenAt (2026-11-23 < ET 2026-11-24).
+  await storage.saveSecurities([
+    {
+      securityId: securityId("massive-stocks", "FIGI00000AAA", "STOCK"),
+      currentSymbol: "AAA",
+      historicalSymbols: [{ symbol: "AAA", effectiveFrom: "2024-01-02", source: "massive-stocks" }],
+      assetType: "STOCK",
+      country: "US",
+      exchange: "XNAS",
+      firstSeenAt: "2024-01-02",
+      status: "ACTIVE",
+      tradable: true,
+      providerIdentities: [{ provider: "massive-stocks", providerSecurityId: "FIGI00000AAA" }],
+      eligibility: "LEVEL_0",
+      barCount: 0,
+      lastUniverseSeenAt: "2026-11-23",
+    },
+  ]);
+
+  const callsBefore = fake.calls.tickers;
+  // 2026-11-25T00:30:00Z is 2026-11-25 in UTC, 2026-11-24 in ET!
+  const report = await runBackfillJob({
+    from: "2025-05-13",
+    to: "2025-05-13",
+    storage,
+    store: client,
+    fetchImpl: fake.fetchImpl,
+    apiKey: "fake-key-not-real",
+    baseUrl: FAKE_MASSIVE_BASE_URL,
+    minRequestIntervalMs: 0,
+    now: () => "2026-11-25T00:30:00.000Z",
+    zstdVersionProbe: pinnedZstd,
+    reopenInactiveTails: true,
+  });
+  assert.equal(report.status, "COMPLETE");
+  assert.ok(fake.calls.tickers > callsBefore, "stale lastUniverseSeenAt must refresh universe (kills always-skip)");
+  const sec = (await storage.loadSecurities())[0]!;
+  assert.equal(sec.lastUniverseSeenAt, "2026-11-24", "UTC midnight boundary uses ET date 2026-11-24");
+
+  const idxManifest = JSON.parse(new TextDecoder().decode((await client.get(TICKER_REFERENCE_INDEX_MANIFEST_KEY))!)) as {
+    asOf: string;
+  };
+  assert.equal(idxManifest.asOf, "2026-11-24", "index asOf uses ET date 2026-11-24");
 });

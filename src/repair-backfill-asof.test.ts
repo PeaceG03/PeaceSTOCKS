@@ -591,3 +591,130 @@ test("repairBackfillAsOf (B1): matches production sec_ IDs, massive-stocks share
   const expectedLine = stableJson({ ...rows[0], effectiveDate: "2026-11-24", observedAt: "2026-11-24" });
   assert.equal(memText.split("\n").includes(expectedLine), true);
 });
+
+test("repairBackfillAsOf (B2): default omitted apply option never writes and UTC-midnight updatedAt uses ET date", async () => {
+  const store = new MemoryObjectStore();
+  // 2026-11-25T00:00:05.102Z is UTC 2026-11-25, ET 2026-11-24
+  await store.put("backfill-reopen-state.json", new TextEncoder().encode(JSON.stringify({ updatedAt: "2026-11-25T00:00:05.102Z" })));
+  await store.put("permanent/security-master.json", new TextEncoder().encode("[]\n"));
+  await store.put("permanent/universe-membership.jsonl", new TextEncoder().encode(""));
+  store.resetCounters();
+
+  const omittedOpts = await repairBackfillAsOf(store);
+  assert.equal(omittedOpts.mode, "dry-run");
+  assert.equal(omittedOpts.targetDate, "2026-11-24", "UTC-midnight boundary resolves to ET date");
+  assert.equal(store.puts, 0);
+  assert.equal(store.deletes, 0);
+});
+
+test("repairBackfillAsOf (B2): kills single-evidence-check mutants (new-membership, bad-index-entry, was-active-before, rename prior-ticker, target-date conflict)", async () => {
+  const store = new MemoryObjectStore();
+  const idNoMem = securityId("massive-stocks", "BBG001NOMEM1", "STOCK");
+  const idNoBadIdx = securityId("massive-stocks", "BBG001NOBAD1", "STOCK");
+  const idNotActiveBefore = securityId("massive-stocks", "BBG001NOTACT", "STOCK");
+  const idBadRenamePrior = securityId("massive-stocks", "BBG001BADREN", "STOCK");
+
+  await writeTickerReferenceIndex(
+    store,
+    {
+      pages: { active: 1, inactive: 1 },
+      entries: [
+        { pass: "active", page: 1, position: 0, raw: JSON.stringify({ ticker: "SYNWRONG", type: "CS", market: "stocks", locale: "us", active: true, share_class_figi: "BBG001BADREN" }), ticker: "SYNWRONG", type: "CS", active: true, share_class_figi: "BBG001BADREN" },
+        { pass: "inactive", page: 1, position: 0, raw: JSON.stringify({ ticker: "SYNNOTACT", type: "CS", market: "stocks", locale: "us", active: false, share_class_figi: "BBG001NOTACT" }), ticker: "SYNNOTACT", type: "CS", active: false, share_class_figi: "BBG001NOTACT" },
+      ],
+    },
+    { provider: "massive-stocks", asOf: "2026-11-24" },
+  );
+
+  await writeTickerReferenceIndex(
+    store,
+    {
+      pages: { active: 1, inactive: 1 },
+      entries: [
+        { pass: "active", page: 1, position: 0, raw: JSON.stringify({ ticker: "SYNNOMEM", type: "CS", market: "stocks", locale: "us", active: true, share_class_figi: "BBG001NOMEM1" }), ticker: "SYNNOMEM", type: "CS", active: true, share_class_figi: "BBG001NOMEM1" },
+        { pass: "active", page: 1, position: 1, raw: JSON.stringify({ ticker: "SYNRENNEW", type: "CS", market: "stocks", locale: "us", active: true, share_class_figi: "BBG001BADREN" }), ticker: "SYNRENNEW", type: "CS", active: true, share_class_figi: "BBG001BADREN" },
+        { pass: "inactive", page: 1, position: 0, raw: JSON.stringify({ ticker: "SYNNOTACT", type: "CS", market: "stocks", locale: "us", active: false, share_class_figi: "BBG001NOTACT" }), ticker: "SYNNOTACT", type: "CS", active: false, share_class_figi: "BBG001NOTACT" },
+      ],
+    },
+    { provider: "massive-stocks", asOf: "2025-05-13" },
+  );
+
+  await store.put("backfill-reopen-state.json", new TextEncoder().encode(JSON.stringify({ updatedAt: "2026-11-25T00:00:05.102Z" })));
+  await store.put(
+    "permanent/security-master.json",
+    new TextEncoder().encode(
+      JSON.stringify([
+        makeSecurity({
+          securityId: idNoMem,
+          currentSymbol: "SYNNOMEM",
+          firstSeenAt: "2025-05-13",
+          lastUniverseSeenAt: "2026-11-24",
+          historicalSymbols: [{ symbol: "SYNNOMEM", effectiveFrom: "2025-05-13", source: "massive-stocks" }],
+          providerIdentities: [{ provider: "massive-stocks", providerSecurityId: "BBG001NOMEM1" }],
+        }),
+        makeSecurity({
+          securityId: idNoBadIdx,
+          currentSymbol: "SYNNOBAD",
+          firstSeenAt: "2025-05-13",
+          lastUniverseSeenAt: "2026-11-24",
+          historicalSymbols: [{ symbol: "SYNNOBAD", effectiveFrom: "2025-05-13", source: "massive-stocks" }],
+          providerIdentities: [{ provider: "massive-stocks", providerSecurityId: "BBG001NOBAD1" }],
+        }),
+        makeSecurity({
+          securityId: idNotActiveBefore,
+          currentSymbol: "SYNNOTACT",
+          status: "INACTIVE",
+          tradable: false,
+          inactiveAt: "2025-05-13",
+          lastUniverseSeenAt: "2026-11-24",
+          providerIdentities: [{ provider: "massive-stocks", providerSecurityId: "BBG001NOTACT" }],
+        }),
+        makeSecurity({
+          securityId: idBadRenamePrior,
+          currentSymbol: "SYNRENNEW",
+          lastUniverseSeenAt: "2026-11-24",
+          historicalSymbols: [
+            { symbol: "SYNRENOLD", effectiveFrom: "2024-01-01", effectiveTo: "2025-05-13", source: "massive-stocks" },
+            { symbol: "SYNRENNEW", effectiveFrom: "2025-05-13", source: "massive-stocks" },
+          ],
+          providerIdentities: [{ provider: "massive-stocks", providerSecurityId: "BBG001BADREN" }],
+        }),
+      ]),
+    ),
+  );
+  await store.put(
+    "permanent/universe-membership.jsonl",
+    new TextEncoder().encode(
+      JSON.stringify({
+        securityId: idNoBadIdx,
+        effectiveDate: "2025-05-13",
+        included: true,
+        eligibility: "LEVEL_0",
+        reason: "NEW",
+        provider: "massive-stocks",
+        observedAt: "2025-05-13",
+      }) + "\n",
+    ),
+  );
+
+  // Target-date conflict rejection
+  await assert.rejects(
+    () => repairBackfillAsOf(store, { badDate: "2025-05-13", targetDate: "2026-11-23", apply: false }),
+    /REPAIR_TARGET_DATE_CONFLICT/u,
+  );
+  await store.put("backfill-reopen-state.json", new TextEncoder().encode(JSON.stringify({ updatedAt: "2026-11-26T00:00:05.102Z" })));
+  await assert.rejects(
+    () => repairBackfillAsOf(store, { badDate: "2025-05-13", apply: false }),
+    /REPAIR_TARGET_DATE_CONFLICT/u,
+  );
+  await store.put("backfill-reopen-state.json", new TextEncoder().encode(JSON.stringify({ updatedAt: "2026-11-25T00:00:05.102Z" })));
+
+  // All 4 missing-evidence cases must remain untouched & unverified
+  const res = await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true });
+  assert.equal(res.securityMaster.repairedFirstSeen, 0);
+  assert.equal(res.securityMaster.repairedInactiveAt, 0);
+  assert.equal(res.securityMaster.repairedHistoricalSymbols, 0);
+  assert.equal(res.securityMaster.unverified, 4);
+  assert.equal(res.universeMembership.repairedRows, 0);
+  assert.equal(res.universeMembership.unverified, 1);
+});
