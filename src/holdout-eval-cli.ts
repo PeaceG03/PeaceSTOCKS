@@ -18,6 +18,7 @@ import { createReadStream, existsSync, readFileSync, writeFileSync } from "node:
 import { createInterface } from "node:readline";
 import type { CorporateAction, SecurityMasterRecord } from "./contracts";
 import { EvalHistory, evaluateSession, summarize, type EvalBar, type SessionOutcome } from "./holdout-eval";
+import { applyTickerDateCollisionExclusions } from "./pit-universe";
 
 function arg(name: string, fallback?: string): string {
   const k = process.argv.indexOf(`--${name}`);
@@ -80,9 +81,11 @@ async function main(): Promise<void> {
     }
     log(`loaded ${month} (lines so far ${lines}, bars kept ${kept.size})`);
   }
+  const master = JSON.parse(readFileSync(`${dir}/permanent/security-master.json`, "utf8")) as SecurityMasterRecord[];
+  const tickerDateCollisions = applyTickerDateCollisionExclusions(kept, master);
+  log(`ticker-date collisions excluded: collidingTickerDates=${tickerDateCollisions.collidingTickerDates} excludedSecurityDates=${tickerDateCollisions.excludedSecurityDates} excludedBars=${tickerDateCollisions.excludedBars}`);
   const history = new EvalHistory(kept.values(), 1000);
   kept.clear();
-  const master = JSON.parse(readFileSync(`${dir}/permanent/security-master.json`, "utf8")) as SecurityMasterRecord[];
 
   // Known splits / reverse splits inside (entry, exit] make an unadjusted return meaningless: drop that name-window.
   const splits = new Map<string, Set<string>>();
@@ -137,7 +140,7 @@ async function main(): Promise<void> {
   for (const [type, s] of Object.entries(summary.lists))
     log(`SUMMARY ${type}: sessions ${s.sessions} mean ${(s.meanReturn * 100).toFixed(3)}% universe ${(s.universeMean * 100).toFixed(3)}% random ${(s.randomMean * 100).toFixed(3)}% spy ${s.spyMean === undefined ? "n/a" : (s.spyMean * 100).toFixed(3) + "%"} excess ${(s.meanExcess * 100).toFixed(3)}% t ${s.excessTStat.toFixed(2)} hit ${(s.hitRate * 100).toFixed(1)}% randomP ${s.randomP.toFixed(3)}`);
   if (out)
-    writeFileSync(out, JSON.stringify({ from, to, horizon, draws, step, winsorize, splitKnowledge, floor: floorArg, sessionsEvaluated: outcomes.map((o) => o.sessionDate), droppedForSplit, splitExcluded, floorExcluded, summary }, null, 2) + "\n");
+    writeFileSync(out, JSON.stringify({ from, to, horizon, draws, step, winsorize, splitKnowledge, floor: floorArg, sessionsEvaluated: outcomes.map((o) => o.sessionDate), droppedForSplit, splitExcluded, floorExcluded, tickerDateCollisions, summary }, null, 2) + "\n");
 }
 
 await main();

@@ -93,3 +93,76 @@ export function pointInTimeUniverse(
   }
   return { bySymbol, memberIds: [...bySymbol.values()].sort(), records, inactiveMembers, ambiguousSymbols };
 }
+
+/** Same ticker resolution filterReopenBars uses for an existing or candidate row. */
+export function reopenTickerOn(security: SecurityMasterRecord, date: string): string | undefined {
+  return symbolOn(security, date) ?? security.currentSymbol;
+}
+
+export interface TickerDateCollisionSummary {
+  /** Distinct ticker-sessionDate pairs claimed by two or more securities. */
+  collidingTickerDates: number;
+  /** Distinct securityId|sessionDate keys on either side of a collision (includes PIT ids with no bar). */
+  excludedSecurityDates: number;
+  /** Stored bars removed because their securityId|sessionDate key was on a collision. */
+  excludedBars: number;
+}
+
+/**
+ * Keys to drop when two distinct securityIds resolve to the same ticker on the same session.
+ *
+ * A security is in play on a date if it is a point-in-time member (`symbolOn` is defined) or it
+ * has a stored bar that day. Stored bars use `symbolOn ?? currentSymbol`, the same fallback
+ * filterReopenBars uses for existing rows, so a leftover INACTIVE first-writer whose membership
+ * has ended still counts. A name with no bar and no PIT membership is not in play, even when
+ * `currentSymbol` matches, so a later listing does not wipe the earlier owner's whole history.
+ *
+ * Both sides of each colliding ticker-date are returned (the stored owner and the refused PIT id).
+ */
+export function excludedTickerDateKeys(
+  securities: readonly SecurityMasterRecord[],
+  hasBar: (securityId: string, sessionDate: string) => boolean,
+  sessionDates: readonly string[],
+): { keys: Set<string>; collidingTickerDates: number; excludedSecurityDates: number } {
+  const keys = new Set<string>();
+  let collidingTickerDates = 0;
+  for (const date of sessionDates) {
+    const byTicker = new Map<string, string[]>();
+    for (const security of securities) {
+      const pit = symbolOn(security, date);
+      const ticker = pit ?? (hasBar(security.securityId, date) ? security.currentSymbol : undefined);
+      if (!ticker) continue;
+      let list = byTicker.get(ticker);
+      if (!list) byTicker.set(ticker, (list = []));
+      if (!list.includes(security.securityId)) list.push(security.securityId);
+    }
+    for (const ids of byTicker.values()) {
+      if (ids.length < 2) continue;
+      collidingTickerDates += 1;
+      for (const id of ids) keys.add(`${id}|${date}`);
+    }
+  }
+  return { keys, collidingTickerDates, excludedSecurityDates: keys.size };
+}
+
+/** Drop colliding securityId|sessionDate bars from a loader map. Aggregate counts only. */
+export function applyTickerDateCollisionExclusions<T extends { securityId: string; sessionDate: string }>(
+  kept: Map<string, T>,
+  securities: readonly SecurityMasterRecord[],
+): TickerDateCollisionSummary {
+  const sessionDates = [...new Set([...kept.values()].map((bar) => bar.sessionDate))].sort();
+  const detected = excludedTickerDateKeys(
+    securities,
+    (securityId, sessionDate) => kept.has(`${securityId}|${sessionDate}`),
+    sessionDates,
+  );
+  let excludedBars = 0;
+  for (const key of detected.keys) {
+    if (kept.delete(key)) excludedBars += 1;
+  }
+  return {
+    collidingTickerDates: detected.collidingTickerDates,
+    excludedSecurityDates: detected.excludedSecurityDates,
+    excludedBars,
+  };
+}

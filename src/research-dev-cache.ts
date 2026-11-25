@@ -75,7 +75,7 @@ export interface DevCacheSession {
 
 export interface DevCacheMeta {
   kind: "dev-cache-meta";
-  version: 2;
+  version: 3;
   from: string;
   heldOutStart: string;
   sessionCount: number;
@@ -314,7 +314,7 @@ export async function buildDevFeatureCache(options: {
     if (got) sessions.push(got);
     if (k % 25 === 0) console.log(`dev-cache progress ${k + 1}/${indexes.length}; aggregate only`);
   }
-  const meta: DevCacheMeta = { kind: "dev-cache-meta", version: 2, from, heldOutStart, sessionCount: sessions.length, manifest };
+  const meta: DevCacheMeta = { kind: "dev-cache-meta", version: 3, from, heldOutStart, sessionCount: sessions.length, manifest };
   mkdirSync(dirname(options.outFile), { recursive: true });
   await new Promise<void>((resolveWrite, rejectWrite) => {
     const stream = createWriteStream(options.outFile, { encoding: "utf8" });
@@ -341,7 +341,7 @@ export function readDevFeatureCache(
   const lines = readFileSync(cachePath, "utf8").split("\n").filter(Boolean);
   if (!lines.length) throw new Error("DEV_CACHE_EMPTY");
   const meta = JSON.parse(lines[0]!) as DevCacheMeta;
-  if (meta.kind !== "dev-cache-meta" || meta.version !== 2) throw new Error("DEV_CACHE_INVALID_META");
+  if (meta.kind !== "dev-cache-meta" || meta.version !== 3) throw new Error("DEV_CACHE_INVALID_META");
   if (meta.heldOutStart > expectedHeldOutStart) {
     throw new Error(`${DEV_CACHE_REFUSED_HELDOUT}:meta:${meta.heldOutStart}>${expectedHeldOutStart}`);
   }

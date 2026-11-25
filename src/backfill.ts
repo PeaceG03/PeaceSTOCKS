@@ -32,7 +32,7 @@ import { refreshEligibility, refreshUniverse } from "./universe";
 import { US_EQUITY_MARKET_CALENDAR } from "./us-calendar";
 import { etCalendarDate } from "./et-time";
 import { finalizeDailyPartition } from "./scanner";
-import { pointInTimeUniverse, symbolOn } from "./pit-universe";
+import { pointInTimeUniverse, reopenTickerOn } from "./pit-universe";
 import { ScanYieldError, createScanYieldCheck } from "./scan-yield";
 
 const STATE_VERSION = "markets-scanner-backfill-v1" as const;
@@ -281,8 +281,9 @@ export function filterReopenBars(
   const existingKeys = new Set(existing.map((b) => `${b.securityId}|${b.sessionDate}|${b.revision}`));
   const existingTickersOnDate = new Set<string>();
   for (const row of existing) {
+    if (row.sessionDate !== sessionDate) continue;
     const sec = byId.get(row.securityId);
-    const ticker = sec ? (symbolOn(sec, sessionDate) ?? sec.currentSymbol) : undefined;
+    const ticker = sec ? reopenTickerOn(sec, sessionDate) : undefined;
     if (ticker) existingTickersOnDate.add(ticker);
   }
   const newBars: CanonicalDailyBar[] = [];
@@ -293,7 +294,7 @@ export function filterReopenBars(
     if (existingKeys.has(`${bar.securityId}|${bar.sessionDate}|${bar.revision}`)) continue;
     const sec = byId.get(bar.securityId);
     const status = sec?.status ?? "UNKNOWN";
-    const ticker = sec ? (symbolOn(sec, sessionDate) ?? sec.currentSymbol) : undefined;
+    const ticker = sec ? reopenTickerOn(sec, sessionDate) : undefined;
     if (ticker && existingTickersOnDate.has(ticker)) {
       skippedCollisionByStatus[status] = (skippedCollisionByStatus[status] ?? 0) + 1;
       continue;
