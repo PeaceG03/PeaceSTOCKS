@@ -1,0 +1,91 @@
+name: Coverage check (read-only)
+# Manual-only read-only R2 coverage check. Never writes to R2, never uses write keys, and emits
+# aggregate counts only (zero tickers, security IDs, or prices).
+on:
+  workflow_dispatch:
+    inputs:
+      skip_reply_dust:
+        description: "Skip Reply Dust expected-set replay (daily-bars aggregates only)"
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: coverage-check
+  cancel-in-progress: false
+jobs:
+  coverage:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    environment: site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Restore pinned zstd 1.5.7
+        id: zstd-cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/zstd-1.5.7
+          key: zstd-1.5.7-eb33e51f49a15e02-${{ runner.os }}-ubuntu-24.04
+      - name: Build pinned zstd 1.5.7
+        if: ${{ steps.zstd-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+          echo "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3  zstd-1.5.7.tar.gz" | sha256sum -c -
+          tar xzf zstd-1.5.7.tar.gz
+          make -C zstd-1.5.7 -j"$(nproc)" zstd-release
+          install -D -m 0755 zstd-1.5.7/programs/zstd ~/.local/zstd-1.5.7/bin/zstd
+      - name: Use pinned zstd 1.5.7
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ~/.local/zstd-1.5.7/bin/zstd --version | grep -F ' v1.5.7,'
+          echo "$HOME/.local/zstd-1.5.7/bin" >> "$GITHUB_PATH"
+      - name: Required read-only R2 secrets present (names only)
+        env:
+          PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+          PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+          PEACESTOCKS_R2_READ_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_READ_ACCESS_KEY_ID }}
+          PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY }}
+        run: |
+          missing=0
+          for name in PEACESTOCKS_R2_ACCOUNT_ID PEACESTOCKS_R2_BUCKET PEACESTOCKS_R2_READ_ACCESS_KEY_ID PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY; do
+            if [ -z "${!name}" ]; then echo "::error::missing secret: $name"; missing=1; fi
+          done
+          exit "$missing"
+      - name: Run read-only coverage check
+        env:
+          PEACESTOCKS_R2_ACCOUNT_ID: ${{ secrets.PEACESTOCKS_R2_ACCOUNT_ID }}
+          PEACESTOCKS_R2_BUCKET: ${{ secrets.PEACESTOCKS_R2_BUCKET }}
+          PEACESTOCKS_R2_READ_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_READ_ACCESS_KEY_ID }}
+          PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY }}
+          SKIP_REPLY_DUST: ${{ inputs.skip_reply_dust }}
+        run: |
+          set -euo pipefail
+          extra=""
+          if [ "$SKIP_REPLY_DUST" = "true" ]; then extra="--skip-reply-dust"; fi
+          node scripts/trim-step-env.cjs PEACESTOCKS_R2_ACCOUNT_ID PEACESTOCKS_R2_BUCKET PEACESTOCKS_R2_READ_ACCESS_KEY_ID PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY -- \
+            pnpm -s exec tsx src/coverage-check.ts --out coverage-check.json $extra
+      # Always upload after the check step so a non-zero exit (missing pairs / anomalies)
+      # still leaves the aggregate summary artifact for review.
+      - name: Upload aggregate coverage report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-check-report
+          path: coverage-check.json
+          if-no-files-found: error
+          retention-days: 30
