@@ -1,7 +1,9 @@
 /**
  * The daily scan always gets the Massive request budget (5/min). Backfill checks this before
  * starting and before every session, and stops at the session boundary when a scan is due or
- * waiting, so a scan never competes with it for requests.
+ * waiting, so a scan never competes with it for requests. While SCANNER_MANUAL_ONLY is not
+ * exactly "false", scheduled-slot guard windows are skipped (no cron will start a scan);
+ * a queued or in-progress scanner.yml run still preempts.
  */
 
 /** UTC minute-of-day windows that start 15 minutes before each scheduled scan (05:30 and 09:30 UTC). */
@@ -19,6 +21,16 @@ export interface ScanYieldOptions {
 export function inScanGuardWindow(at: Date): boolean {
   const minute = at.getUTCHours() * 60 + at.getUTCMinutes();
   return SCAN_GUARD_WINDOWS_UTC.some(([start, end]) => minute >= start && minute < end);
+}
+
+/**
+ * Scheduled-slot yields (05:15–06:15 and 09:15–10:15 UTC) apply only when
+ * SCANNER_MANUAL_ONLY is exactly "false" (schedules are live). Unset defaults
+ * off — the same rule as scannerManualOnly() in health-check.ts. The
+ * queued/in-progress scanner-run check is unchanged.
+ */
+export function scanGuardSlotYieldsEnabled(env?: NodeJS.ProcessEnv): boolean {
+  return env?.SCANNER_MANUAL_ONLY === "false";
 }
 
 const ACTIVE_RUN_STATES = new Set(["queued", "in_progress", "waiting", "pending", "requested"]);
@@ -133,9 +145,10 @@ export function rateLimitInfo(
  * Stateless: one API call per call. Long loops use createScanYieldCheck (throttled, retried).
  */
 export async function scanYieldReason(options: ScanYieldOptions = {}): Promise<string | undefined> {
+  const env = options.env ?? process.env;
   const now = (options.now ?? (() => new Date()))();
-  if (inScanGuardWindow(now)) return `SCAN_GUARD_WINDOW:${now.toISOString()}`;
-  const result = await checkScannerRuns(options);
+  if (scanGuardSlotYieldsEnabled(env) && inScanGuardWindow(now)) return `SCAN_GUARD_WINDOW:${now.toISOString()}`;
+  const result = await checkScannerRuns({ ...options, env });
   if (!result) return undefined;
   return result.ok ? result.waiting : `${SCAN_CHECK_FAILED}:${result.failure}`;
 }
@@ -179,10 +192,11 @@ export function createScanYieldCheck(options: ScanYieldCheckOptions = {}): () =>
   const delays = options.retryDelaysMs ?? SCAN_CHECK_RETRY_DELAYS_MS;
   const maxWait = options.maxRetryWaitMs ?? SCAN_CHECK_MAX_RETRY_WAIT_MS;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+  const env = options.env ?? process.env;
   let lastClearAt: number | undefined;
   return async () => {
     const now = clock();
-    if (inScanGuardWindow(now)) return `SCAN_GUARD_WINDOW:${now.toISOString()}`;
+    if (scanGuardSlotYieldsEnabled(env) && inScanGuardWindow(now)) return `SCAN_GUARD_WINDOW:${now.toISOString()}`;
     if (lastClearAt !== undefined && now.getTime() - lastClearAt < intervalMs) return undefined;
     for (let attempt = 1; ; attempt += 1) {
       const result = await checkScannerRuns({ ...options, now: clock });
@@ -206,7 +220,7 @@ export function createScanYieldCheck(options: ScanYieldCheckOptions = {}): () =>
       }
       await sleep(wait);
       const after = clock();
-      if (inScanGuardWindow(after)) return `SCAN_GUARD_WINDOW:${after.toISOString()}`;
+      if (scanGuardSlotYieldsEnabled(env) && inScanGuardWindow(after)) return `SCAN_GUARD_WINDOW:${after.toISOString()}`;
     }
   };
 }

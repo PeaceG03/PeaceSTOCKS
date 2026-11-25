@@ -98,6 +98,12 @@ concurrency:
   group: ${{ (github.event.schedule == '47 * * * *' || ((github.event.schedule == '20 6 * * 2-6' || github.event.schedule == '20 10 * * 2-6') && vars.TENMIN_DAILY_ENABLED != 'true')) && format('scanner-idle-{0}', github.run_id) || 'peacestocks-r2-writer' }}
   cancel-in-progress: false
 
+# While SCANNER_MANUAL_ONLY is not exactly "false", createScanYieldCheck skips the
+# 05:15–06:15 / 09:15–10:15 UTC scheduled-scan guard windows. It still yields to
+# another queued or in-progress scanner.yml run. Unset defaults to skip the slots.
+env:
+  SCANNER_MANUAL_ONLY: ${{ vars.SCANNER_MANUAL_ONLY }}
+
 jobs:
   scan:
     environment: scanner-data

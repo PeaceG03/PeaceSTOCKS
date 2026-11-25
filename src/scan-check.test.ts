@@ -176,7 +176,7 @@ test("throttle: at most one API call per interval while clear; guard windows nee
   assert.ok(gh.calls <= Math.ceil((5000 * 690) / SCAN_CHECK_INTERVAL_MS) + 1, `api calls ${gh.calls}`);
   assert.ok(gh.calls >= 50);
   const guard = fakeGitHub({ startIso: "2026-10-11T09:20:00Z", limitPerHour: 1000 });
-  const guarded = createScanYieldCheck({ env: ENV, now: guard.clock, fetchImpl: guard.fetchImpl });
+  const guarded = createScanYieldCheck({ env: { ...ENV, SCANNER_MANUAL_ONLY: "false" }, now: guard.clock, fetchImpl: guard.fetchImpl });
   assert.match((await guarded()) ?? "", /^SCAN_GUARD_WINDOW:/u);
   assert.equal(guard.calls, 0);
 });

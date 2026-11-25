@@ -60,13 +60,20 @@ off) must be exactly `true` before a tenmin_history auto re-dispatch, a chain fo
 a scan, or a missed-scan backstop may start another scanner run. Backfill chunk continuation
 inside one manually started run is unchanged.
 
+While `SCANNER_MANUAL_ONLY` is not exactly `false`, backfill and the other
+`createScanYieldCheck` / `scanYieldReason` callers do not stop for the scheduled-scan
+guard windows (05:15–06:15 and 09:15–10:15 UTC). Those windows existed to clear the
+Massive budget before the 05:30/09:30 UTC scan crons. They still yield to another
+queued or in-progress `scanner.yml` run (the `peacestocks-r2-writer` active-run check).
+
 To put the scanner back on a schedule later:
 
 1. Restore the `schedule:` crons on `scanner.yml` (05:30 and 09:30 UTC Tue–Sat for the scan, `:47`
    for the restarter, 06:20 and 10:20 UTC Tue–Sat for the daily liquid step).
 2. Re-enable the disabled workflows with `gh workflow enable`.
 3. Set the repo variable `SCANNER_AUTO_CHAIN` to `true`.
-4. Set the repo variable `SCANNER_MANUAL_ONLY` to `false` so health resumes scan-freshness alerts.
+4. Set the repo variable `SCANNER_MANUAL_ONLY` to `false` so health resumes scan-freshness
+   alerts and backfill again yields for the scheduled-scan guard windows.
 
 ## Scanner universe
 
