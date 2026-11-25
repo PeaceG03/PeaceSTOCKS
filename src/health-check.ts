@@ -43,6 +43,14 @@ import {
 } from "./tenmin-daily-liquid";
 import { lastCompletedSessionDate, pairRangeForDate } from "./tenmin-history";
 
+/** Repo variable SCANNER_MANUAL_ONLY: skip scan freshness / missed-check-in alerts unless exactly "false". Unset defaults on. */
+export function scannerManualOnly(value: string | undefined): boolean {
+  return value !== "false";
+}
+
+/** Health part names whose scheduled freshness is skipped while SCANNER_MANUAL_ONLY is on. */
+export const SCANNER_FRESHNESS_PARTS = new Set(["scan", "daily 10-minute step", "history chain"]);
+
 export const HEALTHY = "Healthy" as const;
 export const NO_PARTS_REPORTING = "no parts reporting" as const;
 export const NO_PARTS_REPORTING_NOTE =
@@ -239,13 +247,17 @@ export function evaluateHealth(input: {
   monitoringSince?: string;
   now: Date;
   stuckDays?: readonly HealthStuckDay[];
+  /** When true, skip scan / daily 10-minute / history-chain freshness so missing scheduled scans do not open the health issue. */
+  manualOnly?: boolean;
 }): HealthCheckResult {
   const results: HealthPartResult[] = [];
   const requests: Record<string, number> = {};
   for (const part of input.parts) {
     const latest = input.latest.get(part.name);
     const allowance = silenceAllowance(part, latest, input.monitoringSince);
+    const skipFreshness = !!input.manualOnly && SCANNER_FRESHNESS_PARTS.has(part.name);
     const silent =
+      !skipFreshness &&
       allowance !== undefined &&
       (latest
         ? isCheckinSilent(ageMinutes(latest.at, input.now), allowance)
@@ -269,7 +281,9 @@ export function evaluateHealth(input: {
             ? behindLine(part.name, latest, stalled ? input.previous?.get(part.name) : undefined)
           : status === "unrecognized word"
             ? `${part.name}: unrecognized word ${JSON.stringify(word)}`
-            : latest
+            : skipFreshness
+              ? `${part.name}: OK (manual-only)`
+              : latest
               ? partOkLine(part.name)
               : allowance === undefined
                 ? `${part.name}: OK (runs only when started; no check-in yet)`
@@ -296,7 +310,7 @@ export function evaluateHealth(input: {
   const stuckAttention = stuckDays.filter(stuckDayNeedsAttention);
   if (stuckAttention.length) attention.push(`daily 10-minute step (${stuckAttention.length} stuck day/s)`);
   const behind = results.filter((r) => r.status === "behind" && !r.stalled).map((r) => `${r.name} (${r.remaining ?? "?"} remaining)`);
-  const headline = !input.parts.length || !anyReported
+  const headline = !input.parts.length || (!anyReported && !input.manualOnly)
     ? NO_PARTS_REPORTING
     : attention.length
       ? `needs attention: ${attention.join(", ")}${behind.length ? `; behind: ${behind.join(", ")}` : ""}`
@@ -304,6 +318,7 @@ export function evaluateHealth(input: {
         ? `behind: ${behind.join(", ")}`
         : HEALTHY;
   const lines = [headline, `errors: ${errors}, missing: ${missing}`];
+  if (input.manualOnly) lines.push("scan freshness skipped: manual-only");
   // Before the first check-ins this is expected once (Auditor, final review): say so in the issue body.
   if (headline === NO_PARTS_REPORTING) lines.push(NO_PARTS_REPORTING_NOTE);
   if (fault) lines.push(`health check likely at fault: ${silent.length} parts silent at once (${silent.join(", ")})`);
@@ -355,6 +370,7 @@ export async function readStuckDays(
 export async function runHealthCheck(
   store: HealthPruneStore,
   now: Date = new Date(),
+  options?: { manualOnly?: boolean },
 ): Promise<HealthCheckResult & { prunedCheckins: number; pruneError?: string }> {
   const latest = new Map<string, HealthCheckinFacts | undefined>();
   const previous = new Map<string, HealthCheckinFacts | undefined>();
@@ -392,6 +408,7 @@ export async function runHealthCheck(
     priorRequests,
     now,
     stuckDays: await readStuckDays(store, now),
+    ...(options?.manualOnly ? { manualOnly: true } : {}),
   });
   const at = now.toISOString();
   // Retention: check-ins older than one month are pruned (after the latest ones were read). A prune
@@ -410,7 +427,7 @@ export async function runHealthCheck(
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  runHealthCheck(R2ObjectClient.fromEnv(process.env))
+  runHealthCheck(R2ObjectClient.fromEnv(process.env), new Date(), { manualOnly: scannerManualOnly(process.env.SCANNER_MANUAL_ONLY) })
     .then(async (result) => {
       for (const line of result.lines) process.stdout.write(`${line}\n`);
       process.stdout.write(`pruned check-ins older than one month: ${result.prunedCheckins}\n`);

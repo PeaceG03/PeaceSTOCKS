@@ -57,6 +57,8 @@ jobs:
           PEACESTOCKS_R2_ACCESS_KEY_ID: ${{ secrets.PEACESTOCKS_R2_ACCESS_KEY_ID }}
           PEACESTOCKS_R2_SECRET_ACCESS_KEY: ${{ secrets.PEACESTOCKS_R2_SECRET_ACCESS_KEY }}
           HEALTH_RESULT_FILE: ${{ runner.temp }}/health-result.json
+          # Unset or any value other than false: skip scan freshness / missed-check-in alerts (manual-only).
+          SCANNER_MANUAL_ONLY: ${{ vars.SCANNER_MANUAL_ONLY }}
         run: pnpm -s exec tsx src/health-check.ts
       # A non-OK result (or a check that did not finish) opens ONE "PeaceSTOCKS health needs attention"
       # issue (label scanner-alert), or comments on the open one; never a new issue per run. No R2 secrets here.

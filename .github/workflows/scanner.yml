@@ -10,8 +10,9 @@ name: Scanner
 run-name: ${{ github.event.schedule == '47 * * * *' && 'Scanner restarter' || ((github.event.schedule == '20 6 * * 2-6' || github.event.schedule == '20 10 * * 2-6') && (vars.TENMIN_DAILY_ENABLED == 'true' && 'Scanner tenmin daily' || 'Scanner tenmin daily (off)') || 'Scanner') }}
 
 on:
-  # Intentionally no push trigger: online work is schedule + workflow_dispatch only.
-  # Push events that only change this file must not start a scan or backfill.
+  # Intentionally no push trigger: online work is workflow_dispatch only while
+  # manual-only (Peace, Nov 24 2026). Push events that only change this file must
+  # not start a scan or backfill.
   workflow_dispatch:
     inputs:
       mode:
@@ -80,26 +81,11 @@ on:
         description: "tenmin_history only: consecutive STOP_SCAN_CHECK_FAILED runs before this one (set by the restarter's one auto-restart; 0 otherwise)"
         required: false
         default: "0"
-  schedule:
-    # 05:30 UTC Tue–Sat: just after midnight ET (00:30 EST / 01:30 EDT) so collectionDue targets the
-    # previous ET trading day (S2: due only when ET date strictly after D). Saturday covers Friday.
-    - cron: "30 5 * * 2-6"
-    # Later UTC morning retry if Massive was not ready yet (04:30 EST / 05:30 EDT). Saturday covers Friday.
-    - cron: "30 9 * * 2-6"
-    # Observed Nov 2026: GitHub has not been firing the 05:30/09:30 UTC scan crons above (no scheduled
-    # run near either slot in the week to Nov 24, 2026). In practice the scan path is the hourly :47
-    # restarter's scan_backstop plus the chain follow-ups. See docs/SCANNER.md.
-    # Ten-minute history restarter: hourly at :47 (off the :00/:30 marks). Runs ONLY the restarter
-    # job (tenmin-history-fallback.yml via workflow_call); the scan job skips this cron. The decide
-    # step waits (no dispatch) inside or just before a guard window and while any scan/history run
-    # is active. Must match TENMIN_RESTARTER_CRON in src/tenmin-redispatch.ts.
-    - cron: "47 * * * *"
-    # Daily liquid 10-minute step (src/tenmin-daily-liquid.ts): 5 min after each scan guard window
-    # ends, Tue–Sat (Mon–Fri sessions; no Sun/Mon run). The scan's slot is always first: these join
-    # peacestocks-r2-writer and queue behind a running scan. 06:20 + 155 min budget = 08:55Z, before
-    # the 09:15Z guard window; the 10:20 run catches up anything the first run left (idempotent).
-    - cron: "20 6 * * 2-6"
-    - cron: "20 10 * * 2-6"
+  # Manual-only until reliable (Peace, Nov 24 2026): no schedule: triggers.
+  # Jobs still keyed on github.event_name == 'schedule' or github.event.schedule
+  # simply do not run. To restore later: put back the 05:30/09:30 UTC Tue-Sat scan
+  # crons, the :47 restarter, and the 06:20/10:20 daily liquid crons; set
+  # SCANNER_AUTO_CHAIN=true; and set SCANNER_MANUAL_ONLY=false. See docs/SCANNER.md.
 
 # One writer at a time: scans and backfills both write R2 (month files, cursor), so they queue
 # instead of overlapping. A run already in progress is never canceled.
@@ -344,7 +330,7 @@ jobs:
   # alert as tenmin-history-fallback.yml (reused via workflow_call, not duplicated). It rides on this
   # workflow's schedule because the fallback file's own schedule never fired.
   restarter:
-    if: ${{ github.event_name == 'schedule' && github.event.schedule == '47 * * * *' }}
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '47 * * * *' && vars.SCANNER_AUTO_CHAIN == 'true' }}
     permissions:
       contents: read
       actions: write
@@ -357,7 +343,7 @@ jobs:
   # queues in peacestocks-r2-writer until this run ends). Same kill switch, same rules, same stop alert.
   chain_followup:
     needs: [scan, tenmin_daily, backfill]
-    if: ${{ always() && (needs.scan.result != 'skipped' || needs.tenmin_daily.result != 'skipped' || needs.backfill.result != 'skipped') }}
+    if: ${{ always() && vars.SCANNER_AUTO_CHAIN == 'true' && (needs.scan.result != 'skipped' || needs.tenmin_daily.result != 'skipped' || needs.backfill.result != 'skipped') }}
     permissions:
       contents: read
       actions: write
@@ -424,7 +410,7 @@ jobs:
   # Missed-scheduled-scan backstop (same reliable :47 cron): if the 05:30/09:30 UTC scheduled scan never
   # started, dispatch one mode=scan run. Harmless when redundant (collectionDue). Logic: src/scan-backstop.ts.
   scan_backstop:
-    if: ${{ github.event_name == 'schedule' && github.event.schedule == '47 * * * *' }}
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '47 * * * *' && vars.SCANNER_AUTO_CHAIN == 'true' }}
     permissions:
       contents: read
       actions: write
@@ -433,7 +419,7 @@ jobs:
   # Same open-ended backstop at the end of every tenmin_history run (dispatched, so it fires when crons do not).
   scan_backstop_after_history:
     needs: [tenmin_history]
-    if: ${{ always() && needs.tenmin_history.result != 'skipped' }}
+    if: ${{ always() && vars.SCANNER_AUTO_CHAIN == 'true' && needs.tenmin_history.result != 'skipped' }}
     permissions:
       contents: read
       actions: write
@@ -635,6 +621,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           TENMIN_AUTO_REDISPATCH: ${{ vars.TENMIN_AUTO_REDISPATCH }}
           TENMIN_AUTO_REDISPATCH_MAX_CHAIN: ${{ vars.TENMIN_AUTO_REDISPATCH_MAX_CHAIN }}
+          SCANNER_AUTO_CHAIN: ${{ vars.SCANNER_AUTO_CHAIN }}
           TENMIN_CHAIN: ${{ github.event.inputs.tenmin_history_chain }}
           TENMIN_SCAN_CHECK_STOPS: ${{ github.event.inputs.tenmin_scan_check_stops }}
           TENMIN_STEP_OUTCOME: ${{ steps.history.outcome }}

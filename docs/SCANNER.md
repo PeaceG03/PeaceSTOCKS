@@ -37,6 +37,37 @@ The package already contains:
 - Dust storage/reader work;
 - tests.
 
+## Manual-only until reliable (Peace, Nov 24 2026)
+
+Peace's rule: the scanner must not run on a schedule until it is reliable. Scans run only when
+manually started and watched.
+
+`scanner.yml` no longer has a `schedule:` block (those crons cannot be turned off with
+`gh workflow disable` without also blocking manual `workflow_dispatch`). The following workflows
+are already disabled and stay disabled until the scanner is reliable:
+
+- Scan backstop
+- Ten-minute history fallback
+- Daily-bars gap refill
+- Oct 2024 ten-minute fetch
+- Paper trading
+
+The Health check (`health.yml`) stays on its schedule. Repo variable `SCANNER_MANUAL_ONLY`
+(unset is treated as true) makes that check skip scan freshness and missed-check-in alerts for
+the scanner (scan, daily 10-minute step, history chain) and reports the skip as `manual-only`.
+A failed manual run still needs a person. Repo variable `SCANNER_AUTO_CHAIN` (unset defaults
+off) must be exactly `true` before a tenmin_history auto re-dispatch, a chain follow-up after
+a scan, or a missed-scan backstop may start another scanner run. Backfill chunk continuation
+inside one manually started run is unchanged.
+
+To put the scanner back on a schedule later:
+
+1. Restore the `schedule:` crons on `scanner.yml` (05:30 and 09:30 UTC Tue–Sat for the scan, `:47`
+   for the restarter, 06:20 and 10:20 UTC Tue–Sat for the daily liquid step).
+2. Re-enable the disabled workflows with `gh workflow enable`.
+3. Set the repo variable `SCANNER_AUTO_CHAIN` to `true`.
+4. Set the repo variable `SCANNER_MANUAL_ONLY` to `false` so health resumes scan-freshness alerts.
+
 ## Scanner universe
 
 Initial production scope:
@@ -293,10 +324,12 @@ This led to requirements for:
 
 #### GitHub Actions scan crons (observed Nov 2026)
 
-scanner.yml schedules the scan at 05:30 and 09:30 UTC, Tue–Sat (`30 5 * * 2-6`, `30 9 * * 2-6`).
+scanner.yml used to schedule the scan at 05:30 and 09:30 UTC, Tue–Sat (`30 5 * * 2-6`, `30 9 * * 2-6`).
 GitHub has not been firing those two crons: in the week to Nov 24, 2026 no scheduled run started near
-either slot. In practice the scan runs through the hourly :47 restarter's `scan_backstop` and the
-chain follow-ups (scan dispatched after a history run), so it arrives late but is not skipped.
+either slot. In practice the scan ran through the hourly :47 restarter's `scan_backstop` and the
+chain follow-ups (scan dispatched after a history run), so it arrived late but was not skipped.
+Those `schedule:` triggers were removed from scanner.yml on Nov 24 2026 (manual-only until
+reliable; see the section above).
 
 ### Nightly scan health record and missed-freeze alert
 

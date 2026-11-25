@@ -123,7 +123,8 @@ test("alert: a fallback stop seen only next to restarter runs still alerts (coun
 test("workflows: scanner.yml restarter cron, run-name, scan gate, concurrency, and the restarter job agree", () => {
   const scanner = readFileSync(new URL("../.github/workflows/scanner.yml", import.meta.url), "utf8");
   const cron = TENMIN_RESTARTER_CRON;
-  assert.ok(scanner.includes(`    - cron: "${cron}"`), "cron in on.schedule");
+  // Manual-only (Peace, Nov 24 2026): no on.schedule. The restarter job if still names the cron so a later restore stays consistent.
+  assert.ok(!scanner.includes(`    - cron: "${cron}"`), "no cron in on.schedule while manual-only");
   const daily = "(github.event.schedule == '20 6 * * 2-6' || github.event.schedule == '20 10 * * 2-6')";
   assert.ok(
     scanner.includes(
@@ -143,13 +144,12 @@ test("workflows: scanner.yml restarter cron, run-name, scan gate, concurrency, a
     "scan skips the restarter and daily liquid crons",
   );
   const job = scanner.slice(scanner.indexOf("\n  restarter:\n"), scanner.indexOf("\n  backfill:\n"));
-  assert.ok(job.includes(`if: \${{ github.event_name == 'schedule' && github.event.schedule == '${cron}' }}`));
+  assert.ok(job.includes(`if: \${{ github.event_name == 'schedule' && github.event.schedule == '${cron}' && vars.SCANNER_AUTO_CHAIN == 'true' }}`));
   assert.ok(job.includes("uses: ./.github/workflows/tenmin-history-fallback.yml"));
   for (const p of ["contents: read", "actions: write", "issues: write"]) assert.ok(job.includes(p), p);
-  // Scan crons (05:30 / 09:30), the restarter, and the daily liquid crons (06:20 / 10:20, right
-  // after each guard window); none sits on :00.
+  // Manual-only: no schedule crons on scanner.yml.
   const crons = [...scanner.matchAll(/- cron: "([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(crons, ["30 5 * * 2-6", "30 9 * * 2-6", cron, "20 6 * * 2-6", "20 10 * * 2-6"]);
+  assert.deepEqual(crons, []);
 
   const fallback = readFileSync(new URL("../.github/workflows/tenmin-history-fallback.yml", import.meta.url), "utf8");
   assert.ok(fallback.includes("\n  workflow_call:\n"));
