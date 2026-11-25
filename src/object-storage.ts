@@ -246,51 +246,107 @@ export class ObjectMarketStorage implements MarketStore {
         ? await this.client.getWithEtag(keyName)
         : await this.client.get(keyName).then((body) => (body ? { body, etag: undefined } : undefined));
       const readSha = got ? createHash("sha256").update(got.body).digest("hex") : undefined;
-      const oldLines = got ? text(got.body).split("\n").filter(Boolean) : [];
-      // Keep existing lines byte-for-byte; only append new (securityId, sessionDate, revision) keys.
-      const firstByKey = new Map<string, { record: CanonicalDailyBar; line: string }>();
-      for (const rawLine of oldLines) {
-        const item = JSON.parse(rawLine) as CanonicalDailyBar;
-        const k = `${item.securityId}|${item.sessionDate}|${item.revision}`;
-        if (!firstByKey.has(k)) firstByKey.set(k, { record: item, line: rawLine });
+      // Keep existing lines byte-for-byte without splitting the whole file or JSON-parsing every row.
+      const existingKeys: string[] = [];
+      const existingOffsets: number[] = [];
+      const existingIndexByKey = new Map<string, number>();
+      let duplicateExisting = false;
+      let duplicateDiffers = false;
+      let unsortedExisting = false;
+      let prevExistingKey: string | undefined;
+      if (got) {
+        scanJsonlLines(got.body, (lineBytes, start, end) => {
+          const line = utf8Decoder.decode(lineBytes);
+          const secMatch = /"securityId"\s*:\s*"([^"\\]+)"/u.exec(line);
+          const dateMatch = /"sessionDate"\s*:\s*"([^"\\]+)"/u.exec(line);
+          const revMatch = /"revision"\s*:\s*(\d+)/u.exec(line);
+          let k: string;
+          if (secMatch && dateMatch && revMatch) {
+            k = `${secMatch[1]}|${dateMatch[1]}|${revMatch[1]}`;
+          } else {
+            const item = JSON.parse(line) as CanonicalDailyBar;
+            k = `${item.securityId}|${item.sessionDate}|${item.revision}`;
+          }
+          const seenIdx = existingIndexByKey.get(k);
+          if (seenIdx !== undefined) {
+            duplicateExisting = true;
+            const pStart = existingOffsets[seenIdx * 2]!;
+            const pEnd = existingOffsets[seenIdx * 2 + 1]!;
+            if (Buffer.compare(got.body.subarray(pStart, pEnd), lineBytes) !== 0) duplicateDiffers = true;
+            return;
+          }
+          if (prevExistingKey !== undefined && prevExistingKey.localeCompare(k) >= 0) unsortedExisting = true;
+          prevExistingKey = k;
+          const idx = existingKeys.length;
+          existingIndexByKey.set(k, idx);
+          existingKeys.push(k);
+          existingOffsets.push(start, end);
+        });
       }
-      let added = 0;
-      const addedRecords: CanonicalDailyBar[] = [];
+      const addedMap = new Map<string, { record: CanonicalDailyBar; bytes: Uint8Array }>();
       for (const record of monthRecords) {
         const k = `${record.securityId}|${record.sessionDate}|${record.revision}`;
-        if (firstByKey.has(k)) continue;
-        firstByKey.set(k, { record, line: stableJson(record) });
-        added += 1;
-        addedRecords.push(record);
+        if (existingIndexByKey.has(k) || addedMap.has(k)) continue;
+        addedMap.set(k, { record, bytes: utf8Encoder.encode(stableJson(record)) });
       }
-      if (added === 0) continue;
-      for (const record of addedRecords) {
-        const prior = firstByKey.get(`${record.securityId}|${record.sessionDate}|${record.revision - 1}`)?.record;
-        if (prior)
+      if (addedMap.size === 0) continue;
+      if (duplicateDiffers) throw new Error(`DAILY_BARS_MONTH_LINE_LOST:${keyName}`);
+      if (unsortedExisting) throw new Error(`DAILY_BARS_MONTH_ORDER_DRIFT:${keyName}`);
+      if (duplicateExisting) throw new Error(`DAILY_BARS_MONTH_SHRUNK:${keyName}`);
+      for (const { record } of addedMap.values()) {
+        const priorKey = `${record.securityId}|${record.sessionDate}|${record.revision - 1}`;
+        let priorRevision: number | undefined;
+        const priorIdx = existingIndexByKey.get(priorKey);
+        if (priorIdx !== undefined && got) {
+          const s = existingOffsets[priorIdx * 2]!;
+          const e = existingOffsets[priorIdx * 2 + 1]!;
+          priorRevision = (JSON.parse(utf8Decoder.decode(got.body.subarray(s, e))) as CanonicalDailyBar).revision;
+        } else {
+          const priorAdded = addedMap.get(priorKey);
+          if (priorAdded) priorRevision = priorAdded.record.revision;
+        }
+        if (priorRevision !== undefined) {
           corrections.push({
             correctionId: `${record.securityId}|${record.sessionDate}|${record.revision}`,
             evidenceKey: `${record.securityId}|${record.sessionDate}`,
-            supersedesRevision: prior.revision,
+            supersedesRevision: priorRevision,
             replacementRevision: record.revision,
             reason: "provider-revision",
             correctedAt: record.ingestedAt,
             provenance: record.provenance,
           });
+        }
       }
-      const newLines = [...firstByKey.entries()]
-        .sort((a, b) => a[0].localeCompare(b[0]))
-        .map(([, entry]) => entry.line);
-      const newIndex = new Map<string, number>();
-      newLines.forEach((line, idx) => newIndex.set(line, idx));
-      let prevIdx = -1;
-      for (const oldLine of oldLines) {
-        const idx = newIndex.get(oldLine);
-        if (idx === undefined) throw new Error(`DAILY_BARS_MONTH_LINE_LOST:${keyName}`);
-        if (idx <= prevIdx) throw new Error(`DAILY_BARS_MONTH_ORDER_DRIFT:${keyName}`);
-        prevIdx = idx;
+      const addedSorted = [...addedMap.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+      let totalBytes = 0;
+      for (let i = 0; i < existingKeys.length; i += 1) {
+        totalBytes += existingOffsets[i * 2 + 1]! - existingOffsets[i * 2]! + 1;
       }
-      if (newLines.length < oldLines.length) throw new Error(`DAILY_BARS_MONTH_SHRUNK:${keyName}`);
-      const nextBytes = bytes(newLines.join("\n") + "\n");
+      for (const [, entry] of addedSorted) totalBytes += entry.bytes.byteLength + 1;
+      const nextBytes = new Uint8Array(totalBytes);
+      let ei = 0;
+      let ai = 0;
+      let outPos = 0;
+      while (ei < existingKeys.length || ai < addedSorted.length) {
+        const takeExisting =
+          ai >= addedSorted.length ||
+          (ei < existingKeys.length && existingKeys[ei]!.localeCompare(addedSorted[ai]![0]) <= 0);
+        if (takeExisting) {
+          const s = existingOffsets[ei * 2]!;
+          const e = existingOffsets[ei * 2 + 1]!;
+          const len = e - s;
+          nextBytes.set(got!.body.subarray(s, e), outPos);
+          nextBytes[outPos + len] = 0x0a;
+          outPos += len + 1;
+          ei += 1;
+        } else {
+          const b = addedSorted[ai]![1].bytes;
+          nextBytes.set(b, outPos);
+          nextBytes[outPos + b.byteLength] = 0x0a;
+          outPos += b.byteLength + 1;
+          ai += 1;
+        }
+      }
       const nextSha = createHash("sha256").update(nextBytes).digest("hex");
       if (readSha !== undefined && nextSha === readSha) continue;
       this.barCountsByKey.delete(keyName);
