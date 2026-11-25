@@ -7,7 +7,9 @@
  * - Live ticker-reference-index asOf (verifying it is a live/today date, not a historical chunk --to date).
  * - Per-month and pre/post-held-out (>= 2026-08-27) daily-bars counts and distinct INACTIVE ids with >= 1 bar.
  * - Optional Reply Dust replay (pointInTimeUniverse -> readDailyReplyDustBars -> filterReopenBars) to measure
- *   how many expected INACTIVE ids have >= 1 bar now and confirm reopen idempotency (0 missing Dust rows).
+ *   expected INACTIVE coverage by exact securityId|sessionDate|revision pairs (overall and held-out
+ *   >= 2026-08-27 separately). Id-level any-bar counts are secondary. Exits non-zero when any expected
+ *   pair is missing or any anomaly fires (including IDEMPOTENCY_WOULD_ADD_ROWS, INDEX_ASOF_NOT_LIVE).
  */
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -132,6 +134,14 @@ export interface CoverageCheckReport {
     expectedInactiveRowsPresentInBars: number;
     expectedInactiveRowsMissingFromBars: number;
     expectedInactiveRowsHeldOut: number;
+    expectedInactivePairsTotal: number;
+    expectedInactivePairsPresentInBars: number;
+    expectedInactivePairsMissingFromBars: number;
+    expectedInactivePairsCoverageFraction: number | null;
+    expectedInactivePairsHeldOutTotal: number;
+    expectedInactivePairsHeldOutPresentInBars: number;
+    expectedInactivePairsHeldOutMissingFromBars: number;
+    expectedInactivePairsHeldOutCoverageFraction: number | null;
     idempotencyWouldAddInactiveRows: number;
     idempotencyWouldAddNonInactiveRows: number;
     idempotencySkippedCollisionRows: number;
@@ -371,6 +381,8 @@ export async function runCoverageCheck(
   let expectedInactiveRowsPresentInBars = 0;
   let expectedInactiveRowsMissingFromBars = 0;
   let expectedInactiveRowsHeldOut = 0;
+  let expectedInactivePairsHeldOutPresentInBars = 0;
+  let expectedInactivePairsHeldOutMissingFromBars = 0;
   let idempotencyWouldAddInactiveRows = 0;
   let idempotencyWouldAddNonInactiveRows = 0;
   let idempotencySkippedCollisionRows = 0;
@@ -486,11 +498,19 @@ export async function runCoverageCheck(
         let presentCount = 0;
         let missingCount = 0;
         let heldOutCount = 0;
+        let heldOutPresentCount = 0;
+        let heldOutMissingCount = 0;
         for (const b of expected.newBars) {
           expectedIds.push(b.securityId);
-          if (b.sessionDate >= heldOutStart) heldOutCount += 1;
-          if (liveKeySet.has(`${b.securityId}|${b.sessionDate}|${b.revision}`)) presentCount += 1;
+          const present = liveKeySet.has(`${b.securityId}|${b.sessionDate}|${b.revision}`);
+          const heldOut = b.sessionDate >= heldOutStart;
+          if (present) presentCount += 1;
           else missingCount += 1;
+          if (heldOut) {
+            heldOutCount += 1;
+            if (present) heldOutPresentCount += 1;
+            else heldOutMissingCount += 1;
+          }
         }
         return {
           expectedIds,
@@ -498,6 +518,8 @@ export async function runCoverageCheck(
           presentCount,
           missingCount,
           heldOutCount,
+          heldOutPresentCount,
+          heldOutMissingCount,
           idempotentAdded: idempotent.addedByStatus,
           idempotentSkippedCollision: idempotent.skippedCollisionByStatus,
           idempotentSkippedNonInactive: idempotent.skippedNonInactiveByStatus,
@@ -510,6 +532,8 @@ export async function runCoverageCheck(
         expectedInactiveRowsPresentInBars += out.presentCount;
         expectedInactiveRowsMissingFromBars += out.missingCount;
         expectedInactiveRowsHeldOut += out.heldOutCount;
+        expectedInactivePairsHeldOutPresentInBars += out.heldOutPresentCount;
+        expectedInactivePairsHeldOutMissingFromBars += out.heldOutMissingCount;
         mExpectedRows += out.expectedRows;
         mExpectedPresent += out.presentCount;
         mExpectedMissing += out.missingCount;
@@ -559,6 +583,13 @@ export async function runCoverageCheck(
       if (inactiveIdsWithAnyBar.has(sid)) expectedPresentIds += 1;
       else expectedMissingIds += 1;
     }
+    const expectedInactivePairsTotal = expectedInactiveRowsTotal;
+    const expectedInactivePairsPresentInBars = expectedInactiveRowsPresentInBars;
+    const expectedInactivePairsMissingFromBars = expectedInactiveRowsMissingFromBars;
+    const expectedInactivePairsHeldOutTotal = expectedInactiveRowsHeldOut;
+    if (expectedInactivePairsMissingFromBars > 0) {
+      anomalies.push(`EXPECTED_INACTIVE_PAIRS_MISSING:${expectedInactivePairsMissingFromBars}`);
+    }
     if (expectedMissingIds > 0) anomalies.push(`EXPECTED_INACTIVE_IDS_MISSING:${expectedMissingIds}`);
     if (idempotencyWouldAddInactiveRows > 0 || idempotencyWouldAddNonInactiveRows > 0) {
       anomalies.push(`IDEMPOTENCY_WOULD_ADD_ROWS:${idempotencyWouldAddInactiveRows + idempotencyWouldAddNonInactiveRows}`);
@@ -576,6 +607,18 @@ export async function runCoverageCheck(
       expectedInactiveRowsPresentInBars,
       expectedInactiveRowsMissingFromBars,
       expectedInactiveRowsHeldOut,
+      expectedInactivePairsTotal,
+      expectedInactivePairsPresentInBars,
+      expectedInactivePairsMissingFromBars,
+      expectedInactivePairsCoverageFraction:
+        expectedInactivePairsTotal > 0 ? expectedInactivePairsPresentInBars / expectedInactivePairsTotal : null,
+      expectedInactivePairsHeldOutTotal,
+      expectedInactivePairsHeldOutPresentInBars,
+      expectedInactivePairsHeldOutMissingFromBars,
+      expectedInactivePairsHeldOutCoverageFraction:
+        expectedInactivePairsHeldOutTotal > 0
+          ? expectedInactivePairsHeldOutPresentInBars / expectedInactivePairsHeldOutTotal
+          : null,
       idempotencyWouldAddInactiveRows,
       idempotencyWouldAddNonInactiveRows,
       idempotencySkippedCollisionRows,
@@ -665,13 +708,21 @@ export function formatCoverageSummaryMarkdown(report: CoverageCheckReport): stri
 
   if (report.replyDustReopen) {
     const r = report.replyDustReopen;
-    const pct = r.expectedInactiveIdsCoverageFraction === null ? "n/a" : `${(r.expectedInactiveIdsCoverageFraction * 100).toFixed(2)}%`;
+    const pairPct =
+      r.expectedInactivePairsCoverageFraction === null
+        ? "n/a"
+        : `${(r.expectedInactivePairsCoverageFraction * 100).toFixed(2)}%`;
+    const heldOutPairPct =
+      r.expectedInactivePairsHeldOutCoverageFraction === null
+        ? "n/a"
+        : `${(r.expectedInactivePairsHeldOutCoverageFraction * 100).toFixed(2)}%`;
     lines.push(
       "",
       "## Reply Dust Reopen Expected-Set Verification (`pointInTimeUniverse` + `filterReopenBars`)",
       `- Dust sessions in reopen window: **${r.dustSessionsInReopenWindow}** (missing Dust: ${r.missingDustSessionsInReopenWindow}; total manifests in R2: ${r.dustManifestsTotal})`,
-      `- Expected \`INACTIVE\` IDs present in live bars: **${r.expectedInactiveIdsPresentInBars.toLocaleString("en-US")} / ${r.expectedInactiveIdsCount.toLocaleString("en-US")}** (${pct}; missing: **${r.expectedInactiveIdsMissingFromBars.toLocaleString("en-US")}**)`,
-      `- Expected \`INACTIVE\` rows present in live bars: **${r.expectedInactiveRowsPresentInBars.toLocaleString("en-US")} / ${r.expectedInactiveRowsTotal.toLocaleString("en-US")}** (missing: **${r.expectedInactiveRowsMissingFromBars.toLocaleString("en-US")}**, held-out: ${r.expectedInactiveRowsHeldOut.toLocaleString("en-US")})`,
+      `- Expected \`INACTIVE\` pairs (\`securityId|sessionDate|revision\`) present in live bars: **${r.expectedInactivePairsPresentInBars.toLocaleString("en-US")} / ${r.expectedInactivePairsTotal.toLocaleString("en-US")}** (${pairPct}; missing: **${r.expectedInactivePairsMissingFromBars.toLocaleString("en-US")}**)`,
+      `- Held-out expected \`INACTIVE\` pairs (\`>= ${report.heldOutStart}\`): **${r.expectedInactivePairsHeldOutPresentInBars.toLocaleString("en-US")} / ${r.expectedInactivePairsHeldOutTotal.toLocaleString("en-US")}** (${heldOutPairPct}; missing: **${r.expectedInactivePairsHeldOutMissingFromBars.toLocaleString("en-US")}**)`,
+      `- Expected \`INACTIVE\` IDs with any live bar (secondary): **${r.expectedInactiveIdsPresentInBars.toLocaleString("en-US")} / ${r.expectedInactiveIdsCount.toLocaleString("en-US")}** (missing: **${r.expectedInactiveIdsMissingFromBars.toLocaleString("en-US")}**)`,
       `- Reopen idempotency against live bars: would add **${r.idempotencyWouldAddInactiveRows}** \`INACTIVE\` rows, **${r.idempotencyWouldAddNonInactiveRows}** non-\`INACTIVE\` rows`,
     );
   }
@@ -745,6 +796,10 @@ export function parseCoverageCheckArgs(args: readonly string[]): {
   };
 }
 
+export function coverageCheckFailed(report: CoverageCheckReport): boolean {
+  return report.anomalies.length > 0;
+}
+
 export async function coverageCheckMain(
   args: readonly string[] = process.argv.slice(2),
   env: NodeJS.ProcessEnv = process.env,
@@ -784,6 +839,10 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import
   coverageCheckMain()
     .then((report) => {
       process.stdout.write(`${JSON.stringify(report)}\n`);
+      if (coverageCheckFailed(report)) {
+        process.stderr.write(`COVERAGE_CHECK_ANOMALIES:${report.anomalies.join(",")}\n`);
+        process.exitCode = 2;
+      }
     })
     .catch((error: unknown) => {
       process.stderr.write(`COVERAGE_CHECK_FAILED:${readReason(error)}\n`);

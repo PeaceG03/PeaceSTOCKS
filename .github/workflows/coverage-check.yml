@@ -79,6 +79,8 @@ jobs:
           if [ "$SKIP_REPLY_DUST" = "true" ]; then extra="--skip-reply-dust"; fi
           node scripts/trim-step-env.cjs PEACESTOCKS_R2_ACCOUNT_ID PEACESTOCKS_R2_BUCKET PEACESTOCKS_R2_READ_ACCESS_KEY_ID PEACESTOCKS_R2_READ_SECRET_ACCESS_KEY -- \
             pnpm -s exec tsx src/coverage-check.ts --out coverage-check.json $extra
+      # Always upload after the check step so a non-zero exit (missing pairs / anomalies)
+      # still leaves the aggregate summary artifact for review.
       - name: Upload aggregate coverage report
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
