@@ -19,7 +19,8 @@
     "backfill": "tsx src/backfill-job-cli.ts",
     "research": "tsx src/research-harness-cli.ts",
     "backfill:dry-run": "tsx src/backfill-dry-run-cli.ts",
-    "scan:reliability": "tsx src/scan-reliability-cli.ts"
+    "scan:reliability": "tsx src/scan-reliability-cli.ts",
+    "repair:backfill-asof": "tsx src/repair-backfill-asof.ts"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

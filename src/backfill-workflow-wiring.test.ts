@@ -47,6 +47,10 @@ test("workflow: backfill mode runs `pnpm backfill` with the spacing, chunk, cap 
   assert.match(backfillJob, /if: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.mode == 'backfill' && github\.ref == 'refs\/heads\/main' \}\}/u);
 });
 
+test("workflow: backfill step keeps 12 GB NODE_OPTIONS heap safety net", () => {
+  assert.match(runStep, /\n {10}NODE_OPTIONS: --max-old-space-size=12288\n/u);
+});
+
 test("`pnpm backfill` is the job CLI; the old direct entry point refuses to run", () => {
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { scripts: Record<string, string> };
   const script = pkg.scripts.backfill ?? "";

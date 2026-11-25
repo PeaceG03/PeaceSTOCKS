@@ -432,6 +432,16 @@ async function readManifest(store: Pick<IndexStore, "get">): Promise<TickerRefer
   return parseManifest(bytes);
 }
 
+export function signTickerReferenceManifest(
+  body: Omit<TickerReferenceIndexManifest, "checksum">,
+): TickerReferenceIndexManifest {
+  return { ...body, checksum: checksumOf(body) };
+}
+
+export function parseTickerReferenceManifest(bytes: Uint8Array): TickerReferenceIndexManifest {
+  return parseManifest(bytes);
+}
+
 function parseManifest(bytes: Uint8Array): TickerReferenceIndexManifest {
   let manifest: TickerReferenceIndexManifest;
   try {
