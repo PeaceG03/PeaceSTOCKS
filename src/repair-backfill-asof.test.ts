@@ -13,6 +13,7 @@ import {
 } from "./ticker-reference-index";
 import { formatRepairSummary, repairBackfillAsOf } from "./repair-backfill-asof";
 import type { SecurityMasterRecord } from "./contracts";
+import { securityId, stableJson } from "./identity";
 
 class MemoryObjectStore implements ObjectClient {
   readonly objects = new Map<string, { body: Uint8Array; etag: string; metadata: ObjectMetadata }>();
@@ -286,7 +287,7 @@ test("repairBackfillAsOf: dry-run performs zero writes, leaks no tickers, and ap
   assert.equal(drySummary.universeMembership.deduplicatedRows, 1);
   assert.equal(drySummary.universeMembership.unverified, 1);
   assert.equal(drySummary.tickerReferenceIndex.action, "relink-previous-past-bad");
-  assert.equal(drySummary.tickerReferenceIndex.deletedKeysCount, 2);
+  assert.equal(drySummary.tickerReferenceIndex.deletedKeysCount, 0);
 
   const printed = formatRepairSummary(drySummary);
   for (const forbidden of ["SYNADD", "SYNOUT", "SYNDELIST", "SYNOLD", "SYNNEW", "SYNRB", "SYNUNV", "figi:", "FIGI"]) {
@@ -299,7 +300,7 @@ test("repairBackfillAsOf: dry-run performs zero writes, leaks no tickers, and ap
   assert.equal(applySummary.securityMaster.wrote, true);
   assert.equal(applySummary.universeMembership.wrote, true);
   assert.equal(applySummary.tickerReferenceIndex.wrote, true);
-  assert.equal(store.deletes, 2);
+  assert.equal(store.deletes, 0);
 
   const master = JSON.parse(new TextDecoder().decode((await store.get("permanent/security-master.json"))!)) as SecurityMasterRecord[];
   const byId = new Map(master.map((r) => [r.securityId, r]));
@@ -329,7 +330,7 @@ test("repairBackfillAsOf: dry-run performs zero writes, leaks no tickers, and ap
   assert.equal(history.every((m) => (m.manifest?.asOf ?? "") !== "2025-05-13"), true);
   assert.equal(history.length, 2);
   const badObjects = (await store.list("permanent/ticker-reference-index/")).filter((k) => k.includes("2025-05"));
-  assert.deepEqual(badObjects, []);
+  assert.equal(badObjects.length > 0, true, "bad index objects kept as evidence");
 
   // Idempotent second run: 0 writes, 0 deletes
   store.resetCounters();
@@ -423,4 +424,170 @@ test("repairBackfillAsOf: refuses --apply on non-main GitHub Actions ref", async
       }),
     /REPAIR_REFUSE_NON_MAIN/u,
   );
+});
+
+test("repairBackfillAsOf (B1): matches production sec_ IDs, massive-stocks share_class_figi/composite_figi/ticker, uses stableJson, and keeps bad index objects", async () => {
+  const store = new MemoryObjectStore();
+  const makeProdEntry = (
+    pass: "active" | "inactive",
+    position: number,
+    fields: { ticker: string; type: "CS" | "ETF"; active: boolean; share_class_figi?: string; composite_figi?: string },
+  ): TickerReferenceEntry => {
+    const payload = {
+      ticker: fields.ticker,
+      type: fields.type,
+      market: "stocks",
+      locale: "us",
+      active: fields.active,
+      ...(fields.share_class_figi ? { share_class_figi: fields.share_class_figi } : {}),
+      ...(fields.composite_figi ? { composite_figi: fields.composite_figi } : {}),
+    };
+    return {
+      pass,
+      page: 1,
+      position,
+      raw: JSON.stringify(payload),
+      ticker: fields.ticker,
+      type: fields.type,
+      active: fields.active,
+      ...(fields.share_class_figi ? { share_class_figi: fields.share_class_figi } : {}),
+      ...(fields.composite_figi ? { composite_figi: fields.composite_figi } : {}),
+    };
+  };
+
+  // Production IDs: share_class_figi wins over composite_figi; ETF without FIGI uses ticker
+  const addId = securityId("massive-stocks", "BBG001SCADD1", "STOCK");
+  const etfAddId = securityId("massive-stocks", "SYNETF1", "ETF");
+  const reusedOldId = securityId("massive-stocks", "SYNREUSE", "STOCK");
+  const reusedNewId = securityId("massive-stocks", "BBG001SCREUS", "STOCK");
+  const inactOutId = securityId("massive-stocks", "BBG001SCOUT1", "STOCK");
+  const renameId = securityId("massive-stocks", "BBG001SCREN1", "STOCK");
+
+  await writeTickerReferenceIndex(
+    store,
+    {
+      pages: { active: 1, inactive: 0 },
+      entries: [
+        makeProdEntry("active", 0, { ticker: "SYNOUTP", type: "CS", active: true, share_class_figi: "BBG001SCOUT1", composite_figi: "BBG000CMOUT1" }),
+        makeProdEntry("active", 1, { ticker: "SYNOLDP", type: "CS", active: true, share_class_figi: "BBG001SCREN1", composite_figi: "BBG000CMREN1" }),
+        makeProdEntry("active", 2, { ticker: "SYNREUSE", type: "CS", active: true }),
+      ],
+    },
+    { provider: "massive-stocks", asOf: "2026-11-24" },
+  );
+
+  await writeTickerReferenceIndex(
+    store,
+    {
+      pages: { active: 1, inactive: 0 },
+      entries: [
+        makeProdEntry("active", 0, { ticker: "SYNNEWP", type: "CS", active: true, share_class_figi: "BBG001SCREN1", composite_figi: "BBG000CMREN9" }),
+        makeProdEntry("active", 1, { ticker: "SYNADDP", type: "CS", active: true, share_class_figi: "BBG001SCADD1", composite_figi: "BBG000CMADD1" }),
+        makeProdEntry("active", 2, { ticker: "SYNETF1", type: "ETF", active: true }),
+        makeProdEntry("active", 3, { ticker: "SYNREUSE", type: "CS", active: true, share_class_figi: "BBG001SCREUS", composite_figi: "BBG000CMREUS" }),
+        makeProdEntry("active", 3, { ticker: "SYNREUSE", type: "CS", active: true, share_class_figi: "BBG001SCREUS", composite_figi: "BBG000CMREUS" }),
+      ],
+    },
+    { provider: "massive-stocks", asOf: "2025-05-13" },
+  );
+
+  await writeTickerReferenceIndex(
+    store,
+    {
+      pages: { active: 1, inactive: 0 },
+      entries: [
+        makeProdEntry("active", 0, { ticker: "SYNNEWP", type: "CS", active: true, share_class_figi: "BBG001SCREN1", composite_figi: "BBG000CMREN9" }),
+        makeProdEntry("active", 1, { ticker: "SYNADDP", type: "CS", active: true, share_class_figi: "BBG001SCADD1", composite_figi: "BBG000CMADD1" }),
+        makeProdEntry("active", 2, { ticker: "SYNETF1", type: "ETF", active: true }),
+      ],
+    },
+    { provider: "massive-stocks", asOf: "2026-11-24" },
+  );
+
+  await store.put("backfill-reopen-state.json", new TextEncoder().encode(JSON.stringify({ updatedAt: "2026-11-25T00:00:05.102Z" })));
+
+  const securities: SecurityMasterRecord[] = [
+    makeSecurity({
+      securityId: addId,
+      currentSymbol: "SYNADDP",
+      firstSeenAt: "2025-05-13",
+      lastUniverseSeenAt: "2026-11-24",
+      historicalSymbols: [{ symbol: "SYNADDP", effectiveFrom: "2025-05-13", source: "massive-stocks" }],
+      providerIdentities: [{ provider: "massive-stocks", providerSecurityId: "BBG001SCADD1" }],
+    }),
+    makeSecurity({
+      securityId: etfAddId,
+      currentSymbol: "SYNETF1",
+      assetType: "ETF",
+      firstSeenAt: "2025-05-13",
+      lastUniverseSeenAt: "2026-11-24",
+      historicalSymbols: [{ symbol: "SYNETF1", effectiveFrom: "2025-05-13", source: "massive-stocks" }],
+      providerIdentities: [{ provider: "massive-stocks", providerSecurityId: "SYNETF1" }],
+    }),
+    makeSecurity({
+      securityId: inactOutId,
+      currentSymbol: "SYNOUTP",
+      status: "INACTIVE",
+      tradable: false,
+      inactiveAt: "2025-05-13",
+      lastUniverseSeenAt: "2026-11-23",
+      providerIdentities: [{ provider: "massive-stocks", providerSecurityId: "BBG001SCOUT1" }],
+    }),
+    makeSecurity({
+      securityId: reusedOldId,
+      currentSymbol: "SYNREUSE",
+      status: "INACTIVE",
+      tradable: false,
+      inactiveAt: "2025-05-13",
+      lastUniverseSeenAt: "2026-11-23",
+      providerIdentities: [{ provider: "massive-stocks", providerSecurityId: "SYNREUSE" }],
+    }),
+    makeSecurity({
+      securityId: reusedNewId,
+      currentSymbol: "SYNREUSE",
+      firstSeenAt: "2025-05-13",
+      lastUniverseSeenAt: "2026-11-24",
+      historicalSymbols: [{ symbol: "SYNREUSE", effectiveFrom: "2025-05-13", source: "massive-stocks" }],
+      providerIdentities: [{ provider: "massive-stocks", providerSecurityId: "BBG001SCREUS" }],
+    }),
+    makeSecurity({
+      securityId: renameId,
+      currentSymbol: "SYNNEWP",
+      lastUniverseSeenAt: "2026-11-24",
+      historicalSymbols: [
+        { symbol: "SYNOLDP", effectiveFrom: "2024-01-02", effectiveTo: "2025-05-13", source: "massive-stocks" },
+        { symbol: "SYNNEWP", effectiveFrom: "2025-05-13", source: "massive-stocks" },
+      ],
+      providerIdentities: [{ provider: "massive-stocks", providerSecurityId: "BBG001SCREN1" }],
+    }),
+  ];
+  await store.put("permanent/security-master.json", new TextEncoder().encode(JSON.stringify(securities, null, 2) + "\n"));
+
+  const rows = [
+    { securityId: addId, effectiveDate: "2025-05-13", included: true, eligibility: "LEVEL_0", reason: "NEW", provider: "massive-stocks", observedAt: "2025-05-13" },
+    { securityId: etfAddId, effectiveDate: "2025-05-13", included: true, eligibility: "LEVEL_0", reason: "NEW", provider: "massive-stocks", observedAt: "2025-05-13" },
+    { securityId: inactOutId, effectiveDate: "2025-05-13", included: false, eligibility: "LEVEL_0", reason: "INACTIVE", provider: "universe-diff", observedAt: "2025-05-13" },
+    { securityId: reusedOldId, effectiveDate: "2025-05-13", included: false, eligibility: "LEVEL_0", reason: "INACTIVE", provider: "universe-diff", observedAt: "2025-05-13" },
+    { securityId: reusedNewId, effectiveDate: "2025-05-13", included: true, eligibility: "LEVEL_0", reason: "NEW", provider: "massive-stocks", observedAt: "2025-05-13" },
+  ];
+  await store.put("permanent/universe-membership.jsonl", new TextEncoder().encode(rows.map((r) => JSON.stringify(r)).join("\n") + "\n"));
+  store.resetCounters();
+
+  const res = await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true });
+  assert.equal(res.securityMaster.repairedFirstSeen, 3);
+  assert.equal(res.securityMaster.repairedInactiveAt, 2);
+  assert.equal(res.securityMaster.repairedHistoricalSymbols, 4);
+  assert.equal(res.securityMaster.unverified, 0);
+  assert.equal(res.universeMembership.repairedRows, 5);
+  assert.equal(res.universeMembership.unverified, 0);
+  // Cheap optional: keep bad index objects instead of deleting them (relink only)
+  assert.equal(res.tickerReferenceIndex.action, "relink-previous-past-bad");
+  assert.equal(res.tickerReferenceIndex.deletedKeysCount, 0);
+  assert.equal(store.deletes, 0);
+  assert.equal((await store.list("permanent/ticker-reference-index/")).some((k) => k.includes("2025-05")), true);
+
+  // Cheap optional: membership rewrites use stableJson (alphabetical keys)
+  const memText = new TextDecoder().decode((await store.get("permanent/universe-membership.jsonl"))!).trimEnd();
+  const expectedLine = stableJson({ ...rows[0], effectiveDate: "2026-11-24", observedAt: "2026-11-24" });
+  assert.equal(memText.split("\n").includes(expectedLine), true);
 });

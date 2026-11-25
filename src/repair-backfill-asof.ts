@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { etCalendarDate } from "./et-time";
+import { securityId, stableJson } from "./identity";
 import { R2ObjectClient, type ObjectClient } from "./object-store";
 import {
   loadTickerReferenceIndexFromManifest,
@@ -96,20 +97,82 @@ async function writeWithEtag(store: ObjectClient, key: string, body: Uint8Array,
   await store.put(key, body);
 }
 
-function compositeFigiOfRecord(record: SecurityMasterRecord): string | undefined {
-  if (record.securityId.startsWith("figi:")) return record.securityId.slice(5);
-  const massive = record.providerIdentities?.find((p) => p.provider === "massive")?.providerSecurityId;
-  if (massive) return massive;
-  return undefined;
+interface EntryLookup {
+  bySecId: Map<string, TickerReferenceEntry>;
+  byShareClassFigi: Map<string, TickerReferenceEntry>;
+  byCompositeFigi: Map<string, TickerReferenceEntry>;
+  byTicker: Map<string, TickerReferenceEntry>;
 }
 
-function indexEntriesByFigi(entries: TickerReferenceEntry[]): Map<string, TickerReferenceEntry> {
-  const map = new Map<string, TickerReferenceEntry>();
+function nonEmpty(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function buildEntryLookup(entries: TickerReferenceEntry[]): EntryLookup {
+  const bySecId = new Map<string, TickerReferenceEntry>();
+  const byShareClassFigi = new Map<string, TickerReferenceEntry>();
+  const byCompositeFigi = new Map<string, TickerReferenceEntry>();
+  const byTicker = new Map<string, TickerReferenceEntry>();
+
   for (const entry of entries) {
-    const figi = typeof entry.composite_figi === "string" ? entry.composite_figi : undefined;
-    if (figi && !map.has(figi)) map.set(figi, entry);
+    let rawMarket: string | undefined;
+    let rawLocale: string | undefined;
+    let rawType = nonEmpty(entry.type)?.toUpperCase();
+    if (entry.raw) {
+      try {
+        const raw = JSON.parse(entry.raw) as Record<string, unknown>;
+        rawMarket = nonEmpty(raw.market)?.toLowerCase();
+        rawLocale = nonEmpty(raw.locale)?.toLowerCase();
+        if (!rawType) rawType = nonEmpty(raw.type)?.toUpperCase();
+      } catch {
+        // Ignore malformed raw in synthetic fixtures; fall back to parsed entry fields.
+      }
+    }
+
+    const scFigi = nonEmpty(entry.share_class_figi);
+    const compFigi = nonEmpty(entry.composite_figi);
+    const ticker = nonEmpty(entry.ticker);
+    const pid = scFigi ?? compFigi ?? ticker;
+    const isUsStockOrEtf =
+      (!rawType || rawType === "CS" || rawType === "ETF") &&
+      (!rawMarket || rawMarket === "stocks") &&
+      (!rawLocale || rawLocale === "us");
+
+    if (pid && isUsStockOrEtf) {
+      const assetType = rawType === "ETF" ? "ETF" : "STOCK";
+      const sid = securityId("massive-stocks", pid, assetType);
+      if (!bySecId.has(sid)) bySecId.set(sid, entry);
+    }
+    if (isUsStockOrEtf) {
+      if (scFigi && !byShareClassFigi.has(scFigi)) byShareClassFigi.set(scFigi, entry);
+      if (!scFigi && compFigi && !byCompositeFigi.has(compFigi)) byCompositeFigi.set(compFigi, entry);
+      if (!scFigi && !compFigi && ticker && !byTicker.has(ticker)) byTicker.set(ticker, entry);
+    }
   }
-  return map;
+  return { bySecId, byShareClassFigi, byCompositeFigi, byTicker };
+}
+
+function lookupIndexEntry(record: SecurityMasterRecord, lookup: EntryLookup | undefined): TickerReferenceEntry | undefined {
+  if (!lookup) return undefined;
+  const byId = lookup.bySecId.get(record.securityId);
+  if (byId) return byId;
+
+  for (const identity of record.providerIdentities ?? []) {
+    if (identity.provider !== "massive-stocks" && identity.provider !== "massive") continue;
+    const pid = identity.providerSecurityId;
+    if (!pid) continue;
+    const matched =
+      lookup.byShareClassFigi.get(pid) ??
+      lookup.byCompositeFigi.get(pid) ??
+      lookup.byTicker.get(pid);
+    if (matched) return matched;
+  }
+
+  if (record.securityId.startsWith("figi:")) {
+    const figi = record.securityId.slice(5);
+    return lookup.byShareClassFigi.get(figi) ?? lookup.byCompositeFigi.get(figi);
+  }
+  return undefined;
 }
 
 function membershipRowKey(row: Pick<UniverseMembershipEvidence, "securityId" | "effectiveDate" | "included">): string {
@@ -225,8 +288,8 @@ export async function repairBackfillAsOf(
   const morningEntries = morningManifest
     ? (await loadTickerReferenceIndexFromManifest(store, morningManifest)).entries
     : undefined;
-  const badByFigi = badEntries ? indexEntriesByFigi(badEntries) : undefined;
-  const morningByFigi = morningEntries ? indexEntriesByFigi(morningEntries) : undefined;
+  const badLookup = badEntries ? buildEntryLookup(badEntries) : undefined;
+  const morningLookup = morningEntries ? buildEntryLookup(morningEntries) : undefined;
 
   const baselineById = new Map<string, SecurityMasterRecord>();
   let baselineMasterLoaded = false;
@@ -288,9 +351,8 @@ export async function repairBackfillAsOf(
   const verifiedRenameIds = new Set<string>();
 
   const nextSecurities = securities.map((record) => {
-    const figi = compositeFigiOfRecord(record);
-    const morningEntry = figi ? morningByFigi?.get(figi) : undefined;
-    const badEntry = figi ? badByFigi?.get(figi) : undefined;
+    const morningEntry = lookupIndexEntry(record, morningLookup);
+    const badEntry = lookupIndexEntry(record, badLookup);
     const baselineRec = baselineMasterLoaded ? baselineById.get(record.securityId) : undefined;
     const secMembership = membershipBySecId.get(record.securityId) ?? [];
 
@@ -316,7 +378,7 @@ export async function repairBackfillAsOf(
     let handledNewHist = false;
     if (record.firstSeenAt === badDate) {
       const absentBefore =
-        (morningByFigi !== undefined && morningEntry === undefined) ||
+        (morningLookup !== undefined && morningEntry === undefined) ||
         (baselineMasterLoaded && baselineRec === undefined);
       const seenDuringBadRun = badEntry !== undefined;
       if (absentBefore && seenDuringBadRun && hasBadNewMembership) {
@@ -462,7 +524,7 @@ export async function repairBackfillAsOf(
     }
     existingTargetKeys.add(nextKey);
     repairedRows += 1;
-    nextMembershipLines.push({ raw: JSON.stringify(repairedRow), parsed: repairedRow });
+    nextMembershipLines.push({ raw: stableJson(repairedRow), parsed: repairedRow });
   }
 
   // 7. Plan ticker-reference-index manifest chain repair
@@ -475,7 +537,7 @@ export async function repairBackfillAsOf(
       if (morningArchiveBytes && morningManifest) {
         indexAction = "restore-previous-to-live";
         nextManifestBytes = morningArchiveBytes;
-        keysToDelete.push(badManifest.base.key);
+        // Keep bad index base object as forensic evidence; relink manifest only.
       } else {
         indexChainUnverified = true;
       }
@@ -487,7 +549,7 @@ export async function repairBackfillAsOf(
       });
       indexAction = "relink-previous-past-bad";
       nextManifestBytes = new TextEncoder().encode(JSON.stringify(relinked, null, 2) + "\n");
-      keysToDelete.push(badManifest.base.key, badManifestArchiveKey);
+      // Keep bad index objects as forensic evidence; relink manifest only.
     } else {
       indexChainUnverified = true;
     }
