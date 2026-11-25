@@ -170,3 +170,83 @@ test("backfill ET UTC-midnight boundary and reopen refresh skip when lastUnivers
   };
   assert.equal(idxManifest.asOf, "2026-11-24", "index asOf uses ET date 2026-11-24");
 });
+
+test("reopen failedSessions and stoppedOnError ignore stale failures outside [from, to]", async () => {
+  const client = new MemoryObjectClient();
+  const storage = new ObjectMarketStorage(client);
+  const fake = fakeMassive({
+    tickers: [{ ticker: "AAA", figi: "FIGI00000AAA", type: "CS", active: true }],
+    grouped: () => [{ T: "AAA", o: 10, h: 11, l: 9, c: 10.5, v: 1000 }],
+  });
+  const seedProvider = new MassiveMarketProvider({
+    apiKey: "fake-key-not-real",
+    baseUrl: FAKE_MASSIVE_BASE_URL,
+    fetchImpl: fake.fetchImpl,
+    minRequestIntervalMs: 0,
+    retryBackoffMs: 0,
+    keepRawReplies: true,
+    now: () => "2025-05-13T21:00:00.000Z",
+  });
+  await seedProvider.listApprovedSecurities();
+  const bars = await seedProvider.getDailyBars("2025-05-13", [securityId("massive-stocks", "FIGI00000AAA", "STOCK")]);
+  await writeDailyReplyDust(client, seedProvider.takeRawReplies()[0]!, {
+    provider: seedProvider.providerName,
+    observedAt: bars[0]!.observedAt,
+  });
+
+  await storage.saveBackfillReopenProgress({
+    schemaVersion: "markets-scanner-backfill-reopen-v1",
+    provider: "massive-stocks",
+    completedSessions: [],
+    failedSessions: { "2024-10-07": "MASSIVE_HTTP_403:plan_window" },
+    updatedAt: "2026-11-24T22:00:00.000Z",
+  });
+
+  // Case A: 2025-05-13 succeeds -> stale 2024-10-07 must not leak into report.failedSessions
+  const okReport = await runBackfillJob({
+    from: "2025-05-13",
+    to: "2025-05-13",
+    storage,
+    store: client,
+    fetchImpl: fake.fetchImpl,
+    apiKey: "fake-key-not-real",
+    baseUrl: FAKE_MASSIVE_BASE_URL,
+    minRequestIntervalMs: 0,
+    now: () => "2026-11-24T22:30:00.000Z",
+    zstdVersionProbe: pinnedZstd,
+    reopenInactiveTails: true,
+  });
+  assert.equal(okReport.status, "COMPLETE");
+  assert.deepEqual(okReport.failedSessions, {});
+
+  // Case B: 2025-05-14 fails with HTTP 500 -> stale 2024-10-07 403 must not mask stopReason as PLAN_WINDOW_403
+  const failFake = fakeMassive({
+    tickers: [{ ticker: "AAA", figi: "FIGI00000AAA", type: "CS", active: true }],
+    grouped: () => [],
+    onRequest: (url) => {
+      if (url.pathname.includes("/grouped/")) return new Response("boom", { status: 500 });
+      return undefined;
+    },
+  });
+  const failReport = await runBackfillJob({
+    from: "2025-05-14",
+    to: "2025-05-14",
+    storage,
+    store: client,
+    fetchImpl: failFake.fetchImpl,
+    apiKey: "fake-key-not-real",
+    baseUrl: FAKE_MASSIVE_BASE_URL,
+    minRequestIntervalMs: 0,
+    now: () => "2026-11-24T22:35:00.000Z",
+    zstdVersionProbe: pinnedZstd,
+    reopenInactiveTails: true,
+  });
+  assert.equal(failReport.status, "STOPPED_RESUMABLE");
+  assert.equal(failReport.stopReason, "SESSION_FAILED");
+  assert.deepEqual(Object.keys(failReport.failedSessions), ["2025-05-14"]);
+
+  // Checkpoint on disk still retains 2024-10-07 alongside 2025-05-14
+  const saved = (await storage.loadBackfillReopenProgress()) as { failedSessions: Record<string, string> };
+  assert.equal(typeof saved.failedSessions["2024-10-07"], "string");
+  assert.equal(typeof saved.failedSessions["2025-05-14"], "string");
+});

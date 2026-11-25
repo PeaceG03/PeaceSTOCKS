@@ -612,6 +612,12 @@ export async function backfillHistoricalEvidence(options: {
     }),
     {},
   );
+  const scopedFailedSessions = Object.fromEntries(
+    Object.entries(failedSessions).filter(([k]) => {
+      const d = k.slice(0, 10);
+      return d >= options.from && d <= options.to;
+    }),
+  );
   return {
     provider: provider.providerName,
     requestedFrom: options.from,
@@ -619,7 +625,7 @@ export async function backfillHistoricalEvidence(options: {
     attemptedSessions,
     completedSessions,
     skippedExistingSessions,
-    failedSessions,
+    failedSessions: scopedFailedSessions,
     barsStored,
     actionsStored,
     stoppedOnError,

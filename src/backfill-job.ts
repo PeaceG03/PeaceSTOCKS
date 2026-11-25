@@ -223,7 +223,12 @@ export async function runBackfillJob(options: BackfillJobOptions): Promise<Backf
     if (check.state === "verified") sessionsVerified += 1;
     else shaMismatches.push(sessionDate);
   }
-  const failedMessage = Object.values(result.failedSessions)[0];
+  const inRangeFailures = Object.entries(result.failedSessions).filter(([k]) => {
+    const d = k.slice(0, 10);
+    return d >= options.from && d <= options.to;
+  });
+  const scopedFailedSessions = Object.fromEntries(inRangeFailures);
+  const failedMessage = inRangeFailures.at(-1)?.[1];
   const stopReason: BackfillStopReason | undefined = result.stoppedOnError
     ? classifyStop(failedMessage ?? "")
     : result.yieldedForScan
@@ -263,7 +268,7 @@ export async function runBackfillJob(options: BackfillJobOptions): Promise<Backf
     requests: requestTimes.length,
     minRequestGapMs: gaps.length ? Math.min(...gaps) : null,
     elapsedMs: requestTimes.length ? requestTimes.at(-1)! - requestTimes[0]! : 0,
-    failedSessions: result.failedSessions,
+    failedSessions: scopedFailedSessions,
     backfill: {
       barsStored: result.barsStored,
       actionsStored: result.actionsStored,
