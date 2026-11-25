@@ -15,6 +15,9 @@ import { formatRepairSummary, repairBackfillAsOf } from "./repair-backfill-asof"
 import type { SecurityMasterRecord } from "./contracts";
 import { securityId, stableJson } from "./identity";
 
+/** Apply tests inject a local env so a GitHub Actions GITHUB_REF cannot trip the main-only guard. */
+const LOCAL_ENV: NodeJS.ProcessEnv = {};
+
 class MemoryObjectStore implements ObjectClient {
   readonly objects = new Map<string, { body: Uint8Array; etag: string; metadata: ObjectMetadata }>();
   private seq = 0;
@@ -295,7 +298,7 @@ test("repairBackfillAsOf: dry-run performs zero writes, leaks no tickers, and ap
   }
 
   // Apply
-  const applySummary = await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true });
+  const applySummary = await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true, env: LOCAL_ENV });
   assert.equal(applySummary.mode, "apply");
   assert.equal(applySummary.securityMaster.wrote, true);
   assert.equal(applySummary.universeMembership.wrote, true);
@@ -334,7 +337,7 @@ test("repairBackfillAsOf: dry-run performs zero writes, leaks no tickers, and ap
 
   // Idempotent second run: 0 writes, 0 deletes
   store.resetCounters();
-  const second = await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true });
+  const second = await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true, env: LOCAL_ENV });
   assert.equal(second.securityMaster.wrote, false);
   assert.equal(second.universeMembership.wrote, false);
   assert.equal(second.tickerReferenceIndex.wrote, false);
@@ -372,12 +375,12 @@ test("repairBackfillAsOf: uses --baseline-master to restore exact pre-incident l
       }
     };
     await assert.rejects(
-      () => repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true, baselineMasterPath: baselinePath }),
+      () => repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true, baselineMasterPath: baselinePath, env: LOCAL_ENV }),
       /REPAIR_ETAG_DRIFT/u,
     );
 
     store.onBeforePutIfMatch = undefined;
-    await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true, baselineMasterPath: baselinePath });
+    await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true, baselineMasterPath: baselinePath, env: LOCAL_ENV });
     const master = JSON.parse(new TextDecoder().decode((await store.get("permanent/security-master.json"))!)) as SecurityMasterRecord[];
     assert.equal(master.find((r) => r.securityId === "figi:FIGIRB2")?.lastUniverseSeenAt, "2026-10-13");
   } finally {
@@ -401,7 +404,7 @@ test("repairBackfillAsOf: pre-scan state restores morning manifest to live and w
   await store.put("permanent/security-master.json", new TextEncoder().encode("[]\n"));
   await store.put("permanent/universe-membership.jsonl", new TextEncoder().encode(""));
 
-  const res = await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true });
+  const res = await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true, env: LOCAL_ENV });
   assert.equal(res.tickerReferenceIndex.action, "restore-previous-to-live");
   const live = await loadTickerReferenceIndex(store);
   assert.equal(live?.manifest.asOf, "2026-11-24");
@@ -424,6 +427,33 @@ test("repairBackfillAsOf: refuses --apply on non-main GitHub Actions ref", async
       }),
     /REPAIR_REFUSE_NON_MAIN/u,
   );
+});
+
+test("repairBackfillAsOf: falling back to process.env still refuses apply on refs/pull/*/merge", async () => {
+  const store = new MemoryObjectStore();
+  const prevActions = process.env.GITHUB_ACTIONS;
+  const prevRef = process.env.GITHUB_REF;
+  process.env.GITHUB_ACTIONS = "true";
+  process.env.GITHUB_REF = "refs/pull/137/merge";
+  try {
+    await assert.rejects(
+      () => repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true }),
+      /REPAIR_REFUSE_NON_MAIN:refs\/pull\/137\/merge/u,
+    );
+  } finally {
+    if (prevActions === undefined) delete process.env.GITHUB_ACTIONS;
+    else process.env.GITHUB_ACTIONS = prevActions;
+    if (prevRef === undefined) delete process.env.GITHUB_REF;
+    else process.env.GITHUB_REF = prevRef;
+  }
+});
+
+test("production CLI does not wire env from argv or config and falls back to process.env", () => {
+  const source = readFileSync(new URL("./repair-backfill-asof.ts", import.meta.url), "utf8");
+  assert.match(source, /const options = parseCliArgs\(process\.argv\.slice\(2\)\);/u);
+  assert.match(source, /repairBackfillAsOf\(store, options\)/u);
+  assert.doesNotMatch(source, /options\.env\s*=/u);
+  assert.doesNotMatch(source, /arg === "--env"/u);
 });
 
 test("repairBackfillAsOf (B1): matches production sec_ IDs, massive-stocks share_class_figi/composite_figi/ticker, uses stableJson, and keeps bad index objects", async () => {
@@ -573,7 +603,7 @@ test("repairBackfillAsOf (B1): matches production sec_ IDs, massive-stocks share
   await store.put("permanent/universe-membership.jsonl", new TextEncoder().encode(rows.map((r) => JSON.stringify(r)).join("\n") + "\n"));
   store.resetCounters();
 
-  const res = await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true });
+  const res = await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true, env: LOCAL_ENV });
   assert.equal(res.securityMaster.repairedFirstSeen, 3);
   assert.equal(res.securityMaster.repairedInactiveAt, 2);
   assert.equal(res.securityMaster.repairedHistoricalSymbols, 4);
@@ -710,7 +740,7 @@ test("repairBackfillAsOf (B2): kills single-evidence-check mutants (new-membersh
   await store.put("backfill-reopen-state.json", new TextEncoder().encode(JSON.stringify({ updatedAt: "2026-11-25T00:00:05.102Z" })));
 
   // All 4 missing-evidence cases must remain untouched & unverified
-  const res = await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true });
+  const res = await repairBackfillAsOf(store, { badDate: "2025-05-13", apply: true, env: LOCAL_ENV });
   assert.equal(res.securityMaster.repairedFirstSeen, 0);
   assert.equal(res.securityMaster.repairedInactiveAt, 0);
   assert.equal(res.securityMaster.repairedHistoricalSymbols, 0);

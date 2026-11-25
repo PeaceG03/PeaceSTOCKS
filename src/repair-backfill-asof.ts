@@ -650,6 +650,7 @@ function parseCliArgs(argv: string[]): RepairBackfillAsOfOptions {
 async function main(): Promise<void> {
   const options = parseCliArgs(process.argv.slice(2));
   const store = R2ObjectClient.fromEnv();
+  // parseCliArgs never sets env from argv or config; production always falls back to process.env.
   const summary = await repairBackfillAsOf(store, options);
   console.log(formatRepairSummary(summary));
 }
