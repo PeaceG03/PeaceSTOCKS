@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,7 +12,7 @@ import {
   type TickerReferenceCapture,
   type TickerReferenceEntry,
 } from "./ticker-reference-index";
-import { formatRepairSummary, repairBackfillAsOf } from "./repair-backfill-asof";
+import { formatRepairSummary, parseCliArgs, repairBackfillAsOf } from "./repair-backfill-asof";
 import type { SecurityMasterRecord } from "./contracts";
 import { securityId, stableJson } from "./identity";
 
@@ -747,4 +748,32 @@ test("repairBackfillAsOf (B2): kills single-evidence-check mutants (new-membersh
   assert.equal(res.securityMaster.unverified, 4);
   assert.equal(res.universeMembership.repairedRows, 0);
   assert.equal(res.universeMembership.unverified, 1);
+});
+
+test("parseCliArgs skips a standalone -- from pnpm and keeps rejecting unknown args", () => {
+  assert.deepEqual(parseCliArgs(["--", "--bad-date", "2025-05-13"]), { badDate: "2025-05-13" });
+  assert.deepEqual(parseCliArgs(["--", "--bad-date", "2025-05-13", "--apply"]), { badDate: "2025-05-13", apply: true });
+  assert.throws(() => parseCliArgs(["--oops"]), /REPAIR_UNKNOWN_ARG:--oops/u);
+  assert.throws(() => parseCliArgs(["--", "--unknown"]), /REPAIR_UNKNOWN_ARG:--unknown/u);
+});
+
+test("workflow repair npm script with pnpm -- reaches past arg parsing against a missing store", () => {
+  const yml = readFileSync(new URL("../.github/workflows/scanner.yml", import.meta.url), "utf8");
+  const start = yml.indexOf("\n  repair_backfill_asof:\n");
+  assert.ok(start >= 0, "repair_backfill_asof job present");
+  const job = yml.slice(start);
+  assert.match(job, /pnpm run repair:backfill-asof -- "\$\{ARGS\[@\]\}"/u);
+
+  // The workflow expands ARGS to --bad-date <date> (and optionally --apply); pnpm leaves a literal -- in argv.
+  assert.deepEqual(parseCliArgs(["--", "--bad-date", "2025-05-13"]), { badDate: "2025-05-13" });
+
+  const out = spawnSync("pnpm", ["run", "repair:backfill-asof", "--", "--bad-date", "2025-05-13"], {
+    cwd: new URL("..", import.meta.url).pathname,
+    env: { PATH: process.env.PATH, HOME: process.env.HOME },
+    encoding: "utf8",
+  });
+  const text = `${out.stdout ?? ""}${out.stderr ?? ""}`;
+  assert.equal(text.includes("REPAIR_UNKNOWN_ARG:--"), false, "arg parsing must accept the workflow's pnpm --");
+  assert.match(text, /R2_CONFIG_REQUIRED/u);
+  assert.notEqual(out.status, 0);
 });

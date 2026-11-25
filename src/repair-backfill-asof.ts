@@ -620,11 +620,13 @@ export async function repairBackfillAsOf(
   };
 }
 
-function parseCliArgs(argv: string[]): RepairBackfillAsOfOptions {
+export function parseCliArgs(argv: string[]): RepairBackfillAsOfOptions {
   const options: RepairBackfillAsOfOptions = {};
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!;
-    if (arg === "--apply") {
+    if (arg === "--") {
+      continue;
+    } else if (arg === "--apply") {
       options.apply = true;
     } else if (arg === "--dry-run") {
       options.apply = false;
